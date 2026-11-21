@@ -11,3 +11,8 @@ dist/
 # teamwork backup files
 .opencode/
 .vscode/
+.swarm/
+
+# local reverse-engineering scratch data
+.re-scratch/
+docs/re/_scratch/

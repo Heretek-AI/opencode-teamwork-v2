@@ -36,6 +36,7 @@
     "lib",
     "bin",
     "docs",
+    "!docs/re/**",
     "scripts",
     "postinstall.mjs",
     "README.md",
