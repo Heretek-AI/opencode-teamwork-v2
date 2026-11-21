@@ -41,6 +41,7 @@ try {
   const planRes = await registeredTools.plan.execute({
     sessionId: "20261018-000000-test",
     topology: "distributed-coding",
+    skipInterview: true, // fixture: this part exercises the DAG engine, not the spec gate
     tasks: [
       { id: "T1", dependsOn: [], maxRounds: 2 },
       { id: "T2", dependsOn: ["T1"], maxRounds: 2 },
@@ -102,7 +103,7 @@ try {
   assert.strictEqual(nextRes.readyForWorker.length, 1)
   assert.strictEqual(nextRes.readyForWorker[0].id, "T1")
   assert.strictEqual(nextRes.readyForWorker[0].round, 2, "Should advance to round 2")
-  assert.strictEqual(nextRes.readyForWorker[0].feedback, "Fix edge case in validation")
+  assert.strictEqual(nextRes.readyForWorker[0].feedback, "R1: Fix edge case in validation", "Unresolved feedback must carry its round prefix")
 
   // Step 5: T1 passes on round 2
   await registeredTools.task_update.execute({
@@ -119,6 +120,11 @@ try {
   await registeredTools.task_update.execute({
     sessionId: "20261018-000000-test",
     taskId: "T1",
+    status: "verifier_active",
+  })
+  await registeredTools.task_update.execute({
+    sessionId: "20261018-000000-test",
+    taskId: "T1",
     status: "verified_pass",
     verification: { status: "PASS", passedChecks: 5, totalChecks: 5 },
   })
@@ -129,10 +135,20 @@ try {
   assert.strictEqual(nextRes.readyForWorker[0].id, "T2", "T2 should now be ready for worker")
 
   // Step 7: T2 passes -> Pre-merge security gate triggers!
+  // The lifecycle is walked explicitly: a direct pending -> verified_pass jump is
+  // refused by the transition graph, and verified_pass requires PASS evidence.
+  for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+    await registeredTools.task_update.execute({
+      sessionId: "20261018-000000-test",
+      taskId: "T2",
+      status,
+    })
+  }
   await registeredTools.task_update.execute({
     sessionId: "20261018-000000-test",
     taskId: "T2",
     status: "verified_pass",
+    verification: { status: "PASS", passedChecks: 3, totalChecks: 3 },
   })
   nextRes = await registeredTools.next.execute({ sessionId: "20261018-000000-test" })
   assert.strictEqual(nextRes.status, "READY_FOR_SECURITY_AUDIT", "Should require security audit before all-passed")
@@ -149,7 +165,7 @@ try {
   nextRes = await registeredTools.next.execute({ sessionId: "20261018-000000-test" })
   assert.strictEqual(nextRes.status, "BLOCKED_BY_SECURITY", "Should block final merge when audit fails")
 
-  // Step 9: Remediate and run clean Security Audit -> ALL_PASSED
+  // Step 9: Remediate and run clean Security Audit -> final verification gate
   const passAuditRes = await registeredTools.security_audit.execute({
     sessionId: "20261018-000000-test",
     status: "PASS",
@@ -158,10 +174,252 @@ try {
   })
   assert.strictEqual(passAuditRes.status, "PASS")
 
+  // (a) Tasks + audit pass, but no verify/final.json -> NOT done.
+  const finalFile = join(testDir, ".opencode", "teamwork", "20261018-000000-test", "verify", "final.json")
+  const mainStateFile = join(testDir, ".opencode", "teamwork", "20261018-000000-test", "state.json")
   nextRes = await registeredTools.next.execute({ sessionId: "20261018-000000-test" })
-  assert.strictEqual(nextRes.status, "ALL_PASSED", "Should report ALL_PASSED when security audit passes")
+  assert.strictEqual(nextRes.status, "READY_FOR_FINAL_VERIFICATION", "Missing final.json must block ALL_PASSED")
+  assert.strictEqual(nextRes.finalReport, finalFile, "Response must name the final report path")
+  assert.strictEqual(nextRes.passedCount, 2)
+  let phase = JSON.parse(readFileSync(mainStateFile, "utf8")).phase
+  assert.strictEqual(phase, "FINAL_VERIFICATION", "Phase must advance to FINAL_VERIFICATION")
+
+  // (b) A FAIL final report blocks the run (never ALL_PASSED).
+  mkdirSync(dirname(finalFile), { recursive: true })
+  writeFileSync(finalFile, JSON.stringify({ status: "FAIL", summary: "acceptance criteria not met" }) + "\n")
+  nextRes = await registeredTools.next.execute({ sessionId: "20261018-000000-test" })
+  assert.strictEqual(nextRes.status, "BLOCKED_BY_FINAL_VERIFICATION", "A FAIL final report must block the run")
+  assert.notStrictEqual(nextRes.status, "ALL_PASSED")
+  assert.strictEqual(nextRes.finalReport, finalFile)
+
+  // (c) Only a PASS final report completes the run.
+  writeFileSync(finalFile, JSON.stringify({ status: "PASS", summary: "independent final check passed" }) + "\n")
+  nextRes = await registeredTools.next.execute({ sessionId: "20261018-000000-test" })
+  assert.strictEqual(nextRes.status, "ALL_PASSED", "A PASS final report is required for ALL_PASSED")
+  assert.strictEqual(nextRes.finalReport, finalFile, "ALL_PASSED must include the final report path")
+  phase = JSON.parse(readFileSync(mainStateFile, "utf8")).phase
+  assert.strictEqual(phase, "MERGE", "Phase must advance to MERGE only after final PASS")
 
   console.log("✓ DAG engine, dynamic pitfall injection & security gate verified")
+
+  // ==========================================
+  // Part 1b: Topology normalisation + verified_pass accounting
+  // ==========================================
+  console.log("Testing topology normalisation & completion accounting...")
+
+  const planFileOf = (id) => join(testDir, ".opencode", "teamwork", id, "plan.dag.json")
+  const stateFileOf = (id) => join(testDir, ".opencode", "teamwork", id, "state.json")
+  const runFile = (root, runId, name) => join(root, ".opencode", "teamwork", runId, name)
+  const readEvents = (root, runId) =>
+    readFileSync(runFile(root, runId, "events.jsonl"), "utf8")
+      .split("\n")
+      .filter((l) => l !== "")
+      .map((l) => JSON.parse(l))
+
+  // Every legacy alias is accepted and persisted as its canonical topology.
+  const aliases = {
+    "large-swarm": "distributed-coding",
+    "doc-review": "document-review",
+    "long-proof": "proof",
+    "massive-proof-swarm": "massive-proof",
+  }
+  for (const [alias, canonical] of Object.entries(aliases)) {
+    const id = `20261018-000000-alias-${alias}`
+    const r = await registeredTools.plan.execute({ sessionId: id, topology: alias, skipInterview: true, tasks: [{ id: "T1" }] })
+    assert(r.content.startsWith("Planned"), `alias ${alias} must be accepted: ${r.content}`)
+    const persisted = JSON.parse(readFileSync(planFileOf(id), "utf8"))
+    assert.strictEqual(persisted.topology, canonical, `${alias} must be persisted as ${canonical}`)
+    assert(!("routingReason" in persisted), "routingReason must be absent when not provided")
+  }
+
+  // routingReason is optional and persisted when provided.
+  const reasonRun = "20261018-000000-reason"
+  await registeredTools.plan.execute({
+    sessionId: reasonRun,
+    topology: "doc-review",
+    routingReason: "docs-only review",
+    skipInterview: true,
+    tasks: [{ id: "T1" }],
+  })
+  const reasonPlan = JSON.parse(readFileSync(planFileOf(reasonRun), "utf8"))
+  assert.strictEqual(reasonPlan.topology, "document-review", "alias must be normalised on write")
+  assert.strictEqual(reasonPlan.routingReason, "docs-only review", "routingReason must be persisted")
+
+  // An unknown topology is refused and writes nothing.
+  const badTopoRun = "20261018-000000-badtopo"
+  const badTopo = await registeredTools.plan.execute({
+    sessionId: badTopoRun,
+    topology: "not-a-topology",
+    tasks: [{ id: "T1" }],
+  })
+  assert(badTopo.content.startsWith("refused: invalid topology"), `unknown topology must be refused: ${badTopo.content}`)
+  assert(badTopo.content.includes("document-review"), "refusal must list the accepted values")
+  assert(!existsSync(join(testDir, ".opencode", "teamwork", badTopoRun)), "a refused plan must write nothing")
+
+  // verified_pass is the canonical terminal state: status counts it, resume is complete.
+  // The legal lifecycle must be walked and PASS evidence supplied (the engine refuses
+  // both a status jump and an evidence-free verified_pass).
+  const passRun = "20261018-000000-verified"
+  await registeredTools.plan.execute({ sessionId: passRun, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "P1" }, { id: "P2" }] })
+  for (const taskId of ["P1", "P2"]) {
+    for (const status of ["worker_active", "worker_done", "verifier_active", "verified_pass"]) {
+      await registeredTools.task_update.execute({
+        sessionId: passRun,
+        taskId,
+        status,
+        ...(status === "verified_pass" ? { verification: { status: "PASS" } } : {}),
+      })
+    }
+  }
+  const passStatus = await registeredTools.status.execute({ sessionId: passRun })
+  assert(passStatus.content.includes("2/2 pass"), `status must count verified_pass: ${passStatus.content}`)
+  const passResume = await registeredTools.resume.execute({ sessionId: passRun })
+  assert(passResume.content.includes("is complete"), `resume must treat verified_pass as closed: ${passResume.content}`)
+
+  // Legacy `pass` in an existing state.json is still counted as complete.
+  const legacyRun = "20261018-000000-legacy-pass"
+  await registeredTools.plan.execute({ sessionId: legacyRun, topology: "small-focused", skipInterview: true, tasks: [{ id: "L1" }] })
+  const legacyState = JSON.parse(readFileSync(stateFileOf(legacyRun), "utf8"))
+  legacyState.tasks.L1.status = "pass"
+  writeFileSync(stateFileOf(legacyRun), JSON.stringify(legacyState, null, 2) + "\n")
+  const legacyStatus = await registeredTools.status.execute({ sessionId: legacyRun })
+  assert(legacyStatus.content.includes("1/1 pass"), `status must still count legacy pass: ${legacyStatus.content}`)
+  const legacyResume = await registeredTools.resume.execute({ sessionId: legacyRun })
+  assert(legacyResume.content.includes("is complete"), `resume must treat legacy pass as closed: ${legacyResume.content}`)
+
+  console.log("✓ topology aliases normalised, unknown topologies refused, verified_pass counted as complete")
+
+  // ==========================================
+  // Part 1c: teamwork_plan spec gate (3.4)
+  // ==========================================
+  console.log("Testing the teamwork_plan spec gate...")
+
+  // (a) no spec + defaults -> refused, and the run dir is never created.
+  const noSpecRun = "20261018-000000-nospec"
+  const noSpecRes = await registeredTools.plan.execute({ sessionId: noSpecRun, topology: "iterative-coding", tasks: [{ id: "S1" }] })
+  assert(noSpecRes.content.startsWith("refused: no spec found"), `plan without a spec must be refused: ${noSpecRes.content}`)
+  assert(noSpecRes.content.includes(runFile(testDir, noSpecRun, "prompt_draft.md")), "refusal must name the expected spec path")
+  assert(noSpecRes.content.includes("skipInterview: true"), "refusal must name the explicit bypass")
+  assert(noSpecRes.content.includes("/teamwork-craft"), "refusal must name the action that produces a spec")
+  assert(!existsSync(join(testDir, ".opencode", "teamwork", noSpecRun)), "a spec-gate refusal must create no run directory")
+
+  // A whitespace-only prompt_draft.md is not a spec: still refused, still no plan files.
+  const blankSpecRun = "20261018-000000-blankspec"
+  mkdirSync(join(testDir, ".opencode", "teamwork", blankSpecRun), { recursive: true })
+  writeFileSync(runFile(testDir, blankSpecRun, "prompt_draft.md"), "  \n\t\n")
+  const blankRes = await registeredTools.plan.execute({ sessionId: blankSpecRun, topology: "iterative-coding", tasks: [{ id: "S1" }] })
+  assert(blankRes.content.startsWith("refused: no spec found"), `a whitespace-only spec must not satisfy the gate: ${blankRes.content}`)
+  assert(!existsSync(planFileOf(blankSpecRun)), "a refused plan with an existing run dir must write no plan files")
+
+  // (b) skipInterview: true -> succeeds, and run_created records the bypass.
+  const bypassRun = "20261018-000000-specbypass"
+  const bypassRes = await registeredTools.plan.execute({ sessionId: bypassRun, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "S1" }] })
+  assert(bypassRes.content.startsWith("Planned"), `skipInterview must allow planning without a spec: ${bypassRes.content}`)
+  assert(bypassRes.content.includes("Spec gate bypassed"), "the bypass must be visible in the tool result")
+  const bypassCreated = readEvents(testDir, bypassRun).find((e) => e.event === "run_created")
+  assert.strictEqual(bypassCreated.specGate, "bypassed", "run_created must record specGate: bypassed")
+  assert(!Object.hasOwn(bypassCreated, "specPath"), "a bypass must not record a specPath")
+
+  // (c) non-empty prompt_draft.md -> succeeds, specPath recorded.
+  const specRun = "20261018-000000-specok"
+  mkdirSync(join(testDir, ".opencode", "teamwork", specRun), { recursive: true })
+  writeFileSync(runFile(testDir, specRun, "prompt_draft.md"), "# Spec\n\nBuild the thing.\n")
+  const specRes = await registeredTools.plan.execute({ sessionId: specRun, topology: "iterative-coding", tasks: [{ id: "S1" }] })
+  assert(specRes.content.startsWith("Planned"), `a present spec must satisfy the gate: ${specRes.content}`)
+  const specCreated = readEvents(testDir, specRun).find((e) => e.event === "run_created")
+  assert.strictEqual(specCreated.specGate, "satisfied", "run_created must record specGate: satisfied")
+  assert.strictEqual(specCreated.specPath, runFile(testDir, specRun, "prompt_draft.md"), "a satisfied gate must record the spec path")
+  assert.deepStrictEqual(
+    Object.keys(specCreated),
+    ["ts", "event", "sessionId", "taskId", "from", "to", "round", "agent", "branch", "worktree", "phase", "specGate", "specPath"],
+    "existing run_created fields must keep their order; the gate fields are appended",
+  )
+
+  // (d) requireSpec: false -> succeeds without a spec and is recorded as such.
+  const optOutRun = "20261018-000000-specoptout"
+  const optOutRes = await registeredTools.plan.execute({ sessionId: optOutRun, topology: "iterative-coding", requireSpec: false, tasks: [{ id: "S1" }] })
+  assert(optOutRes.content.startsWith("Planned"), `requireSpec: false must allow planning without a spec: ${optOutRes.content}`)
+  assert(!existsSync(runFile(testDir, optOutRun, "prompt_draft.md")), "requireSpec: false must not invent a spec file")
+  const optOutCreated = readEvents(testDir, optOutRun).find((e) => e.event === "run_created")
+  assert.strictEqual(optOutCreated.specGate, "not_required", "run_created must record specGate: not_required")
+  assert(!Object.hasOwn(optOutCreated, "specPath"), "not_required must not record a specPath")
+
+  console.log("✓ plan refuses without a spec (writing nothing), records satisfied/bypassed/not_required")
+
+  // ==========================================
+  // Part 1d: Transition graph + evidence for verified_pass
+  // ==========================================
+  console.log("Testing task transition graph & verified_pass evidence...")
+
+  const transitionRun = "20261018-000000-transitions"
+  await registeredTools.plan.execute({
+    sessionId: transitionRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    tasks: [{ id: "G1" }, { id: "G2" }],
+  })
+  const transitionState = stateFileOf(transitionRun)
+
+  // (d) pending -> verified_pass is refused, even with inline PASS evidence.
+  const jump = await registeredTools.task_update.execute({
+    sessionId: transitionRun,
+    taskId: "G1",
+    status: "verified_pass",
+    verification: { status: "PASS" },
+  })
+  assert(jump.content.startsWith("Error: Illegal transition"), `pending -> verified_pass must be refused: ${jump.content}`)
+  assert(jump.content.includes("worker_active") && jump.content.includes("blocked"), `refusal must list allowed next states: ${jump.content}`)
+  assert.strictEqual(JSON.parse(readFileSync(transitionState, "utf8")).tasks.G1.status, "pending", "a refused transition must not be persisted")
+
+  for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+    const r = await registeredTools.task_update.execute({ sessionId: transitionRun, taskId: "G1", status })
+    assert(r.content.includes("updated"), `legal ${status} transition must succeed: ${r.content}`)
+  }
+
+  // (e) verifier_active -> verified_pass without evidence is refused.
+  const noEvidence = await registeredTools.task_update.execute({
+    sessionId: transitionRun,
+    taskId: "G1",
+    status: "verified_pass",
+  })
+  assert(noEvidence.content.startsWith("Error: Refusing verified_pass"), `evidence-free verified_pass must be refused: ${noEvidence.content}`)
+  assert(noEvidence.content.includes("verification.status") && noEvidence.content.includes("report-G1.json"), `refusal must name both evidence paths: ${noEvidence.content}`)
+  assert.strictEqual(JSON.parse(readFileSync(transitionState, "utf8")).tasks.G1.status, "verifier_active", "refusal must leave state unchanged")
+
+  // (f) verifier_active -> verified_pass with an inline PASS is accepted.
+  const withEvidence = await registeredTools.task_update.execute({
+    sessionId: transitionRun,
+    taskId: "G1",
+    status: "verified_pass",
+    verification: { status: "PASS", passedChecks: 2, totalChecks: 2 },
+  })
+  assert.strictEqual(withEvidence.status, "verified_pass", `inline PASS evidence must be accepted: ${withEvidence.content}`)
+  assert.strictEqual(JSON.parse(readFileSync(transitionState, "utf8")).tasks.G1.status, "verified_pass")
+
+  // (g) blocked stays reachable from verified_pass (escalation can never deadlock).
+  const blockFromPass = await registeredTools.task_update.execute({
+    sessionId: transitionRun,
+    taskId: "G1",
+    status: "blocked",
+  })
+  assert.strictEqual(blockFromPass.status, "blocked", `verified_pass -> blocked must be allowed: ${blockFromPass.content}`)
+  assert.strictEqual(JSON.parse(readFileSync(transitionState, "utf8")).tasks.G1.status, "blocked")
+
+  // An on-disk PASS verifier report is equally valid evidence.
+  for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+    await registeredTools.task_update.execute({ sessionId: transitionRun, taskId: "G2", status })
+  }
+  const reportFile = join(testDir, ".opencode", "teamwork", transitionRun, "verify", "report-G2.json")
+  mkdirSync(dirname(reportFile), { recursive: true })
+  writeFileSync(reportFile, JSON.stringify({ taskId: "G2", status: "PASS", feedbackForWorker: "", fatalFindings: [] }) + "\n")
+  const fromReport = await registeredTools.task_update.execute({
+    sessionId: transitionRun,
+    taskId: "G2",
+    status: "verified_pass",
+  })
+  assert.strictEqual(fromReport.status, "verified_pass", `PASS report evidence must be accepted: ${fromReport.content}`)
+
+  console.log("✓ status jumps refused, verified_pass needs legal predecessor + PASS evidence, blocked reachable everywhere")
 
   // ==========================================
   // Part 2: Max Rounds & Deadlock Detection
@@ -171,13 +429,21 @@ try {
   await registeredTools.plan.execute({
     sessionId: "20261018-000000-deadlock",
     topology: "distributed-coding",
+    skipInterview: true,
     tasks: [
       { id: "A", dependsOn: [], maxRounds: 1 },
       { id: "B", dependsOn: ["A"], maxRounds: 2 },
     ],
   })
 
-  // Task A fails at round 1 (maxRounds is 1) -> transitions to blocked
+  // Task A fails at round 1 (maxRounds is 1) -> verifier verdict coerces to blocked.
+  for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+    await registeredTools.task_update.execute({
+      sessionId: "20261018-000000-deadlock",
+      taskId: "A",
+      status,
+    })
+  }
   const updateBlockRes = await registeredTools.task_update.execute({
     sessionId: "20261018-000000-deadlock",
     taskId: "A",
@@ -226,6 +492,7 @@ try {
     await gitTools.plan.execute({
       sessionId: gitSessionId,
       topology: "distributed-coding",
+      skipInterview: true,
       tasks: [{ id: "feature-1" }],
     })
 
@@ -428,12 +695,6 @@ try {
   const workerRow = (cost, t) => ({ id: CHILD_SES, parent: ROOT_SES, agent: "team/worker", cost, t })
   const T1 = { input: 1000, output: 200, reasoning: 10, read: 50, write: 5 }
 
-  const runFile = (root, runId, name) => join(root, ".opencode", "teamwork", runId, name)
-  const readEvents = (root, runId) =>
-    readFileSync(runFile(root, runId, "events.jsonl"), "utf8")
-      .split("\n")
-      .filter((l) => l !== "")
-      .map((l) => JSON.parse(l))
 
   /** A fresh project root with the real tools registered and a run planned by the root session. */
   async function attrFixture(runId, planAgent = "team/worker", taskIds = ["alpha"]) {
@@ -456,7 +717,7 @@ try {
       root,
     )
     await tools.plan.execute(
-      { sessionId: runId, topology: "iterative-coding", tasks: taskIds.map((id) => ({ id, agent: planAgent })) },
+      { sessionId: runId, topology: "iterative-coding", skipInterview: true, tasks: taskIds.map((id) => ({ id, agent: planAgent })) },
       { sessionID: ROOT_SES },
     )
     return { root, tools }
@@ -606,6 +867,111 @@ try {
 }
 
 // ==========================================
+// Part 1e: cumulative issue ledger (3.6)
+// ==========================================
+{
+  console.log("Testing cumulative issue ledger (3.6)...")
+  const ledgerDir = mkdtempSync(join(tmpdir(), "teamwork-ledger-test-"))
+  try {
+    const tools = {}
+    await registerTeamworkTools(
+      {
+        tool: {
+          transform: async (cb) => {
+            await cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = tool) })
+          },
+        },
+        session: { get: async () => undefined },
+      },
+      ledgerDir,
+    )
+    const ledgerRunFile = (runId, name) => join(ledgerDir, ".opencode", "teamwork", runId, name)
+    const ledgerStateOf = (runId) => JSON.parse(readFileSync(ledgerRunFile(runId, "state.json"), "utf8"))
+    const planLedger = async (runId, maxRounds = 3) => {
+      const r = await tools.plan.execute({
+        sessionId: runId,
+        topology: "iterative-coding",
+        skipInterview: true,
+        tasks: [{ id: "L1", maxRounds }],
+      })
+      assert(r.content.startsWith("Planned"), `ledger fixture plan must succeed: ${r.content}`)
+    }
+    const walk = async (runId, statuses, round) => {
+      for (const status of statuses) {
+        await tools.task_update.execute({ sessionId: runId, taskId: "L1", status, round, ...(status === "verified_pass" ? { verification: { status: "PASS" } } : {}) })
+      }
+    }
+
+    // (a) two consecutive failed rounds keep two unresolved entries, in order.
+    const RUN = "20261018-000000-ledger"
+    await planLedger(RUN)
+    await walk(RUN, ["worker_active", "worker_done", "verifier_active"], 1)
+    await tools.task_update.execute({ sessionId: RUN, taskId: "L1", status: "verified_fail", round: 1, feedback: "first issue" })
+    await walk(RUN, ["worker_active", "worker_done", "verifier_active"], 2)
+    await tools.task_update.execute({ sessionId: RUN, taskId: "L1", status: "verified_fail", round: 2, feedback: "second issue" })
+    let st = ledgerStateOf(RUN)
+    assert.deepStrictEqual(
+      st.tasks.L1.feedbackLog.map((e) => [e.round, e.text, e.resolved]),
+      [
+        [1, "first issue", false],
+        [2, "second issue", false],
+      ],
+      "two failed rounds must append two unresolved ledger entries in round order",
+    )
+    assert.strictEqual(st.tasks.L1.feedback, "second issue", "the latest-round feedback field must be unchanged")
+
+    // (b) teamwork_next exposes both entries in one string, each round-prefixed.
+    let nextRes = await tools.next.execute({ sessionId: RUN })
+    let worker = nextRes.readyForWorker.find((t) => t.id === "L1")
+    assert(worker, "L1 must be ready for another worker round after two failures")
+    assert.strictEqual(worker.feedback, "R1: first issue\nR2: second issue", "next must join every unresolved entry, oldest first")
+    assert(!/[\x00-\x1f]/.test(worker.feedback.replace(/\n/g, "")), "only the engine's own newline separators may reach the payload")
+
+    // (c) verified_pass resolves every existing entry, in the same write.
+    await walk(RUN, ["worker_active", "worker_done", "verifier_active", "verified_pass"], 3)
+    st = ledgerStateOf(RUN)
+    assert.strictEqual(st.tasks.L1.feedbackLog.length, 2, "verified_pass must preserve the ledger")
+    assert(st.tasks.L1.feedbackLog.every((e) => e.resolved === true), "verified_pass must resolve every ledger entry")
+
+    // (d) a later teamwork_next no longer surfaces the resolved texts.
+    nextRes = await tools.next.execute({ sessionId: RUN })
+    assert(!(nextRes.readyForWorker || []).some((t) => t.id === "L1"), "a passed task is not dispatched again")
+    const nextJson = JSON.stringify(nextRes)
+    assert(!nextJson.includes("first issue") && !nextJson.includes("second issue"), "resolved feedback must not be surfaced")
+
+    // (e) the ledger caps at the newest 20 entries, dropping the oldest.
+    const CAP_RUN = "20261018-000000-ledgercap"
+    await planLedger(CAP_RUN)
+    await tools.task_update.execute({ sessionId: CAP_RUN, taskId: "L1", status: "worker_active", round: 1 })
+    for (let i = 1; i <= 21; i++) {
+      await tools.task_update.execute({ sessionId: CAP_RUN, taskId: "L1", status: "worker_active", round: 1, feedback: `issue ${i}` })
+    }
+    const capLog = ledgerStateOf(CAP_RUN).tasks.L1.feedbackLog
+    assert.strictEqual(capLog.length, 20, "feedbackLog must be capped at 20 entries")
+    assert.strictEqual(capLog[0].text, "issue 2", "the cap must drop the oldest entry")
+    assert.strictEqual(capLog.at(-1).text, "issue 21", "the cap must keep the newest entry")
+    assert.deepStrictEqual(capLog.map((e) => e.text), Array.from({ length: 20 }, (_, i) => `issue ${i + 2}`), "the newest 20 must be kept in order")
+
+    // (f) a legacy run with only `feedback` (no ledger) still surfaces that text.
+    const LEGACY_RUN = "20261018-000000-ledgerlegacy"
+    await planLedger(LEGACY_RUN)
+    const legacyFile = ledgerRunFile(LEGACY_RUN, "state.json")
+    const legacyState = JSON.parse(readFileSync(legacyFile, "utf8"))
+    legacyState.tasks.L1.feedback = "legacy only feedback"
+    delete legacyState.tasks.L1.feedbackLog
+    writeFileSync(legacyFile, JSON.stringify(legacyState, null, 2) + "\n")
+    nextRes = await tools.next.execute({ sessionId: LEGACY_RUN })
+    worker = nextRes.readyForWorker.find((t) => t.id === "L1")
+    assert(worker, "legacy L1 must still be ready for a worker")
+    assert.strictEqual(worker.feedback, "legacy only feedback", "a run without feedbackLog must fall back to the latest feedback")
+
+    console.log("✓ ledger accumulates per round, next surfaces unresolved entries, verified_pass resolves them, 20-entry cap, legacy fallback")
+  } finally {
+    rmSync(ledgerDir, { recursive: true, force: true })
+  }
+}
+
+// ==========================================
 // Part 7: SEC-1 / SEC-3 — prototype-key integrity and tool-result sanitising
 // ==========================================
 {
@@ -643,7 +1009,7 @@ try {
         },
         root,
       )
-      const planRes = await tools.plan.execute({ sessionId: runId, topology: "iterative-coding", tasks: taskIds.map((id) => ({ id })) }, {})
+      const planRes = await tools.plan.execute({ sessionId: runId, topology: "iterative-coding", skipInterview: true, tasks: taskIds.map((id) => ({ id })) }, {})
       assert(planRes.content.startsWith("Planned"), `fixture plan must succeed: ${planRes.content}`)
       return { root, tools }
     }

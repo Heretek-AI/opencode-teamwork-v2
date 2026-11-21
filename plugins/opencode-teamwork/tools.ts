@@ -489,6 +489,29 @@ function isSafeTaskId(id: string): boolean {
 }
 
 /**
+ * Canonical terminal status is `verified_pass`; `pass` is the legacy alias.
+ * Every completion count must use this predicate so a finished run is never
+ * reported as having zero passed tasks.
+ */
+const isPassStatus = (s: any) => s === "pass" || s === "verified_pass"
+
+// Canonical topologies (docs/ARTIFACTS.md) and the legacy aliases the plan tool
+// still accepts. Aliases are normalised before they are persisted.
+const TOPOLOGIES = ["small-focused", "iterative-coding", "distributed-coding", "proof", "massive-proof", "document-review"]
+const TOPOLOGY_ALIASES: Record<string, string> = {
+  "large-swarm": "distributed-coding",
+  "doc-review": "document-review",
+  "long-proof": "proof",
+  "massive-proof-swarm": "massive-proof",
+}
+
+/** Normalise a topology (canonical or legacy alias); undefined when unknown. */
+function normalizeTopology(value: unknown): string | undefined {
+  const v = clean(value, 64)
+  return TOPOLOGY_ALIASES[v] ?? (TOPOLOGIES.includes(v) ? v : undefined)
+}
+
+/**
  * Lexical containment check: `child` must be a strict descendant of `parent`.
  * Returns an error string when it is not, `undefined` when it is safe.
  * Must be evaluated BEFORE any mkdir / rmSync / git worktree add on `child`.
@@ -500,7 +523,7 @@ function containmentError(parent: string, child: string): string | undefined {
   }
   return undefined
 }
-const PHASES = new Set(["LOAD_SPEC", "WORKTREE_INIT", "DAG_BUILD", "DISPATCH", "SECURITY_AUDIT", "MERGE", "PRESENT_PARTIAL", "DONE"])
+const PHASES = new Set(["LOAD_SPEC", "WORKTREE_INIT", "DAG_BUILD", "DISPATCH", "SECURITY_AUDIT", "FINAL_VERIFICATION", "MERGE", "PRESENT_PARTIAL", "DONE"])
 
 // Per-agent read-only policy, enforced in code. Keys are agent ids; values are
 // the actions that agent may NOT perform. Anything not listed keeps its
@@ -533,6 +556,17 @@ function clean(value: unknown, max = 64): string {
   return String(value ?? "")
     .replace(/[\r\n\t\x00-\x1f\x7f-\x9f\u0085\u2028\u2029]/g, " ")
     .slice(0, max)
+}
+
+/**
+ * Multi-line variant of clean() for the cumulative feedback ledger: the same
+ * control characters are replaced with spaces, except "\n", which is preserved
+ * so one line can hold one round. The result never adds a line that the engine
+ * did not join itself. Truncation is marked with "…" and stays within `max`.
+ */
+function cleanBlock(value: unknown, max = 2000): string {
+  const s = String(value ?? "").replace(/[\r\t\x00-\x09\x0b-\x1f\x7f-\x9f\u0085\u2028\u2029]/g, " ")
+  return s.length > max ? s.slice(0, Math.max(0, max - 1)) + "…" : s
 }
 
 /**
@@ -712,6 +746,10 @@ async function appendEvent(
     branch?: string | null
     worktree?: string | null
     phase?: string | null
+    /** run_created only: how the spec gate was decided (3.4). */
+    specGate?: "satisfied" | "bypassed" | "not_required"
+    /** run_created only: the spec file, when the gate was satisfied. */
+    specPath?: string | null
   },
 ) {
   try {
@@ -731,6 +769,11 @@ async function appendEvent(
         branch: opt(ev.branch, 120),
         worktree: opt(ev.worktree, 200),
         phase: opt(ev.phase, 32),
+        // Only run_created carries the spec-gate decision; other event lines stay
+        // byte-identical to their previous 11-field shape.
+        ...(ev.specGate
+          ? { specGate: clean(ev.specGate, 16), ...(ev.specPath ? { specPath: clean(ev.specPath, 200) } : {}) }
+          : {}),
       })
       appendFileSync(eventsFile, line + "\n")
     })
@@ -767,7 +810,7 @@ export function describeRun(root: string): string | undefined {
   const state = readJson<any>(join(run, "state.json"), undefined)
   if (!state) return undefined
   const tasks = Object.values(state.tasks || {}) as any[]
-  const pass = tasks.filter((t) => t?.status === "pass" || t?.status === "verified_pass").length
+  const pass = tasks.filter((t) => isPassStatus(t?.status)).length
   const fail = tasks.filter((t) => t?.status === "fail" || t?.status === "verified_fail" || t?.status === "blocked").length
   const allPitfalls = readPitfalls(run)
   const pitfalls = allPitfalls.length
@@ -808,9 +851,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         type: "object",
         properties: {
           sessionId: { type: "string", description: "Reuse an existing session id; omit to create one." },
-          topology: { type: "string", description: "small-focused | iterative-coding | distributed-coding | proof | massive-proof | document-review" },
+          topology: { type: "string", description: "small-focused | iterative-coding | distributed-coding | proof | massive-proof | document-review. Legacy aliases accepted and normalised: large-swarm → distributed-coding, doc-review → document-review, long-proof → proof, massive-proof-swarm → massive-proof." },
+          routingReason: { type: "string", description: "Optional. Why this topology was chosen; persisted in plan.dag.json when provided." },
           budgetUsd: { type: "number", description: "Run budget in USD. When using opencode/ models + opencode_console, derive this from credits (full or partial, per the user's choice)." },
           budgetSource: { type: "string", description: "Where the budget came from: credits | default | manual." },
+          requireSpec: { type: "boolean", description: "Default true. When true, the run must have a non-empty prompt_draft.md (the approved spec) before the plan is written; see skipInterview for the explicit bypass." },
+          skipInterview: { type: "boolean", description: "Default false. Explicit bypass of the spec gate: plan without an approved prompt_draft.md. Recorded in events.jsonl as specGate: bypassed." },
           tasks: {
             type: "array",
             items: {
@@ -835,6 +881,14 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const resolved = resolveRun(root, sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
+        // Refuse an unknown topology before anything is written, so a typo can
+        // never become the run's permanent label.
+        const topology = normalizeTopology(input.topology)
+        if (!topology) {
+          return {
+            content: `refused: invalid topology "${clean(input.topology, 32)}" (accepted: ${TOPOLOGIES.join(", ")}; aliases: ${Object.keys(TOPOLOGY_ALIASES).join(", ")})`,
+          }
+        }
         // SEC-1: task ids become keys of state/costs maps and path/branch segments.
         // Refuse the whole plan (before anything is written) on any unsafe id.
         for (const t of input.tasks || []) {
@@ -842,6 +896,24 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const i = ids.findIndex((id: unknown) => typeof id !== "string" || !isSafeTaskId(id))
           if (i !== -1) {
             return { content: `refused: invalid task id "${clean(ids[i], 32)}" (must be a single segment matching ${TASK_ID})` }
+          }
+        }
+        // 3.4: a run starts from an approved spec (`<run>/prompt_draft.md`). The
+        // gate runs BEFORE mkdir, so a refusal leaves no run dir and no plan files
+        // behind. `skipInterview` is the explicit, recorded bypass.
+        const specFile = join(run, "prompt_draft.md")
+        let specText = ""
+        try {
+          if (existsSync(specFile)) specText = readFileSync(specFile, "utf8").trim()
+        } catch {
+          specText = "" // unreadable spec = no usable spec
+        }
+        const hasSpec = specText.length > 0
+        const specGate: "satisfied" | "bypassed" | "not_required" | undefined =
+          input.requireSpec === false ? "not_required" : hasSpec ? "satisfied" : input.skipInterview === true ? "bypassed" : undefined
+        if (!specGate) {
+          return {
+            content: `refused: no spec found for this run (expected ${specFile}). Run /teamwork-craft to produce one, or re-call with skipInterview: true to proceed without an approved prompt.`,
           }
         }
         mkdirSync(run, { recursive: true })
@@ -854,7 +926,13 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           round: 0,
           maxRounds: Number.isFinite(t.maxRounds) ? t.maxRounds : 4,
         }))
-        writeJson(join(run, "plan.dag.json"), { sessionId, topology: clean(input.topology, 64), tasks })
+        const routingReason = typeof input.routingReason === "string" ? clean(input.routingReason, 200).trim() : ""
+        writeJson(join(run, "plan.dag.json"), {
+          sessionId,
+          topology,
+          tasks,
+          ...(routingReason ? { routingReason } : {}),
+        })
         if (!existsSync(join(run, "state.json"))) {
           writeJson(join(run, "state.json"), {
             version: 1,
@@ -919,7 +997,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           writeSnapshots(join(run, "snapshots.json"), snaps)
         })
         touch(join(run, "pitfalls.md"), "# Pitfalls\n\n_answer-agnostic failure modes; one per line_\n")
-        await appendEvent(run, { event: "run_created", sessionId, taskId: null, from: null, to: "pending", round: 0, phase: "DAG_BUILD" })
+        await appendEvent(run, { event: "run_created", sessionId, taskId: null, from: null, to: "pending", round: 0, phase: "DAG_BUILD", specGate, ...(specGate === "satisfied" ? { specPath: specFile } : {}) })
         // Backstop: if console credits apply but the budget wasn't derived from
         // them, warn (advisory — the sentinel is instructed to run the preflight).
         let creditWarning = ""
@@ -927,7 +1005,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           creditWarning = "\n⚠ opencode/ models + opencode_console connected — run teamwork_budget and derive budgetUsd from credits before dispatching."
         }
         return {
-          content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.${creditWarning}`,
+          content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${creditWarning}`,
         }
       },
     })
@@ -943,7 +1021,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const state = readJson<any>(join(run, "state.json"), {})
         const tasks = state.tasks || {}
         const lines = Object.entries(tasks).map(([id, t]: any) => `  ${clean(id, 64)}: ${clean(t?.status, 16)} (round ${Number(t?.round) || 0})`)
-        const pass = Object.values(tasks).filter((t: any) => t?.status === "pass").length
+        const pass = Object.values(tasks).filter((t: any) => isPassStatus(t?.status)).length
         return { content: `Run ${basename(run)} — phase ${PHASES.has(state.phase) ? state.phase : "UNKNOWN"}\n${pass}/${lines.length} pass\n${lines.join("\n")}` }
       },
     })
@@ -957,7 +1035,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
         const state = readJson<any>(join(run, "state.json"), {})
-        const open = Object.entries(state.tasks || {}).filter(([, t]: any) => t?.status !== "pass")
+        const open = Object.entries(state.tasks || {}).filter(([, t]: any) => !isPassStatus(t?.status))
         if (!open.length) return { content: `Run ${basename(run)} is complete (all tasks pass).` }
         return {
           content: `Resume ${basename(run)} at phase ${PHASES.has(state.phase) ? state.phase : "UNKNOWN"}. Open tasks:\n` + open.map(([id, t]: any) => `  ${clean(id, 64)}: ${clean(t?.status, 16)} round ${Number(t?.round) || 0}`).join("\n"),
@@ -1257,6 +1335,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             })
           } else if (allDepsPassed && (status === "pending" || ((status === "verified_fail" || status === "fail") && round < maxRounds))) {
             const pitfalls = readPitfalls(run, id)
+            // 3.6: surface the cumulative unresolved issue set, not just the latest
+            // round. Oldest first, one `R<n>: <text>` line per entry, capped.
+            const log = Array.isArray(st.feedbackLog) ? st.feedbackLog : []
+            const unresolved = log
+              .filter((e: any) => e && typeof e === "object" && e.resolved !== true)
+              .map((e: any) => `R${Number(e.round) || 0}: ${clean(e.text, 500)}`)
             readyForWorker.push({
               id,
               agent: def.agent || "team/worker",
@@ -1265,7 +1349,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               requirements: def.requirements || [],
               dependsOn: deps,
               branch: st.branch || `teamwork/${basename(run)}-${id}`,
-              feedback: st.feedback,
+              // A legacy run has no ledger: keep the single latest `feedback` field.
+              feedback: log.length ? cleanBlock(unresolved.join("\n"), 2000) : st.feedback,
               avoidPitfalls: pitfalls,
             })
           }
@@ -1301,16 +1386,44 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
 
+          // "Done" needs an independent final verdict, not just per-task PASSes.
+          // Missing, unreadable, or malformed reports are NOT done.
+          const finalFile = join(run, "verify", "final.json")
+          const finalReport = existsSync(finalFile) ? readJson<any>(finalFile, undefined) : undefined
+
+          if (!finalReport || typeof finalReport !== "object" || typeof finalReport.status !== "string") {
+            if (state.phase !== "FINAL_VERIFICATION") {
+              state.phase = "FINAL_VERIFICATION"
+              writeJson(join(run, "state.json"), state)
+            }
+            return {
+              content: `READY_FOR_FINAL_VERIFICATION: All ${taskDefs.size} tasks passed verification and security audit PASSED, but there is no usable final verification report at ${finalFile} (missing, unreadable, or malformed).\nRun an independent final verification of the whole run and write verify/final.json with "status": "PASS" or "FAIL" before merging.`,
+              status: "READY_FOR_FINAL_VERIFICATION",
+              finalReport: finalFile,
+              passedCount: passedTasks.length,
+            }
+          }
+
+          if (finalReport.status !== "PASS") {
+            return {
+              content: `BLOCKED_BY_FINAL_VERIFICATION: Final verification did not pass the run (status ${clean(finalReport.status, 32)}).\nAddress the findings in ${finalFile} and re-run the final verification; merge stays blocked until verify/final.json reports PASS.`,
+              status: "BLOCKED_BY_FINAL_VERIFICATION",
+              finalReport: finalFile,
+              passedCount: passedTasks.length,
+            }
+          }
+
           if (state.phase !== "MERGE" && state.phase !== "DONE") {
             state.phase = "MERGE"
             writeJson(join(run, "state.json"), state)
           }
 
           return {
-            content: `ALL_TASKS_PASSED: All ${taskDefs.size} tasks have passed verification and security audit PASSED. Ready to merge Sentinel base worktree to user branch and present final artifact.`,
+            content: `ALL_TASKS_PASSED: All ${taskDefs.size} tasks have passed verification, security audit PASSED, and final verification PASSED. Ready to merge Sentinel base worktree to user branch and present final artifact.`,
             status: "ALL_PASSED",
             passedCount: passedTasks.length,
             securityAuditPassed: true,
+            finalReport: finalFile,
           }
         }
 
@@ -1434,6 +1547,17 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             "verified_fail",
             "blocked",
           ])
+          // Deterministic transition graph. `blocked` is reachable from every state
+          // so escalation can never deadlock; a same-status re-write is always allowed.
+          const ALLOWED_NEXT: Record<string, string[]> = {
+            pending: ["worker_active", "blocked"],
+            worker_active: ["worker_done", "blocked"],
+            worker_done: ["verifier_active", "blocked"],
+            verifier_active: ["verified_pass", "verified_fail", "blocked"],
+            verified_fail: ["worker_active", "blocked"],
+            verified_pass: ["blocked"],
+            blocked: ["worker_active", "pending"],
+          }
           if (!VALID_STATUSES.has(status)) {
             return { content: `Error: Invalid status "${status}". Allowed: ${Array.from(VALID_STATUSES).join(", ")}` }
           }
@@ -1451,6 +1575,58 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             status = "blocked"
           }
 
+          // Legacy aliases in an existing state.json still resolve to the canonical
+          // node; an unrecognised status is treated as `pending` (same fail-open
+          // default the rest of the engine uses). The event log keeps the raw value.
+          const canonicalFrom =
+            fromStatus === "pass" ? "verified_pass"
+              : fromStatus === "fail" ? "verified_fail"
+              : fromStatus === "running" ? "worker_active"
+              : VALID_STATUSES.has(fromStatus) ? fromStatus
+              : "pending"
+          const allowedNext = ALLOWED_NEXT[canonicalFrom] || []
+          if (status !== canonicalFrom && !allowedNext.includes(status)) {
+            return {
+              content: `Error: Illegal transition for task "${taskId}": ${fromStatus} -> ${status}. Allowed next statuses from ${canonicalFrom}: ${allowedNext.join(", ")} (or ${canonicalFrom} again).`,
+            }
+          }
+
+          // `verified_pass` needs evidence: either an inline PASS verdict or an
+          // on-disk verifier report for THIS task. `verified_fail` needs none.
+          if (status === "verified_pass") {
+            const inlinePass = input.verification?.status === "PASS"
+            const reportFile = isSafeTaskId(taskId) ? join(run, "verify", `report-${taskId}.json`) : undefined
+            const report = reportFile && existsSync(reportFile) ? readJson<any>(reportFile, undefined) : undefined
+            if (!inlinePass && report?.status !== "PASS") {
+              return {
+                content: `Error: Refusing verified_pass for task "${taskId}" without PASS evidence. Provide input.verification.status = "PASS", or write a verifier report at ${reportFile ?? "verify/report-<taskId>.json"} with "status": "PASS".`,
+              }
+            }
+          }
+
+          // 3.6: cumulative feedback ledger. Every non-empty feedback is appended
+          // (sanitised) instead of replacing the previous round; verified_pass
+          // resolves all entries in the same write, verified_fail leaves them open.
+          // The array is capped at 20 entries, oldest dropped first.
+          const priorLog: any[] = Array.isArray(current.feedbackLog)
+            ? current.feedbackLog
+                .filter((e: any) => e && typeof e === "object")
+                .map((e: any) => ({
+                  round: Number(e.round) || 0,
+                  at: clean(e.at, 32),
+                  text: clean(e.text, 500),
+                  resolved: e.resolved === true,
+                }))
+            : []
+          const feedbackText = input.feedback ? clean(input.feedback, 500) : ""
+          if (feedbackText) {
+            priorLog.push({ round, at: new Date().toISOString(), text: feedbackText, resolved: false })
+          }
+          if (status === "verified_pass") {
+            for (const e of priorLog) e.resolved = true
+          }
+          const feedbackLog = priorLog.slice(-20)
+
           state.tasks[taskId] = {
             ...current,
             status,
@@ -1458,7 +1634,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             ...(input.branch ? { branch: clean(input.branch, 120) } : {}),
             ...(input.worktree ? { worktree: clean(input.worktree, 200) } : {}),
             ...(input.summary ? { summary: clean(input.summary, 300) } : {}),
-            ...(input.feedback ? { feedback: clean(input.feedback, 500) } : {}),
+            ...(feedbackText ? { feedback: feedbackText } : {}),
+            // Only tasks that have ledger entries gain the field: the state.json
+            // shape of a task that never failed stays exactly as before.
+            ...(feedbackLog.length || Array.isArray(current.feedbackLog) ? { feedbackLog } : {}),
             ...(input.verification ? { verification: input.verification } : {}),
             updatedAt: new Date().toISOString(),
           }

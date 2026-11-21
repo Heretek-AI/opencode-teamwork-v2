@@ -27,13 +27,49 @@ const agents = readdirSync(agentsDir).filter((f) => f.endsWith(".md"))
 const read = (p) => readFileSync(p, "utf8")
 
 // Canonical topologies, parsed from docs/ARTIFACTS.md so there is one source.
+// The table lives in the level-2 "Topologies" section; scoping the parse to that
+// section keeps unrelated documentation tables (feedbackLog fields, plan inputs,
+// …) from being mistaken for topologies.
+const EXPECTED_TOPOLOGIES = [
+  "small-focused",
+  "iterative-coding",
+  "distributed-coding",
+  "proof",
+  "massive-proof",
+  "document-review",
+]
+
+// Text of the level-2 "Topologies" section, up to the next level-2 heading.
+function topologySection(md) {
+  const heading = /^##[ \t]+Topologies[ \t]*$/m.exec(md)
+  if (!heading) return null
+  const rest = md.slice(heading.index + heading[0].length)
+  const next = /^##[ \t]+\S/m.exec(rest)
+  return next ? rest.slice(0, next.index) : rest
+}
+
 let canonical = []
 if (!existsSync(artifactsFile)) {
   errors.push("docs/ARTIFACTS.md is missing")
 } else {
   const md = read(artifactsFile)
-  canonical = [...md.matchAll(/^\| `([a-z][a-z-]+)` \|/gm)].map((m) => m[1])
-  if (canonical.length < 6) errors.push(`docs/ARTIFACTS.md: expected >=6 topologies, found ${canonical.length}`)
+  const section = topologySection(md)
+  if (section === null) {
+    errors.push("docs/ARTIFACTS.md: topology section not found")
+  } else {
+    canonical = [...section.matchAll(/^\| `([a-z][a-z-]+)` \|/gm)].map((m) => m[1])
+    if (canonical.length < 6) errors.push(`docs/ARTIFACTS.md: expected >=6 topologies, found ${canonical.length}`)
+
+    // The parsed set must be exactly the canonical six. This catches a misparse
+    // with a message about the document, not about the agent prompts.
+    const found = new Set(canonical)
+    const missing = EXPECTED_TOPOLOGIES.filter((t) => !found.has(t))
+    const extra = [...found].filter((t) => !EXPECTED_TOPOLOGIES.includes(t))
+    const duplicates = canonical.filter((t, i) => canonical.indexOf(t) !== i)
+    if (missing.length) errors.push(`docs/ARTIFACTS.md: topology section missing canonical topologies: ${missing.join(", ")}`)
+    if (extra.length) errors.push(`docs/ARTIFACTS.md: topology section has unknown entries: ${extra.join(", ")}`)
+    if (duplicates.length) errors.push(`docs/ARTIFACTS.md: topology section has duplicate entries: ${duplicates.join(", ")}`)
+  }
 }
 
 const LEGACY = ["large-swarm", "doc-review", "long-proof", "massive-proof-swarm"]

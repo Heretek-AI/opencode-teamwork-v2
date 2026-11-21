@@ -16,3 +16,7 @@ dist/
 # local reverse-engineering scratch data
 .re-scratch/
 docs/re/_scratch/
+
+# compiled re tool binaries (sources stay tracked)
+docs/re/tools/pclntab/pclntab
+docs/re/tools/strhdr/strhdr

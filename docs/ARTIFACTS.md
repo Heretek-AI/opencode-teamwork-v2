@@ -10,7 +10,7 @@ Every run writes under one root:
 
 ```
 .opencode/teamwork/<session-id>/
-├── prompt_draft.md          # spec (from the crafter, or inlined by the sentinel)
+├── prompt_draft.md          # spec (from the crafter, or inlined by the sentinel); required by teamwork_plan unless bypassed
 ├── plan.dag.json            # task DAG
 ├── state.json               # resumable coordinator state
 ├── costs.json               # coordinator-maintained budget tracker
@@ -102,7 +102,7 @@ Legacy aliases — accept them, normalize on write:
 {
   "version": 1,
   "sessionId": "20260112-101500-a1b2",
-  "phase": "LOAD_SPEC|WORKTREE_INIT|DAG_BUILD|DISPATCH|SECURITY_AUDIT|MERGE|PRESENT_PARTIAL|DONE",
+  "phase": "LOAD_SPEC|WORKTREE_INIT|DAG_BUILD|DISPATCH|SECURITY_AUDIT|FINAL_VERIFICATION|MERGE|PRESENT_PARTIAL|DONE",
   "tasks": {
     "R1-impl": {
       "status": "pending|worker_active|worker_done|verifier_active|verified_pass|verified_fail|blocked",
@@ -111,6 +111,14 @@ Legacy aliases — accept them, normalize on write:
       "worktree": "../.teamwork-worktrees/20260112-101500-a1b2/R1-impl",
       "summary": "Implemented core validation logic",
       "feedback": "Verifier found edge case in empty inputs",
+      "feedbackLog": [
+        {
+          "round": 1,
+          "at": "2026-01-12T10:15:00Z",
+          "text": "Verifier found edge case in empty inputs",
+          "resolved": false
+        }
+      ],
       "verification": {
         "status": "PASS|FAIL",
         "passedChecks": 4,
@@ -137,12 +145,52 @@ Task lifecycle:
 Resume: re-read `state.json`, skip tasks already `verified_pass`, continue the current
 `round` for `verified_fail`/`worker_active`/`worker_done`.
 
+**Cumulative feedback ledger (`feedbackLog`).** `feedback` holds only the latest
+round, so it is lossy across repeated review rounds. Each task may therefore also
+carry `feedbackLog`, an ordered array of per-round entries:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `round` | integer | The task round the feedback was recorded in. |
+| `at` | string | ISO 8601 time the entry was written. |
+| `text` | string | The feedback, sanitised with `clean()` and capped at 500 chars. |
+| `resolved` | boolean | `true` once the verifier accepted the work. |
+
+Every `teamwork_task_update` call carrying a non-empty `feedback` appends one
+entry with `resolved: false`; existing entries are preserved, never overwritten.
+The array is capped at **20 entries**: when a 21st would be added, the oldest is
+dropped, so state stays bounded. A task that has never failed has no
+`feedbackLog` field at all.
+
+`verified_pass` marks **every** existing entry `resolved: true` in the same write
+that records the transition, so no second tool call is needed. `verified_fail`
+leaves existing entries unresolved; the verifier's new feedback is appended as
+another unresolved entry. `feedback` continues to hold the latest round only and
+is unchanged by this ledger.
+
+`teamwork_next` surfaces the unresolved set to the next worker: for each
+`readyForWorker` entry, `feedback` is the newline-joined list of
+`R<n>: <text>` for every entry with `resolved: false`, oldest first, capped at
+2000 characters (truncated with `…`). Runs written before the ledger existed — or
+a task with an absent/empty `feedbackLog` — fall back to the single `feedback`
+field, exactly as before.
+
 ### Engine Tools
 
 The plugin provides deterministic orchestration tools for the Sentinel coordinator:
+- `teamwork_plan`: Creates the run directory and writes `plan.dag.json`, `state.json` and `costs.json`. It is gated on a spec by default (`requireSpec`, see below). `skipInterview` is the explicit, recorded bypass.
 - `teamwork_next`: Evaluates the DAG dependencies against current task lifecycle statuses. Categorizes tasks into `readyForWorker`, `readyForVerifier`, `inProgress`, or terminal conditions (`ALL_TASKS_PASSED` / `DEADLOCK`).
 - `teamwork_task_update`: Enforces deterministic state transitions, tracks worker branch names and diff summaries, updates verifier metrics, and advances run `phase` to `MERGE` or `PRESENT_PARTIAL`.
 - `teamwork_worktree`: Isolates git worktrees outside the project repo (`setup` for sentinel and worker), inspects branch diffs (`diff`), performs clean merges into `teamwork/base-$SESSION_ID` with automatic conflict abort (`merge`), and prunes worktrees (`cleanup`).
+
+**Spec gate (`teamwork_plan`).** A run must start from an approved spec: `<run>/prompt_draft.md`, present and non-empty after trimming. The check runs after topology/task-id validation and **before anything is written**, so a refusal creates no run directory and no plan files. Two inputs control it:
+
+| Input | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `requireSpec` | boolean | `true` | When true, a usable `prompt_draft.md` must exist or the plan is refused. `false` records `specGate: "not_required"`. |
+| `skipInterview` | boolean | `false` | Explicit bypass: plan without an approved prompt. Recorded as `specGate: "bypassed"`, and the tool result says so. |
+
+With no spec and neither override, the call is refused with an actionable message naming the expected path, `/teamwork-craft`, and `skipInterview: true`. A whitespace-only `prompt_draft.md` counts as no spec.
 
 ### `costs.json`
 
@@ -277,6 +325,13 @@ The three event kinds:
 
 - `run_created`: written by `teamwork_plan` once the run is created. `taskId` and
   `from` are `null`, `to` is `"pending"`, `round` is `0`, `phase` is `"DAG_BUILD"`.
+  It additionally carries the spec-gate decision: `specGate`
+  (`"satisfied" | "bypassed" | "not_required"`) and, only when satisfied,
+  `specPath` (the `prompt_draft.md` path, ≤200 chars). These two fields appear
+  **only** on `run_created`; every other event keeps the 11 fields above.
+  `specGate` and `specPath` also go through `clean()`. The timeline view parses
+  events field by field and does not surface `specGate` (it is visible in
+  `events.jsonl` itself).
 - `task_transition`: written by `teamwork_task_update` after `state.json` is saved.
   `from` is the previous status and `to` the status that landed. `round`, `branch`,
   `worktree` and `phase` are the values after the transition.
