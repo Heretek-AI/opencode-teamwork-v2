@@ -43,8 +43,9 @@ const MAX_MISSION_READ_BYTES = 64 * 1024
 const MAX_SPEC_READ_BYTES = 64 * 1024
 const MAX_COSTS_READ_BYTES = 64 * 1024
 
-// Preserve "\n" for blocks; replace every other control / line separator.
-const BLOCK_CONTROL = /[\r\t\x00-\x08\x0b-\x1f\x7f-\x9f\u0085\u2028\u2029]/g
+// Preserve "\n" (0x0a) for blocks; replace every other control / line
+// separator. \x00-\x09 covers tab; \x0b-\x1f covers CR; \x7f-\x9f covers NEL.
+const BLOCK_CONTROL = /[\x00-\x09\x0b-\x1f\x7f-\x9f\u2028\u2029]/g
 const SAFE_TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const ARTIFACT_INDEX = [
   "plan.dag.json",
@@ -55,12 +56,19 @@ const ARTIFACT_INDEX = [
   "GATE_STATUS.md",
 ] as const
 
+/** Stringify only primitives; objects/arrays/functions become "". */
+function primitiveText(value: unknown): string {
+  if (typeof value === "string") return value
+  if (typeof value === "number" || typeof value === "boolean") return String(value)
+  return ""
+}
+
 /**
  * Sanitise multi-line briefing text while keeping "\n". Caps by characters and
  * marks a truncation. Never returns a raw control character.
  */
 export function sanitizeBriefingText(value: unknown, max = MAX_MISSION_CHARS): string {
-  const raw = String(value ?? "").replace(BLOCK_CONTROL, " ")
+  const raw = primitiveText(value).replace(BLOCK_CONTROL, " ")
   const collapsed = raw.replace(/\n{3,}/g, "\n\n").trim()
   const capped =
     collapsed.length > max ? collapsed.slice(0, Math.max(0, max - 1)) + "…" : collapsed
@@ -73,7 +81,7 @@ export function sanitizeBriefingText(value: unknown, max = MAX_MISSION_CHARS): s
  * the briefing's own `## Section` markers are content here.
  */
 export function sanitizeBriefingOutput(value: unknown, max = MAX_BRIEFING_BYTES): string {
-  const raw = String(value ?? "").replace(BLOCK_CONTROL, " ")
+  const raw = primitiveText(value).replace(BLOCK_CONTROL, " ")
   return raw.length > max ? raw.slice(0, Math.max(0, max - 1)) + "…" : raw
 }
 
@@ -84,7 +92,7 @@ export function sanitizeBriefingOutput(value: unknown, max = MAX_BRIEFING_BYTES)
 function defuseHeadings(text: string): string {
   return text
     .split("\n")
-    .map((line) => line.replace(/^(\s{0,3})(#{1,6})(?=\s|$)/, "$1\\$2"))
+    .map((line) => line.replace(/^(\s{0,3})(#{1,6})(?=\s|$)/, String.raw`$1\$2`))
     .join("\n")
 }
 
@@ -139,6 +147,36 @@ function isRegularRunFile(run: string, rel: string): boolean {
   }
 }
 
+function readRunValue(run: string, rel: string, maxBytes: number): any {
+  const res = readBoundedRunJson<any>(run, join(run, rel), maxBytes)
+  return res.status === "ok" ? res.value : undefined
+}
+
+function taskStatus(stateTasks: any, id: string): string {
+  const own = Object.hasOwn(stateTasks, id) ? stateTasks[id] : undefined
+  return typeof own?.status === "string" ? own.status : "pending"
+}
+
+type TaskBucket = "pending" | "active" | "verifiedPass" | "failed" | "blocked"
+
+function taskBucket(status: string): TaskBucket {
+  if (status === "worker_active" || status === "worker_done" || status === "verifier_active") return "active"
+  if (status === "verified_pass" || status === "pass") return "verifiedPass"
+  if (status === "verified_fail" || status === "fail") return "failed"
+  if (status === "blocked") return "blocked"
+  return "pending"
+}
+
+function collectTaskIds(plan: any, state: any): string[] {
+  const fromPlan: string[] = Array.isArray(plan?.tasks)
+    ? plan.tasks.map((t: any) => t?.id).filter((id: any) => typeof id === "string")
+    : []
+  const stateTasks = state?.tasks && typeof state.tasks === "object" && !Array.isArray(state.tasks) ? state.tasks : {}
+  const ids: string[] = []
+  for (const id of [...fromPlan, ...Object.keys(stateTasks)]) if (!ids.includes(id)) ids.push(id)
+  return ids
+}
+
 function taskCounts(plan: any, state: any): {
   total: number
   pending: number
@@ -148,79 +186,44 @@ function taskCounts(plan: any, state: any): {
   blocked: number
   ids: string[]
 } {
-  const fromPlan: string[] = Array.isArray(plan?.tasks)
-    ? plan.tasks.map((t: any) => t?.id).filter((id: any) => typeof id === "string")
-    : []
   const stateTasks = state?.tasks && typeof state.tasks === "object" && !Array.isArray(state.tasks) ? state.tasks : {}
-  const fromState = Object.keys(stateTasks)
-  const ids: string[] = []
-  for (const id of [...fromPlan, ...fromState]) if (!ids.includes(id)) ids.push(id)
-
-  let pending = 0
-  let active = 0
-  let verifiedPass = 0
-  let failed = 0
-  let blocked = 0
-  for (const id of ids) {
-    const own = Object.prototype.hasOwnProperty.call(stateTasks, id) ? stateTasks[id] : undefined
-    const status = typeof own?.status === "string" ? own.status : "pending"
-    if (status === "pending") pending++
-    else if (status === "worker_active" || status === "worker_done" || status === "verifier_active") active++
-    else if (status === "verified_pass" || status === "pass") verifiedPass++
-    else if (status === "verified_fail" || status === "fail") failed++
-    else if (status === "blocked") blocked++
-    else pending++
-  }
-  return { total: ids.length, pending, active, verifiedPass, failed, blocked, ids }
+  const ids = collectTaskIds(plan, state)
+  const counts: Record<TaskBucket, number> = { pending: 0, active: 0, verifiedPass: 0, failed: 0, blocked: 0 }
+  for (const id of ids) counts[taskBucket(taskStatus(stateTasks, id))]++
+  return { total: ids.length, ...counts, ids }
 }
 
-/**
- * Build the full briefing text. Reads only run-local artifacts through the
- * bounded, no-follow helpers, and sanitises every value it interpolates.
- */
-export function buildBriefing(run: string, timestamp = new Date().toISOString()): string {
-  const planRes = readBoundedRunJson<any>(run, join(run, "plan.dag.json"), 8 * 1024 * 1024)
-  const plan = planRes.status === "ok" ? planRes.value : undefined
-  const stateRes = readBoundedRunJson<any>(run, join(run, "state.json"), 8 * 1024 * 1024)
-  const state = stateRes.status === "ok" ? stateRes.value : undefined
-  const costsRes = readBoundedRunJson<any>(run, join(run, "costs.json"), MAX_COSTS_READ_BYTES)
-  const costs = costsRes.status === "ok" ? costsRes.value : undefined
+function identityFor(run: string, plan: any, state: any, costs: any) {
+  return {
+    sessionId: clean(plan?.sessionId || state?.sessionId || run.split(/[\\/]/).pop() || "unknown", 64),
+    topology: clean(plan?.topology || "unknown", 32),
+    integrityMode: clean(plan?.integrityMode || state?.integrityMode || "development", 32),
+    verification: normalizeVerificationMode(plan?.verification ?? state?.verification) ?? "standard",
+    victoryMode: resolveVictoryAuditMode(plan, state, run).mode,
+    budget: costs && typeof costs.budgetUsd === "number" ? `$${costs.budgetUsd}` : "unknown",
+    phase: clean(state?.phase || "UNKNOWN", 32),
+  }
+}
 
-  const sessionId = clean(plan?.sessionId || state?.sessionId || run.split(/[\\/]/).pop() || "unknown", 64)
-  const topology = clean(plan?.topology || "unknown", 32)
-  const integrityMode = clean(plan?.integrityMode || state?.integrityMode || "development", 32)
-  const verification =
-    normalizeVerificationMode(plan?.verification ?? state?.verification) ?? "standard"
-  const victoryMode = resolveVictoryAuditMode(plan, state, run).mode
-  const budget =
-    costs && typeof costs.budgetUsd === "number" ? `$${costs.budgetUsd}` : "unknown"
-  const phase = clean(state?.phase || "UNKNOWN", 32)
+function strictGateStatus(run: string, ids: string[], stateTasks: any): string {
+  if (!ids.length) return "MISSING"
+  const gate = evaluateStrictGate(
+    run,
+    ids.map((id) => ({ id, status: taskStatus(stateTasks, id) })),
+    "strict",
+  )
+  return gate.status
+}
 
-  const counts = taskCounts(plan, state)
-  const safeIds = counts.ids.filter((id) => SAFE_TASK_ID.test(id))
-  const gateLine =
-    verification === "strict"
-      ? `- Gate (strict): ${
-          safeIds.length
-            ? evaluateStrictGate(
-                run,
-                safeIds.map((id) => ({ id, status: (state?.tasks?.[id]?.status as string) || "pending" })),
-                "strict",
-              ).status
-            : "MISSING"
-        }`
-      : undefined
-  const victoryGate = evaluateVictoryGate(run, victoryMode)
-  const victoryStatus = victoryGate.skipped
-    ? "SKIPPED"
-    : victoryGate.status === "CONFIRMED"
-      ? "CONFIRMED"
-      : victoryGate.status === "REJECTED"
-        ? "REJECTED"
-        : "PENDING"
+function victoryStatusLabel(gate: ReturnType<typeof evaluateVictoryGate>): string {
+  if (gate.skipped) return "SKIPPED"
+  if (gate.status === "CONFIRMED") return "CONFIRMED"
+  if (gate.status === "REJECTED") return "REJECTED"
+  return "PENDING"
+}
 
-  const artifacts = ARTIFACT_INDEX.filter((rel) => isRegularRunFile(run, rel))
-  const constraints: string[] = [
+function constraintsFor(verification: string, victoryMode: string): string[] {
+  const constraints = [
     "- Do not edit outside the run worktrees; the Sentinel owns state.json and plan.dag.json.",
     "- Do not publish, push, or open PRs; the Sentinel performs the merge.",
     "- Do not self-certify: verifier reports and the final gate are recomputed from artifacts.",
@@ -237,6 +240,26 @@ export function buildBriefing(run: string, timestamp = new Date().toISOString())
   } else {
     constraints.push("- Victory audit explicitly skipped for this run (recorded in the plan).")
   }
+  return constraints
+}
+
+/**
+ * Build the full briefing text. Reads only run-local artifacts through the
+ * bounded, no-follow helpers, and sanitises every value it interpolates.
+ */
+export function buildBriefing(run: string, timestamp = new Date().toISOString()): string {
+  const plan = readRunValue(run, "plan.dag.json", 8 * 1024 * 1024)
+  const state = readRunValue(run, "state.json", 8 * 1024 * 1024)
+  const costs = readRunValue(run, "costs.json", MAX_COSTS_READ_BYTES)
+  const identity = identityFor(run, plan, state, costs)
+  const counts = taskCounts(plan, state)
+  const safeIds = counts.ids.filter((id) => SAFE_TASK_ID.test(id))
+  const gateLine =
+    identity.verification === "strict"
+      ? `- Gate (strict): ${strictGateStatus(run, safeIds, state?.tasks)}`
+      : undefined
+  const victory = victoryStatusLabel(evaluateVictoryGate(run, identity.victoryMode))
+  const artifacts = ARTIFACT_INDEX.filter((rel) => isRegularRunFile(run, rel))
 
   const lines: string[] = [
     `# BRIEFING — ${timestamp}`,
@@ -245,21 +268,21 @@ export function buildBriefing(run: string, timestamp = new Date().toISOString())
     missionText(run),
     "",
     "## Identity",
-    `- Session: ${sessionId}`,
-    `- Topology: ${topology}`,
-    `- Integrity mode: ${integrityMode}`,
-    `- Verification mode: ${verification}`,
-    `- Victory audit mode: ${victoryMode}`,
-    `- Budget: ${budget}`,
+    `- Session: ${identity.sessionId}`,
+    `- Topology: ${identity.topology}`,
+    `- Integrity mode: ${identity.integrityMode}`,
+    `- Verification mode: ${identity.verification}`,
+    `- Victory audit mode: ${identity.victoryMode}`,
+    `- Budget: ${identity.budget}`,
     "",
     "## Key Constraints",
-    ...constraints,
+    ...constraintsFor(identity.verification, identity.victoryMode),
     "",
     "## Project Status",
-    `- Phase: ${phase}`,
+    `- Phase: ${identity.phase}`,
     `- Tasks: ${counts.total} total — pending ${counts.pending}, active ${counts.active}, verified_pass ${counts.verifiedPass}, failed ${counts.failed}, blocked ${counts.blocked}`,
     ...(gateLine ? [gateLine] : []),
-    `- Victory: ${victoryStatus}`,
+    `- Victory: ${victory}`,
     "",
     "## Artifact Index",
     ...(artifacts.length ? artifacts.map((rel) => `- ${rel}`) : ["- (none yet)"]),

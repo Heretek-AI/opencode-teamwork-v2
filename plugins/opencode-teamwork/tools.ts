@@ -1434,41 +1434,49 @@ export function describeRun(root: string): string | undefined {
   const id = basename(run)
   if (!SESSION_ID.test(id)) return undefined // never inject a non-conforming dir name
   const phase = PHASES.has(state.phase) ? state.phase : "UNKNOWN"
-  const costs = readJson<any>(join(run, "costs.json"), undefined)
-  let costLine = "Cost: unknown."
-  if (costs && typeof costs.budgetUsd === "number") {
-    const budget = costs.budgetUsd
-    const spent = Number(costs.spentUsd) || 0
-    const pct = budget ? Math.floor((spent / budget) * 100) : 0
-    costLine = `Cost: $${spent} of $${budget} (${pct}%)${pct >= 80 ? " — near budget, halt non-essential workers" : ""}.`
-  }
-  let tournamentLine: string | undefined
-  const mRes = readTournamentManifest(run)
-  if (mRes.status === "ok") {
-    const m = mRes.manifest
-    const mPhase = TOURNAMENT_PHASES.has(m.phase) ? m.phase : "UNKNOWN"
-    const candList = Object.values(m.candidates || {})
-    const surviving = candList.filter((c) => c && c.status !== "pruned").length
-    tournamentLine = `Tournament: phase ${mPhase}, iter ${Number(m.iteration) || 0}/${Number(m.config?.maxIterations) || 0}, level ${Number(m.currentLevel) || 0}/${Number(m.config?.levels) || 0}, candidates ${candList.length} (${surviving} surviving).`
-  }
-  const briefing = readBriefingExcerpt(run)
-  const briefingLines = briefing
-    ? [
-        `[teamwork] run briefing (${join(runsDir(root), id, "BRIEFING.md")})${briefing.truncated ? ` — first 4096 of ${briefing.bytes} bytes` : ""}:`,
-        briefing.text,
-        ...(briefing.truncated
-          ? [`[teamwork] briefing excerpt truncated at 4096 bytes; read BRIEFING.md for the rest.`]
-          : []),
-      ]
-    : []
+  const tournamentLine = describeTournamentLine(run)
   return [
     `[teamwork] active run ${id} — phase ${phase}.`,
     `Tasks: ${pass}/${tasks.length} pass, ${fail} fail. Open pitfalls: ${pitfalls}${pitfallSuffix}.`,
     ...(tournamentLine ? [tournamentLine] : []),
-    costLine,
-    ...briefingLines,
+    describeCostLine(run),
+    ...describeBriefingLines(root, id),
     `State: ${join(runsDir(root), id, "state.json")} (read it before dispatching).`,
   ].join("\n")
+}
+
+function describeCostLine(run: string): string {
+  const costs = readJson<any>(join(run, "costs.json"), undefined)
+  if (!costs || typeof costs.budgetUsd !== "number") return "Cost: unknown."
+  const budget = costs.budgetUsd
+  const spent = Number(costs.spentUsd) || 0
+  const pct = budget ? Math.floor((spent / budget) * 100) : 0
+  return `Cost: $${spent} of $${budget} (${pct}%)${pct >= 80 ? " — near budget, halt non-essential workers" : ""}.`
+}
+
+function describeTournamentLine(run: string): string | undefined {
+  const mRes = readTournamentManifest(run)
+  if (mRes.status !== "ok") return undefined
+  const m = mRes.manifest
+  const mPhase = TOURNAMENT_PHASES.has(m.phase) ? m.phase : "UNKNOWN"
+  const candList = Object.values(m.candidates || {})
+  const surviving = candList.filter((c) => c && c.status !== "pruned").length
+  return `Tournament: phase ${mPhase}, iter ${Number(m.iteration) || 0}/${Number(m.config?.maxIterations) || 0}, level ${Number(m.currentLevel) || 0}/${Number(m.config?.levels) || 0}, candidates ${candList.length} (${surviving} surviving).`
+}
+
+function describeBriefingLines(root: string, id: string): string[] {
+  const run = join(runsDir(root), id)
+  const briefing = readBriefingExcerpt(run)
+  if (!briefing) return []
+  const file = join(run, "BRIEFING.md")
+  const header = briefing.truncated
+    ? `[teamwork] run briefing (${file}) — first 4096 of ${briefing.bytes} bytes:`
+    : `[teamwork] run briefing (${file}):`
+  const lines = [header, briefing.text]
+  if (briefing.truncated) {
+    lines.push("[teamwork] briefing excerpt truncated at 4096 bytes; read BRIEFING.md for the rest.")
+  }
+  return lines
 }
 
 /**
