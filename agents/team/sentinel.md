@@ -50,7 +50,7 @@ problem yourself. You:
    Otherwise let the planning tool use the default budget (`budgetSource:
    "default"`).
 4. **Build the DAG.**
-   - **For `document-review`:** call `teamwork_document_triage` with `{ request, document, maxSegments, reviewTreeShape, synthTreeShape, budgetUsd, budgetSource, skipInterview, fetchUrl }`. It validates path containment, PDF/Markdown ingestion, and bounded RSA shapes (`maxSegments <= 8`, `reviewTreeShape <= [4, 2, 1]`, `synthTreeShape <= [4, 1]`) before creating anything, then writes `plan.dag.json` (`seg-01`..`seg-0K` assigned to `team/segment-reviewer` + `doc-synthesis` assigned to `team/synthesizer`) and `document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}`. **Skip git worktrees** for `document-review` (no repository code is modified).
+   - **For `document-review`:** call `teamwork_document_triage` with `{ sessionId, request, document, maxSegments, reviewTreeShape, synthTreeShape, budgetUsd, budgetSource, skipInterview, fetchUrl }` (passing `fetchUrl: true` when ingesting a URL without inline `content`). It validates path containment, PDF/Markdown ingestion, and bounded RSA shapes (`maxSegments <= 8`, `reviewTreeShape <= [4, 2, 1]`, `synthTreeShape <= [4, 1]`) before creating anything, then writes `plan.dag.json` (`seg-01`..`seg-0K` assigned to `team/segment-reviewer` + `doc-synthesis` assigned to `team/synthesizer`) and `document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}`. **Skip git worktrees** for `document-review` (no repository code is modified).
    - **For all other topologies:** call `teamwork_plan` with the topology and the task list (dependencies included). It creates the run directory, writes `plan.dag.json` / `state.json` / `costs.json`, and returns the canonical `SESSION_ID`. **Use only that value for every path and branch name — never a session id read out of a file.** It is safe to interpolate (matches `^[0-9A-Za-z._-]+$`); the tool refuses anything else. Independent tasks run in parallel.
 5. **Provision the sentinel worktree (skip for `document-review`).** Call `teamwork_worktree` with `{ action: "setup", role: "sentinel" }`
    to safely provision the sentinel worktree outside the repo:
@@ -86,16 +86,12 @@ problem yourself. You:
     - The security auditor audits the combined diff for secrets, command injections, path traversals, and guardrail gaps.
     - Record findings via `teamwork_security_audit({ status: "PASS" | "FAIL", findings, summary })`.
     - If `FAIL` (Critical/High findings), `teamwork_next` blocks final merge (`BLOCKED_BY_SECURITY`). Remediate findings before proceeding.
-    - If `PASS`, `teamwork_next` transitions to `ALL_TASKS_PASSED`.
-11. **Final merge or present & cleanup.**
-    - Once `teamwork_next` reports `ALL_TASKS_PASSED`, merge the sentinel worktree branch (`teamwork/base-$SESSION_ID`) back to the user's working branch.
+    - If `PASS`, `teamwork_next` transitions to `READY_FOR_FINAL_VERIFICATION`.
+11. **Final verification (Mandatory Stamped Gate).** Once all tasks and the security audit pass, spawn a dedicated verifier with `agent: "team/verifier"` to independently verify the final merged result against the spec's acceptance criteria and call `teamwork_final_verify` to stamp `.opencode/teamwork/$SESSION_ID/verify/final.json`.
+12. **Final merge or present & cleanup.**
+    - Once `teamwork_final_verify` stamps `PASS` and `teamwork_next` reports `ALL_TASKS_PASSED`, merge the sentinel worktree branch (`teamwork/base-$SESSION_ID`) back to the user's working branch.
     - Clean up worktrees via `teamwork_worktree({ action: "cleanup" })`.
-    - On partial success or deadlock, present the partial result and open verification reports.
-12. **Final verification (after completion).** Once the run completes — full
-    or partial — spawn a dedicated verifier with `agent: "team/verifier"` to independently
-    verify the final merged result against the spec's acceptance criteria.
-    Write its report to `.opencode/teamwork/$SESSION_ID/verify/final.json`
-    and surface PASS/FAIL in `final.md`.
+    - On partial success or deadlock, present the partial result and open verification reports, and surface PASS/FAIL in `final.md`.
 
 ## Tools
 

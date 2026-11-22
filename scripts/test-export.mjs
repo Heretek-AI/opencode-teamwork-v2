@@ -550,7 +550,7 @@ await check("document-review: buildExportData and renderExport render document-r
       sessionId: drSession,
       phase: "MERGE",
       tasks: {
-        "seg-01": { status: "verified_pass", round: 1, summary: `Reviewed segment ${XSS}`, verification: { status: "PASS", passedChecks: 2, totalChecks: 2 } },
+        "seg-01": { status: "verified_pass", round: 1, summary: `Reviewed segment https://example.com/rfc ${XSS}`, verification: { status: "PASS", passedChecks: 2, totalChecks: 2 } },
         "doc-synthesis": { status: "verified_pass", round: 1, summary: "Synthesized DOCUMENT_REVIEW_REPORT.md", verification: { status: "PASS", passedChecks: 2, totalChecks: 2 } },
       },
     },
