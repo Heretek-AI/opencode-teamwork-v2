@@ -19,6 +19,7 @@ import {
 } from "../plugins/opencode-teamwork/lemma.ts"
 import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
 import { renderGateStatus } from "../plugins/opencode-teamwork/strict.ts"
+import { refreshRunBriefing, MAX_BRIEFING_BYTES } from "../plugins/opencode-teamwork/briefing.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import {
   currentModels,
@@ -6501,5 +6502,179 @@ process.exit(0);
       rmSync(root, { recursive: true, force: true })
     }
     console.log("✓ install/refresh/registration writes are atomic, create-only where required, and no-follow")
+  }
+}
+
+// ==========================================
+// Part 10.9: shared BRIEFING.md continuity artifact + handoff documentation
+// ==========================================
+{
+  console.log("Testing shared BRIEFING.md continuity artifact...")
+  const root = mkdtempSync(join(tmpdir(), "teamwork-briefing-"))
+  try {
+    const tools = {}
+    const ctx = {
+      tool: {
+        transform: async (cb) =>
+          cb({
+            namespace: () => {},
+            add: (tool) => {
+              tools[tool.name] = tool
+            },
+          }),
+      },
+      session: { get: async () => undefined, hook: async () => {} },
+    }
+    await registerTeamworkTools(ctx, root)
+
+    const sid = "20261019-000000-brief"
+    const run = join(root, ".opencode", "teamwork", sid)
+    const briefingFile = join(run, "BRIEFING.md")
+    const mission =
+      "Build the widget.\n\n## Fake Section\nKeep   these spaces\tand this tab " +
+      ESC_CHAR +
+      "[31mred"
+    const planned = await tools.plan.execute({
+      sessionId: sid,
+      topology: "iterative-coding",
+      skipInterview: true,
+      request: mission,
+      verification: "strict",
+      tasks: [{ id: "T1" }, { id: "T2" }],
+    })
+    assert(planned.content.startsWith("Planned"), `briefing plan must succeed: ${planned.content}`)
+    assert(existsSync(briefingFile), "teamwork_plan must write BRIEFING.md")
+    let text = readFileSync(briefingFile, "utf8")
+
+    assert(/^# BRIEFING — \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\n/.test(text), `briefing must start with # BRIEFING — ISO: ${text.slice(0, 60)}`)
+    for (const section of ["## Mission", "## Identity", "## Key Constraints", "## Project Status", "## Artifact Index", "## Succession"]) {
+      assert(text.includes(section), `briefing must contain ${section}`)
+    }
+    assert(text.includes("Build the widget."), "briefing Mission must carry the verbatim request")
+    assert(text.includes("\\## Fake Section"), "mission headings must be defused, never create a section")
+    assert(!text.includes("\n## Fake Section"), "the mission must not forge a new briefing section")
+    assert(text.includes(`- Session: ${sid}`), "Identity must name the session")
+    assert(text.includes("- Topology: iterative-coding"), "Identity must name the topology")
+    assert(text.includes("- Verification mode: strict"), "Identity must record strict verification")
+    assert(text.includes("- Victory audit mode: required"), "Identity must record the victory mode")
+    assert(text.includes("- Tasks: 2 total — pending 2, active 0, verified_pass 0, failed 0, blocked 0"), `status counts must be exact: ${text}`)
+    assert(text.includes("- Gate (strict): MISSING"), "strict run must show a MISSING gate before evidence exists")
+    assert(text.includes("- Victory: PENDING"), "victory must read PENDING before an audit")
+    assert(text.includes("- plan.dag.json") && text.includes("- state.json"), "artifact index must list plan/state")
+    assert(text.includes("- ORIGINAL_REQUEST.md") && text.includes("- requirements.json"), "artifact index must list request/requirements")
+    assert(!text.includes("- verify/final.json") && !text.includes("- GATE_STATUS.md"), "absent artifacts must not be indexed")
+    assert(text.includes("Not supported on this host (ADR 0003); continuity is this briefing"), "succession must state the ADR 0003 position")
+    assert(!text.includes(ESC_CHAR), "briefing must contain no raw ESC")
+    assert(!/[\x00-\x08\x0b-\x1f\x7f-\x9f\u0085\u2028\u2029]/.test(text), "briefing must contain no control characters or line separators")
+    assert(Buffer.byteLength(text, "utf8") <= MAX_BRIEFING_BYTES, "briefing must stay within 16 KiB")
+
+    // Idempotent refresh: unchanged content is not rewritten.
+    const unchanged = refreshRunBriefing(run)
+    assert.strictEqual(unchanged.changed, false, "an unchanged briefing must not be rewritten")
+    assert.strictEqual(readFileSync(briefingFile, "utf8"), text, "an idempotent refresh must leave bytes identical")
+
+    // A task status change refreshes counts/phase without appending sections.
+    await tools.task_update.execute({ sessionId: sid, taskId: "T1", status: "worker_active" })
+    text = readFileSync(briefingFile, "utf8")
+    assert(text.includes("- Tasks: 2 total — pending 1, active 1, verified_pass 0, failed 0, blocked 0"), `active count must refresh: ${text}`)
+    assert(text.includes("- Phase: DISPATCH"), "phase must stay DISPATCH while work is active")
+
+    for (const status of ["worker_done", "verifier_active"]) {
+      await tools.task_update.execute({ sessionId: sid, taskId: "T1", status })
+    }
+    await tools.task_update.execute({
+      sessionId: sid,
+      taskId: "T1",
+      status: "verified_pass",
+      verification: { status: "PASS", passedChecks: 1, totalChecks: 1 },
+    })
+    await tools.task_update.execute({ sessionId: sid, taskId: "T2", status: "blocked" })
+    text = readFileSync(briefingFile, "utf8")
+    assert(text.includes("- Tasks: 2 total — pending 0, active 0, verified_pass 1, failed 0, blocked 1"), `counts must refresh: ${text}`)
+    assert(text.includes("- Phase: PRESENT_PARTIAL"), `blocked-after-pass phase must refresh: ${text}`)
+    assert.strictEqual((text.match(/# BRIEFING — /g) || []).length, 1, "refresh must replace, never append a second briefing")
+    assert(Buffer.byteLength(text, "utf8") <= MAX_BRIEFING_BYTES, "briefing must stay bounded after refreshes")
+
+    // describeRun injects a clearly marked, bounded briefing excerpt.
+    const described = describeRun(root)
+    assert(described && described.includes("run briefing"), "describeRun must mark the injected run briefing")
+    assert(described.includes("## Mission"), "describeRun must include the briefing mission")
+    assert(described.includes("Build the widget."), "describeRun must include the mission text")
+
+    // A pre-planted symlink is refused; the target is untouched and the plan still succeeds.
+    const symSid = "20261019-000001-brief-symlink"
+    const symRun = join(root, ".opencode", "teamwork", symSid)
+    mkdirSync(symRun, { recursive: true })
+    const victim = join(root, "briefing-victim.md")
+    writeFileSync(victim, "VICTIM")
+    symlinkSync(victim, join(symRun, "BRIEFING.md"))
+    const symPlan = await tools.plan.execute({
+      sessionId: symSid,
+      topology: "iterative-coding",
+      skipInterview: true,
+      tasks: [{ id: "S1" }],
+    })
+    assert(symPlan.content.startsWith("Planned"), `a refused briefing write must not fail the plan: ${symPlan.content}`)
+    assert.strictEqual(readFileSync(victim, "utf8"), "VICTIM", "a symlinked BRIEFING.md target must remain untouched")
+    assert(lstatSync(join(symRun, "BRIEFING.md")).isSymbolicLink(), "the planted BRIEFING.md symlink must be left in place")
+    assert(existsSync(join(symRun, "plan.dag.json")) && existsSync(join(symRun, "state.json")), "the plan artifacts must still be written")
+    const symEvents = readFileSync(join(symRun, "events.jsonl"), "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+    assert(symEvents.some((e) => e.event === "briefing_warning"), "a refused briefing write must record a briefing_warning event")
+
+    // Legacy runs (state.json, no BRIEFING.md) keep the old context exactly.
+    const legacyRoot = mkdtempSync(join(tmpdir(), "teamwork-briefing-legacy-"))
+    try {
+      const legacySid = "20261019-000002-legacy"
+      const legacyRun = join(legacyRoot, ".opencode", "teamwork", legacySid)
+      mkdirSync(legacyRun, { recursive: true })
+      writeFileSync(join(legacyRun, "state.json"), JSON.stringify({ sessionId: legacySid, phase: "DISPATCH", tasks: { T1: { status: "verified_pass" } } }))
+      const legacyDesc = describeRun(legacyRoot)
+      assert(legacyDesc, "a legacy run must still describe")
+      assert(!legacyDesc.includes("run briefing") && !legacyDesc.includes("BRIEFING.md"), "a legacy run must not invent a briefing")
+      assert(legacyDesc.includes(`[teamwork] active run ${legacySid} — phase DISPATCH.`), "legacy describeRun must keep its exact header")
+      assert(legacyDesc.includes("State: "), "legacy describeRun must keep its state line")
+
+      const symRoot = mkdtempSync(join(tmpdir(), "teamwork-briefing-desc-sym-"))
+      try {
+        const symDescSid = "20261019-000003-desc-sym"
+        const symDescRun = join(symRoot, ".opencode", "teamwork", symDescSid)
+        mkdirSync(symDescRun, { recursive: true })
+        writeFileSync(join(symDescRun, "state.json"), JSON.stringify({ sessionId: symDescSid, phase: "DONE", tasks: {} }))
+        const secret = join(symRoot, "secret-briefing.md")
+        writeFileSync(secret, "TOP_SECRET_BRIEFING\n")
+        symlinkSync(secret, join(symDescRun, "BRIEFING.md"))
+        const symDesc = describeRun(symRoot)
+        assert(symDesc, "a symlinked briefing must not hide the run")
+        assert(!symDesc.includes("TOP_SECRET_BRIEFING"), "describeRun must not follow a symlinked BRIEFING.md")
+      } finally {
+        rmSync(symRoot, { recursive: true, force: true })
+      }
+    } finally {
+      rmSync(legacyRoot, { recursive: true, force: true })
+    }
+
+    // Documentation contract: the five handoff sections and briefing sections.
+    const repoRoot = fileURLToPath(new URL("../", import.meta.url))
+    const artifacts = readFileSync(join(repoRoot, "docs", "ARTIFACTS.md"), "utf8")
+    const handoffSections = ["1. Observation", "2. Logic Chain", "3. Caveats", "4. Conclusion", "5. Verification Method"]
+    for (const section of handoffSections) {
+      assert(artifacts.includes(section), `docs/ARTIFACTS.md must document handoff section ${section}`)
+    }
+    const briefingSections = ["## Mission", "## Identity", "## Key Constraints", "## Project Status", "## Artifact Index", "## Succession"]
+    for (const section of briefingSections) {
+      assert(artifacts.includes(section), `docs/ARTIFACTS.md must document briefing section ${section}`)
+    }
+    for (const agent of ["worker.md", "verifier.md", "falsifier.md", "security-auditor.md", "victory-auditor.md"]) {
+      const prompt = readFileSync(join(repoRoot, "agents", "team", agent), "utf8")
+      for (const section of handoffSections) {
+        assert(prompt.includes(section), `${agent} must require handoff section ${section}`)
+      }
+    }
+    console.log("✓ BRIEFING.md is bounded, sanitised, atomic, fail-open, refreshed, and excerpted; handoff docs match")
+  } finally {
+    rmSync(root, { recursive: true, force: true })
   }
 }
