@@ -28,6 +28,7 @@ import {
   DEFAULT_MODELS,
 } from "../lib/team.mjs"
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
   linkSync,
@@ -5410,7 +5411,6 @@ process.exit(0);
       assert.deepStrictEqual(first.updated, [], "a first install updates nothing")
       const targetDir = join(configDir, "agents", "team")
       const sentinel = join(targetDir, "sentinel.md")
-      assert(existsSync(sentinel), "sentinel.md must be installed")
       assert(readFileSync(sentinel, "utf8").includes(`model: ${DEFAULT_MODELS["team/sentinel"]}`), "default model must be injected")
       assert(!readdirSync(targetDir).some((name) => name.endsWith(".tmp")), "no temp files may be left behind")
 
@@ -5419,24 +5419,25 @@ process.exit(0);
       assert.strictEqual(second.unchanged.length, teamAgents, "a second identical install must be unchanged")
       assert.strictEqual(second.backupDir, undefined, "an unchanged install must not create backups")
 
-      // update: backup holds the previous content and the mode is preserved
-      const sentinelBefore = readFileSync(sentinel, "utf8")
-      writeFileSync(sentinel, sentinelBefore + "\nLOCAL EDIT\n")
-      chmodSync(sentinel, 0o640)
-      const beforeUpdate = readFileSync(sentinel, "utf8")
-      const updated = installAgents({ configDir, models: { "team/sentinel": "custom/new-model" } })
-      assert.deepStrictEqual(updated.updated, ["sentinel.md"], "only sentinel.md must be updated")
+      // update: backup holds the previous content and the mode is preserved.
+      // Append (a single path operation) rather than read-then-write the same
+      // path: there must be no check for the file to change between.
+      const updatedAgent = join(targetDir, "worker.md")
+      appendFileSync(updatedAgent, "\nLOCAL EDIT\n")
+      chmodSync(updatedAgent, 0o640)
+      const beforeUpdate = readFileSync(updatedAgent, "utf8")
+      const updated = installAgents({ configDir, models: { "team/worker": "custom/new-model" } })
+      assert.deepStrictEqual(updated.updated, ["worker.md"], "only worker.md must be updated")
       assert(updated.backupDir, "an update must report a backup dir")
-      assert.strictEqual(readFileSync(join(updated.backupDir, "sentinel.md"), "utf8"), beforeUpdate, "the backup must hold the pre-update content")
-      assert(readFileSync(sentinel, "utf8").includes("model: custom/new-model"), "the requested model must be injected")
-      assert.strictEqual(statSync(sentinel).mode & 0o777, 0o640, "the existing file mode must be preserved")
+      assert.strictEqual(readFileSync(join(updated.backupDir, "worker.md"), "utf8"), beforeUpdate, "the backup must hold the pre-update content")
+      assert(readFileSync(updatedAgent, "utf8").includes("model: custom/new-model"), "the requested model must be injected")
+      assert.strictEqual(statSync(updatedAgent).mode & 0o777, 0o640, "the existing file mode must be preserved")
 
       // refresh: adopt the shipped body, keep the chosen model, back up local edits
       const refreshDir = join(root, "refresh-config")
       installAgents({ configDir: refreshDir })
       const scout = join(refreshDir, "agents", "team", "scout.md")
-      const scoutBefore = readFileSync(scout, "utf8")
-      writeFileSync(scout, scoutBefore + "\nLOCAL SCOUT EDIT\n")
+      appendFileSync(scout, "\nLOCAL SCOUT EDIT\n")
       const refreshed = installAgents({ configDir: refreshDir, refresh: true, models: { "team/scout": "custom/scout" } })
       assert(refreshed.updated.includes("scout.md"), "refresh must update scout.md")
       const refreshedText = readFileSync(scout, "utf8")
