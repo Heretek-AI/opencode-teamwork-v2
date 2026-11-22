@@ -60,9 +60,13 @@ import {
   recordFormalizationDraft,
   recordFormalizationFinalReview,
   recordFormalizationPreReview,
+  resolveManifestAxiomAllowlist,
+  sameAxiomSet,
   validateLemmaBounds,
+  validateLemmaPolicy,
   verifyLemmaNodeAttempt,
   type LemmaBounds,
+  type LemmaPolicy,
   type LemmaProbeResult,
 } from "./lemma.ts"
 import {
@@ -1528,6 +1532,20 @@ async function createPlanRun(
     }
     lemmaBounds = boundsCheck.bounds
   }
+  // The caller may propose the axiom allowlist only at plan time. It is
+  // validated here, persisted in lemma/manifest.json, and never accepted again
+  // by verification.
+  let lemmaPolicy: LemmaPolicy | undefined
+  if (input.lemmaPolicy !== undefined) {
+    if (!isLemma) {
+      return { ok: false, content: "refused: lemmaPolicy requires lemmaMode: true (or route: \"lemma\"); nothing was written." }
+    }
+    const policyCheck = validateLemmaPolicy(input.lemmaPolicy)
+    if (policyCheck.error || !policyCheck.policy) {
+      return { ok: false, content: policyCheck.error ?? "refused: invalid lemmaPolicy; nothing was written." }
+    }
+    lemmaPolicy = policyCheck.policy
+  }
   let lemmaProbe: LemmaProbeResult | undefined
   if (isLemma) {
     let runExists = existsSync(run)
@@ -1568,6 +1586,28 @@ async function createPlanRun(
               maxWidth: prevB.maxWidth,
               maxNodes: prevB.maxNodes,
               maxRetries: prevB.maxRetries,
+            }
+          }
+          // The approved axiom policy is immutable once persisted. A re-plan
+          // that supplies a different list is refused; omitting it keeps the
+          // previously approved policy (matching the bounds-consistency rule).
+          const prevPolicy = parsedMan?.policy
+          if (prevPolicy !== undefined && prevPolicy !== null) {
+            const resolved = resolveManifestAxiomAllowlist(parsedMan)
+            if (resolved.error) {
+              return { ok: false, content: `${resolved.error}; nothing was written.` }
+            }
+            if (input.lemmaPolicy !== undefined && !sameAxiomSet(resolved.allowedAxioms, lemmaPolicy?.allowedAxioms ?? [])) {
+              return {
+                ok: false,
+                content: "refused: lemmaPolicy conflicts with the approved policy in lemma/manifest.json; nothing was written.",
+              }
+            }
+          } else if (input.lemmaPolicy !== undefined && (lemmaPolicy?.allowedAxioms.length ?? 0) > 0) {
+            return {
+              ok: false,
+              content:
+                "refused: existing lemma/manifest.json has no approved axiom policy (legacy run); start a new run instead of widening it.",
             }
           }
         } catch {}
@@ -1827,7 +1867,7 @@ async function createPlanRun(
     }
   }
   if (isLemma && lemmaBounds && lemmaProbe) {
-    const lemmaInit = initLemmaArtifacts(run, sessionId, lemmaBounds, lemmaProbe)
+    const lemmaInit = initLemmaArtifacts(run, sessionId, lemmaBounds, lemmaProbe, lemmaPolicy ?? null)
     if (lemmaInit.error) {
       return { ok: false, content: lemmaInit.error }
     }
@@ -1982,6 +2022,15 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               maxWidth: { type: "number" },
               maxNodes: { type: "number" },
               maxRetries: { type: "number" },
+            },
+            additionalProperties: false,
+          },
+          lemmaPolicy: {
+            type: "object",
+            description:
+              "Optional plan-time LEMMA axiom policy. allowedAxioms (max 32 safe Lean axiom names; sorryAx always rejected) extends the standard axioms (Classical.choice, propext, Quot.sound) for the whole run. Persisted in lemma/manifest.json; verification reads it from disk and refuses caller-supplied overrides. A re-plan must match the persisted policy.",
+            properties: {
+              allowedAxioms: { type: "array", items: { type: "string" } },
             },
             additionalProperties: false,
           },
@@ -5331,7 +5380,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     editor.add({
       name: "lemma_verify",
       description:
-        "Execute real Lean 4 (`lean`, `lake env lean`, or `lake build`) on lemma/nodes/<lemmaId>/attempt-<r>.lean, bind the declared theorem/lemma name and type to the approved node statement, check transitive axiom dependencies via `#print axioms`, reject sorry/admit/unauthorized axioms even on exit 0, and stamp verify-<r>.json.",
+        "Execute real Lean 4 (`lean`, `lake env lean`, or `lake build`) on lemma/nodes/<lemmaId>/attempt-<r>.lean, bind the declared theorem/lemma name and type to the approved node statement, check transitive axiom dependencies via `#print axioms` against the allowlist approved in lemma/manifest.json at plan time, reject sorry/admit/unauthorized axioms even on exit 0, and stamp verify-<r>.json.",
       input: {
         type: "object",
         properties: {
@@ -5340,7 +5389,6 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           round: { type: "number" },
           mode: { type: "string", description: "lean | lake-env-lean | lake-build (default: lean)" },
           cwd: { type: "string", description: "Optional working directory inside project root or run worktree." },
-          allowedAxioms: { type: "array", items: { type: "string" } },
         },
         required: ["lemmaId"],
         additionalProperties: false,
@@ -5349,6 +5397,14 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
+        // Deprecated field: never accept a caller-supplied allowlist. Widening
+        // the axiom gate is a plan-time decision persisted in the manifest.
+        if (input?.allowedAxioms !== undefined) {
+          return {
+            content:
+              "refused: allowedAxioms is no longer accepted by teamwork_lemma_verify; declare it once as lemmaPolicy.allowedAxioms on teamwork_plan, where it is validated and persisted in lemma/manifest.json.",
+          }
+        }
         const modeRaw = input?.mode ? clean(input.mode, 32) : "lean"
         if (modeRaw !== "lean" && modeRaw !== "lake-env-lean" && modeRaw !== "lake-build") {
           return { content: `refused: invalid mode "${modeRaw}" (allowed: lean | lake-env-lean | lake-build)` }
@@ -5363,7 +5419,6 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             round: typeof input?.round === "number" ? input.round : undefined,
             mode: modeRaw,
             cwd: verifiedCwd,
-            allowedAxioms: Array.isArray(input?.allowedAxioms) ? input.allowedAxioms.map(String) : undefined,
           })
           if (res.error || !res.report) return { content: res.error ?? "verification failed" }
           return {

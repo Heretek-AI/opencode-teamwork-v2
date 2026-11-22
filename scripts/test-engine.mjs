@@ -14,6 +14,7 @@ import {
   probeLemmaToolchain,
   stripLeanComments,
   stripLeanCommentsAndStrings,
+  validateLemmaPolicy,
   verifyLeanFile,
 } from "../plugins/opencode-teamwork/lemma.ts"
 import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
@@ -4627,13 +4628,16 @@ process.exit(0);
       assert.strictEqual(vSorryAx.hasSorry, true)
       assert(vSorryAx.stderr.includes("sorryAx"))
 
-      // (b) admit & unauthorized axiom -> FAIL
+      // (b) admit & unauthorized axiom -> FAIL; a caller-supplied allowlist is refused.
       await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 2, leanCode: "@[simp] axiom bogus : False\ntheorem t : 1 = 1 := by admit" })
-      const vAx = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 2, allowedAxioms: ["other_ax"] })
+      const vAxWiden = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 2, allowedAxioms: ["other_ax"] })
+      assert(vAxWiden.content.startsWith("refused:"), `caller-supplied allowedAxioms must be refused: ${vAxWiden.content}`)
+      assert(!vAxWiden.report, "refused allowlist override must not emit a verify report")
+      const vAx = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 2 })
       assert.strictEqual(vAx.report.status, "FAIL")
       assert.strictEqual(vAx.report.hasAdmit, true)
       assert.strictEqual(vAx.report.hasUnauthorizedAxiom, true)
-      assert.deepStrictEqual(vAx.report.allowedAxioms, ["other_ax"], "allowedAxioms must be persisted into verify report")
+      assert.deepStrictEqual(vAx.report.allowedAxioms, [], "legacy/no-policy manifest must record an empty configured allowlist (standard axioms only)")
 
       // (c) clean .lean text but lean exits 1 -> FAIL (never infer PASS from text!)
       await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 3, leanCode: "-- SYNTAX_ERROR\ntheorem t : 1 = 1 := by rfl" })
@@ -4923,12 +4927,13 @@ process.exit(0);
       process.env.PATH = `${stubBin}:${savedPath}`
       const rootB = mkdtempSync(join(lemmaTestDir, "root-binding-"))
       const tools = await makeToolsFor(rootB)
-      const setupRun = async (RUN, maxRetries = 4) => {
+      const setupRun = async (RUN, maxRetries = 4, lemmaPolicy) => {
         await tools.plan.execute({
           sessionId: RUN,
           topology: "proof",
           lemmaMode: true,
           lemmaBounds: { maxRetries },
+          ...(lemmaPolicy ? { lemmaPolicy } : {}),
           skipInterview: true,
           tasks: [{ id: "L1", agent: "team/proof-worker" }],
         })
@@ -5034,7 +5039,7 @@ process.exit(0);
       assert(vTransitiveSorry.report.unauthorizedAxioms.includes("sorryAx"), "transitive sorryAx must be reported")
 
       const RUN_AX = "20261018-000000-lemma-axioms"
-      await setupRun(RUN_AX, 2)
+      await setupRun(RUN_AX, 2, { allowedAxioms: ["my_custom_ax"] })
       await tools.lemma_node.execute({ sessionId: RUN_AX, action: "attempt", lemmaId: "root", round: 1, leanCode: "-- AXIOM_BAD_DEP\ntheorem t : 1 = 1 := by rfl" })
       const vBadAx = await tools.lemma_verify.execute({ sessionId: RUN_AX, lemmaId: "root", round: 1 })
       assert.strictEqual(vBadAx.report.status, "FAIL", "unauthorized transitive axiom must FAIL")
@@ -5046,11 +5051,11 @@ process.exit(0);
         sessionId: RUN_AX,
         lemmaId: "root",
         round: 2,
-        allowedAxioms: ["my_custom_ax"],
       })
-      assert.strictEqual(vAllowedAx.report.status, "PASS", `allowlisted transitive axiom must PASS: ${JSON.stringify(vAllowedAx.report)}`)
+      assert.strictEqual(vAllowedAx.report.status, "PASS", `manifest-allowlisted transitive axiom must PASS: ${JSON.stringify(vAllowedAx.report)}`)
       assert(vAllowedAx.report.axiomDependencies.includes("my_custom_ax"))
       assert.deepStrictEqual(vAllowedAx.report.unauthorizedAxioms, [])
+      assert.deepStrictEqual(vAllowedAx.report.allowedAxioms, ["my_custom_ax"], "verify report must record the manifest-approved allowlist")
 
       // S2 E2E: a printing command in the attempt must stop the probe.
       const RUN_HIJACK = "20261018-000000-lemma-hijack"
@@ -5070,6 +5075,144 @@ process.exit(0);
       )
 
       console.log("✓ 9.4b declaration binding + transitive axiom dependencies verified")
+    }
+
+    // --- 9.4c Plan-time axiom policy owns the transitive-axiom allowlist ---
+    {
+      // Pure validation: dedupe/guillemets, cap, safe names, sorryAx.
+      const goodPolicy = validateLemmaPolicy({ allowedAxioms: ["my_custom_ax", "my_custom_ax", "«other_ax»"] })
+      assert.strictEqual(goodPolicy.error, undefined, `valid policy must pass: ${goodPolicy.error}`)
+      assert.deepStrictEqual(goodPolicy.policy.allowedAxioms, ["my_custom_ax", "other_ax"], "policy must dedupe and strip guillemets")
+      const badPolicies = [
+        ["sorryAx", { allowedAxioms: ["sorryAx"] }, /sorryAx/],
+        ["unsafe name", { allowedAxioms: ["bad name"] }, /safe Lean axiom name/],
+        ["unsafe guillemet payload", { allowedAxioms: ["«bad name»"] }, /safe Lean axiom name/],
+        ["empty entry", { allowedAxioms: [""] }, /non-empty/],
+        ["over cap", { allowedAxioms: Array.from({ length: 33 }, (_, i) => `ax_${i}`) }, /max 32/],
+      ]
+      for (const [label, policy, pattern] of badPolicies) {
+        const rejected = validateLemmaPolicy(policy)
+        assert(rejected.error && pattern.test(rejected.error), `${label} policy must be rejected: ${rejected.error}`)
+      }
+
+      const stubBin = makeFullStubEnv("policy")
+      process.env.PATH = `${stubBin}:${savedPath}`
+      const rootP = mkdtempSync(join(lemmaTestDir, "root-policy-"))
+      const tools = await makeToolsFor(rootP)
+      const RUN = "20261018-000000-lemma-policy"
+      const planPolicy = { allowedAxioms: ["my_custom_ax"] }
+      const planArgs = {
+        sessionId: RUN,
+        topology: "proof",
+        lemmaMode: true,
+        lemmaPolicy: planPolicy,
+        lemmaBounds: { maxRetries: 4 },
+        skipInterview: true,
+        tasks: [{ id: "L1", agent: "team/proof-worker" }],
+      }
+      const p1 = await tools.plan.execute(planArgs)
+      assert(p1.content.startsWith("Planned"), `policy plan must succeed: ${p1.content}`)
+      const manifestFile = join(rootP, ".opencode", "teamwork", RUN, "lemma", "manifest.json")
+      const plannedManifest = JSON.parse(readFileSync(manifestFile, "utf8"))
+      assert.deepStrictEqual(plannedManifest.policy, { version: 1, allowedAxioms: ["my_custom_ax"] }, "plan must persist the approved policy")
+
+      // Re-plan with a different allowlist must refuse; the identical policy is idempotent.
+      const replanDenied = await tools.plan.execute({ ...planArgs, lemmaPolicy: { allowedAxioms: ["other_ax"] } })
+      assert(replanDenied.content.startsWith("refused:"), `different re-plan policy must be refused: ${replanDenied.content}`)
+      assert(/lemmaPolicy conflicts/.test(replanDenied.content), "refusal must name the policy conflict")
+      const replanSame = await tools.plan.execute({ ...planArgs })
+      assert(!replanSame.content.startsWith("refused:"), `identical re-plan policy must be accepted: ${replanSame.content}`)
+      const afterReplan = JSON.parse(readFileSync(manifestFile, "utf8"))
+      assert.deepStrictEqual(afterReplan.policy, plannedManifest.policy, "re-plan must not silently change the persisted policy")
+
+      // sorryAx can never be approved at plan time; refusal writes zero files.
+      const RUN_SORRY = "20261018-000000-lemma-policy-sorry"
+      const planSorry = await tools.plan.execute({
+        ...planArgs,
+        sessionId: RUN_SORRY,
+        lemmaPolicy: { allowedAxioms: ["sorryAx"] },
+      })
+      assert(planSorry.content.startsWith("refused:"), `sorryAx policy must be refused: ${planSorry.content}`)
+      assert(!existsSync(join(rootP, ".opencode", "teamwork", RUN_SORRY)), "refused policy plan must create zero dirs")
+
+      // Legacy manifest (no policy) fails closed to the standard axiom set.
+      const RUN_LEGACY = "20261018-000000-lemma-policy-legacy"
+      await tools.plan.execute({
+        ...planArgs,
+        sessionId: RUN_LEGACY,
+        lemmaPolicy: undefined,
+      })
+      const legacyManifestFile = join(rootP, ".opencode", "teamwork", RUN_LEGACY, "lemma", "manifest.json")
+      const legacyManifest = JSON.parse(readFileSync(legacyManifestFile, "utf8"))
+      delete legacyManifest.policy
+      writeFileSync(legacyManifestFile, JSON.stringify(legacyManifest, null, 2) + "\n")
+      await tools.lemma_formalize.execute({ sessionId: RUN_LEGACY, action: "draft", leanCode: "theorem t : 1 = 1 := by sorry" })
+      await tools.lemma_formalize.execute({ sessionId: RUN_LEGACY, action: "review_pre", verdict: "APPROVE", notes: "ok" })
+      await tools.lemma_node.execute({ sessionId: RUN_LEGACY, action: "create", lemmaId: "root", declaration: "t", statement: "1 = 1" })
+      await tools.lemma_node.execute({ sessionId: RUN_LEGACY, action: "attempt", lemmaId: "root", round: 1, leanCode: "-- AXIOM_CUSTOM_DEP\ntheorem t : 1 = 1 := by rfl" })
+      const legacyCustom = await tools.lemma_verify.execute({ sessionId: RUN_LEGACY, lemmaId: "root", round: 1 })
+      assert.strictEqual(legacyCustom.report.status, "FAIL", "legacy manifest must not allow a configured custom axiom")
+      assert(legacyCustom.report.unauthorizedAxioms.includes("my_custom_ax"), "legacy manifest must reject the custom axiom")
+      await tools.lemma_node.execute({ sessionId: RUN_LEGACY, action: "attempt", lemmaId: "root", round: 2, leanCode: "theorem t : 1 = 1 := by rfl" })
+      const legacyStandard = await tools.lemma_verify.execute({ sessionId: RUN_LEGACY, lemmaId: "root", round: 2 })
+      assert.strictEqual(legacyStandard.report.status, "PASS", `standard axiom proof must PASS on a legacy manifest: ${JSON.stringify(legacyStandard.report)}`)
+      assert.deepStrictEqual(legacyStandard.report.allowedAxioms, [], "legacy manifest must report an empty configured allowlist")
+
+      // A forged verify report cannot widen the approved policy at final verification.
+      const RUN_FINAL = "20261018-000000-lemma-policy-final"
+      await tools.plan.execute({ ...planArgs, sessionId: RUN_FINAL })
+      await tools.lemma_formalize.execute({ sessionId: RUN_FINAL, action: "draft", leanCode: "theorem t : 1 = 1 := by sorry" })
+      await tools.lemma_formalize.execute({ sessionId: RUN_FINAL, action: "review_pre", verdict: "APPROVE", notes: "ok" })
+      await tools.lemma_node.execute({ sessionId: RUN_FINAL, action: "create", lemmaId: "root", declaration: "t", statement: "1 = 1" })
+      await tools.lemma_node.execute({ sessionId: RUN_FINAL, action: "attempt", lemmaId: "root", round: 1, leanCode: "-- AXIOM_CUSTOM_DEP\ntheorem t : 1 = 1 := by rfl" })
+      const policyPass = await tools.lemma_verify.execute({ sessionId: RUN_FINAL, lemmaId: "root", round: 1 })
+      assert.strictEqual(policyPass.report.status, "PASS", `approved custom axiom must PASS: ${JSON.stringify(policyPass.report)}`)
+
+      for (const st of ["worker_active", "worker_done", "verifier_active"]) {
+        await tools.task_update.execute({ sessionId: RUN_FINAL, taskId: "L1", status: st })
+      }
+      await tools.task_update.execute({ sessionId: RUN_FINAL, taskId: "L1", status: "verified_pass", verification: { status: "PASS" } })
+      const finalRepFile = join(rootP, ".opencode", "teamwork", RUN_FINAL, "verify", "report-L1.json")
+      mkdirSync(dirname(finalRepFile), { recursive: true })
+      writeFileSync(finalRepFile, JSON.stringify({ taskId: "L1", status: "PASS" }) + "\n")
+      await tools.security_audit.execute({ sessionId: RUN_FINAL, status: "PASS", findings: [] })
+      await tools.lemma_formalize.execute({ sessionId: RUN_FINAL, action: "review_final", verdict: "FAITHFUL", notes: "matches" })
+      const fvPolicyOk = await tools.final_verify.execute({ sessionId: RUN_FINAL })
+      assert.strictEqual(fvPolicyOk.status, "PASS", `approved policy run must PASS final_verify: ${fvPolicyOk.content}`)
+
+      const finalManifestFile = join(rootP, ".opencode", "teamwork", RUN_FINAL, "lemma", "manifest.json")
+      const finalVerifyFile = join(rootP, ".opencode", "teamwork", RUN_FINAL, "lemma", "nodes", "root", "verify-1.json")
+      const savedFinalManifest = readFileSync(finalManifestFile, "utf8")
+      const savedFinalVerify = readFileSync(finalVerifyFile, "utf8")
+
+      const widenedReport = JSON.parse(savedFinalVerify)
+      widenedReport.allowedAxioms = ["my_custom_ax", "my_evil_ax"]
+      writeFileSync(finalVerifyFile, JSON.stringify(widenedReport, null, 2) + "\n")
+      const fvWidened = await tools.final_verify.execute({ sessionId: RUN_FINAL })
+      assert.strictEqual(fvWidened.status, "FAIL", "a report that widens allowedAxioms must FAIL final_verify")
+
+      const forgedDeps = JSON.parse(savedFinalVerify)
+      forgedDeps.allowedAxioms = ["my_custom_ax", "my_evil_ax"]
+      forgedDeps.axiomDependencies = ["my_evil_ax"]
+      writeFileSync(finalVerifyFile, JSON.stringify(forgedDeps, null, 2) + "\n")
+      const fvForgedDeps = await tools.final_verify.execute({ sessionId: RUN_FINAL })
+      assert.strictEqual(fvForgedDeps.status, "FAIL", "forged axiomDependencies must FAIL final_verify")
+
+      // Removing the policy from the manifest narrows the gate; the stamped
+      // report (still listing the custom axiom) must no longer match.
+      const manifestNoPolicy = JSON.parse(savedFinalManifest)
+      delete manifestNoPolicy.policy
+      writeFileSync(finalManifestFile, JSON.stringify(manifestNoPolicy, null, 2) + "\n")
+      writeFileSync(finalVerifyFile, savedFinalVerify)
+      const fvPolicyRemoved = await tools.final_verify.execute({ sessionId: RUN_FINAL })
+      assert.strictEqual(fvPolicyRemoved.status, "FAIL", "removed manifest policy must invalidate the stamped allowlist")
+
+      writeFileSync(finalManifestFile, savedFinalManifest)
+      writeFileSync(finalVerifyFile, savedFinalVerify)
+      const fvPolicyRestored = await tools.final_verify.execute({ sessionId: RUN_FINAL })
+      assert.strictEqual(fvPolicyRestored.status, "PASS", "restored policy and report must PASS final_verify again")
+
+      console.log("✓ 9.4c plan-time axiom policy owns the allowlist (caller overrides refused, legacy fails closed, forged reports rejected)")
     }
 
     // --- 9.5 Security containment ---

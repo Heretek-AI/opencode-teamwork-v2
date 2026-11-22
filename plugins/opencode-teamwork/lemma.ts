@@ -28,6 +28,8 @@ export const MAX_LEMMA_WIDTH = 4
 export const MAX_LEMMA_NODES = 24
 export const MAX_LEMMA_RETRIES = 4
 export const MAX_FORMALIZATION_ROUNDS = 3
+export const MAX_LEMMA_ALLOWED_AXIOMS = 32
+export const LEMMA_POLICY_VERSION = 1
 export const MAX_LEMMA_FILE_BYTES = 1024 * 1024 // 1 MiB
 
 export const DEFAULT_LEMMA_BOUNDS = {
@@ -42,6 +44,17 @@ export interface LemmaBounds {
   maxWidth: number
   maxNodes: number
   maxRetries: number
+}
+
+/**
+ * Approved axiom policy for the LEMMA transitive-axiom gate. It is declared
+ * once at plan/formalization time (from the user's spec) and persisted in
+ * `lemma/manifest.json`; verification reads it from disk and never from the
+ * tool caller. `allowedAxioms` extends (never replaces) the standard axioms.
+ */
+export interface LemmaPolicy {
+  version: number
+  allowedAxioms: string[]
 }
 
 export type ProbeStatus = "READY" | "MISSING" | "OUTAGE"
@@ -1778,6 +1791,115 @@ export function validateLemmaBounds(raw?: any): { bounds?: LemmaBounds; error?: 
   return { bounds: { maxDepth, maxWidth, maxNodes, maxRetries } }
 }
 
+/**
+ * Canonicalize an axiom allowlist for comparison: strip guillemets, drop
+ * blanks, dedupe, and sort. Standard axioms are implicit; this list only
+ * extends them.
+ */
+export function canonicalAxiomSet(values: unknown): string[] {
+  if (!Array.isArray(values)) return []
+  return [
+    ...new Set(
+      values
+        .map((value) => stripGuillemets(String(value ?? "").trim()))
+        .filter(Boolean),
+    ),
+  ].sort()
+}
+
+export function sameAxiomSet(a: unknown, b: unknown): boolean {
+  const left = canonicalAxiomSet(a)
+  const right = canonicalAxiomSet(b)
+  return left.length === right.length && left.every((name, i) => name === right[i])
+}
+
+/**
+ * Validate a plan-time `lemmaPolicy`. Every configured axiom must be a safe
+ * Lean name, the list is deduped, `sorryAx` is always rejected, and the list
+ * is capped. The standard axioms remain allowed implicitly; this list only
+ * extends them.
+ */
+export function validateLemmaPolicy(raw?: any): { policy?: LemmaPolicy; error?: string } {
+  if (raw === undefined || raw === null) {
+    return { policy: { version: LEMMA_POLICY_VERSION, allowedAxioms: [] } }
+  }
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    return { error: "refused: lemmaPolicy must be an object" }
+  }
+  if (
+    raw.version !== undefined &&
+    raw.version !== null &&
+    raw.version !== LEMMA_POLICY_VERSION
+  ) {
+    return {
+      error: `refused: unsupported lemmaPolicy.version "${clean(raw.version, 16)}" (expected ${LEMMA_POLICY_VERSION})`,
+    }
+  }
+
+  const rawAxioms = raw.allowedAxioms
+  if (rawAxioms === undefined || rawAxioms === null) {
+    return { policy: { version: LEMMA_POLICY_VERSION, allowedAxioms: [] } }
+  }
+  if (!Array.isArray(rawAxioms)) {
+    return { error: "refused: lemmaPolicy.allowedAxioms must be an array of Lean axiom names" }
+  }
+  if (rawAxioms.length > MAX_LEMMA_ALLOWED_AXIOMS) {
+    return {
+      error: `refused: lemmaPolicy.allowedAxioms has ${rawAxioms.length} entries (max ${MAX_LEMMA_ALLOWED_AXIOMS})`,
+    }
+  }
+
+  const allowedAxioms: string[] = []
+  const seen = new Set<string>()
+  for (const entry of rawAxioms) {
+    if (typeof entry !== "string") {
+      return { error: `refused: lemmaPolicy.allowedAxioms entry "${clean(entry, 80)}" must be a string` }
+    }
+    const trimmed = entry.trim()
+    if (!trimmed) {
+      return { error: "refused: lemmaPolicy.allowedAxioms entries must be non-empty" }
+    }
+    // `clean` both strips control characters and caps length; a mismatch means
+    // the entry would have been silently rewritten, so refuse instead.
+    if (clean(trimmed, 128) !== trimmed) {
+      return { error: `refused: unsafe lemmaPolicy.allowedAxioms entry "${clean(entry, 80)}"` }
+    }
+    const name = stripGuillemets(trimmed)
+    if (!name || !isSafeLeanDeclarationName(name)) {
+      return {
+        error: `refused: invalid lemmaPolicy.allowedAxioms entry "${clean(entry, 80)}" (must be a safe Lean axiom name)`,
+      }
+    }
+    if (name === "sorryAx") {
+      return { error: "refused: sorryAx can never be allowlisted as a transitive axiom" }
+    }
+    if (seen.has(name)) continue
+    seen.add(name)
+    allowedAxioms.push(name)
+  }
+  return { policy: { version: LEMMA_POLICY_VERSION, allowedAxioms } }
+}
+
+/**
+ * Resolve the approved allowlist from a persisted manifest. A missing policy
+ * (legacy run) is fail-closed: only the standard axioms are permitted. A
+ * malformed or tampered policy is also fail-closed and reported as an error.
+ */
+export function resolveManifestAxiomAllowlist(manifest: unknown): { allowedAxioms: string[]; error?: string } {
+  const policy = (manifest as any)?.policy
+  if (policy === undefined || policy === null) {
+    return { allowedAxioms: [] }
+  }
+  const checked = validateLemmaPolicy(policy)
+  if (checked.error || !checked.policy) {
+    return {
+      allowedAxioms: [],
+      error: checked.error ?? "refused: lemma/manifest.json policy is malformed (failing closed)",
+    }
+  }
+  return { allowedAxioms: checked.policy.allowedAxioms }
+}
+
 export interface LemmaNodeRecord {
   id: string
   parentId: string | null
@@ -1797,6 +1919,8 @@ export interface LemmaManifest {
   sessionId: string
   phase: "FORMALIZE" | "SOLVING" | "VERIFIED" | "BLOCKED"
   bounds: LemmaBounds & { maxFormalizationRounds: number }
+  /** Approved plan-time axiom policy. Absent on legacy manifests (standard axioms only). */
+  policy?: LemmaPolicy
   toolchain: {
     status: ProbeStatus
     lean: string | null
@@ -1843,12 +1967,18 @@ export interface FormalizationReviewFile {
   } | null
 }
 
-function emptyManifest(sessionId: string, bounds: LemmaBounds, probe: LemmaProbeResult): LemmaManifest {
+function emptyManifest(
+  sessionId: string,
+  bounds: LemmaBounds,
+  probe: LemmaProbeResult,
+  policy: LemmaPolicy,
+): LemmaManifest {
   return {
     version: 1,
     sessionId: clean(sessionId, 64),
     phase: "FORMALIZE",
     bounds: { ...bounds, maxFormalizationRounds: MAX_FORMALIZATION_ROUNDS },
+    policy: { version: LEMMA_POLICY_VERSION, allowedAxioms: [...policy.allowedAxioms] },
     toolchain: {
       status: probe.status,
       lean: probe.lean.version,
@@ -1861,17 +1991,41 @@ function emptyManifest(sessionId: string, bounds: LemmaBounds, probe: LemmaProbe
   }
 }
 
+/**
+ * `policy` is the plan-time decision: `null` means the caller omitted it (a
+ * re-plan keeps the persisted policy untouched), while an object is compared
+ * with any existing manifest and refused on mismatch.
+ */
 export function initLemmaArtifacts(
   runDir: string,
   sessionId: string,
   bounds: LemmaBounds,
   probe: LemmaProbeResult,
+  policy: LemmaPolicy | null = null,
 ): { error?: string } {
   const existing = ensureSafeSubpath(runDir, "lemma/manifest.json")
   if (existing.error) return { error: existing.error }
   if (!existsSync(existing.path!)) {
-    const w1 = writeJsonAtomicSafe(runDir, "lemma/manifest.json", emptyManifest(sessionId, bounds, probe))
+    const initialPolicy = policy ?? { version: LEMMA_POLICY_VERSION, allowedAxioms: [] }
+    const w1 = writeJsonAtomicSafe(runDir, "lemma/manifest.json", emptyManifest(sessionId, bounds, probe, initialPolicy))
     if (w1.error) return { error: w1.error }
+  } else if (policy) {
+    const mRead = readJsonSafe<LemmaManifest>(runDir, "lemma/manifest.json")
+    if (mRead.error || !mRead.value) return { error: mRead.error ?? "refused: lemma/manifest.json unreadable" }
+    const persisted = resolveManifestAxiomAllowlist(mRead.value)
+    if (persisted.error) return { error: persisted.error }
+    if (mRead.value.policy === undefined || mRead.value.policy === null) {
+      if (policy.allowedAxioms.length > 0) {
+        return {
+          error:
+            "refused: existing lemma/manifest.json has no approved axiom policy (legacy run); start a new run instead of widening it",
+        }
+      }
+    } else if (!sameAxiomSet(persisted.allowedAxioms, policy.allowedAxioms)) {
+      return {
+        error: "refused: lemmaPolicy conflicts with the approved policy in lemma/manifest.json; nothing was written.",
+      }
+    }
   }
   const rev = ensureSafeSubpath(runDir, "lemma/formalization-review.json")
   if (rev.error) return { error: rev.error }
@@ -2385,7 +2539,6 @@ export function verifyLemmaNodeAttempt(
     round?: number
     mode?: "lean" | "lake-env-lean" | "lake-build"
     cwd?: string
-    allowedAxioms?: string[]
     env?: NodeJS.ProcessEnv
   },
 ): { report?: StampedLemmaVerifyReport; verifyPath?: string; node?: LemmaNodeRecord; error?: string } {
@@ -2395,6 +2548,11 @@ export function verifyLemmaNodeAttempt(
   const mRead = readJsonSafe<LemmaManifest>(runDir, "lemma/manifest.json")
   if (mRead.error || !mRead.value) return { error: mRead.error ?? "refused: lemma/manifest.json missing" }
   const manifest = mRead.value
+  // The allowlist is approved at plan time and read from the manifest. It is
+  // never taken from the tool caller, so an agent cannot widen the gate.
+  const approvedPolicy = resolveManifestAxiomAllowlist(manifest)
+  if (approvedPolicy.error) return { error: approvedPolicy.error }
+  const approvedAxioms = approvedPolicy.allowedAxioms
   const nodes: Record<string, LemmaNodeRecord> = Object.assign(Object.create(null), manifest.nodes || {})
   if (!Object.prototype.hasOwnProperty.call(nodes, params.lemmaId)) {
     return { error: `refused: unknown lemmaId "${params.lemmaId}"` }
@@ -2418,16 +2576,12 @@ export function verifyLemmaNodeAttempt(
   }
   const attemptHash = createHash("sha256").update(attemptRead.text, "utf8").digest("hex")
 
-  const normalizedAllowedAxioms = Array.isArray(params.allowedAxioms)
-    ? params.allowedAxioms.map((a) => clean(a, 128).trim()).filter(Boolean)
-    : []
-
   const res = verifyLeanFile({
     filePath: attemptSafe.path,
     cwd: params.cwd ?? dirname(attemptSafe.path),
     mode: params.mode ?? "lean",
     env: params.env,
-    allowedAxioms: normalizedAllowedAxioms,
+    allowedAxioms: approvedAxioms,
   })
 
   const report: StampedLemmaVerifyReport = {
@@ -2435,7 +2589,7 @@ export function verifyLemmaNodeAttempt(
     round,
     attemptFile: attemptRel,
     attemptHash,
-    allowedAxioms: normalizedAllowedAxioms,
+    allowedAxioms: approvedAxioms,
     ...res,
   }
 
@@ -2464,7 +2618,7 @@ export function verifyLemmaNodeAttempt(
         cwd: params.cwd ?? dirname(attemptSafe.path),
         mode: params.mode ?? "lean",
         env: params.env,
-        allowedAxioms: normalizedAllowedAxioms,
+        allowedAxioms: approvedAxioms,
       })
       report.axiomDependencies = axioms.check.dependencies
       report.unauthorizedAxioms = axioms.check.unauthorized
@@ -2579,6 +2733,13 @@ export function evaluateLemmaFinalEvidence(runDir: string): LemmaFinalEvidence {
   if (boundsCheck.error) {
     reasons.push(`lemma bounds invalid: ${boundsCheck.error}`)
   }
+  // Final evidence re-derives the approved allowlist from the manifest; a
+  // forged verify report cannot widen it by editing its own `allowedAxioms`.
+  const approvedPolicy = resolveManifestAxiomAllowlist(manifest)
+  if (approvedPolicy.error) {
+    reasons.push(`lemma manifest policy invalid: ${approvedPolicy.error}`)
+  }
+  const approvedAxioms = approvedPolicy.allowedAxioms
 
   let problemLeanPresent = false
   let currentProblemHash: string | undefined
@@ -2688,10 +2849,14 @@ export function evaluateLemmaFinalEvidence(runDir: string): LemmaFinalEvidence {
       if (!Array.isArray(vReport.axiomDependencies)) {
         reasons.push(`lemma node ${id}: stamped verification does not record axiomDependencies`)
       } else {
-        const evaluated = evaluateAxiomDependencies(
-          vReport.axiomDependencies.map(String),
-          Array.isArray(vReport.allowedAxioms) ? vReport.allowedAxioms.map(String) : [],
-        )
+        if (!Array.isArray(vReport.allowedAxioms)) {
+          reasons.push(`lemma node ${id}: stamped verification does not record the approved axiom allowlist`)
+        } else if (!sameAxiomSet(vReport.allowedAxioms, approvedAxioms)) {
+          reasons.push(
+            `lemma node ${id}: stamped axiom allowlist does not match the approved lemma/manifest.json policy`,
+          )
+        }
+        const evaluated = evaluateAxiomDependencies(vReport.axiomDependencies.map(String), approvedAxioms)
         if (evaluated.unauthorized.length > 0) {
           reasons.push(
             `lemma node ${id}: stamped axiomDependencies contain unauthorized dependencies (${evaluated.unauthorized.join(", ")})`,
