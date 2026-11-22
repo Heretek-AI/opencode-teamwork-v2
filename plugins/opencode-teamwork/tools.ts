@@ -124,6 +124,7 @@ import {
   validateRequirementsBaseline,
 } from "./victory.ts"
 import type { RequirementsFile, VictoryAuditMode } from "./victory.ts"
+import { readBriefingExcerpt, refreshRunBriefing } from "./briefing.ts"
 
 // ---------------------------------------------------------------------------
 // OpenCode native cost tracking
@@ -1322,6 +1323,7 @@ async function appendEvent(
       | "preflight"
       | "tournament_step"
       | "tournament_cancelled"
+      | "briefing_warning"
     sessionId: string
     taskId?: string | null
     from?: string | null
@@ -1449,13 +1451,51 @@ export function describeRun(root: string): string | undefined {
     const surviving = candList.filter((c) => c && c.status !== "pruned").length
     tournamentLine = `Tournament: phase ${mPhase}, iter ${Number(m.iteration) || 0}/${Number(m.config?.maxIterations) || 0}, level ${Number(m.currentLevel) || 0}/${Number(m.config?.levels) || 0}, candidates ${candList.length} (${surviving} surviving).`
   }
+  const briefing = readBriefingExcerpt(run)
+  const briefingLines = briefing
+    ? [
+        `[teamwork] run briefing (${join(runsDir(root), id, "BRIEFING.md")})${briefing.truncated ? ` — first 4096 of ${briefing.bytes} bytes` : ""}:`,
+        briefing.text,
+        ...(briefing.truncated
+          ? [`[teamwork] briefing excerpt truncated at 4096 bytes; read BRIEFING.md for the rest.`]
+          : []),
+      ]
+    : []
   return [
     `[teamwork] active run ${id} — phase ${phase}.`,
     `Tasks: ${pass}/${tasks.length} pass, ${fail} fail. Open pitfalls: ${pitfalls}${pitfallSuffix}.`,
     ...(tournamentLine ? [tournamentLine] : []),
     costLine,
+    ...briefingLines,
     `State: ${join(runsDir(root), id, "state.json")} (read it before dispatching).`,
   ].join("\n")
+}
+
+/**
+ * Rebuild `<run>/BRIEFING.md` without ever failing the caller's operation.
+ * A refused/failed write is recorded as a `briefing_warning` event; the
+ * primary tool result is unchanged either way.
+ */
+async function refreshBriefingSafe(run: string): Promise<string | undefined> {
+  try {
+    refreshRunBriefing(run)
+    return undefined
+  } catch (err: any) {
+    const note = clean(err?.message || "briefing refresh failed", 200)
+    try {
+      await appendEvent(run, {
+        event: "briefing_warning",
+        sessionId: basename(run),
+        taskId: null,
+        to: "BRIEFING",
+        round: 0,
+        agent: null,
+        phase: null,
+        note,
+      })
+    } catch {}
+    return note
+  }
 }
 
 function ensureSafeRunSubpath(run: string, targetFile: string) {
@@ -2093,6 +2133,8 @@ async function createPlanRun(
     }
   }
   await appendEvent(run, { event: "run_created", sessionId, taskId: null, from: null, to: "pending", round: 0, phase: "DAG_BUILD", specGate, ...(specGate === "satisfied" ? { specPath: specFile } : {}), ...(preflightNote ? { note: preflightNote } : {}) })
+  // Shared continuity briefing: written after plan/state/costs, never fatal.
+  await refreshBriefingSafe(run)
   // Backstop: if console credits apply but the budget wasn't derived from
   // them, warn (advisory — the sentinel is instructed to run the preflight).
   let creditWarning = ""
@@ -4130,6 +4172,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             if (state.phase !== "SECURITY_AUDIT" && !auditFailed) {
               state.phase = "SECURITY_AUDIT"
               writeJson(join(run, "state.json"), state)
+              await refreshBriefingSafe(run)
             }
 
             if (auditFailed) {
@@ -4196,6 +4239,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             if (state.phase !== "FINAL_VERIFICATION") {
               state.phase = "FINAL_VERIFICATION"
               writeJson(join(run, "state.json"), state)
+              await refreshBriefingSafe(run)
             }
             return {
               content: `READY_FOR_FINAL_VERIFICATION: All ${taskDefs.size} tasks passed verification and security audit PASSED, but there is no usable final verification report at ${finalFile} (missing, unreadable, or malformed).\nRun an independent final verification of the whole run and write verify/final.json with "status": "PASS" or "FAIL" before merging.\n${integrityModeNote}`,
@@ -4223,6 +4267,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             if (state.phase !== "FINAL_VERIFICATION") {
               state.phase = "FINAL_VERIFICATION"
               writeJson(join(run, "state.json"), state)
+              await refreshBriefingSafe(run)
             }
             return {
               content: `FINAL_VERIFICATION_UNVERIFIED: verify/final.json reports PASS but is not stamped by teamwork_final_verify (no usable generatedBy.session, generatedAt, or evidence), so it cannot complete the run.\nRun teamwork_final_verify to compute the verdict from the per-task reports and the security audit and stamp provenance. To accept this hand-written or legacy report instead, re-call teamwork_next with allowUnstamped: true; that is recorded as a bypass event.\n${integrityModeNote}`,
@@ -4244,6 +4289,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             if (state.phase !== "FINAL_VERIFICATION") {
               state.phase = "FINAL_VERIFICATION"
               writeJson(join(run, "state.json"), state)
+              await refreshBriefingSafe(run)
             }
             const rejected = nextVictoryGate.status === "REJECTED"
             return {
@@ -4296,6 +4342,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (state.phase !== "MERGE" && state.phase !== "DONE") {
             state.phase = "MERGE"
             writeJson(join(run, "state.json"), state)
+            await refreshBriefingSafe(run)
           }
 
           if (!stamped) {
@@ -4589,6 +4636,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             worktree: input.worktree ?? current.worktree ?? null,
             phase: state.phase ?? null,
           })
+          await refreshBriefingSafe(run)
 
           return {
             // SEC-3: the branch is echoed to the caller, so it is sanitised like every other field.
@@ -4746,6 +4794,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           to: status,
           phase: state?.phase ?? null,
         })
+        await refreshBriefingSafe(run)
 
         if (status === "FAIL") {
           const violationNote =
@@ -4837,6 +4886,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           agentSource: "session",
           phase: state?.phase ?? null,
         })
+        await refreshBriefingSafe(run)
         return {
           content: `VICTORY AUDIT RECORDED: ${result.verdict.verdict} (${result.verdict.requirements.length} requirement(s)).\nArtifact: ${join(run, "verify", "victory.json")}`,
           verdict: result.verdict,
@@ -5356,6 +5406,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             agentSource: caller?.agent ? "session" : undefined,
             phase: state.phase ?? null,
           })
+          await refreshBriefingSafe(run)
 
           const integrityModeNote =
             integrity.source === "artifact"
