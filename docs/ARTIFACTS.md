@@ -17,6 +17,8 @@ Every run writes under one root:
 ├── preflight.json           # input-checks report (written by teamwork_preflight)
 ├── state.json               # resumable coordinator state
 ├── costs.json               # coordinator-maintained budget tracker
+├── BRIEFING.md              # shared run briefing: mission, identity, constraints, status, artifacts, succession
+├── handoff.md               # five-section agent handoff (completion, block, or handoff)
 ├── events.jsonl             # append-only lifecycle event log (JSON Lines)
 ├── pitfalls.md              # answer-agnostic failure registry
 ├── document-review/         # present for document-review runs
@@ -308,6 +310,83 @@ is unchanged by this ledger.
 2000 characters (truncated with `…`). Runs written before the ledger existed — or
 a task with an absent/empty `feedbackLog` — fall back to the single `feedback`
 field, exactly as before.
+
+### `BRIEFING.md` — shared run briefing (continuity)
+
+One briefing per run, written by `teamwork_plan` after `plan.dag.json`,
+`state.json`, and `costs.json`, then refreshed on `teamwork_task_update`,
+`teamwork_security_audit`, `teamwork_final_verify`, `teamwork_victory_audit`,
+and `teamwork_next` phase changes. It is a *shared* run artifact: per-agent state
+roots are not supported on this host (ADR 0003), so the briefing is the
+continuity record a fresh agent session starts from.
+
+```markdown
+# BRIEFING — 2026-01-12T10:15:00.000Z
+
+## Mission
+<verbatim request, bounded and sanitised; or the spec title>
+
+## Identity
+- Session: 20260112-101500-a1b2
+- Topology: distributed-coding
+- Integrity mode: development
+- Verification mode: standard|strict
+- Victory audit mode: required|skip
+- Budget: $20
+
+## Key Constraints
+- no edits outside the worktree, no publish/PR, strict + victory requirements
+
+## Project Status
+- Phase: DISPATCH
+- Tasks: 3 total — pending 2, active 1, verified_pass 0, failed 0, blocked 0
+- Gate (strict): PASS|FAIL|MISSING        # strict runs only
+- Victory: CONFIRMED|REJECTED|PENDING|SKIPPED
+
+## Artifact Index
+- plan.dag.json
+- state.json
+- ORIGINAL_REQUEST.md
+- requirements.json
+- verify/final.json          # when present
+- GATE_STATUS.md             # when present
+
+## Succession
+- Not supported on this host (ADR 0003); continuity is this briefing.
+```
+
+The file is capped at **16 KiB** (UTF-8), every interpolated value is sanitised
+(control characters removed, mission headings defused), the write is atomic and
+refuses a symlink, and an unchanged refresh does not rewrite it. A failed
+refresh never fails the primary tool call; it is recorded as a
+`briefing_warning` event. `session.context` injects only the first **4 KiB**,
+explicitly marked as the run briefing and truncated when longer. Legacy runs
+without a briefing behave exactly as before.
+
+### `handoff.md` — five-section agent handoff
+
+Required whenever an agent **completes, blocks, or hands off**. The next agent
+(or the Sentinel) reads it instead of replaying the session, so it must stand on
+its own and use exactly these five sections:
+
+```markdown
+## 1. Observation
+What you actually saw and ran: concrete paths, commands, outputs, diffs, failures.
+
+## 2. Logic Chain
+How the observation leads to the conclusion, step by step, with no leap of faith.
+
+## 3. Caveats
+What you did not check, assumptions made, and remaining risks or open questions.
+
+## 4. Conclusion
+The decision or run state the next agent must act on (done, blocked, needs re-scope).
+
+## 5. Verification Method
+How to reproduce or independently check the conclusion: the exact command, test, or artifact.
+```
+
+Keep it short and evidence-first; never assert a PASS you did not observe.
 
 ### Engine Tools
 

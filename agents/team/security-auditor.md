@@ -78,6 +78,14 @@ it and let the task fail.
 This per-task audit is in addition to the run-level pre-merge
 `teamwork_security_audit`; do not conflate the two files.
 
+## Handoff
+
+If you complete, block, or hand off, write `handoff.md` with exactly these five
+sections: `## 1. Observation` (files/commands inspected and findings),
+`## 2. Logic Chain` (evidence → audit verdict), `## 3. Caveats` (classes not
+audited or assumptions), `## 4. Conclusion` (CLEAN, findings, or blocked), and
+`## 5. Verification Method` (how to reproduce each finding or the CLEAN result).
+
 ## Output
 
 - A findings table: ID, severity (Critical/High/Medium/Low), `file:line`, one line.
