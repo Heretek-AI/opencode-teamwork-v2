@@ -1968,7 +1968,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           },
           lemmaMode: {
             type: "boolean",
-            description: "Optional. True only for explicit Lean 4 / LEMMA formal-proof runs (requires topology: 'proof' and Lean 4 + leap-tools on PATH).",
+            description: "Optional. True only for explicit Lean 4 / LEMMA formal-proof runs (requires topology: 'proof' and Lean 4 + the LEAP CLI `leap`, or legacy `leap-tools`, on PATH).",
           },
           route: {
             type: "string",
@@ -5167,7 +5167,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     editor.add({
       name: "lemma_probe",
       description:
-        "Read-only probe for the external LEMMA toolchain (`lean`, `lake`, `leap-tools`) on PATH. Never touches disk and never installs packages.",
+        "Read-only probe for the external LEMMA toolchain (`lean`, `lake`, and the LEAP CLI `leap`, or legacy `leap-tools`) on PATH. Never touches disk and never installs packages.",
       input: {
         type: "object",
         properties: {
@@ -5184,7 +5184,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
         }
         return {
-          content: `LEMMA toolchain READY: lean (${probe.lean.version}), lake (${probe.lake.version}), leap-tools (${probe.leapTools.version}).`,
+          content: `LEMMA toolchain READY: lean (${probe.lean.version}), lake (${probe.lake.version}), ${probe.leap.name} (${probe.leap.version}).`,
           ...probe,
         }
       },

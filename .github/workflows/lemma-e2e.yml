@@ -1,0 +1,78 @@
+name: LEMMA live toolchain E2E
+
+on:
+  pull_request:
+    paths:
+      - "plugins/**"
+      - "agents/**"
+      - "scripts/**"
+      - ".github/workflows/lemma-e2e.yml"
+  push:
+    branches: [main]
+    paths:
+      - "plugins/**"
+      - "agents/**"
+      - "scripts/**"
+      - ".github/workflows/lemma-e2e.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lemma-e2e:
+    name: Live Lean 4 + LEAP CLI (no Mathlib)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      # setup-python keeps `python3 -m pip install --user` working on
+      # Ubuntu 24.04, whose system Python is externally managed (PEP 668).
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Cache elan toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.elan
+          key: ${{ runner.os }}-elan-lean4-stable-v1
+          restore-keys: |
+            ${{ runner.os }}-elan-lean4-stable-
+
+      - name: Install elan + Lean 4 stable (core only, no Mathlib)
+        run: |
+          if [ ! -x "$HOME/.elan/bin/lean" ]; then
+            curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y --default-toolchain leanprover/lean4:stable
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$PATH"
+          lean --version
+
+      # The `leap-tools` PyPI package does not exist. Install the pinned git
+      # revision; `leap` is the console script (legacy alias `leap-tools`).
+      # `leap lean` (Lean 4.34 + Mathlib, ~11 GB) is deliberately NOT run:
+      # LEMMA verification needs only core Lean.
+      - name: Install LEAP CLI (pinned git revision, no Mathlib)
+        run: |
+          python3 -m pip install --user "git+https://github.com/billkunghappy/LEAP-CLI@afc016d23579d8236050a157fe6cac8f17b13096"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.elan/bin:$HOME/.local/bin:$PATH"
+          lean --version
+          lake --version
+          leap --help
+
+      - name: Tests (live LEMMA E2E must run, not skip)
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee "$RUNNER_TEMP/npm-test.log"
+          if grep -F "[SKIP] LEMMA live-toolchain" "$RUNNER_TEMP/npm-test.log"; then
+            echo "::error::LEMMA live-toolchain E2E was skipped; the probe did not see lean/lake/leap on PATH"
+            exit 1
+          fi
+          grep -F "live Lean 4 E2E verification passed" "$RUNNER_TEMP/npm-test.log"
