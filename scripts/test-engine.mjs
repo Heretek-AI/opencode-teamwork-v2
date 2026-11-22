@@ -95,6 +95,25 @@ async function stampVictoryFor(tools, ctx, root, runId, { sessionID = "ses_victo
   }
 }
 
+// Register the real engine tools against a throwaway project root. Shared by
+// every fixture that needs the full tool set, so the editor/ctx shim lives in
+// one place instead of being copied into each block.
+async function makeToolsFor(root) {
+  const tools = {}
+  await registerTeamworkTools(
+    {
+      tool: {
+        transform: async (cb) => {
+          await cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = tool) })
+        },
+      },
+      session: { get: async () => undefined },
+    },
+    root,
+  )
+  return tools
+}
+
 try {
   let registeredTools = {}
   const mockCtx = {
@@ -4927,22 +4946,6 @@ try {
     console.log("✓ 9.0 sentinel/orchestrator teamwork_plan calls record the verbatim request")
   }
 
-  const makeToolsFor = async (root) => {
-    const tools = {}
-    await registerTeamworkTools(
-      {
-        tool: {
-          transform: async (cb) => {
-            await cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = tool) })
-          },
-        },
-        session: { get: async () => undefined },
-      },
-      root,
-    )
-    return tools
-  }
-
   const writeStubBin = (dir, name, scriptBody) => {
     const p = join(dir, name)
     writeFileSync(p, `#!${process.execPath}\n${scriptBody}\n`, "utf8")
@@ -6267,20 +6270,7 @@ process.exit(0);
 
     const root = mkdtempSync(join(tmpdir(), "teamwork-atomic-tools-"))
     try {
-      const tools = {}
-      const ctx = {
-        tool: {
-          transform: async (cb) =>
-            cb({
-              namespace: () => {},
-              add: (tool) => {
-                tools[tool.name] = tool
-              },
-            }),
-        },
-        session: { get: async () => undefined, hook: async () => {} },
-      }
-      await registerTeamworkTools(ctx, root)
+      const tools = await makeToolsFor(root)
       const sid = "20261018-200000-atom"
       const run = join(root, ".opencode", "teamwork", sid)
       mkdirSync(run, { recursive: true })
@@ -6512,20 +6502,7 @@ process.exit(0);
   console.log("Testing shared BRIEFING.md continuity artifact...")
   const root = mkdtempSync(join(tmpdir(), "teamwork-briefing-"))
   try {
-    const tools = {}
-    const ctx = {
-      tool: {
-        transform: async (cb) =>
-          cb({
-            namespace: () => {},
-            add: (tool) => {
-              tools[tool.name] = tool
-            },
-          }),
-      },
-      session: { get: async () => undefined, hook: async () => {} },
-    }
-    await registerTeamworkTools(ctx, root)
+    const tools = await makeToolsFor(root)
 
     const sid = "20261019-000000-brief"
     const run = join(root, ".opencode", "teamwork", sid)
@@ -6551,7 +6528,7 @@ process.exit(0);
       assert(text.includes(section), `briefing must contain ${section}`)
     }
     assert(text.includes("Build the widget."), "briefing Mission must carry the verbatim request")
-    assert(text.includes("\\## Fake Section"), "mission headings must be defused, never create a section")
+    assert(text.includes(String.raw`\## Fake Section`), "mission headings must be defused, never create a section")
     assert(!text.includes("\n## Fake Section"), "the mission must not forge a new briefing section")
     assert(text.includes(`- Session: ${sid}`), "Identity must name the session")
     assert(text.includes("- Topology: iterative-coding"), "Identity must name the topology")
@@ -6565,7 +6542,7 @@ process.exit(0);
     assert(!text.includes("- verify/final.json") && !text.includes("- GATE_STATUS.md"), "absent artifacts must not be indexed")
     assert(text.includes("Not supported on this host (ADR 0003); continuity is this briefing"), "succession must state the ADR 0003 position")
     assert(!text.includes(ESC_CHAR), "briefing must contain no raw ESC")
-    assert(!/[\x00-\x08\x0b-\x1f\x7f-\x9f\u0085\u2028\u2029]/.test(text), "briefing must contain no control characters or line separators")
+    assert(!/[\x00-\x09\x0b-\x1f\x7f-\x9f\u2028\u2029]/.test(text), "briefing must contain no control characters or line separators")
     assert(Buffer.byteLength(text, "utf8") <= MAX_BRIEFING_BYTES, "briefing must stay within 16 KiB")
 
     // Idempotent refresh: unchanged content is not rewritten.
@@ -6579,9 +6556,9 @@ process.exit(0);
     assert(text.includes("- Tasks: 2 total — pending 1, active 1, verified_pass 0, failed 0, blocked 0"), `active count must refresh: ${text}`)
     assert(text.includes("- Phase: DISPATCH"), "phase must stay DISPATCH while work is active")
 
-    for (const status of ["worker_done", "verifier_active"]) {
-      await tools.task_update.execute({ sessionId: sid, taskId: "T1", status })
-    }
+    // Ordered transitions: each status is only reachable from the previous one.
+    await tools.task_update.execute({ sessionId: sid, taskId: "T1", status: "worker_done" })
+    await tools.task_update.execute({ sessionId: sid, taskId: "T1", status: "verifier_active" })
     await tools.task_update.execute({
       sessionId: sid,
       taskId: "T1",
@@ -6597,7 +6574,7 @@ process.exit(0);
 
     // describeRun injects a clearly marked, bounded briefing excerpt.
     const described = describeRun(root)
-    assert(described && described.includes("run briefing"), "describeRun must mark the injected run briefing")
+    assert(described?.includes("run briefing"), "describeRun must mark the injected run briefing")
     assert(described.includes("## Mission"), "describeRun must include the briefing mission")
     assert(described.includes("Build the widget."), "describeRun must include the mission text")
 
