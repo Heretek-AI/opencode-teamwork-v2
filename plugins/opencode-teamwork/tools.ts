@@ -4848,7 +4848,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     editor.add({
       name: "wave_record",
       description:
-        "Record one strict-verification verdict. Only team/falsifier may record kind=challenge (verdict PASS) and only team/security-auditor may record kind=audit (verdict CLEAN); the caller identity is derived from the trusted session and cannot be supplied as an input. Requires the task to exist and its verify/report-<taskId>.json to be PASS, writes verify/challenge-<taskId>.json or verify/audit-<taskId>.json atomically, appends a verification_wave event, and is write-once.",
+        "Record one strict-verification verdict. Only team/falsifier may record kind=challenge (verdict PASS) and only team/security-auditor may record kind=audit (verdict CLEAN); the caller identity is derived from the trusted session and cannot be supplied as an input. Requires the task to exist and its verify/report-<taskId>.json to be PASS, binds the verdict to that report's sha256, writes verify/challenge-<taskId>.json or verify/audit-<taskId>.json atomically, appends a verification_wave event, and refuses re-recording the same report (a changed report is the only overwrite path).",
       input: {
         type: "object",
         properties: {
@@ -4918,7 +4918,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     editor.add({
       name: "final_verify",
       description:
-        "Compute and stamp the run's final verdict from artifacts. PASS requires every task to be verified_pass, every verify/report-<taskId>.json to be PASS, verify/security-audit.json to be PASS, and (unless the plan explicitly skipped it) a CONFIRMED independent victory audit bound to the current ORIGINAL_REQUEST.md. In strict mode it also requires verify/challenge-<taskId>.json (team/falsifier, PASS) and verify/audit-<taskId>.json (team/security-auditor, CLEAN) for every task, and writes GATE_STATUS.md. Writes verify/final.json atomically and appends a final_verification event. The verdict is computed from evidence and cannot be overridden by input.",
+        "Compute and stamp the run's final verdict from artifacts. PASS requires every task to be verified_pass, every verify/report-<taskId>.json to be PASS, verify/security-audit.json to be PASS, and (unless the plan explicitly skipped it) a CONFIRMED independent victory audit bound to the current ORIGINAL_REQUEST.md. In strict mode it also requires verify/challenge-<taskId>.json (team/falsifier, PASS) and verify/audit-<taskId>.json (team/security-auditor, CLEAN) for every task, both bound by reportHash to the current verifier report, and writes GATE_STATUS.md. Writes verify/final.json atomically and appends a final_verification event. The verdict is computed from evidence and cannot be overridden by input.",
       input: {
         type: "object",
         properties: {
@@ -5326,12 +5326,14 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                           path: t.challenge.path,
                           status: t.challenge.verdict,
                           agent: t.challenge.agent,
+                          reportHash: t.challenge.reportHash,
                           ok: t.challenge.ok,
                         },
                         audit: {
                           path: t.audit.path,
                           status: t.audit.verdict,
                           agent: t.audit.agent,
+                          reportHash: t.audit.reportHash,
                           ok: t.audit.ok,
                         },
                       })),

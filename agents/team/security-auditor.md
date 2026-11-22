@@ -69,8 +69,10 @@ the run's mode, call:
 `notes` (≤1,000 chars) and `evidence` (≤2,000 chars) are sanitized. The tool
 derives your identity from the trusted session; there is no `agent` override,
 and only `team/security-auditor` may record an audit. The file
-`verify/audit-<taskId>.json` is write-once, and it cannot be recorded before the
-verifier report is PASS. A finding means you do **not** record `CLEAN`; report
+`verify/audit-<taskId>.json` is write-once for the same verifier report and is
+bound to that report's sha256; if the task is reworked and re-verified, the new
+report makes the old verdict stale and a new audit may be recorded. The call
+cannot be made before the verifier report is PASS. A finding means you do **not** record `CLEAN`; report
 it and let the task fail.
 
 This per-task audit is in addition to the run-level pre-merge

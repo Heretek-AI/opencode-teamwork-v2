@@ -319,7 +319,7 @@ The plugin provides deterministic orchestration tools for the Sentinel coordinat
 - `teamwork_next`: Evaluates the DAG dependencies against current task lifecycle statuses. Categorizes tasks into `readyForWorker`, `readyForVerifier`, `inProgress`, or terminal conditions (`ALL_TASKS_PASSED` / `DEADLOCK`). Completion additionally requires a stamped `verify/final.json` from `teamwork_final_verify` (unless the caller passes the recorded `allowUnstamped: true` legacy bypass) **and** a `CONFIRMED` `verify/victory.json` bound to the current `ORIGINAL_REQUEST.md`, unless the plan explicitly recorded `victoryAudit: "skip"`. Before a confirmed verdict it returns `READY_FOR_VICTORY_AUDIT` (or `BLOCKED_BY_VICTORY_AUDIT` for a rejection). In strict mode it returns `NEEDS_STRICT_WAVE` / `BLOCKED_BY_STRICT_WAVE` first, listing the missing `taskId:kind` pairs, and never returns `ALL_PASSED` without both per-task verdicts.
 - `teamwork_task_update`: Enforces deterministic state transitions, tracks worker branch names and diff summaries, updates verifier metrics, and advances run `phase` to `MERGE` or `PRESENT_PARTIAL`.
 - `teamwork_victory_audit`: Records the independent final acceptance verdict from `team/victory-auditor`. Only a trusted session whose agent resolves to `team/victory-auditor` may call it; there is no caller-supplied `agent` label. Every `requirements.json` id must appear exactly once, `met: true` needs non-empty evidence, and `VICTORY CONFIRMED` needs a current `ORIGINAL_REQUEST.md` (the verdict stores its sha256). Writes `verify/victory.json`; a confirmed verdict is write-once.
-- `teamwork_wave_record`: Strict mode only. Records one wave verdict: `kind: "challenge"` / `verdict: "PASS"` may only be written by a trusted session whose agent resolves to `team/falsifier`; `kind: "audit"` / `verdict: "CLEAN"` only by `team/security-auditor`. There is no caller-supplied `agent` label. It refuses a task absent from `plan.dag.json`, a missing/non-PASS `verify/report-<taskId>.json`, any other verdict, and any overwrite (write-once). It writes `verify/challenge-<taskId>.json` or `verify/audit-<taskId>.json` atomically and appends a `verification_wave` event.
+- `teamwork_wave_record`: Strict mode only. Records one wave verdict: `kind: "challenge"` / `verdict: "PASS"` may only be written by a trusted session whose agent resolves to `team/falsifier`; `kind: "audit"` / `verdict: "CLEAN"` only by `team/security-auditor`. There is no caller-supplied `agent` label. It refuses a task absent from `plan.dag.json`, a missing/non-PASS `verify/report-<taskId>.json`, any other verdict, and a repeat recording for the same report hash. It stores the sha256 of the exact report bytes (the gate requires a match) and writes `verify/challenge-<taskId>.json` or `verify/audit-<taskId>.json` atomically, then appends a `verification_wave` event. A changed report is the only overwrite path (the previous verdict is stale).
 - `teamwork_final_verify`: Computes the run's final verdict from the artifacts on disk — every task must be `verified_pass`, every `verify/report-<taskId>.json` must be `PASS`, `verify/security-audit.json` must be `PASS`, the victory audit must be `CONFIRMED` (unless explicitly skipped), and when `document-review/manifest.json` exists, every segment's `unit-report.md` and `DOCUMENT_REVIEW_REPORT.md` must exist as non-empty regular files. In strict mode it also requires `verify/challenge-<taskId>.json` (`team/falsifier`, `PASS`) and `verify/audit-<taskId>.json` (`team/security-auditor`, `CLEAN`) for every task, then writes `GATE_STATUS.md`. It writes `verify/final.json` atomically and appends a `final_verification` event. The verdict is computed from evidence; no input can turn a failing run into `PASS` (a caller-supplied `failReason` can only force `FAIL`). See [`verify/final.json`](#verifyfinaljson-final-verification-verdict).
 - `teamwork_worktree`: Isolates git worktrees outside the project repo (`setup` for sentinel and worker), inspects branch diffs (`diff`), performs clean merges into `teamwork/base-$SESSION_ID` with automatic conflict abort (`merge`), and prunes worktrees (`cleanup`).
 - `teamwork_preflight`: Re-checks the inputs named by an existing run's `ORIGINAL_REQUEST.md` (plus optional `inputs`), writes `<run>/preflight.json`, and appends a `preflight` event. It never throws and never blocks; it reports.
@@ -687,6 +687,7 @@ to derived mode, with start and duration unknown.
   "verdict": "PASS",
   "agent": "team/falsifier",
   "agentSessionId": "ses_abc123",
+  "reportHash": "<sha256 of verify/report-R1-impl.json>",
   "notes": "Tried empty input, overflow, TOCTOU; no fatal or serious flaw.",
   "evidence": "verify/report-R1-impl.json + src/api.ts:42",
   "generatedAt": "ISO8601"
@@ -704,6 +705,7 @@ to derived mode, with start and duration unknown.
   "verdict": "CLEAN",
   "agent": "team/security-auditor",
   "agentSessionId": "ses_def456",
+  "reportHash": "<sha256 of verify/report-R1-impl.json>",
   "notes": "No Critical/High findings; no forbidden integrity rule.",
   "evidence": "npm test tail + git diff base..task",
   "generatedAt": "ISO8601"
@@ -716,9 +718,20 @@ accepts `challenge` only from `team/falsifier` and `audit` only from
 `team/security-auditor`. The task must exist in `plan.dag.json` and its
 `verify/report-<taskId>.json` must already be `PASS`. The allowed verdicts are
 exactly `PASS` (challenge) and `CLEAN` (audit); `notes` and `evidence` are
-sanitised and bounded. Each file is **write-once**, refused if a symlink or
-existing entry is present, and written atomically. A missing/non-PASS report
-refuses the call, so the wave supplements the review and never replaces it.
+sanitised and bounded. Each file is refused if a symlink or unsafe entry is
+present and is written atomically.
+
+**Report binding and rework.** `reportHash` is the sha256 of the exact
+`verify/report-<taskId>.json` bytes the verdict approved. The gate requires it
+to equal the sha256 of the current report, so a verdict can never be reused for
+a report it did not see. Recording the same kind for the same task against the
+**same** report hash is refused (write-once for that verification round).
+Recording against a **different** report hash is the only overwrite path: the
+old verdict is stale because the task was reworked and re-verified, so the new
+verdict replaces it with the new hash. A missing hash is a named
+`strict challenge/audit <task>: reportHash missing or invalid` failure; a hash
+mismatch is a named `strict challenge/audit for <task> is stale (report changed
+since it was recorded)` failure. `GATE_STATUS.md` renders either row as `FAIL`.
 
 ### `verify/security-audit.json` (pre-merge security gate output)
 
@@ -830,8 +843,8 @@ request hash, which catches stale, mislabelled, or partially edited verdicts.
           "id": "R1-impl",
           "report": "verify/report-R1-impl.json",
           "reportStatus": "PASS",
-          "challenge": { "path": "verify/challenge-R1-impl.json", "status": "PASS", "agent": "team/falsifier", "ok": true },
-          "audit": { "path": "verify/audit-R1-impl.json", "status": "CLEAN", "agent": "team/security-auditor", "ok": true }
+          "challenge": { "path": "verify/challenge-R1-impl.json", "status": "PASS", "agent": "team/falsifier", "reportHash": "...", "ok": true },
+          "audit": { "path": "verify/audit-R1-impl.json", "status": "CLEAN", "agent": "team/security-auditor", "reportHash": "...", "ok": true }
         }
       ]
     }
@@ -853,12 +866,13 @@ independent victory audit is `CONFIRMED` with every requirement met and a
 recorded `victoryAudit: "skip"` records `victory: "SKIPPED (explicit)"` instead.
 A plan that recorded `verification: "strict"` must additionally have, for every
 task, `verify/challenge-<taskId>.json` with `kind: "challenge"`,
-`verdict: "PASS"`, `agent: "team/falsifier"` and the run's `sessionId`, plus
+`verdict: "PASS"`, `agent: "team/falsifier"`, the run's `sessionId`, and a
+`reportHash` equal to the current report's sha256, plus
 `verify/audit-<taskId>.json` with `kind: "audit"`, `verdict: "CLEAN"`,
-`agent: "team/security-auditor"` and the run's `sessionId`; a missing, malformed,
-mismatched, or non-PASS/CLEAN verdict adds a named `strict <kind> <taskId>`
-reason. Standard mode never reads those files, so stray wave artifacts cannot
-affect it.
+`agent: "team/security-auditor"`, the run's `sessionId`, and the same current
+`reportHash`; a missing, malformed, mismatched, stale, or non-PASS/CLEAN verdict
+adds a named `strict <kind> <taskId>` reason. Standard mode never reads those
+files, so stray wave artifacts cannot affect it.
 Any unmet condition yields `FAIL` with one entry per condition in `reasons`
 (capped at 100), including named victory reasons (`missing`, `VICTORY REJECTED`,
 unmet requirement, stale hash, forged auditor). The verdict is computed from
@@ -928,11 +942,12 @@ sanitised and written atomically, and cites the artifact behind every row:
 Gate Result: **PASS**
 ```
 
-On FAIL it adds a `## Reasons` list and ends with `Gate Result: **FAIL**`. A task
-adds one worker/verifier/challenger/auditor group; the wave scales by tasks and
-rounds, not by a fixed row count. If `GATE_STATUS.md` cannot be written (for
-example a symlink is planted at the path), final verification records a named
-strict reason and cannot PASS.
+On FAIL it adds a `## Reasons` list and ends with `Gate Result: **FAIL**`. A
+task adds one worker/verifier/challenger/auditor group; the wave scales by tasks
+and rounds, not by a fixed row count. A stale or invalid challenge/audit is
+rendered as `FAIL` in its verdict cell. If `GATE_STATUS.md` cannot be written
+(for example a symlink is planted at the path), final verification records a
+named strict reason and cannot PASS.
 
 ### `synthesis/conflict-<task>.json` (git 3-way merge conflict artifact)
 

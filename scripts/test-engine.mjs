@@ -49,7 +49,7 @@ import { createServer } from "node:http"
 import { execFileSync, spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { deflateSync } from "node:zlib"
-import { randomBytes } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 import assert from "node:assert"
 
 const testDir = mkdtempSync(join(tmpdir(), "teamwork-engine-test-"))
@@ -1410,6 +1410,7 @@ try {
   const strictStateFile = (runId) => join(strictRunDir(runId), "state.json")
   const strictWaveFile = (runId, kind, taskId) => join(strictRunDir(runId), "verify", `${kind}-${taskId}.json`)
   const strictGateFile = (runId) => join(strictRunDir(runId), "GATE_STATUS.md")
+  const sha256 = (text) => createHash("sha256").update(text, "utf8").digest("hex")
   const withAgent = async (agent, fn) => {
     const previous = mockCtx.session.get
     mockCtx.session.get = async () => ({ agent })
@@ -1559,6 +1560,11 @@ try {
   )
   assert.strictEqual(strictChallengeJson.notes, "Tried empty input, overflow, and TOCTOU.", "notes must be sanitized and trimmed")
   assert.strictEqual(strictChallengeJson.evidence, "verify/report-W1.json + src/core.ts:42")
+  assert.strictEqual(
+    strictChallengeJson.reportHash,
+    sha256(readFileSync(reportFileOf(strictWaveRun, "W1"), "utf8")),
+    "the challenge must bind to the exact verifier report bytes",
+  )
   assert(/^\d{4}-\d{2}-\d{2}T/.test(strictChallengeJson.generatedAt), "generatedAt must be recorded")
   const strictChallengeAgain = await recordWave(strictWaveRun, "W1", "challenge", "PASS", "team/falsifier")
   assert(/write-once/.test(strictChallengeAgain.content), `a recorded challenge must be write-once: ${strictChallengeAgain.content}`)
@@ -1650,6 +1656,62 @@ try {
   assert.strictEqual(strictHappyFinalJson.evidence.strict.tasks[0].audit.status, "CLEAN")
   const strictHappyNext = await registeredTools.next.execute({ sessionId: strictHappyRun })
   assert.strictEqual(strictHappyNext.status, "ALL_PASSED", `the strict run must complete: ${strictHappyNext.content}`)
+
+  // Report binding: a reworked and re-verified task invalidates the earlier wave.
+  const strictReworkRun = "20261018-000000-sv-rework"
+  await seedVerifiedRun(strictReworkRun, ["RH1"], {
+    request: "Deliver the strict rework fixture.",
+    victoryAudit: "skip",
+    verification: "strict",
+    stampVictory: false,
+  })
+  const reworkChallenge = await recordWave(strictReworkRun, "RH1", "challenge", "PASS", "team/falsifier")
+  const reworkAudit = await recordWave(strictReworkRun, "RH1", "audit", "CLEAN", "team/security-auditor")
+  const originalReportText = readFileSync(reportFileOf(strictReworkRun, "RH1"), "utf8")
+  assert.strictEqual(reworkChallenge.verdict?.reportHash, sha256(originalReportText))
+  assert.strictEqual(reworkAudit.verdict?.reportHash, sha256(originalReportText))
+  const reworkFirstFinal = await registeredTools.final_verify.execute({ sessionId: strictReworkRun })
+  assert.strictEqual(reworkFirstFinal.status, "PASS", `the original report must pass: ${reworkFirstFinal.content}`)
+
+  const reworkedReportText =
+    JSON.stringify({
+      taskId: "RH1",
+      status: "PASS",
+      checks: [{ name: "reworked behavior", type: "programmatic", passed: true }],
+      timestamp: "2026-11-22T00:00:00.000Z",
+    }) + "\n"
+  assert.notStrictEqual(reworkedReportText, originalReportText, "the fixture must actually change the report bytes")
+  writeFileSync(reportFileOf(strictReworkRun, "RH1"), reworkedReportText)
+  const reworkStaleFinal = await registeredTools.final_verify.execute({ sessionId: strictReworkRun })
+  assert.strictEqual(reworkStaleFinal.status, "FAIL", `a changed report must invalidate the wave: ${reworkStaleFinal.content}`)
+  assert(
+    reworkStaleFinal.reasons.includes("strict challenge for RH1 is stale (report changed since it was recorded)"),
+    `the stale challenge must be named: ${JSON.stringify(reworkStaleFinal.reasons)}`,
+  )
+  assert(
+    reworkStaleFinal.reasons.includes("strict audit for RH1 is stale (report changed since it was recorded)"),
+    `the stale audit must be named: ${JSON.stringify(reworkStaleFinal.reasons)}`,
+  )
+  const reworkGateText = readFileSync(strictGateFile(strictReworkRun), "utf8")
+  assert(reworkGateText.includes("| team/falsifier | challenger | FAIL | verify/challenge-RH1.json |"), `a stale challenge must render FAIL: ${reworkGateText}`)
+  assert(reworkGateText.includes("| team/security-auditor | auditor | FAIL | verify/audit-RH1.json |"), `a stale audit must render FAIL: ${reworkGateText}`)
+
+  const reworkChallengeAgain = await recordWave(strictReworkRun, "RH1", "challenge", "PASS", "team/falsifier", {
+    notes: "Re-challenged the reworked report.",
+  })
+  assert.strictEqual(reworkChallengeAgain.verdict?.verdict, "PASS", `a changed report must allow a new challenge: ${reworkChallengeAgain.content}`)
+  assert.strictEqual(reworkChallengeAgain.verdict?.reportHash, sha256(reworkedReportText), "the new challenge must bind to the new report")
+  const reworkAuditAgain = await recordWave(strictReworkRun, "RH1", "audit", "CLEAN", "team/security-auditor")
+  assert.strictEqual(reworkAuditAgain.verdict?.reportHash, sha256(reworkedReportText), "the new audit must bind to the new report")
+  const reworkSameHash = await recordWave(strictReworkRun, "RH1", "challenge", "PASS", "team/falsifier")
+  assert(/write-once/.test(reworkSameHash.content), `re-recording the same report must be refused: ${reworkSameHash.content}`)
+  const reworkSecondFinal = await registeredTools.final_verify.execute({ sessionId: strictReworkRun })
+  assert.strictEqual(reworkSecondFinal.status, "PASS", `the re-recorded wave must pass: ${reworkSecondFinal.content}`)
+  const reworkFinalJson = JSON.parse(readFileSync(finalFileOf(strictReworkRun), "utf8"))
+  assert.strictEqual(reworkFinalJson.evidence.strict.tasks[0].challenge.reportHash, sha256(reworkedReportText))
+  assert.strictEqual(reworkFinalJson.evidence.strict.tasks[0].audit.reportHash, sha256(reworkedReportText))
+
+  console.log("✓ strict wave is report-hash bound: reworked reports make old verdicts stale, and only a new-report re-record can pass")
 
   const seedStrictGateRun = async (runId, taskId) => {
     await seedVerifiedRun(runId, [taskId], {
