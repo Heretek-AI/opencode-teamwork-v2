@@ -2428,6 +2428,49 @@ try {
     })
     assert.strictEqual(line0MdPaperRoute.topology, "document-review")
 
+    // LaTeX \documentclass preamble + \end{document} and YAML frontmatter + trailing critique
+    const latexPreambleRoute = await tools.route.execute({
+      request:
+        "\\documentclass{article}\n\\begin{document}\n\\begin{theorem}\n\\forall x \\exists y, P(x,y).\n\\end{theorem}\n" +
+        "A".repeat(200) +
+        "\n\\end{document}\n\nPlease critique this paper for soundness.",
+    })
+    assert.strictEqual(
+      latexPreambleRoute.topology,
+      "document-review",
+      "LaTeX \\documentclass preamble + \\end{document} with trailing critique must route to document-review",
+    )
+
+    const yamlFrontmatterRoute = await tools.route.execute({
+      request:
+        "---\ntitle: Spec\n---\n\n# Introduction\n" +
+        "B".repeat(240) +
+        "\n\nPlease critique this spec.",
+    })
+    assert.strictEqual(
+      yamlFrontmatterRoute.topology,
+      "document-review",
+      "YAML frontmatter Markdown doc with trailing critique must route to document-review",
+    )
+
+    // Topic-mention & masked-path positive document-review cases (Challenger 2 / Reviewer 2)
+    mkdirSync(join(docRoot, "docs"), { recursive: true })
+    writeFileSync(join(docRoot, "docs", "spec.md"), "# Spec\nSpecification details.\n")
+    writeFileSync(join(docRoot, "docs", "cli.md"), "# CLI\nDebug flags reference.\n")
+    writeFileSync(join(docRoot, "docs", "debug-guide.md"), "# Debug Guide\nHow to use debug flags.\n")
+    for (const topicReq of [
+      "review this paper for bugs in the proof docs/spec.md",
+      "review docs/cli.md covering debug flags",
+      "review docs/debug-guide.md",
+    ]) {
+      const topicRes = await tools.route.execute({ request: topicReq })
+      assert.strictEqual(
+        topicRes.topology,
+        "document-review",
+        `Topic/path review "${topicReq}" must route to document-review, got ${topicRes.topology}`,
+      )
+    }
+
     const posedProof = await tools.route.execute({
       request: "Prove that there are infinitely many primes ∀ n ∃ p > n.",
     })
@@ -2459,11 +2502,23 @@ try {
       ["check README.md and implement the missing flag", "distributed-coding"],
       ["fix the bug in notes.md", "iterative-coding"],
       ["analyze the bug in src/foo.md", "distributed-coding"],
+      ["analyze the bugs in src/foo.md", "distributed-coding"],
+      ["analyze the errors in src/foo.md", "distributed-coding"],
+      ["analyze these regressions in docs/spec.md", "distributed-coding"],
+      ["analyze the flaky test failure in src/foo.md", "distributed-coding"],
+      ["analyze a memory leak in src/foo.md", "distributed-coding"],
+      ["analyze the performance bottleneck in src/foo.md", "distributed-coding"],
       ["investigate the error in src/foo.md", "distributed-coding"],
       ["diagnose the crash in src/foo.md", "distributed-coding"],
       ["debug src/foo.md", "distributed-coding"],
       ["see ./paper.pdf and solve problem 3", "proof"],
       ["prove Theorem 2 from ./math-paper.md", "proof"],
+      [
+        "\\documentclass{article}\n\\begin{document}\n\\begin{theorem}\n\\forall x \\exists y, P(x,y).\n\\end{theorem}\n" +
+          "A".repeat(180) +
+          "\n\\end{document}\n\nProve Theorem 1.",
+        "proof",
+      ],
       [
         "\\section{Introduction}\n\\begin{theorem}\n\\forall x \\exists y, P(x,y).\n\\end{theorem}\n" +
           "A".repeat(180) +
@@ -2472,6 +2527,12 @@ try {
       ],
       [
         "# Introduction\n" + "C".repeat(240) + "\n\n# Conclusion\nWe analyze these results in Section 2.",
+        "distributed-coding",
+      ],
+      [
+        "# Introduction\n" +
+          "C".repeat(240) +
+          "\n\nIn Section 3 we review prior benchmarks and analyze the throughput results.",
         "distributed-coding",
       ],
     ]
