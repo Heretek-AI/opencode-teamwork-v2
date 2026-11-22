@@ -617,6 +617,7 @@ function isIntegrityRuleForbidden(rule: IntegrityRule, mode: IntegrityMode): boo
  */
 const MAX_RUN_FILE_BYTES = 512 * 1024
 
+
 function readBoundedRunFile(
   run: string,
   file: string,
@@ -1392,6 +1393,49 @@ async function createPlanRun(
   }
   let lemmaProbe: LemmaProbeResult | undefined
   if (isLemma) {
+    let runExists = existsSync(run)
+    if (!runExists) {
+      try {
+        lstatSync(run)
+        runExists = true
+      } catch {}
+    }
+    if (runExists) {
+      for (const rel of ["lemma/manifest.json", "lemma/formalization-review.json"]) {
+        try {
+          ensureSafeRunSubpath(run, join(run, rel))
+        } catch (err: any) {
+          return { ok: false, content: `${clean(err?.message, 200)}; nothing was written.` }
+        }
+      }
+      const existingManRes = readBoundedRunFile(run, join(run, "lemma", "manifest.json"))
+      if (existingManRes.status === "ok") {
+        try {
+          const parsedMan = JSON.parse(existingManRes.text)
+          const prevB = parsedMan?.bounds
+          if (prevB) {
+            if (
+              input.lemmaBounds !== undefined &&
+              (prevB.maxDepth !== lemmaBounds?.maxDepth ||
+                prevB.maxWidth !== lemmaBounds?.maxWidth ||
+                prevB.maxNodes !== lemmaBounds?.maxNodes ||
+                prevB.maxRetries !== lemmaBounds?.maxRetries)
+            ) {
+              return {
+                ok: false,
+                content: "refused: lemmaBounds conflict with existing lemma/manifest.json; nothing was written.",
+              }
+            }
+            lemmaBounds = {
+              maxDepth: prevB.maxDepth,
+              maxWidth: prevB.maxWidth,
+              maxNodes: prevB.maxNodes,
+              maxRetries: prevB.maxRetries,
+            }
+          }
+        } catch {}
+      }
+    }
     // Capability probe runs BEFORE mkdirSync; allowMissingInputs MUST NOT bypass.
     lemmaProbe = probeLemmaToolchain()
     if (!lemmaProbe.ready) {
@@ -2804,6 +2848,30 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
 
+          let lemmaSymlinkNext = false
+          try {
+            lemmaSymlinkNext = lstatSync(join(run, "lemma")).isSymbolicLink()
+          } catch {}
+          const isLemmaRunNext =
+            plan?.lemmaMode === true ||
+            plan?.route === "lemma" ||
+            state?.lemmaMode === true ||
+            lemmaSymlinkNext ||
+            existsSync(join(run, "lemma", "manifest.json"))
+          if (isLemmaRunNext) {
+            const liveLemma = evaluateLemmaFinalEvidence(run)
+            if (liveLemma.reasons.length > 0) {
+              return {
+                content: `BLOCKED_BY_FINAL_VERIFICATION: LEMMA evidence on disk no longer satisfies final verification (${liveLemma.reasons.join("; ")}). Re-run teamwork_final_verify after resolving the LEMMA proof/formalization state.\n${integrityModeNote}`,
+                status: "BLOCKED_BY_FINAL_VERIFICATION",
+                integrityMode: integrity.mode,
+                finalReport: finalFile,
+                passedCount: passedTasks.length,
+                reasons: liveLemma.reasons,
+              }
+            }
+          }
+
           if (state.phase !== "MERGE" && state.phase !== "DONE") {
             state.phase = "MERGE"
             writeJson(join(run, "state.json"), state)
@@ -3768,6 +3836,46 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       },
     })
 
+    const resolveSafeLemmaCwd = (run: string, rawCwd: unknown): { ok: true; cwd?: string } | { ok: false; error: string } => {
+      if (typeof rawCwd !== "string" || !rawCwd.trim()) return { ok: true }
+      const cand = resolve(root, rawCwd)
+      const worktreesBase = resolve(
+        process.env.TEAMWORK_WORKTREES_DIR ? process.env.TEAMWORK_WORKTREES_DIR : join(root, "..", ".teamwork-worktrees"),
+      )
+      const runWorktreeDir = join(worktreesBase, basename(run))
+      const resolveContainedDir = (baseDir: string, targetDir: string, allowEqual: boolean): string | null => {
+        const absBase = resolve(baseDir)
+        const absTarget = resolve(targetDir)
+        const lexRel = relative(absBase, absTarget)
+        if (isAbsolute(lexRel) || lexRel.startsWith("..")) return null
+        if (!allowEqual && !lexRel) return null
+        try {
+          let cur = absBase
+          const segments = lexRel ? lexRel.split(/[\\/]+/).filter(Boolean) : []
+          for (const seg of segments) {
+            cur = join(cur, seg)
+            if (lstatSync(cur).isSymbolicLink()) return null
+          }
+          if (lstatSync(absTarget).isSymbolicLink()) return null
+          if (!statSync(absTarget).isDirectory()) return null
+          const realBase = realpathSync(absBase)
+          const realTarget = realpathSync(absTarget)
+          const realRel = relative(realBase, realTarget)
+          if (isAbsolute(realRel) || realRel.startsWith("..")) return null
+          if (!allowEqual && !realRel) return null
+          return realTarget
+        } catch {
+          return null
+        }
+      }
+      const resolvedInRoot = resolveContainedDir(root, cand, true)
+      const resolvedInWt = resolvedInRoot ? null : resolveContainedDir(runWorktreeDir, cand, true)
+      const safeCwd = resolvedInRoot ?? resolvedInWt
+      if (!safeCwd) {
+        return { ok: false, error: "refused: cwd must be an existing non-symlink directory inside project root or run worktree" }
+      }
+      return { ok: true, cwd: safeCwd }
+    }
 
     editor.add({
       name: "lemma_probe",
@@ -3780,7 +3888,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         additionalProperties: false,
       },
-      execute: async (input: any) => {
+      execute: (input: any) => {
         const probe = probeLemmaToolchain({ timeoutMs: input?.timeoutMs })
         if (!probe.ready) {
           return {
@@ -3809,21 +3917,32 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           notes: { type: "string", description: "Reviewer notes." },
           reviewer: { type: "string", description: "Optional reviewer agent id (default team/formalization-reviewer)." },
           verifyDraft: { type: "boolean", description: "Default true for draft: run Lean syntax/typecheck on problem_draft.lean." },
+          mode: { type: "string", description: "Optional draft verification mode: lean | lake-env-lean (default: lean)." },
+          cwd: { type: "string", description: "Optional working directory inside project root or run worktree (for Lake/Mathlib draft checking)." },
         },
         required: ["action"],
         additionalProperties: false,
       },
-      execute: async (input: any) => {
+      execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
         const action = clean(input?.action, 32)
         const manifestFile = join(run, "lemma", "manifest.json")
+        const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
 
         return await withFileLock(manifestFile, async () => {
           if (action === "draft") {
+            const modeRaw = input?.mode ? clean(input.mode, 32) : "lean"
+            if (modeRaw !== "lean" && modeRaw !== "lake-env-lean") {
+              return { content: `refused: invalid draft mode "${modeRaw}" (allowed: lean | lake-env-lean)` }
+            }
+            const cwdRes = resolveSafeLemmaCwd(run, input?.cwd)
+            if (!cwdRes.ok) return { content: cwdRes.error }
             const res = recordFormalizationDraft(run, String(input?.leanCode ?? ""), {
               verifyDraft: input?.verifyDraft !== false,
+              cwd: cwdRes.cwd,
+              mode: modeRaw,
             })
             if (res.error) return { content: res.error }
             return {
@@ -3831,25 +3950,34 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               ...res,
             }
           }
-          if (action === "review_pre") {
-            const res = recordFormalizationPreReview(
-              run,
-              String(input?.verdict ?? ""),
-              String(input?.notes ?? ""),
-              input?.reviewer ? String(input.reviewer) : "team/formalization-reviewer",
-            )
-            if (res.error) return { content: res.error }
-            return {
-              content: `Recorded preSearch formalization review (promoted=${res.promoted}, phase=${res.phase}).`,
-              ...res,
+          if (action === "review_pre" || action === "review_final") {
+            const caller = await deriveCallerAgent(ctx, run, callSession)
+            const explicitReviewer = input?.reviewer ? clean(input.reviewer, 64).trim() : ""
+            if (explicitReviewer && explicitReviewer !== "team/formalization-reviewer") {
+              return { content: `refused: formalization review must be performed by team/formalization-reviewer (got "${explicitReviewer}").` }
             }
-          }
-          if (action === "review_final") {
+            if (caller?.agent && (caller.agent === "team/proof-worker" || caller.agent === "team/worker")) {
+              return { content: `refused: worker agent "${caller.agent}" cannot self-review formalization; dispatch team/formalization-reviewer.` }
+            }
+            const reviewerId = explicitReviewer || "team/formalization-reviewer"
+            if (action === "review_pre") {
+              const res = recordFormalizationPreReview(
+                run,
+                String(input?.verdict ?? ""),
+                String(input?.notes ?? ""),
+                reviewerId,
+              )
+              if (res.error) return { content: res.error }
+              return {
+                content: `Recorded preSearch formalization review (promoted=${res.promoted}, phase=${res.phase}).`,
+                ...res,
+              }
+            }
             const res = recordFormalizationFinalReview(
               run,
               String(input?.verdict ?? ""),
               String(input?.notes ?? ""),
-              input?.reviewer ? String(input.reviewer) : "team/formalization-reviewer",
+              reviewerId,
             )
             if (res.error) return { content: res.error }
             return {
@@ -3936,45 +4064,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (modeRaw !== "lean" && modeRaw !== "lake-env-lean" && modeRaw !== "lake-build") {
           return { content: `refused: invalid mode "${modeRaw}" (allowed: lean | lake-env-lean | lake-build)` }
         }
-        let verifiedCwd: string | undefined
-        if (typeof input?.cwd === "string" && input.cwd.trim()) {
-          const cand = resolve(root, input.cwd)
-          const worktreesBase = resolve(
-            process.env.TEAMWORK_WORKTREES_DIR ? process.env.TEAMWORK_WORKTREES_DIR : join(root, "..", ".teamwork-worktrees"),
-          )
-          const resolveContainedDir = (baseDir: string, targetDir: string, allowEqual: boolean): string | null => {
-            const absBase = resolve(baseDir)
-            const absTarget = resolve(targetDir)
-            const lexRel = relative(absBase, absTarget)
-            if (isAbsolute(lexRel) || lexRel.startsWith("..")) return null
-            if (!allowEqual && !lexRel) return null
-            try {
-              let cur = absBase
-              const segments = lexRel ? lexRel.split(/[\\/]+/).filter(Boolean) : []
-              for (const seg of segments) {
-                cur = join(cur, seg)
-                if (lstatSync(cur).isSymbolicLink()) return null
-              }
-              if (lstatSync(absTarget).isSymbolicLink()) return null
-              if (!statSync(absTarget).isDirectory()) return null
-              const realBase = realpathSync(absBase)
-              const realTarget = realpathSync(absTarget)
-              const realRel = relative(realBase, realTarget)
-              if (isAbsolute(realRel) || realRel.startsWith("..")) return null
-              if (!allowEqual && !realRel) return null
-              return realTarget
-            } catch {
-              return null
-            }
-          }
-          const resolvedInRoot = resolveContainedDir(root, cand, true)
-          const resolvedInWt = resolvedInRoot ? null : resolveContainedDir(worktreesBase, cand, false)
-          const safeCwd = resolvedInRoot ?? resolvedInWt
-          if (!safeCwd) {
-            return { content: "refused: cwd must be an existing non-symlink directory inside project root or worktrees base" }
-          }
-          verifiedCwd = safeCwd
-        }
+        const cwdRes = resolveSafeLemmaCwd(run, input?.cwd)
+        if (!cwdRes.ok) return { content: cwdRes.error }
+        const verifiedCwd = cwdRes.cwd
         const manifestFile = join(run, "lemma", "manifest.json")
         return await withFileLock(manifestFile, async () => {
           const res = verifyLemmaNodeAttempt(run, {

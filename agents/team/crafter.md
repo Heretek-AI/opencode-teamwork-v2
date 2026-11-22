@@ -87,6 +87,7 @@ random hex). The file has this structure:
 
 **Session ID:** <session-id>
 **Topology:** <small-focused|iterative-coding|distributed-coding|proof|massive-proof|document-review>
+**LEMMA mode:** <true|false (set true only for explicit Lean 4 / LEMMA formal proofs on topology: proof)>
 **Integrity mode:** <development|demo|benchmark>
 **Working directory:** <path>
 
