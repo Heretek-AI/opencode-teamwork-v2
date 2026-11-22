@@ -246,8 +246,8 @@ function isTrailingUserInstruction(paraText: string): boolean {
   const trimmed = paraText.trim()
   if (!trimmed) return false
   if (STRUCT_PARA_RE.test(trimmed)) return false
-  if (EXPLICIT_ASSISTANT_RE.test(trimmed)) return true
   if (BODY_NARRATION_RE.test(trimmed)) return false
+  if (EXPLICIT_ASSISTANT_RE.test(trimmed)) return true
   return IMPERATIVE_START_RE.test(trimmed) || QUESTION_ABOUT_DOC_RE.test(trimmed)
 }
 
@@ -508,7 +508,7 @@ const DEFECT_HEAD_NOUN_BODY =
 const NON_MODIFIER_GUARD =
   "(?!(?:for|in|of|on|to|with|about|from|into|by|and|or|covering|regarding|concerning|paper|document|doc|preprint|manuscript|rfc|draft|spec|specification|article|report)\\b)"
 const DEFECT_ANALYSIS_RE = new RegExp(
-  `\\b(?:analy[sz]e|investigate|trace|inspect|examine|profile|fix|resolve)\\s+(?:(?:the|this|that|these|those|a|an|some|any|my|our|your|their|several|multiple|recent|intermittent|recurring|new|existing)\\s+)?(?:${NON_MODIFIER_GUARD}[a-z0-9_-]+\\s+){0,3}(?:${DEFECT_HEAD_NOUN_BODY})\\b` +
+  `\\b(?:analy[sz]e|check|investigate|trace|inspect|examine|profile|fix|resolve)\\s+(?:(?:the|this|that|these|those|a|an|some|any|my|our|your|their|several|multiple|recent|intermittent|recurring|new|existing)\\s+)?(?:${NON_MODIFIER_GUARD}[a-z0-9_-]+\\s+){0,3}(?:${DEFECT_HEAD_NOUN_BODY})\\b` +
     `|\\b(?:analy[sz]e|investigate|trace|reproduce|root[- ]?cause)\\s+why\\b` +
     `|\\breproduce\\s+(?:(?:the|this|that|these|those|a|an)\\s+)?(?:${NON_MODIFIER_GUARD}[a-z0-9_-]+\\s+){0,3}(?:${DEFECT_HEAD_NOUN_BODY}|behavior|problem)\\b`,
   "i",
@@ -517,9 +517,28 @@ const DEFECT_ANALYSIS_RE = new RegExp(
 const DIAGNOSTIC_VERB_RE = /\b(debug|diagnose|troubleshoot|root[- ]?cause)\b/gi
 const TOPIC_INTRO_RE =
   /(?:^|\s)(?:covering|about|regarding|concerning|discussing|explaining|documenting|describing|detailing|outlining|mentioning)\s+(?:(?:the|a|an|its|their|our|these|those|new|all)\s+)*$/i
-const HOW_TO_RE = /\bhow\s+to\s+(?:[a-z-]+\s*(?:,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+))*$/i
+const HOW_TO_RE = /\bhow\s+to\s+((?:[a-z-]+\s*(?:,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+))*)$/i
 const DEBUG_ATTR_NOUN_RE =
   /^\s+(?:(?:and|or)\s+(?:[a-z0-9_-]+\s+)?)?(?:flags?|modes?|options?|outputs?|logs?|logging|levels?|info(?:rmation)?|symbols?|builds?|configs?|configurations?|settings?|commands?|menus?|panels?|endpoints?|headers?|tools?|tooling|features?|workflows?|guides?|sections?|chapters?|docs?|documentation|assertions?|statements?|prints?|messages?|coverage)\b/i
+
+function isHowToTopicContinuation(beforeHard: string, word: string, after: string): boolean {
+  const m = HOW_TO_RE.exec(beforeHard)
+  if (!m) return false
+  const tail = m[1]
+  // ", and " / ", or " with fewer than 2 commas is a clause boundary, not an Oxford-comma list continuation.
+  if (/,\s*(?:and|or)\s+$/i.test(tail) && tail.split(",").length - 1 < 2) {
+    return false
+  }
+  // A diagnostic verb acting directly on a supplied document token or repeating an earlier verb in the list is imperative.
+  if (/^\s+(?:(?:the|this|that)\s+)?__DOC_REF__\b/i.test(after)) {
+    return false
+  }
+  const escapedWord = word.replace(/[- ]+/g, "[-\\s]")
+  if (tail && new RegExp(`\\b${escapedWord}\\b`, "i").test(tail)) {
+    return false
+  }
+  return true
+}
 
 function hasDebuggingOrDiagnosticIntent(intentText: string): boolean {
   if (DEFECT_ANALYSIS_RE.test(intentText)) return true
@@ -540,7 +559,7 @@ function hasDebuggingOrDiagnosticIntent(intentText: string): boolean {
     const beforeHard = rawPrefix.slice(hardBoundary + 1)
     const beforeComma = rawPrefix.slice(commaBoundary + 1)
     const after = intentText.slice(idx + m[0].length)
-    const isTopicIntro = TOPIC_INTRO_RE.test(beforeComma) || HOW_TO_RE.test(beforeHard)
+    const isTopicIntro = TOPIC_INTRO_RE.test(beforeComma) || isHowToTopicContinuation(beforeHard, word, after)
     const isAttrDebug =
       word === "debug" &&
       (DEBUG_ATTR_NOUN_RE.test(after) ||
@@ -599,13 +618,13 @@ export function classifyRoute(rawInput: RouteClassifyInput | string, root: strin
 
   // Negative Trigger Guard A: PR / pull request / diff / patch / code review
   const rejectedAsPrOrCodeReview =
-    /\b(?:review\s+(?:this|the|my|our|a)?\s*(?:pr|pull\s+request|diff|patch|commit|commits|codebase|code)|pr\s*#?\d+|pull\s+request\s*#?\d+|code\s+review|reviewing\s+(?:this|the)\s+(?:pr|diff|patch|code))\b/i.test(
+    /\b(?:review\s+(?:this|the|my|our|a)?\s*(?:pr|pull\s+request|diff|patch|commit|commits|codebase|code|implementation|function|method|class|module|script|snippet)|pr\s*#?\d+|pull\s+request\s*#?\d+|code\s+review|reviewing\s+(?:this|the)\s+(?:pr|diff|patch|code|implementation|function|method|class|module|script|snippet))\b/i.test(
       intentText,
     )
 
   // Negative Trigger Guard B: primary deliverable is implementing, debugging/diagnosing a failure, or solving/proving a problem
   const hasImplementOrEditIntent =
-    /\b(?:implement|refactor|write\s+(?:a\s+|the\s+)?(?:function|module|script|test|code|patch|class|cli)|build\s+(?:a|the)|add\s+(?:a|the)\s+(?:feature|flag|endpoint|test|option|command)|make\s+tests\s+pass|edit\s+(?:the\s+)?(?:file|code)|update\s+(?:the\s+)?(?:code|docs|readme)|fix\s+(?:this|that|it)\b)\b/i.test(
+    /\b(?:implement|refactor|write\s+(?:a\s+|the\s+)?(?:function|module|script|tests?|code|patch|class|cli)|build\s+(?:a|the)|add\s+(?:a|the)\s+(?:feature|flag|endpoint|test|option|command)|make\s+tests\s+pass|edit\s+(?:the\s+)?(?:file|code)|update\s+(?:the\s+)?(?:code|docs|readme)|fix\s+(?:this|that|it)\b|(?:edit|update|fix)\s+(?:the\s+|this\s+|that\s+)?__DOC_REF__)\b/i.test(
       intentText,
     )
   const hasMathOrSolveIntent =
