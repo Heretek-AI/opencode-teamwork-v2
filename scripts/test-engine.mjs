@@ -1,7 +1,14 @@
 import { registerTeamworkTools, registerTeamworkHooks } from "../plugins/opencode-teamwork/tools.ts"
+import {
+  classifyRoute,
+  detectLeanProofHoles,
+  formatMissingToolchainRefusal,
+  probeLemmaToolchain,
+  stripLeanComments,
+} from "../plugins/opencode-teamwork/lemma.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import { currentModels, readRawModelMap, writeModelMap, installAgents, DEFAULT_MODELS } from "../lib/team.mjs"
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync, chmodSync, symlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { createServer } from "node:http"
@@ -1973,6 +1980,7 @@ try {
     { id: "team/scout", deny: ["edit", "subagent"] },
     { id: "team/security-auditor", deny: ["edit", "subagent", "webfetch"] },
     { id: "team/segment-reviewer", deny: ["edit", "shell", "subagent", "webfetch"] },
+    { id: "team/formalization-reviewer", deny: ["edit", "shell", "subagent", "webfetch"] },
   ].map((p) => ({ ...p, deny: [...p.deny].sort() }))
 
   // --- 8a: READ_ONLY_ACTIONS holds exactly the documented deny sets.
@@ -2819,5 +2827,490 @@ try {
   } finally {
     rmSync(docRoot, { recursive: true, force: true })
     rmSync(outsideDir, { recursive: true, force: true })
+  }
+}
+
+// ==========================================
+// Part 9: LEMMA / Lean 4 formal-proof route (#2)
+// ==========================================
+{
+  console.log("Testing LEMMA / Lean 4 formal-proof route...")
+  const savedPath = process.env.PATH ?? ""
+  const lemmaTestDir = mkdtempSync(join(tmpdir(), "teamwork-lemma-test-"))
+
+  const makeToolsFor = async (root) => {
+    const tools = {}
+    await registerTeamworkTools(
+      {
+        tool: {
+          transform: async (cb) => {
+            await cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = tool) })
+          },
+        },
+        session: { get: async () => undefined },
+      },
+      root,
+    )
+    return tools
+  }
+
+  const writeStubBin = (dir, name, scriptBody) => {
+    const p = join(dir, name)
+    writeFileSync(p, `#!${process.execPath}\n${scriptBody}\n`, "utf8")
+    chmodSync(p, 0o755)
+    return p
+  }
+
+  const makeFullStubEnv = (label) => {
+    const binDir = mkdtempSync(join(lemmaTestDir, `stubs-${label}-`))
+    writeStubBin(
+      binDir,
+      "lean",
+      `
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+if (args.includes("--version")) {
+  console.log("Lean (version 4.14.0, commit stub)");
+  process.exit(0);
+}
+const target = args[args.length - 1];
+const src = target && fs.existsSync(target) ? fs.readFileSync(target, "utf8") : "";
+if (src.includes("SYNTAX_ERROR")) {
+  console.error(target + ":1:0: error: expected command");
+  process.exit(1);
+}
+if (src.includes("COMPILER_SORRY_WARN")) {
+  console.warn(target + ":1:0: warning: declaration uses 'sorry'");
+  process.exit(0);
+}
+if (/\\bsorry\\b/.test(src)) {
+  console.warn(target + ":1:0: warning: declaration uses 'sorry'");
+}
+process.exit(0);
+`,
+    )
+    writeStubBin(
+      binDir,
+      "lake",
+      `
+const args = process.argv.slice(2);
+if (args.includes("--version")) {
+  console.log("Lake version 5.0.0-stub");
+  process.exit(0);
+}
+process.exit(0);
+`,
+    )
+    writeStubBin(
+      binDir,
+      "leap-tools",
+      `
+const args = process.argv.slice(2);
+if (args.includes("--version")) {
+  console.log("leap-tools 0.1.0-stub");
+  process.exit(0);
+}
+process.exit(0);
+`,
+    )
+    return binDir
+  }
+
+  try {
+    // --- 9.1 Pre-mkdir / pre-spending refusal ---
+    {
+      const probeEmpty = probeLemmaToolchain({ env: { PATH: "" } })
+      assert.strictEqual(probeEmpty.ready, false, "empty PATH must not be ready")
+      assert.strictEqual(probeEmpty.status, "MISSING")
+      assert.deepStrictEqual(probeEmpty.missing, ["lean", "lake", "leap-tools"])
+
+      const onlyLeanDir = mkdtempSync(join(lemmaTestDir, "only-lean-"))
+      writeStubBin(onlyLeanDir, "lean", `console.log("Lean 4.14.0")`)
+      writeStubBin(onlyLeanDir, "lake", `console.log("Lake 5.0")`)
+      const probeNoLeap = probeLemmaToolchain({ env: { PATH: onlyLeanDir } })
+      assert.strictEqual(probeNoLeap.ready, false, "missing leap-tools must fail probe")
+      assert.deepStrictEqual(probeNoLeap.missing, ["leap-tools"])
+
+      const outageDir = mkdtempSync(join(lemmaTestDir, "outage-"))
+      writeStubBin(outageDir, "lean", `console.error("broken binary"); process.exit(2)`)
+      writeStubBin(outageDir, "lake", `console.log("Lake 5.0")`)
+      writeStubBin(outageDir, "leap-tools", `console.log("leap-tools 0.1.0")`)
+      const probeOutage = probeLemmaToolchain({ env: { PATH: outageDir } })
+      assert.strictEqual(probeOutage.ready, false)
+      assert.strictEqual(probeOutage.status, "OUTAGE", "non-zero probe on existing binary must report OUTAGE")
+
+      const refusalMsg = formatMissingToolchainRefusal(probeNoLeap)
+      assert(refusalMsg.startsWith("refused:"), "refusal must start with refused:")
+      assert(refusalMsg.includes("elan") && refusalMsg.includes("leanprover/lean4:stable"), "must include Lean 4 install instructions")
+      assert(refusalMsg.includes("$HOME/.elan/bin") && refusalMsg.includes("lean --version && lake --version"), "must include PATH and verify command")
+      assert(refusalMsg.includes("leap-tools") && refusalMsg.includes("leap-tools --version"), "must include leap-tools install instructions")
+
+      // teamwork_plan pre-mkdir refusal even with allowMissingInputs: true & skipInterview: true
+      const rootNoTool = mkdtempSync(join(lemmaTestDir, "root-notool-"))
+      const tools = await makeToolsFor(rootNoTool)
+      process.env.PATH = onlyLeanDir
+      const refusedPlan = await tools.plan.execute({
+        sessionId: "20261018-000000-lemma-refuse",
+        topology: "proof",
+        lemmaMode: true,
+        route: "lemma",
+        skipInterview: true,
+        allowMissingInputs: true,
+        tasks: [{ id: "L1" }],
+      })
+      assert(refusedPlan.content.startsWith("refused:"), `missing toolchain must refuse plan: ${refusedPlan.content}`)
+      assert(refusedPlan.content.includes("elan") && refusedPlan.content.includes("leap-tools"), "plan refusal must print install instructions for both tools")
+      assert(!existsSync(join(rootNoTool, ".opencode", "teamwork", "20261018-000000-lemma-refuse")), "refused LEMMA plan must create zero dirs/files")
+
+      const badTopo = await tools.plan.execute({
+        sessionId: "20261018-000000-lemma-badtopo",
+        topology: "distributed-coding",
+        lemmaMode: true,
+        skipInterview: true,
+        tasks: [{ id: "L1" }],
+      })
+      assert(badTopo.content.startsWith("refused:"), "lemmaMode: true with non-proof topology must refuse before mkdir")
+      assert(!existsSync(join(rootNoTool, ".opencode")), "bad topology refusal must write nothing")
+      console.log("✓ 9.1 pre-mkdir / pre-spending refusal & install instructions verified")
+    }
+
+    // --- 9.2 Explicit opt-in gating ---
+    {
+      const rootRoute = mkdtempSync(join(lemmaTestDir, "root-route-"))
+      const tools = await makeToolsFor(rootRoute)
+
+      const positives = [
+        "Prove Fermat's Little Theorem in Lean 4",
+        "Verify src/Main.lean in Lean 4",
+        "Formalize and prove this theorem in Lean",
+        "Fill in the sorry in Lemma1.lean",
+      ]
+      for (const req of positives) {
+        const r = await tools.route.execute({ request: req })
+        assert.strictEqual(r.route, "lemma", `expected lemma for "${req}", got ${r.route}`)
+        assert.strictEqual(r.topology, "proof")
+        assert.strictEqual(r.lemmaMode, true)
+      }
+
+      const nonOptInLean = [
+        "Rename Lemma.lean to Helper.lean",
+        "Explain what Foo.lean does",
+        "Grep for sorry in src/Proof.lean",
+        "Format and lint all .lean files",
+        "Explain this snippet:\n```lean\n-- Prove theorem in Lean 4\ntheorem foo : 1 = 1 := by rfl\n```",
+        "import Mathlib\ntheorem t : 1 = 1 := by rfl",
+      ]
+      for (const req of nonOptInLean) {
+        const r = await tools.route.execute({ request: req })
+        assert.strictEqual(r.route, "general", `non-opt-in Lean must route to general for "${req}", got ${r.route}`)
+        assert.strictEqual(r.topology, "distributed-coding", `non-opt-in Lean must NOT route to proof: ${r.topology}`)
+        assert.strictEqual(r.lemmaMode, false)
+      }
+
+      const lowercaseLean = await tools.route.execute({ request: "Build a lean microservice in Node.js" })
+      assert.strictEqual(lowercaseLean.route, "general")
+      assert.strictEqual(lowercaseLean.topology, "distributed-coding")
+      assert.strictEqual(lowercaseLean.lemmaMode, false)
+
+      const nlProof = await tools.route.execute({ request: "Prove that there are infinitely many primes" })
+      assert.strictEqual(nlProof.route, "proof")
+      assert.strictEqual(nlProof.topology, "proof")
+      assert.strictEqual(nlProof.lemmaMode, false)
+
+      const docReview = await tools.route.execute({
+        request: "Review this Lean 4 formalization paper (paper.pdf)",
+        document: { content: "A Lean 4 formalization paper about proofs." },
+      })
+      assert.strictEqual(docReview.route, "document-review")
+      assert.strictEqual(docReview.topology, "document-review")
+      assert.strictEqual(docReview.lemmaMode, false)
+      const attachedDocReview = await tools.route.execute({
+        request: "Summarize attached manuscript.tex on Lean proofs",
+        document: { content: "A manuscript about Lean proofs." },
+      })
+      assert.strictEqual(attachedDocReview.route, "document-review")
+
+      console.log("✓ 9.2 explicit opt-in gating & priority order verified")
+    }
+
+    // --- 9.3 Bounded lemma tree & formalization review gate ---
+    {
+      const stubBin = makeFullStubEnv("tree")
+      process.env.PATH = `${stubBin}:${savedPath}`
+      const rootTree = mkdtempSync(join(lemmaTestDir, "root-tree-"))
+      const tools = await makeToolsFor(rootTree)
+      const RUN = "20261018-000000-lemma-tree"
+
+      const badBounds = await tools.plan.execute({
+        sessionId: "20261018-000000-badbounds",
+        topology: "proof",
+        lemmaMode: true,
+        lemmaBounds: { maxDepth: 99 },
+        skipInterview: true,
+        tasks: [{ id: "T1" }],
+      })
+      assert(badBounds.content.startsWith("refused:"), "excessive lemmaBounds must be refused before mkdir")
+      assert(!existsSync(join(rootTree, ".opencode")), "bad bounds refusal must create nothing")
+
+      const okPlan = await tools.plan.execute({
+        sessionId: RUN,
+        topology: "proof",
+        lemmaMode: true,
+        route: "lemma",
+        lemmaBounds: { maxDepth: 2, maxWidth: 2, maxNodes: 4, maxRetries: 2 },
+        skipInterview: true,
+        tasks: [{ id: "T1", agent: "team/proof-worker" }],
+      })
+      assert(okPlan.content.startsWith("Planned"), `stubbed LEMMA plan must succeed: ${okPlan.content}`)
+
+      // Root node creation
+      const rRoot = await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "root", statement: "main theorem" })
+      assert(rRoot.node?.id === "root", `root create failed: ${rRoot.content}`)
+
+      // Attempt before formalization APPROVE must fail
+      const earlyAttempt = await tools.lemma_node.execute({
+        sessionId: RUN,
+        action: "attempt",
+        lemmaId: "root",
+        leanCode: "theorem main : 1 = 1 := by rfl",
+      })
+      assert(earlyAttempt.content.startsWith("refused:"), "attempt before Phase 0 APPROVE must be refused")
+
+      // Failing draft blocks APPROVE
+      const badDraft = await tools.lemma_formalize.execute({
+        sessionId: RUN,
+        action: "draft",
+        leanCode: "SYNTAX_ERROR theorem bad",
+      })
+      assert.strictEqual(badDraft.compiled, false)
+      const approveBad = await tools.lemma_formalize.execute({
+        sessionId: RUN,
+        action: "review_pre",
+        verdict: "APPROVE",
+        notes: "looks good",
+      })
+      assert(approveBad.content.startsWith("refused:"), "failed draft compilation must block APPROVE promotion")
+      assert(!existsSync(join(rootTree, ".opencode", "teamwork", RUN, "lemma", "problem.lean")), "problem.lean must not exist before clean APPROVE")
+
+      // Clean draft + REQUEST_CHANGES then APPROVE
+      const okDraft = await tools.lemma_formalize.execute({
+        sessionId: RUN,
+        action: "draft",
+        leanCode: "theorem main (n : Nat) : n + 0 = n := by sorry",
+      })
+      assert.strictEqual(okDraft.compiled, true)
+      const reqChanges = await tools.lemma_formalize.execute({
+        sessionId: RUN,
+        action: "review_pre",
+        verdict: "REQUEST_CHANGES",
+        notes: "tighten type",
+      })
+      assert.strictEqual(reqChanges.promoted, false)
+      const approveOk = await tools.lemma_formalize.execute({
+        sessionId: RUN,
+        action: "review_pre",
+        verdict: "APPROVE",
+        notes: "faithful",
+      })
+      assert.strictEqual(approveOk.promoted, true)
+      assert(existsSync(join(rootTree, ".opencode", "teamwork", RUN, "lemma", "problem.lean")), "APPROVE must promote problem.lean")
+
+      // Duplicate, unknown parent, width, depth, maxNodes, maxRetries checks
+      const dup = await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "root" })
+      assert(dup.content.startsWith("refused:"), "duplicate lemmaId must be refused")
+      const unk = await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "c1", parentId: "missing" })
+      assert(unk.content.startsWith("refused:"), "unknown parentId must be refused")
+
+      await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "c1", parentId: "root" })
+      await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "c2", parentId: "root" })
+      const overWidth = await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "c3", parentId: "root" })
+      assert(overWidth.content.startsWith("refused:"), "exceeding maxWidth must be refused")
+
+      await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "d2", parentId: "c1" })
+      const overNodes = await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "n5", parentId: "c2" })
+      assert(overNodes.content.startsWith("refused:"), "exceeding maxNodes must be refused")
+
+      // Check depth > maxDepth using a separate small run
+      const RUN_D = "20261018-000000-lemma-depth"
+      await tools.plan.execute({
+        sessionId: RUN_D,
+        topology: "proof",
+        lemmaMode: true,
+        lemmaBounds: { maxDepth: 1, maxWidth: 2, maxNodes: 6, maxRetries: 1 },
+        skipInterview: true,
+        tasks: [{ id: "T1" }],
+      })
+      await tools.lemma_node.execute({ sessionId: RUN_D, action: "create", lemmaId: "root" })
+      await tools.lemma_node.execute({ sessionId: RUN_D, action: "create", lemmaId: "d1", parentId: "root" })
+      const overDepth = await tools.lemma_node.execute({ sessionId: RUN_D, action: "create", lemmaId: "d2", parentId: "d1" })
+      assert(overDepth.content.startsWith("refused:"), "exceeding maxDepth must be refused")
+
+      // Max retries check on RUN
+      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", leanCode: "theorem main : 1 = 1 := by rfl" })
+      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", leanCode: "theorem main : 1 = 1 := by rfl" })
+      const overRetry = await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", leanCode: "theorem main : 1 = 1 := by rfl" })
+      assert(overRetry.content.startsWith("refused:"), "exceeding maxRetries must be refused")
+
+      console.log("✓ 9.3 bounded lemma tree & formalization review gate verified")
+    }
+
+    // --- 9.4 Stub-binary sorry/admit/axiom + exit-code + final_verify ---
+    {
+      // Unit check on comment stripping (nested block comments & line comments)
+      const commented = `-- sorry\n/- outer /- sorry -/ admit -/\ntheorem ok : True := trivial`
+      assert(!stripLeanComments(commented).includes("sorry"), "comments must be stripped cleanly")
+      const cleanCommentHoles = detectLeanProofHoles(commented, "")
+      assert.strictEqual(cleanCommentHoles.hasSorry, false)
+      assert.strictEqual(cleanCommentHoles.hasAdmit, false)
+
+      const stubBin = makeFullStubEnv("verify")
+      process.env.PATH = `${stubBin}:${savedPath}`
+      const rootV = mkdtempSync(join(lemmaTestDir, "root-verify-"))
+      const tools = await makeToolsFor(rootV)
+      const RUN = "20261018-000000-lemma-verify"
+
+      await tools.plan.execute({
+        sessionId: RUN,
+        topology: "proof",
+        lemmaMode: true,
+        lemmaBounds: { maxRetries: 4 },
+        skipInterview: true,
+        tasks: [{ id: "L1", agent: "team/proof-worker" }],
+      })
+      await tools.lemma_formalize.execute({ sessionId: RUN, action: "draft", leanCode: "theorem t : 1 = 1 := by sorry" })
+      await tools.lemma_formalize.execute({ sessionId: RUN, action: "review_pre", verdict: "APPROVE", notes: "ok" })
+      await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "root" })
+
+      // (a) sorry warning even on exit 0 -> FAIL
+      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 1, leanCode: "COMPILER_SORRY_WARN\ntheorem t : 1 = 1 := by sorry" })
+      const vSorry = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 1 })
+      assert.strictEqual(vSorry.report.status, "FAIL", "sorry warning on exit 0 must FAIL")
+      assert.strictEqual(vSorry.report.exitCode, 0)
+      assert.strictEqual(vSorry.report.hasSorry, true)
+
+      // (b) admit & unauthorized axiom -> FAIL
+      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 2, leanCode: "axiom bogus : False\ntheorem t : 1 = 1 := by admit" })
+      const vAx = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 2 })
+      assert.strictEqual(vAx.report.status, "FAIL")
+      assert.strictEqual(vAx.report.hasAdmit, true)
+      assert.strictEqual(vAx.report.hasUnauthorizedAxiom, true)
+
+      // (c) clean .lean text but lean exits 1 -> FAIL (never infer PASS from text!)
+      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 3, leanCode: "-- SYNTAX_ERROR\ntheorem t : 1 = 1 := by rfl" })
+      const vExit1 = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 3 })
+      assert.strictEqual(vExit1.report.status, "FAIL")
+      assert.strictEqual(vExit1.report.exitCode, 1)
+
+      // Satisfy DAG task + security audit so final_verify isolates LEMMA checks
+      for (const st of ["worker_active", "worker_done", "verifier_active"]) {
+        await tools.task_update.execute({ sessionId: RUN, taskId: "L1", status: st })
+      }
+      await tools.task_update.execute({ sessionId: RUN, taskId: "L1", status: "verified_pass", verification: { status: "PASS" } })
+      const repFile = join(rootV, ".opencode", "teamwork", RUN, "verify", "report-L1.json")
+      mkdirSync(dirname(repFile), { recursive: true })
+      writeFileSync(repFile, JSON.stringify({ taskId: "L1", status: "PASS" }) + "\n")
+      await tools.security_audit.execute({ sessionId: RUN, status: "PASS", findings: [] })
+
+      // (d) clean .lean + exit 0 -> PASS, but without final FAITHFUL review final_verify must FAIL
+      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 4, leanCode: "theorem t : 1 = 1 := by rfl" })
+      const vPass = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 4 })
+      assert.strictEqual(vPass.report.status, "PASS")
+      assert.strictEqual(vPass.report.executed, true)
+      assert.strictEqual(vPass.report.exitCode, 0)
+
+      const fvBeforeFaithful = await tools.final_verify.execute({ sessionId: RUN })
+      assert.strictEqual(fvBeforeFaithful.status, "FAIL", "final_verify must FAIL without FAITHFUL final review")
+
+      // (e) Tampering verify-4.json to executed: false -> final_verify FAIL
+      const verify4File = join(rootV, ".opencode", "teamwork", RUN, "lemma", "nodes", "root", "verify-4.json")
+      const savedVerify4 = readFileSync(verify4File, "utf8")
+      const tampered = JSON.parse(savedVerify4)
+      tampered.executed = false
+      writeFileSync(verify4File, JSON.stringify(tampered, null, 2) + "\n")
+      await tools.lemma_formalize.execute({ sessionId: RUN, action: "review_final", verdict: "FAITHFUL", notes: "matches" })
+      const fvTampered = await tools.final_verify.execute({ sessionId: RUN })
+      assert.strictEqual(fvTampered.status, "FAIL", "unstamped executed:false verify report must FAIL final_verify")
+
+      // Restore valid stamped verify-4.json -> final_verify PASS with evidence.lemma
+      writeFileSync(verify4File, savedVerify4)
+      const fvOk = await tools.final_verify.execute({ sessionId: RUN })
+      assert.strictEqual(fvOk.status, "PASS", `valid LEMMA run must PASS final_verify: ${fvOk.content}`)
+      const finalJson = JSON.parse(readFileSync(join(rootV, ".opencode", "teamwork", RUN, "verify", "final.json"), "utf8"))
+      assert(finalJson.evidence?.lemma?.active === true, "verify/final.json must stamp evidence.lemma")
+      assert.strictEqual(finalJson.evidence.lemma.finalVerdict, "FAITHFUL")
+      console.log("✓ 9.4 stub-binary sorry/admit/axiom + exit-code + final_verify verified")
+    }
+
+    // --- 9.5 Security containment ---
+    {
+      const stubBin = makeFullStubEnv("sec")
+      process.env.PATH = `${stubBin}:${savedPath}`
+      const rootSec = mkdtempSync(join(lemmaTestDir, "root-sec-"))
+      const tools = await makeToolsFor(rootSec)
+      const RUN = "20261018-000000-lemma-sec"
+      await tools.plan.execute({
+        sessionId: RUN,
+        topology: "proof",
+        lemmaMode: true,
+        skipInterview: true,
+        tasks: [{ id: "L1" }],
+      })
+
+      for (const badId of ["../escape", "a/b", ".", "..", "", "a".repeat(65)]) {
+        const r = await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: badId })
+        assert(r.content.startsWith("refused:"), `unsafe lemmaId ${JSON.stringify(badId)} must be refused: ${r.content}`)
+      }
+
+      // Control char sanitization in formalization notes
+      await tools.lemma_formalize.execute({ sessionId: RUN, action: "draft", leanCode: "theorem t : 1 = 1 := by sorry" })
+      await tools.lemma_formalize.execute({ sessionId: RUN, action: "review_pre", verdict: "APPROVE", notes: "ok\x1b[31m\nline\u0085" })
+      const rev = JSON.parse(readFileSync(join(rootSec, ".opencode", "teamwork", RUN, "lemma", "formalization-review.json"), "utf8"))
+      assert(!/[\x00-\x1f\x7f-\x9f\u0085]/.test(rev.preSearch.notes), "control chars must be stripped from review notes")
+
+      // Symlinked lemma/ dir refused
+      const outside = mkdtempSync(join(lemmaTestDir, "outside-"))
+      const RUN_SYM = "20261018-000000-lemma-sym"
+      const runSymDir = join(rootSec, ".opencode", "teamwork", RUN_SYM)
+      mkdirSync(runSymDir, { recursive: true })
+      symlinkSync(outside, join(runSymDir, "lemma"))
+      const symRes = await tools.lemma_node.execute({ sessionId: RUN_SYM, action: "create", lemmaId: "root" })
+      assert(symRes.content.startsWith("refused:"), `symlinked lemma/ must be refused: ${symRes.content}`)
+
+      console.log("✓ 9.5 security containment (LEMMA_ID, symlink, sanitization) verified")
+    }
+
+    // --- 9.6 Loud-skipping real-toolchain E2E check ---
+    {
+      process.env.PATH = savedPath
+      const hostProbe = probeLemmaToolchain({ env: { ...process.env, PATH: savedPath } })
+      if (!hostProbe.ready) {
+        console.log(`[SKIP] LEMMA live-toolchain E2E skipped: missing host binaries (${hostProbe.missing.join(", ")})`)
+      } else {
+        const rootLive = mkdtempSync(join(lemmaTestDir, "root-live-"))
+        const tools = await makeToolsFor(rootLive)
+        const RUN = "20261018-000000-lemma-live"
+        const planLive = await tools.plan.execute({
+          sessionId: RUN,
+          topology: "proof",
+          lemmaMode: true,
+          skipInterview: true,
+          tasks: [{ id: "L1", agent: "team/proof-worker" }],
+        })
+        assert(planLive.content.startsWith("Planned"))
+        await tools.lemma_formalize.execute({ sessionId: RUN, action: "draft", leanCode: "theorem add_zero_eq (n : Nat) : n + 0 = n := by sorry" })
+        await tools.lemma_formalize.execute({ sessionId: RUN, action: "review_pre", verdict: "APPROVE", notes: "faithful" })
+        await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "root" })
+        await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 1, leanCode: "theorem add_zero_eq (n : Nat) : n + 0 = n := by sorry" })
+        const liveSorry = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 1 })
+        assert.strictEqual(liveSorry.report.status, "FAIL", "live Lean sorry must FAIL")
+        await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 2, leanCode: "theorem add_zero_eq (n : Nat) : n + 0 = n := by simp" })
+        const liveOk = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 2 })
+        assert.strictEqual(liveOk.report.status, "PASS", "live Lean proof must PASS")
+        console.log("✓ 9.6 live Lean 4 E2E verification passed")
+      }
+    }
+  } finally {
+    process.env.PATH = savedPath
+    rmSync(lemmaTestDir, { recursive: true, force: true })
   }
 }

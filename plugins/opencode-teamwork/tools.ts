@@ -49,6 +49,21 @@ import {
   splitInstructionAndInlineDoc,
   validateTreeBounds,
 } from "./document-review.ts"
+import {
+  classifyRoute as classifyLemmaRoute,
+  evaluateLemmaFinalEvidence,
+  formatMissingToolchainRefusal,
+  initLemmaArtifacts,
+  mutateLemmaNode,
+  probeLemmaToolchain,
+  recordFormalizationDraft,
+  recordFormalizationFinalReview,
+  recordFormalizationPreReview,
+  validateLemmaBounds,
+  verifyLemmaNodeAttempt,
+  type LemmaBounds,
+  type LemmaProbeResult,
+} from "./lemma.ts"
 
 // ---------------------------------------------------------------------------
 // OpenCode native cost tracking
@@ -885,6 +900,7 @@ const READ_ONLY_ACTIONS: Record<string, Set<string>> = {
   "team/scout": new Set(["edit", "subagent"]),
   "team/security-auditor": new Set(["edit", "webfetch", "subagent"]),
   "team/segment-reviewer": new Set(["edit", "shell", "subagent", "webfetch"]),
+  "team/formalization-reviewer": new Set(["edit", "shell", "subagent", "webfetch"]),
 }
 
 const pad = (n: number) => String(n).padStart(2, "0")
@@ -1345,6 +1361,47 @@ async function createPlanRun(
       content: `refused: invalid topology "${clean(input.topology, 32)}" (accepted: ${TOPOLOGIES.join(", ")}; aliases: ${Object.keys(TOPOLOGY_ALIASES).join(", ")})`,
     }
   }
+  const rawRoute = typeof input.route === "string" ? clean(input.route, 32).trim() : ""
+  const isLemma = input.lemmaMode === true || rawRoute === "lemma"
+  if (input.lemmaMode === true && rawRoute && rawRoute !== "lemma") {
+    return {
+      ok: false,
+      content: `refused: lemmaMode: true conflicts with route "${rawRoute}"; nothing was written.`,
+    }
+  }
+  if (input.lemmaMode === false && rawRoute === "lemma") {
+    return {
+      ok: false,
+      content: `refused: route "lemma" conflicts with lemmaMode: false; nothing was written.`,
+    }
+  }
+  if (isLemma && topology !== "proof") {
+    return {
+      ok: false,
+      content: `refused: LEMMA route requires topology "proof" (got "${topology}"); nothing was written.`,
+    }
+  }
+  let lemmaBounds: LemmaBounds | undefined
+  if (isLemma || input.lemmaBounds !== undefined) {
+    const boundsCheck = validateLemmaBounds(input.lemmaBounds)
+    if (boundsCheck.error || !boundsCheck.bounds) {
+      return { ok: false, content: boundsCheck.error ?? "refused: invalid lemmaBounds; nothing was written." }
+    }
+    lemmaBounds = boundsCheck.bounds
+  }
+  let lemmaProbe: LemmaProbeResult | undefined
+  if (isLemma) {
+    // Capability probe runs BEFORE mkdirSync; allowMissingInputs MUST NOT bypass.
+    lemmaProbe = probeLemmaToolchain()
+    if (!lemmaProbe.ready) {
+      return {
+        // Preserve the probe payload for the route/tool caller; the plan tool
+        // only returns content, but tests inspect the refusal text.
+        ok: false,
+        content: formatMissingToolchainRefusal(lemmaProbe),
+      }
+    }
+  }
   // Refuse an unknown integrity mode before anything is written. The mode
   // is the run's integrity contract, so a typo must never be persisted.
   const integrityMode =
@@ -1473,6 +1530,7 @@ async function createPlanRun(
     topology,
     integrityMode,
     preflight,
+    ...(isLemma ? { lemmaMode: true, route: "lemma", lemmaBounds } : rawRoute ? { route: rawRoute } : {}),
     tasks,
     ...(routingReason ? { routingReason } : {}),
   })
@@ -1481,6 +1539,7 @@ async function createPlanRun(
       version: 1,
       sessionId,
       integrityMode,
+      ...(isLemma ? { lemmaMode: true, route: "lemma" } : {}),
       phase: "DISPATCH",
       tasks: nullMap(Object.fromEntries(tasks.map((t: any) => [t.id, { status: "pending", round: 0 }]))),
       updatedAt: new Date().toISOString(),
@@ -1490,10 +1549,20 @@ async function createPlanRun(
     // the caller chose (defaults to development when omitted).
     const stateFile = join(run, "state.json")
     const state = readJson<any>(stateFile, undefined)
-    if (state && state.integrityMode !== integrityMode) {
+    if (state && (state.integrityMode !== integrityMode || (isLemma && !state.lemmaMode))) {
       state.integrityMode = integrityMode
+      if (isLemma) {
+        state.lemmaMode = true
+        state.route = "lemma"
+      }
       state.updatedAt = new Date().toISOString()
       writeJson(stateFile, state)
+    }
+  }
+  if (isLemma && lemmaBounds && lemmaProbe) {
+    const lemmaInit = initLemmaArtifacts(run, sessionId, lemmaBounds, lemmaProbe)
+    if (lemmaInit.error) {
+      return { ok: false, content: lemmaInit.error }
     }
   }
   // Use ?? (nullish coalescing) so budgetUsd: 0 is respected as "no budget"
@@ -1606,6 +1675,25 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             type: "boolean",
             description: "Default false. Explicit bypass: plan even when a blocking input is MISSING/OUTAGE. The bypass is recorded in plan.dag.json and events.jsonl.",
           },
+          lemmaMode: {
+            type: "boolean",
+            description: "Optional. True only for explicit Lean 4 / LEMMA formal-proof runs (requires topology: 'proof' and Lean 4 + leap-tools on PATH).",
+          },
+          route: {
+            type: "string",
+            description: "Optional. Route label (e.g. 'lemma', 'document-review', 'proof', 'massive-proof', 'general').",
+          },
+          lemmaBounds: {
+            type: "object",
+            description: "Optional bounds for LEMMA decomposition tree: maxDepth (1..3), maxWidth (1..4), maxNodes (1..24), maxRetries (1..4).",
+            properties: {
+              maxDepth: { type: "number" },
+              maxWidth: { type: "number" },
+              maxNodes: { type: "number" },
+              maxRetries: { type: "number" },
+            },
+            additionalProperties: false,
+          },
           tasks: {
             type: "array",
             items: {
@@ -1655,7 +1743,59 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         additionalProperties: false,
       },
       execute: (input: any) => {
-        const result = classifyRoute(input || {}, root)
+        // Document Review is the authority for Priority 1; LEMMA owns the
+        // non-document opt-in/gating decision for Priorities 2-7. Both features
+        // must return route + lemmaMode so either caller's tests can assert.
+        const doc = classifyRoute(input || {}, root)
+        const request = String(input?.request ?? "")
+        const lemma = classifyLemmaRoute(
+          {
+            request,
+            inputs: Array.isArray(input?.inputs) ? input.inputs.map(String) : undefined,
+            hasDocument: false,
+          },
+          root,
+        )
+        let result: any
+        if (doc.topology === "document-review") {
+          result = {
+            ...lemma,
+            topology: "document-review",
+            route: "document-review",
+            lemmaMode: false,
+            reason: doc.routingReason,
+            routingReason: doc.routingReason,
+            documentDetected: true,
+          }
+        } else if (lemma.lemmaMode) {
+          result = {
+            ...lemma,
+            documentDetected: doc.documentDetected,
+            routingReason: lemma.reason,
+          }
+        } else if (
+          doc.topology === "proof" &&
+          lemma.signals?.hasLeanSignal &&
+          !lemma.signals?.hasExplicitLeanRequest
+        ) {
+          // Bare `.lean`/Lean syntax without an explicit opt-in must not become
+          // a proof run; the LEMMA classifier owns this negative-gate decision.
+          result = {
+            ...lemma,
+            documentDetected: doc.documentDetected,
+            routingReason: lemma.reason,
+          }
+        } else {
+          result = {
+            ...lemma,
+            topology: doc.topology,
+            route: doc.topology === "distributed-coding" ? "general" : doc.topology,
+            lemmaMode: false,
+            reason: doc.routingReason,
+            routingReason: doc.routingReason,
+            documentDetected: doc.documentDetected,
+          }
+        }
         return {
           content: `Route: ${result.topology}\nDocument detected: ${result.documentDetected}\nReason: ${result.routingReason}`,
           ...result,
@@ -3286,6 +3426,20 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               }
             }
           }
+          let lemmaSymlink = false
+          try {
+            lemmaSymlink = lstatSync(join(run, "lemma")).isSymbolicLink()
+          } catch {}
+          const isLemmaRun =
+            plan?.lemmaMode === true ||
+            plan?.route === "lemma" ||
+            state?.lemmaMode === true ||
+            lemmaSymlink ||
+            existsSync(join(run, "lemma", "manifest.json"))
+          const lemmaEvidence = isLemmaRun ? evaluateLemmaFinalEvidence(run) : undefined
+          if (lemmaEvidence) {
+            reasons.push(...lemmaEvidence.reasons)
+          }
 
           // A supplied failReason can only make the verdict fail, never pass it.
           const failReason = typeof input?.failReason === "string" ? clean(input.failReason, 500).trim() : ""
@@ -3316,6 +3470,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               securityAudit,
               allTasksVerifiedPass,
               ...(documentReviewEvidence ? { documentReview: documentReviewEvidence } : {}),
+              ...(lemmaEvidence ? { lemma: lemmaEvidence } : {}),
             },
             reasons: cappedReasons,
             ...(summary ? { summary } : {}),
@@ -3609,6 +3764,205 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         }
 
         return { content: `Error: unknown action "${action}". Allowed: setup | diff | merge | resolve | cleanup` }
+      },
+    })
+
+
+    editor.add({
+      name: "lemma_probe",
+      description:
+        "Read-only probe for the external LEMMA toolchain (`lean`, `lake`, `leap-tools`) on PATH. Never touches disk and never installs packages.",
+      input: {
+        type: "object",
+        properties: {
+          timeoutMs: { type: "number", description: "Optional per-binary probe timeout in ms (250..30000)." },
+        },
+        additionalProperties: false,
+      },
+      execute: async (input: any) => {
+        const probe = probeLemmaToolchain({ timeoutMs: input?.timeoutMs })
+        if (!probe.ready) {
+          return {
+            content: formatMissingToolchainRefusal(probe),
+            ...probe,
+          }
+        }
+        return {
+          content: `LEMMA toolchain READY: lean (${probe.lean.version}), lake (${probe.lake.version}), leap-tools (${probe.leapTools.version}).`,
+          ...probe,
+        }
+      },
+    })
+
+    editor.add({
+      name: "lemma_formalize",
+      description:
+        "Manage LEMMA Phase 0 formalization (problem_draft.lean -> preSearch APPROVE/REQUEST_CHANGES -> problem.lean) and final faithfulness review (FAITHFUL/UNFAITHFUL/MISFORMALIZED).",
+      input: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string" },
+          action: { type: "string", description: "draft | review_pre | review_final" },
+          leanCode: { type: "string", description: "Lean 4 source for problem_draft.lean (action=draft)." },
+          verdict: { type: "string", description: "APPROVE | REQUEST_CHANGES (review_pre) or FAITHFUL | UNFAITHFUL | MISFORMALIZED (review_final)." },
+          notes: { type: "string", description: "Reviewer notes." },
+          reviewer: { type: "string", description: "Optional reviewer agent id (default team/formalization-reviewer)." },
+          verifyDraft: { type: "boolean", description: "Default true for draft: run Lean syntax/typecheck on problem_draft.lean." },
+        },
+        required: ["action"],
+        additionalProperties: false,
+      },
+      execute: async (input: any) => {
+        const resolved = resolveRun(root, input?.sessionId)
+        if (resolved.error) return { content: resolved.error }
+        const run = resolved.run as string
+        const action = clean(input?.action, 32)
+        const manifestFile = join(run, "lemma", "manifest.json")
+
+        return await withFileLock(manifestFile, async () => {
+          if (action === "draft") {
+            const res = recordFormalizationDraft(run, String(input?.leanCode ?? ""), {
+              verifyDraft: input?.verifyDraft !== false,
+            })
+            if (res.error) return { content: res.error }
+            return {
+              content: `Recorded lemma/problem_draft.lean (compiled=${res.compiled}, exitCode=${res.exitCode}).`,
+              ...res,
+            }
+          }
+          if (action === "review_pre") {
+            const res = recordFormalizationPreReview(
+              run,
+              String(input?.verdict ?? ""),
+              String(input?.notes ?? ""),
+              input?.reviewer ? String(input.reviewer) : "team/formalization-reviewer",
+            )
+            if (res.error) return { content: res.error }
+            return {
+              content: `Recorded preSearch formalization review (promoted=${res.promoted}, phase=${res.phase}).`,
+              ...res,
+            }
+          }
+          if (action === "review_final") {
+            const res = recordFormalizationFinalReview(
+              run,
+              String(input?.verdict ?? ""),
+              String(input?.notes ?? ""),
+              input?.reviewer ? String(input.reviewer) : "team/formalization-reviewer",
+            )
+            if (res.error) return { content: res.error }
+            return {
+              content: `Recorded final formalization faithfulness review (phase=${res.phase}).`,
+              ...res,
+            }
+          }
+          return { content: `refused: unknown action "${action}" (allowed: draft | review_pre | review_final)` }
+        })
+      },
+    })
+
+    editor.add({
+      name: "lemma_node",
+      description:
+        "Manage bounded LEMMA decomposition tree nodes under lemma/nodes/<lemmaId>/ (create, update, blueprint, attempt) enforcing maxDepth, maxWidth, maxNodes, maxRetries, and cycle/symlink guards.",
+      input: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string" },
+          action: { type: "string", description: "create | update | blueprint | attempt" },
+          lemmaId: { type: "string" },
+          parentId: { type: "string" },
+          statement: { type: "string" },
+          status: { type: "string" },
+          blueprint: { type: "string" },
+          leanCode: { type: "string" },
+          round: { type: "number" },
+        },
+        required: ["action", "lemmaId"],
+        additionalProperties: false,
+      },
+      execute: async (input: any) => {
+        const resolved = resolveRun(root, input?.sessionId)
+        if (resolved.error) return { content: resolved.error }
+        const run = resolved.run as string
+        const action = clean(input?.action, 32)
+        if (action !== "create" && action !== "update" && action !== "blueprint" && action !== "attempt") {
+          return { content: `refused: unknown action "${action}" (allowed: create | update | blueprint | attempt)` }
+        }
+        const manifestFile = join(run, "lemma", "manifest.json")
+        return await withFileLock(manifestFile, async () => {
+          const res = mutateLemmaNode(run, {
+            action,
+            lemmaId: String(input?.lemmaId ?? ""),
+            parentId: input?.parentId === undefined ? undefined : input.parentId === null ? null : String(input.parentId),
+            statement: typeof input?.statement === "string" ? input.statement : undefined,
+            status: typeof input?.status === "string" ? input.status : undefined,
+            blueprint: typeof input?.blueprint === "string" ? input.blueprint : undefined,
+            leanCode: typeof input?.leanCode === "string" ? input.leanCode : undefined,
+            round: typeof input?.round === "number" ? input.round : undefined,
+          })
+          if (res.error) return { content: res.error }
+          return {
+            content: `LEMMA node ${res.node?.id} (${action}) updated: status=${res.node?.status}, depth=${res.node?.depth}, attempts=${res.node?.attempts}.`,
+            ...res,
+          }
+        })
+      },
+    })
+
+    editor.add({
+      name: "lemma_verify",
+      description:
+        "Execute real Lean 4 (`lean`, `lake env lean`, or `lake build`) on lemma/nodes/<lemmaId>/attempt-<r>.lean, reject sorry/admit/unauthorized axioms even on exit 0, and stamp verify-<r>.json.",
+      input: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string" },
+          lemmaId: { type: "string" },
+          round: { type: "number" },
+          mode: { type: "string", description: "lean | lake-env-lean | lake-build (default: lean)" },
+          cwd: { type: "string", description: "Optional working directory inside project root or run worktree." },
+          allowedAxioms: { type: "array", items: { type: "string" } },
+        },
+        required: ["lemmaId"],
+        additionalProperties: false,
+      },
+      execute: async (input: any) => {
+        const resolved = resolveRun(root, input?.sessionId)
+        if (resolved.error) return { content: resolved.error }
+        const run = resolved.run as string
+        const modeRaw = input?.mode ? clean(input.mode, 32) : "lean"
+        if (modeRaw !== "lean" && modeRaw !== "lake-env-lean" && modeRaw !== "lake-build") {
+          return { content: `refused: invalid mode "${modeRaw}" (allowed: lean | lake-env-lean | lake-build)` }
+        }
+        let verifiedCwd: string | undefined
+        if (typeof input?.cwd === "string" && input.cwd.trim()) {
+          const cand = resolve(root, input.cwd)
+          const worktreesBase = resolve(
+            process.env.TEAMWORK_WORKTREES_DIR ? process.env.TEAMWORK_WORKTREES_DIR : join(root, "..", ".teamwork-worktrees"),
+          )
+          const inRoot = !containmentError(root, cand) || resolve(root) === cand
+          const inWt = !containmentError(worktreesBase, cand)
+          if (!inRoot && !inWt) {
+            return { content: "refused: cwd escapes project root and worktrees base" }
+          }
+          verifiedCwd = cand
+        }
+        const manifestFile = join(run, "lemma", "manifest.json")
+        return await withFileLock(manifestFile, async () => {
+          const res = verifyLemmaNodeAttempt(run, {
+            lemmaId: String(input?.lemmaId ?? ""),
+            round: typeof input?.round === "number" ? input.round : undefined,
+            mode: modeRaw,
+            cwd: verifiedCwd,
+            allowedAxioms: Array.isArray(input?.allowedAxioms) ? input.allowedAxioms.map(String) : undefined,
+          })
+          if (res.error || !res.report) return { content: res.error ?? "verification failed" }
+          return {
+            content: `LEMMA verify ${res.report.lemmaId} round ${res.report.round}: ${res.report.status} (executed=${res.report.executed}, exitCode=${res.report.exitCode}, sorry=${res.report.hasSorry}, admit=${res.report.hasAdmit}, unauthorizedAxiom=${res.report.hasUnauthorizedAxiom}).`,
+            ...res,
+          }
+        })
       },
     })
   })

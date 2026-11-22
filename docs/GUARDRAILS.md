@@ -17,8 +17,9 @@ remove the sharpest edges.
 | --- | --- | --- |
 | **Session-id allowlist** `^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$` + containment assert | `plugins/opencode-teamwork/tools.ts` (`resolveRun`) | Path traversal / arbitrary file write or append via `sessionId` in any `teamwork_*` tool. |
 | **Server-derived session id** — `teamwork_plan` generates and returns the id; prompts must use it, never a value read from a file | `tools.ts` + `agents/team/sentinel.md` | Command injection through a malicious `prompt_draft.md` session id interpolated into `git worktree` shell lines. |
-| **Read-only enforcement (per-agent deny list)** | `tools.ts` `registerTeamworkHooks` → `permission.hook("evaluate")` | `edit` for the verifier, falsifier, scout, security auditor and segment reviewer, so none can write through the `edit` tool; plus `shell` for the falsifier and segment reviewer, `webfetch` for the verifier, security auditor and segment reviewer, and `subagent` for all five. `shell` remains available to the verifier, scout and security auditor and **can modify files**, so only the falsifier and segment reviewer are left without a shell write path. Fail-closed: a hook that cannot register fails plugin load. |
+| **Read-only enforcement (per-agent deny list)** | `tools.ts` `registerTeamworkHooks` → `permission.hook("evaluate")` | `edit` for the verifier, falsifier, scout, security auditor, segment reviewer, and formalization reviewer, so none can write through the `edit` tool; plus `shell` for the falsifier, segment reviewer, and formalization reviewer, `webfetch` for the verifier, security auditor, segment reviewer, and formalization reviewer, and `subagent` for all six. `shell` remains available to the verifier, scout and security auditor and **can modify files**, so only the falsifier, segment reviewer, and formalization reviewer are left without a shell write path. Fail-closed: a hook that cannot register fails plugin load. |
 | **Document Review containment & bounds** | `document-review.ts` + `tools.ts` (`teamwork_document_triage`, `teamwork_document_record`) | Segment-ID allowlist `^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`, `realpathSync` + `O_NOFOLLOW` symlink/escape refusal on source documents and `document-review/` artifacts, 16 MiB file / 512 KiB inline / 4 MiB PDF-inflate caps, and immutable RSA bounds (`maxSegments <= 8`, `reviewTreeShape <= [4,2,1]`, `synthTreeShape <= [4,1]`). |
+| **LEMMA path & process containment** | `plugins/opencode-teamwork/lemma.ts` + `tools.ts` | Validates `LEMMA_ID` (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`), refuses symlinks component-wise (`lstatSync` + `O_NOFOLLOW`), enforces `realpathSync` containment inside the run dir, executes `lean`/`lake`/`leap-tools` via `execFileSync` fixed argv (zero shell interpolation), and rejects `sorry`/`admit`/unauthorized `axiom` even on exit `0`. |
 | **Sanitised run-state injection** — only whitelisted/enumerated fields, newlines stripped, id from the directory name | `tools.ts` `describeRun` → `session.hook("context")` | Stored prompt injection from an untrusted `state.json` into a system prompt. |
 | **Non-destructive installer** — `refresh` defaults to false; `--refresh` opts in with backup | `lib/team.mjs` `installAgents` | Silent overwrite of a user's edited agent prompts. |
 | **Non-destructive config edits** — refuse symlinks, never rewrite commented (JSONC) configs | `lib/team.mjs` `registerPlugin` | Comment loss / value corruption / symlink write-through when editing `opencode.json(c)`. |
@@ -30,8 +31,8 @@ remove the sharpest edges.
   edit outside your worktree," but with `resource: "*"` nothing enforces it.
   `git worktree` isolation is prompt-level. (Mitigated only by the permission
   hook: for the verifier, scout and security auditor it denies `edit` but not
-  `shell`, which can write anywhere; both the falsifier and segment reviewer
-  also have `shell` denied.)
+  `shell`, which can write anywhere; the falsifier, segment reviewer, and
+  formalization reviewer also have `shell` denied.)
 - **`constraints.network` / `constraints.sandbox`** in `docs/ARTIFACTS.md` are
   descriptive; they are not enforced. "Network: denied" is honor-system.
 - **Plugin tools are not agent-scoped.** The permission layer does not mediate
