@@ -1701,7 +1701,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           sessionId: { type: "string", description: "Reuse an existing session id; omit to create one." },
           topology: { type: "string", description: "small-focused | iterative-coding | distributed-coding | proof | massive-proof | document-review. Legacy aliases accepted and normalised: large-swarm → distributed-coding, doc-review → document-review, long-proof → proof, massive-proof-swarm → massive-proof." },
           routingReason: { type: "string", description: "Optional. Why this topology was chosen; persisted in plan.dag.json when provided." },
-          request: { type: "string", description: "Optional. The verbatim text this run was routed on (max 20000 chars); recorded once in ORIGINAL_REQUEST.md. A second plan into the same run with a non-empty request file is refused." },
+          request: { type: "string", description: "The verbatim text this run was routed on (max 20000 chars); recorded once in ORIGINAL_REQUEST.md. Sentinel must always pass this for LEMMA and general runs; a second plan into the same run with a non-empty request file is refused." },
           integrityMode: { type: "string", description: "development | demo | benchmark. Default development. Recorded in ORIGINAL_REQUEST.md, state.json and plan.dag.json; the security auditor and final gate read it from ORIGINAL_REQUEST.md." },
           budgetUsd: { type: "number", description: "Run budget in USD. When using opencode/ models + opencode_console, derive this from credits (full or partial, per the user's choice)." },
           budgetSource: { type: "string", description: "Where the budget came from: credits | default | manual." },
@@ -3993,7 +3993,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     editor.add({
       name: "lemma_node",
       description:
-        "Manage bounded LEMMA decomposition tree nodes under lemma/nodes/<lemmaId>/ (create, update, blueprint, attempt) enforcing maxDepth, maxWidth, maxNodes, maxRetries, and cycle/symlink guards.",
+        "Manage bounded LEMMA decomposition tree nodes under lemma/nodes/<lemmaId>/ (create, update, blueprint, attempt) enforcing maxDepth, maxWidth, maxNodes, maxRetries, and cycle/symlink guards. Record `declaration` (Lean theorem/lemma name) and `statement` (exact Lean proposition type) so lemma_verify can bind the attempt to the approved proposition.",
       input: {
         type: "object",
         properties: {
@@ -4001,7 +4001,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           action: { type: "string", description: "create | update | blueprint | attempt" },
           lemmaId: { type: "string" },
           parentId: { type: "string" },
-          statement: { type: "string" },
+          statement: { type: "string", description: "Approved Lean proposition/type this node must prove (exact type after the declaration name)." },
+          declaration: { type: "string", description: "Lean theorem/lemma name the verified attempt must declare (optional; inferred from lemma/problem.lean when unique)." },
           status: { type: "string" },
           blueprint: { type: "string" },
           leanCode: { type: "string" },
@@ -4025,6 +4026,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             lemmaId: String(input?.lemmaId ?? ""),
             parentId: input?.parentId === undefined ? undefined : input.parentId === null ? null : String(input.parentId),
             statement: typeof input?.statement === "string" ? input.statement : undefined,
+            declaration: typeof input?.declaration === "string" ? input.declaration : undefined,
             status: typeof input?.status === "string" ? input.status : undefined,
             blueprint: typeof input?.blueprint === "string" ? input.blueprint : undefined,
             leanCode: typeof input?.leanCode === "string" ? input.leanCode : undefined,
@@ -4042,7 +4044,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     editor.add({
       name: "lemma_verify",
       description:
-        "Execute real Lean 4 (`lean`, `lake env lean`, or `lake build`) on lemma/nodes/<lemmaId>/attempt-<r>.lean, reject sorry/admit/unauthorized axioms even on exit 0, and stamp verify-<r>.json.",
+        "Execute real Lean 4 (`lean`, `lake env lean`, or `lake build`) on lemma/nodes/<lemmaId>/attempt-<r>.lean, bind the declared theorem/lemma name and type to the approved node statement, check transitive axiom dependencies via `#print axioms`, reject sorry/admit/unauthorized axioms even on exit 0, and stamp verify-<r>.json.",
       input: {
         type: "object",
         properties: {

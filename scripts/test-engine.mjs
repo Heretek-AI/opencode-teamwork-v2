@@ -1,8 +1,12 @@
 import { registerTeamworkTools, registerTeamworkHooks } from "../plugins/opencode-teamwork/tools.ts"
 import {
+  bindVerifiedDeclaration,
+  checkLeanAxiomDependencies,
   classifyRoute,
   detectLeanProofHoles,
   formatMissingToolchainRefusal,
+  parseLeanAxiomOutput,
+  parseLeanDeclarations,
   probeLemmaToolchain,
   stripLeanComments,
   stripLeanCommentsAndStrings,
@@ -2837,8 +2841,31 @@ try {
 // ==========================================
 {
   console.log("Testing LEMMA / Lean 4 formal-proof route...")
+  const repoRoot = fileURLToPath(new URL("..", import.meta.url))
   const savedPath = process.env.PATH ?? ""
   const lemmaTestDir = mkdtempSync(join(tmpdir(), "teamwork-lemma-test-"))
+
+  // --- 9.0 Sentinel/orchestrator plan calls must record the verbatim request.
+  {
+    const sentinel = readFileSync(join(repoRoot, "agents/team/sentinel.md"), "utf8")
+    const planStart = sentinel.indexOf("**Build the DAG.**")
+    const planEnd = sentinel.indexOf("**Provision the sentinel worktree")
+    assert(planStart >= 0 && planEnd > planStart, "sentinel must document the Build the DAG step")
+    const planStep = sentinel.slice(planStart, planEnd)
+    assert(/\brequest\b/.test(planStep), "sentinel Build the DAG step must pass the verbatim `request` to teamwork_plan")
+    assert(planStep.includes("ORIGINAL_REQUEST.md"), "sentinel must state that request is recorded in ORIGINAL_REQUEST.md")
+    assert(/verbatim/i.test(planStep), "sentinel must require the request verbatim")
+    assert(
+      /ORIGINAL_REQUEST\.md/.test(sentinel.slice(sentinel.indexOf("LEMMA bounded workflow"), sentinel.indexOf("The worker commits"))),
+      "sentinel LEMMA workflow must point both formalization reviews at ORIGINAL_REQUEST.md",
+    )
+
+    const orchestrator = readFileSync(join(repoRoot, "agents/team/orchestrator.md"), "utf8")
+    const orchPlan = orchestrator.slice(orchestrator.indexOf("**Plan**"), orchestrator.indexOf("**Propose**"))
+    assert(/\brequest\b/.test(orchPlan), "orchestrator Plan step must pass the verbatim `request` to teamwork_plan")
+    assert(orchPlan.includes("ORIGINAL_REQUEST.md"), "orchestrator must state that request is recorded in ORIGINAL_REQUEST.md")
+    console.log("✓ 9.0 sentinel/orchestrator teamwork_plan calls record the verbatim request")
+  }
 
   const makeToolsFor = async (root) => {
     const tools = {}
@@ -2880,6 +2907,24 @@ const src = target && fs.existsSync(target) ? fs.readFileSync(target, "utf8") : 
 if (src.includes("SYNTAX_ERROR")) {
   console.error(target + ":1:0: error: expected command");
   process.exit(1);
+}
+const axiomMatch = src.match(/#print axioms\\s+([^\\s]+)/);
+if (axiomMatch) {
+  const name = axiomMatch[1];
+  if (src.includes("AXIOM_SORRY_DEP")) {
+    console.log("'" + name + "' depends on axioms: [sorryAx, Classical.choice, propext, Quot.sound]");
+    process.exit(0);
+  }
+  if (src.includes("AXIOM_BAD_DEP")) {
+    console.log("'" + name + "' depends on axioms: [my_evil_ax]");
+    process.exit(0);
+  }
+  if (src.includes("AXIOM_CUSTOM_DEP")) {
+    console.log("'" + name + "' depends on axioms: [my_custom_ax]");
+    process.exit(0);
+  }
+  console.log("'" + name + "' does not depend on any axioms");
+  process.exit(0);
 }
 if (src.includes("COMPILER_SORRY_WARN")) {
   process.stderr.write(target + ":1:0: warning: declaration uses 'sorry'\\n");
@@ -3292,7 +3337,7 @@ process.exit(0);
       })
       await tools.lemma_formalize.execute({ sessionId: RUN, action: "draft", leanCode: "theorem t : 1 = 1 := by sorry" })
       await tools.lemma_formalize.execute({ sessionId: RUN, action: "review_pre", verdict: "APPROVE", notes: "ok" })
-      await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "root" })
+      await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "root", declaration: "t", statement: "1 = 1" })
 
       // V3.16: direct update to status: "disproved" without verification must be refused
       const directDisproved = await tools.lemma_node.execute({ sessionId: RUN, action: "update", lemmaId: "root", status: "disproved" })
@@ -3380,6 +3425,152 @@ process.exit(0);
       console.log("✓ 9.4 stub-binary sorry/admit/axiom + exit-code + final_verify verified")
     }
 
+    // --- 9.4b Proposition binding + transitive axiom dependencies ---
+    {
+      // Pure parsing/binding helper (no Lean required).
+      const exactSrc = "theorem t : 1 = 1 := by rfl"
+      const exactDecls = parseLeanDeclarations(exactSrc)
+      assert.strictEqual(exactDecls.length, 1, "exactly one theorem declaration must be parsed")
+      assert.strictEqual(exactDecls[0].name, "t")
+      assert.strictEqual(exactDecls[0].normalizedType, "1 = 1")
+
+      const exact = bindVerifiedDeclaration(exactSrc, { declaration: "t", statement: "1 = 1" })
+      assert.strictEqual(exact.ok, true, `exact declaration must bind: ${exact.findings}`)
+
+      const whitespace = bindVerifiedDeclaration("theorem t : 1   =   1 := by rfl", { declaration: "t", statement: "1 = 1" })
+      assert.strictEqual(whitespace.ok, true, `whitespace-different type must bind: ${whitespace.findings}`)
+
+      const multiline = parseLeanDeclarations("theorem add_zero_eq (n : Nat) :\n    n + 0 = n := by simp")
+      assert.strictEqual(multiline[0].normalizedType, "(n : Nat) : n + 0 = n", "multiline type must keep binders and normalize newlines")
+      assert.strictEqual(
+        bindVerifiedDeclaration("theorem add_zero_eq (n : Nat) : n + 0 = n := by simp", {
+          declaration: "add_zero_eq",
+          statement: "(n : Nat) :\n  n + 0 = n",
+        }).ok,
+        true,
+        "multiline whitespace differences must bind",
+      )
+
+      const wrongName = bindVerifiedDeclaration(exactSrc, { declaration: "other", statement: "1 = 1" })
+      assert.strictEqual(wrongName.ok, false, "wrong declaration name must be rejected")
+      assert(wrongName.findings.some((f) => f.includes("does not declare expected theorem/lemma")), wrongName.findings.join("; "))
+
+      const wrongType = bindVerifiedDeclaration(exactSrc, { declaration: "t", statement: "2 = 2" })
+      assert.strictEqual(wrongType.ok, false, "wrong statement type must be rejected")
+      assert(wrongType.findings.some((f) => f.includes("does not match approved node statement")), wrongType.findings.join("; "))
+
+      const missing = bindVerifiedDeclaration("def x : Nat := 1", { declaration: "t", statement: "1 = 1" })
+      assert.strictEqual(missing.ok, false, "missing declaration must be rejected")
+      assert(missing.findings.some((f) => f.includes("declares no theorem/lemma")), missing.findings.join("; "))
+
+      const disproof = bindVerifiedDeclaration("theorem notP : ¬(1 = 2) := by omega", {
+        declaration: "notP",
+        statement: "1 = 2",
+        disproof: true,
+      })
+      assert.strictEqual(disproof.ok, true, `disprove node must accept the declared negation: ${disproof.findings}`)
+      assert.strictEqual(
+        bindVerifiedDeclaration("theorem notP : ¬(1 = 2) := by omega", { declaration: "notP", statement: "1 = 2" }).ok,
+        false,
+        "disprove negation must not satisfy a proved node",
+      )
+
+      const noAx = parseLeanAxiomOutput("'t' does not depend on any axioms")
+      assert.strictEqual(noAx.recognized, true)
+      assert.deepStrictEqual(noAx.unauthorized, [])
+      const standardAx = parseLeanAxiomOutput("'t' depends on axioms: [propext, Classical.choice, Quot.sound]")
+      assert.deepStrictEqual(standardAx.unauthorized, [], "standard Lean axioms must be allowed")
+      const sorryAx = parseLeanAxiomOutput("'t' depends on axioms: [sorryAx, propext]", ["sorryAx"])
+      assert.deepStrictEqual(sorryAx.unauthorized, ["sorryAx"], "sorryAx must never be allowlisted")
+      assert.strictEqual(parseLeanAxiomOutput("'t' depends on axioms: [my_ax]").unauthorized[0], "my_ax")
+      assert.deepStrictEqual(parseLeanAxiomOutput("'t' depends on axioms: [my_ax]", ["my_ax"]).unauthorized, [])
+      assert.strictEqual(parseLeanAxiomOutput("unparseable output").recognized, false)
+
+      // Toolchain absent: the axiom probe must fail closed, never PASS.
+      const axTmpDir = mkdtempSync(join(lemmaTestDir, "axiom-notool-"))
+      const axTmpFile = join(axTmpDir, "attempt.lean")
+      writeFileSync(axTmpFile, exactSrc + "\n", "utf8")
+      const noToolAx = checkLeanAxiomDependencies({
+        filePath: axTmpFile,
+        declaration: "t",
+        cwd: axTmpDir,
+        env: { PATH: "" },
+      })
+      assert.strictEqual(noToolAx.executed, false, "axiom check must fail closed without lean")
+      assert(noToolAx.check.findings.some((f) => f.includes("not found on PATH")), "missing toolchain must be reported")
+      assert(!noToolAx.check.recognized, "failed axiom probe must not be treated as recognized")
+
+      const stubBin = makeFullStubEnv("binding")
+      process.env.PATH = `${stubBin}:${savedPath}`
+      const rootB = mkdtempSync(join(lemmaTestDir, "root-binding-"))
+      const tools = await makeToolsFor(rootB)
+      const setupRun = async (RUN, maxRetries = 4) => {
+        await tools.plan.execute({
+          sessionId: RUN,
+          topology: "proof",
+          lemmaMode: true,
+          lemmaBounds: { maxRetries },
+          skipInterview: true,
+          tasks: [{ id: "L1", agent: "team/proof-worker" }],
+        })
+        await tools.lemma_formalize.execute({ sessionId: RUN, action: "draft", leanCode: "theorem t : 1 = 1 := by sorry" })
+        await tools.lemma_formalize.execute({ sessionId: RUN, action: "review_pre", verdict: "APPROVE", notes: "ok" })
+        await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "root", declaration: "t", statement: "1 = 1" })
+      }
+
+      const RUN = "20261018-000000-lemma-binding"
+      await setupRun(RUN)
+      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 1, leanCode: "theorem other : 1 = 1 := by rfl" })
+      const vWrongName = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 1 })
+      assert.strictEqual(vWrongName.report.status, "FAIL", "a valid but differently named theorem must not pass")
+      assert(
+        vWrongName.report.findings.some((f) => f.includes("does not declare expected theorem/lemma")),
+        `wrong-name finding missing: ${JSON.stringify(vWrongName.report.findings)}`,
+      )
+
+      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 2, leanCode: "theorem t : 2 = 2 := by rfl" })
+      const vWrongType = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 2 })
+      assert.strictEqual(vWrongType.report.status, "FAIL", "a valid theorem with the wrong type must not pass")
+      assert(
+        vWrongType.report.findings.some((f) => f.includes("does not match approved node statement")),
+        `wrong-type finding missing: ${JSON.stringify(vWrongType.report.findings)}`,
+      )
+
+      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 3, leanCode: "theorem t : 1  =  1 := by rfl" })
+      const vWhitespace = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 3 })
+      assert.strictEqual(vWhitespace.report.status, "PASS", `whitespace-only type difference must PASS: ${JSON.stringify(vWhitespace.report)}`)
+      assert.strictEqual(vWhitespace.report.declaration, "t")
+      assert.deepStrictEqual(vWhitespace.report.unauthorizedAxioms, [])
+      assert(vWhitespace.node.status === "proved", "bound declaration must mark the node proved")
+
+      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 4, leanCode: "-- AXIOM_SORRY_DEP\ntheorem t : 1 = 1 := by rfl" })
+      const vTransitiveSorry = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 4 })
+      assert.strictEqual(vTransitiveSorry.report.status, "FAIL", "transitive sorryAx must FAIL even with a clean source text")
+      assert.strictEqual(vTransitiveSorry.report.hasSorry, true, "transitive sorryAx must set hasSorry")
+      assert(vTransitiveSorry.report.unauthorizedAxioms.includes("sorryAx"), "transitive sorryAx must be reported")
+
+      const RUN_AX = "20261018-000000-lemma-axioms"
+      await setupRun(RUN_AX, 2)
+      await tools.lemma_node.execute({ sessionId: RUN_AX, action: "attempt", lemmaId: "root", round: 1, leanCode: "-- AXIOM_BAD_DEP\ntheorem t : 1 = 1 := by rfl" })
+      const vBadAx = await tools.lemma_verify.execute({ sessionId: RUN_AX, lemmaId: "root", round: 1 })
+      assert.strictEqual(vBadAx.report.status, "FAIL", "unauthorized transitive axiom must FAIL")
+      assert(vBadAx.report.unauthorizedAxioms.includes("my_evil_ax"), "unauthorized dependency must be reported")
+      assert.strictEqual(vBadAx.report.hasUnauthorizedAxiom, true)
+
+      await tools.lemma_node.execute({ sessionId: RUN_AX, action: "attempt", lemmaId: "root", round: 2, leanCode: "-- AXIOM_CUSTOM_DEP\ntheorem t : 1 = 1 := by rfl" })
+      const vAllowedAx = await tools.lemma_verify.execute({
+        sessionId: RUN_AX,
+        lemmaId: "root",
+        round: 2,
+        allowedAxioms: ["my_custom_ax"],
+      })
+      assert.strictEqual(vAllowedAx.report.status, "PASS", `allowlisted transitive axiom must PASS: ${JSON.stringify(vAllowedAx.report)}`)
+      assert(vAllowedAx.report.axiomDependencies.includes("my_custom_ax"))
+      assert.deepStrictEqual(vAllowedAx.report.unauthorizedAxioms, [])
+
+      console.log("✓ 9.4b declaration binding + transitive axiom dependencies verified")
+    }
+
     // --- 9.5 Security containment ---
     {
       const stubBin = makeFullStubEnv("sec")
@@ -3418,7 +3609,7 @@ process.exit(0);
       // Reviewer Finding 4: symlinked cwd in lemma_verify must be refused via realpathSync/lstatSync containment
       await tools.lemma_formalize.execute({ sessionId: RUN, action: "draft", leanCode: "theorem t : 1 = 1 := by sorry" })
       await tools.lemma_formalize.execute({ sessionId: RUN, action: "review_pre", verdict: "APPROVE", notes: "ok" })
-      await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "root" })
+      await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "root", declaration: "t", statement: "1 = 1" })
       await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 1, leanCode: "theorem t : 1 = 1 := by rfl" })
       symlinkSync(outside, join(rootSec, "escape-cwd"))
       const symCwdRes = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 1, cwd: "escape-cwd" })
@@ -3450,7 +3641,7 @@ process.exit(0);
         assert(planLive.content.startsWith("Planned"))
         await tools.lemma_formalize.execute({ sessionId: RUN, action: "draft", leanCode: "theorem add_zero_eq (n : Nat) : n + 0 = n := by sorry" })
         await tools.lemma_formalize.execute({ sessionId: RUN, action: "review_pre", verdict: "APPROVE", notes: "faithful" })
-        await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "root" })
+        await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "root", declaration: "add_zero_eq", statement: "(n : Nat) : n + 0 = n" })
         await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 1, leanCode: "theorem add_zero_eq (n : Nat) : n + 0 = n := by sorry" })
         const liveSorry = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 1 })
         assert.strictEqual(liveSorry.report.status, "FAIL", "live Lean sorry must FAIL")

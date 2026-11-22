@@ -16,10 +16,11 @@ import {
   realpathSync,
   renameSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs"
 import { execFileSync, spawnSync } from "node:child_process"
-import { createHash } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path"
 
 export const MAX_LEMMA_DEPTH = 3
@@ -847,6 +848,334 @@ export function detectLeanProofHoles(
   return { hasSorry, hasAdmit, hasUnauthorizedAxiom, findings }
 }
 
+// ---------------------------------------------------------------------------
+// Declaration binding (verified attempt must prove the approved proposition)
+// ---------------------------------------------------------------------------
+
+export interface LeanDeclaration {
+  name: string
+  type: string
+  normalizedType: string
+}
+
+export interface DeclarationBindingExpectation {
+  declaration?: string | null
+  statement: string
+  disproof?: boolean
+}
+
+export interface DeclarationBindingResult {
+  ok: boolean
+  declaration?: LeanDeclaration
+  findings: string[]
+}
+
+const LEAN_DECL_START_RE =
+  /(?:^|\n)[ \t]*(?:@\[[^\]]*\][ \t]*)*(?:(?:private|protected|noncomputable|unsafe|partial)[ \t]+)*(theorem|lemma)[ \t]+(«[^»]+»|[A-Za-z_][A-Za-z0-9_'.]*)/g
+
+/** Collapse whitespace in a Lean statement/type so formatting differences do not matter. */
+export function normalizeLeanStatement(statement: unknown): string {
+  return stripLeanComments(String(statement ?? ""))
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+/**
+ * Extract top-level `theorem`/`lemma` declarations (name + the type written
+ * between the name and the terminating `:=`). Comments are stripped first, so
+ * commented-out declarations are ignored. This is intentionally a lexical
+ * helper: it is used for proposition binding before/without invoking Lean.
+ */
+export function parseLeanDeclarations(source: string): LeanDeclaration[] {
+  const code = stripLeanComments(String(source ?? ""))
+  const starts: Array<{ name: string; bodyStart: number; start: number }> = []
+  for (const m of code.matchAll(LEAN_DECL_START_RE)) {
+    const start = m.index ?? 0
+    starts.push({ name: m[2], start, bodyStart: start + m[0].length })
+  }
+
+  const declarations: LeanDeclaration[] = []
+  for (let i = 0; i < starts.length; i++) {
+    const end = i + 1 < starts.length ? starts[i + 1].start : code.length
+    const rawBody = code.slice(starts[i].bodyStart, end)
+    const proofIdx = rawBody.indexOf(":=")
+    const rawSignature = (proofIdx >= 0 ? rawBody.slice(0, proofIdx) : rawBody).trim()
+    // `theorem foo : P` -> the type is `P`; `theorem foo (n : Nat) : P` keeps
+    // the binders so the recorded statement can be compared verbatim.
+    const type = rawSignature.replace(/^:\s*/, "").trim()
+    declarations.push({ name: starts[i].name, type, normalizedType: normalizeLeanStatement(type) })
+  }
+  return declarations
+}
+
+/**
+ * Fail-closed binding check: the attempt's declaration name must be the
+ * expected one (or the only theorem/lemma when no name is recorded) and its
+ * type must equal the approved node statement after whitespace normalization.
+ * A `disprove`/`disproved` node must declare the negation instead.
+ */
+export function bindVerifiedDeclaration(
+  source: string,
+  expected: DeclarationBindingExpectation,
+): DeclarationBindingResult {
+  const declarations = parseLeanDeclarations(source)
+  const expectedName = stripGuillemets(clean(expected.declaration ?? "", 128).trim())
+  const statement = normalizeLeanStatement(expected.statement)
+  const findings: string[] = []
+
+  if (declarations.length === 0) {
+    return {
+      ok: false,
+      findings: ["verified attempt declares no theorem/lemma; cannot bind it to the approved statement"],
+    }
+  }
+  if (!statement) {
+    findings.push("approved node statement is empty; cannot bind the verified declaration to a proposition")
+  }
+
+  let declaration: LeanDeclaration | undefined
+  if (expectedName) {
+    declaration = declarations.find((d) => stripGuillemets(d.name) === expectedName)
+    if (!declaration) {
+      const found = declarations.map((d) => d.name).join(", ")
+      findings.push(
+        `verified attempt does not declare expected theorem/lemma "${expectedName}" (found: ${found || "none"})`,
+      )
+    }
+  } else if (declarations.length === 1) {
+    declaration = declarations[0]
+  } else {
+    findings.push(
+      `cannot bind proposition: verified attempt declares ${declarations.length} theorem/lemma candidates and no declaration name is recorded on the node`,
+    )
+  }
+
+  if (declaration && statement) {
+    const actual = declaration.normalizedType
+    if (expected.disproof) {
+      const shown = statement
+      const candidates = new Set(
+        [
+          `Not (${shown})`,
+          `¬(${shown})`,
+          `¬ (${shown})`,
+          `¬${shown}`,
+          `Not ${shown}`,
+        ].map((s) => normalizeLeanStatement(s)),
+      )
+      if (!candidates.has(actual)) {
+        findings.push(
+          `declared type "${clean(actual, 240)}" is not the required negation of the approved statement "${clean(shown, 240)}"`,
+        )
+      }
+    } else if (actual !== statement) {
+      findings.push(
+        `declared type "${clean(actual, 240)}" does not match approved node statement "${clean(statement, 240)}"`,
+      )
+    }
+  }
+
+  return { ok: findings.length === 0, declaration, findings }
+}
+
+// ---------------------------------------------------------------------------
+// Transitive axiom dependencies (`#print axioms <declName>`)
+// ---------------------------------------------------------------------------
+
+/** Axioms Lean itself and Mathlib treat as standard, non-proof-relevant trust. */
+export const STANDARD_LEAN_AXIOMS = ["Classical.choice", "propext", "Quot.sound"] as const
+
+export interface AxiomDependencyCheck {
+  recognized: boolean
+  dependencies: string[]
+  unauthorized: string[]
+  findings: string[]
+}
+
+/**
+ * Parse Lean's `#print axioms` output and reject anything outside the standard
+ * axioms plus the caller's allowlist. `sorryAx` is never allowed, even if a
+ * caller tries to allowlist it.
+ */
+export function parseLeanAxiomOutput(output: unknown, allowedAxioms: string[] = []): AxiomDependencyCheck {
+  const text = String(output ?? "")
+  const findings: string[] = []
+  let dependencies: string[] = []
+
+  const depends = text.match(/depends on axioms:\s*\[([\s\S]*?)\]/i)
+  if (depends) {
+    dependencies = depends[1]
+      .split(",")
+      .map((d) => stripGuillemets(d.trim()))
+      .filter(Boolean)
+  } else if (/does not depend on any axioms/i.test(text)) {
+    dependencies = []
+  } else {
+    return {
+      recognized: false,
+      dependencies: [],
+      unauthorized: [],
+      findings: ["could not determine transitive axiom dependencies from Lean output (failing closed)"],
+    }
+  }
+
+  const allowed = new Set<string>(STANDARD_LEAN_AXIOMS)
+  for (const a of allowedAxioms) {
+    const name = stripGuillemets(String(a ?? "").trim())
+    if (name) allowed.add(name)
+  }
+
+  const unauthorized: string[] = []
+  for (const dep of dependencies) {
+    const name = stripGuillemets(dep)
+    if (!name) continue
+    if (name === "sorryAx" || !allowed.has(name)) unauthorized.push(name)
+  }
+
+  const uniqueDeps = [...new Set(dependencies)]
+  const uniqueUnauthorized = [...new Set(unauthorized)]
+  if (uniqueUnauthorized.length > 0) {
+    findings.push(`unauthorized transitive axiom dependency: ${uniqueUnauthorized.join(", ")}`)
+  }
+  return { recognized: true, dependencies: uniqueDeps, unauthorized: uniqueUnauthorized, findings }
+}
+
+export interface LeanAxiomProbeOptions {
+  filePath: string
+  declaration: string
+  cwd?: string
+  mode?: "lean" | "lake-env-lean" | "lake-build"
+  env?: NodeJS.ProcessEnv
+  timeoutMs?: number
+  allowedAxioms?: string[]
+}
+
+export interface LeanAxiomProbeResult {
+  executed: boolean
+  check: AxiomDependencyCheck
+  stdout: string
+  stderr: string
+  error?: string
+}
+
+function isSafeLeanDeclarationName(name: unknown): name is string {
+  return typeof name === "string" && /^(?:«[^»]+»|[A-Za-z_][A-Za-z0-9_'.]*)$/.test(name)
+}
+
+/**
+ * Compile the attempt plus `#print axioms <declaration>` in a throwaway file
+ * (same cwd/mode/timeout discipline as the attempt check) and parse the axiom
+ * set. Fails closed when the toolchain is unavailable or the output cannot be
+ * interpreted.
+ */
+export function checkLeanAxiomDependencies(options: LeanAxiomProbeOptions): LeanAxiomProbeResult {
+  const empty: AxiomDependencyCheck = { recognized: false, dependencies: [], unauthorized: [], findings: [] }
+  const declaration = options.declaration
+  if (!isSafeLeanDeclarationName(declaration)) {
+    return {
+      executed: false,
+      check: {
+        ...empty,
+        findings: [`refused: unsafe Lean declaration name "${clean(declaration, 80)}"; cannot check transitive axioms`],
+      },
+      stdout: "",
+      stderr: "",
+      error: "unsafe declaration name",
+    }
+  }
+
+  const read = readBoundedRegular(options.filePath)
+  if (read.error || read.text === undefined) {
+    return {
+      executed: false,
+      check: { ...empty, findings: [read.error ?? "could not read Lean attempt for axiom check"] },
+      stdout: "",
+      stderr: "",
+      error: read.error,
+    }
+  }
+
+  const env = options.env ?? process.env
+  const timeoutMs = Math.max(500, Math.min(120000, Number(options.timeoutMs) || 30000))
+  const mode = options.mode ?? "lean"
+  const cwd = options.cwd ?? dirname(options.filePath)
+  const binName = mode === "lean" ? "lean" : "lake"
+  const binPath = resolveExecutableOnPath(binName, env.PATH)
+  if (!binPath) {
+    return {
+      executed: false,
+      check: {
+        ...empty,
+        findings: [`${binName} executable not found on PATH; cannot check transitive axiom dependencies (failing closed)`],
+      },
+      stdout: "",
+      stderr: "",
+      error: `${binName} not found on PATH`,
+    }
+  }
+
+  const probePath = join(
+    dirname(options.filePath),
+    `.lemma-axioms-${process.pid}-${randomBytes(8).toString("hex")}.lean`,
+  )
+  const probeSource = `${read.text.endsWith("\n") ? read.text : read.text + "\n"}#print axioms ${declaration}\n`
+  try {
+    writeFileSync(probePath, probeSource, { encoding: "utf8", flag: "wx" })
+  } catch (err: any) {
+    return {
+      executed: false,
+      check: { ...empty, findings: [`could not write axiom probe: ${clean(err?.message, 160)}`] },
+      stdout: "",
+      stderr: "",
+      error: clean(err?.message, 160),
+    }
+  }
+
+  let stdout = ""
+  let stderr = ""
+  let error: string | undefined
+  let executed = false
+  try {
+    const args = mode === "lean" ? [probePath] : ["env", "lean", probePath]
+    const proc = spawnSync(binPath, args, {
+      cwd,
+      env,
+      timeout: timeoutMs,
+      maxBuffer: 1024 * 1024,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: false,
+    })
+    stdout = typeof proc.stdout === "string" ? proc.stdout : String(proc.stdout ?? "")
+    stderr = typeof proc.stderr === "string" ? proc.stderr : String(proc.stderr ?? "")
+    const status = typeof proc.status === "number" ? proc.status : -1
+    if (proc.error) {
+      const code = (proc.error as any)?.code
+      error = code === "ETIMEDOUT" ? `${binName} axiom probe timed out after ${timeoutMs}ms` : clean(proc.error.message || code, 200)
+    } else if (proc.status === null) {
+      error = `${binName} axiom probe terminated by signal ${proc.signal ?? "unknown"}`
+    } else if (status !== 0) {
+      error = `${binName} axiom probe exited with status ${status}`
+    } else {
+      executed = true
+    }
+  } finally {
+    try {
+      unlinkSync(probePath)
+    } catch {}
+  }
+
+  const check = parseLeanAxiomOutput(`${stdout}\n${stderr}`, options.allowedAxioms ?? [])
+  if (error) check.findings.unshift(error)
+  return {
+    executed: executed && check.recognized,
+    check,
+    stdout: cleanBlock(stdout, 4000),
+    stderr: cleanBlock(stderr, 4000),
+    ...(error ? { error } : {}),
+  }
+}
+
 export interface LeanVerifyOptions {
   filePath: string
   cwd?: string
@@ -1078,6 +1407,7 @@ export interface LemmaNodeRecord {
   parentId: string | null
   depth: number
   statement: string
+  declaration?: string | null
   status: "pending" | "informal" | "formal" | "disprove" | "review" | "proved" | "disproved" | "blocked"
   attempts: number
   verifiedRound: number | null
@@ -1395,6 +1725,7 @@ export function mutateLemmaNode(
     lemmaId: string
     parentId?: string | null
     statement?: string
+    declaration?: string
     status?: string
     blueprint?: string
     leanCode?: string
@@ -1419,6 +1750,9 @@ export function mutateLemmaNode(
   if (params.action === "create") {
     if (Object.prototype.hasOwnProperty.call(nodes, lemmaId)) {
       return { error: `refused: duplicate lemmaId "${lemmaId}"` }
+    }
+    if (params.declaration !== undefined && params.declaration.trim() && !isSafeLeanDeclarationName(params.declaration.trim())) {
+      return { error: `refused: invalid declaration "${clean(params.declaration, 80)}" (must be a Lean theorem/lemma name)` }
     }
     const existingCount = Object.keys(nodes).length
     if (existingCount >= bounds.maxNodes) {
@@ -1468,6 +1802,7 @@ export function mutateLemmaNode(
       parentId,
       depth,
       statement: cleanBlock(params.statement ?? "", 2000),
+      declaration: params.declaration ? clean(params.declaration, 128).trim() || null : null,
       status: status as LemmaNodeRecord["status"],
       attempts: 0,
       verifiedRound: null,
@@ -1574,6 +1909,16 @@ export function mutateLemmaNode(
   if (typeof params.statement === "string") {
     node.statement = cleanBlock(params.statement, 2000)
   }
+  if (typeof params.declaration === "string") {
+    const decl = params.declaration.trim()
+    if (!decl) {
+      node.declaration = null
+    } else if (!isSafeLeanDeclarationName(decl)) {
+      return { error: `refused: invalid declaration "${clean(params.declaration, 80)}" (must be a Lean theorem/lemma name)` }
+    } else {
+      node.declaration = clean(decl, 128)
+    }
+  }
   node.updatedAt = now
   manifest.nodes = nodes
   manifest.updatedAt = now
@@ -1590,6 +1935,37 @@ export interface StampedLemmaVerifyReport extends LeanVerifyResult {
   attemptFile: string
   attemptHash?: string
   allowedAxioms: string[]
+  declaration?: string
+  declarationType?: string
+  axiomDependencies?: string[]
+  unauthorizedAxioms?: string[]
+}
+
+/**
+ * Resolve what the attempt must prove: the node's recorded `declaration` and
+ * `statement`, falling back to the single declaration in the approved
+ * `lemma/problem.lean` when the node does not record them. A node statement
+ * always wins over the fallback, so an approved informal statement cannot be
+ * silently replaced by the formalization.
+ */
+function expectedDeclarationForNode(
+  runDir: string,
+  node: LemmaNodeRecord,
+): { declaration: string | null; statement: string } {
+  const recorded = node.declaration ? stripGuillemets(clean(node.declaration, 128).trim()) : ""
+  const statement = cleanBlock(node.statement ?? "", 2000).trim()
+  if (recorded) return { declaration: recorded, statement }
+
+  const probSafe = ensureSafeSubpath(runDir, "lemma/problem.lean")
+  if (probSafe.error || !probSafe.path) return { declaration: null, statement }
+  const probRead = readBoundedRegular(probSafe.path)
+  if (probRead.error || probRead.text === undefined) return { declaration: null, statement }
+  const declarations = parseLeanDeclarations(probRead.text)
+  if (declarations.length !== 1) return { declaration: null, statement }
+  return {
+    declaration: stripGuillemets(declarations[0].name),
+    statement: statement || declarations[0].type,
+  }
 }
 
 export function verifyLemmaNodeAttempt(
@@ -1652,6 +2028,46 @@ export function verifyLemmaNodeAttempt(
     allowedAxioms: normalizedAllowedAxioms,
     ...res,
   }
+
+  // Acceptance is not proof of the assignment: bind the verified declaration to
+  // the approved proposition and check its transitive axiom dependencies before
+  // the PASS branch can mark the node proved/disproved.
+  if (report.status === "PASS") {
+    const expected = expectedDeclarationForNode(runDir, node)
+    const binding = bindVerifiedDeclaration(attemptRead.text, {
+      declaration: expected.declaration,
+      statement: expected.statement,
+      disproof: node.status === "disprove" || node.status === "disproved",
+    })
+    if (!binding.ok || !binding.declaration) {
+      report.status = "FAIL"
+      report.findings.push(...binding.findings)
+    } else {
+      const declaration = stripGuillemets(binding.declaration.name)
+      report.declaration = declaration
+      report.declarationType = binding.declaration.normalizedType
+      const axioms = checkLeanAxiomDependencies({
+        filePath: attemptSafe.path,
+        declaration,
+        cwd: params.cwd ?? dirname(attemptSafe.path),
+        mode: params.mode ?? "lean",
+        env: params.env,
+        allowedAxioms: normalizedAllowedAxioms,
+      })
+      report.axiomDependencies = axioms.check.dependencies
+      report.unauthorizedAxioms = axioms.check.unauthorized
+      if (!axioms.executed || !axioms.check.recognized || axioms.check.unauthorized.length > 0) {
+        report.status = "FAIL"
+        if (axioms.check.unauthorized.length > 0) report.hasUnauthorizedAxiom = true
+        if (axioms.check.unauthorized.includes("sorryAx")) report.hasSorry = true
+        report.findings.push(...axioms.check.findings)
+        if (axioms.check.findings.length === 0) {
+          report.findings.push(axioms.error ?? "transitive axiom check failed (failing closed)")
+        }
+      }
+    }
+  }
+
   const verifyRel = `lemma/nodes/${params.lemmaId}/verify-${round}.json`
   const wVer = writeJsonAtomicSafe(runDir, verifyRel, report)
   if (wVer.error || !wVer.path) return { error: wVer.error ?? "failed to write verify report" }
