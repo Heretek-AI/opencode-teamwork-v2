@@ -47,8 +47,9 @@ task until it passes.
 
 ## Highlights
 
-- 11 agents: Sentinel, Orchestrator, Crafter, Scout, Worker, Proof Worker,
-  Proposer, Falsifier, Synthesizer, Verifier, Security Auditor
+- 14 agents: Sentinel, Orchestrator, Crafter, Scout, Worker, Proof Worker,
+  Proposer, Falsifier, Synthesizer, Verifier, Security Auditor, Segment Reviewer,
+  Formalization Reviewer, Referee
 - 7 slash commands (`/teamwork`, `/teamwork-craft`, `/team-orchestrate`,
   `/team-propose`, `/team-falsify`, `/team-synthesize`, `/team-review`)
 - DAG runner, per-agent git worktrees, verification loops until PASS, cost tracking

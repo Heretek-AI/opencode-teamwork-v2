@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-11-22
+
+### Added
+
+- Document Review route (`#1`): bounded segment triage and a review/synthesis tree, `teamwork_document_triage` and `teamwork_document_record`, `team/segment-reviewer`, and the `document-review` topology. It triggers only for a supplied document whose deliverable is a critique, ahead of Math/Proof.
+- LEMMA Lean 4 formal-proof route (`#2`): a pre-spend capability gate, a bounded lemma tree, `team/formalization-reviewer`, kernel/sorry/axiom verification, declaration-to-statement binding, transitive `#print axioms` checks, and a plan-time axiom policy.
+- Bounded massive-proof tournament (`#3`): explicit opt-in only, budget preflight with the 80% dispatch halt cap, the `teamwork_tournament` state machine, ranked candidates, referee verdict gating, and cancellation/partial reports.
+- ADRs 0001–0003 (`#5`, `#6`, `#4`): reject a shared mutable swarm board, retain the single artifact root pending per-conversation storage, and record successor handoff as not possible on this host. ADR 0004 proposes a post-open containment check for intermediate symlink races.
+- Roster expansion (`#7`): 14 agents, including the segment reviewer, formalization reviewer and referee, each consumed by a route, with explicit deny sets and a documented roster table.
+- `lemma-e2e` CI job: live Lean 4 + LEAP CLI verification on a core-only toolchain (no Mathlib), which fails if the live E2E is skipped.
+
+### Changed
+
+- Security hardening across the engine, `lib/` and `bin/`: atomic `O_CREAT|O_EXCL` writes, `O_NOFOLLOW|O_NONBLOCK` reads with `fstat` as the authority, symlink/FIFO refusals, and session-id allowlisting before localhost API calls.
+- LEMMA install contract now names the real LEAP CLI (`pipx install git+https://github.com/billkunghappy/LEAP-CLI@…`) instead of the non-existent `leap-tools` PyPI package; `leap` or legacy `leap-tools` satisfies the gate.
+- The axiom allowlist is now approved at plan time, validated and persisted in `lemma/manifest.json`; callers can no longer widen it at verification time. Legacy runs fail closed to the standard axioms.
+
+### Fixed
+
+- `ORIGINAL_REQUEST.md` is created write-once with `O_EXCL`, removing a check-then-use race.
+- `teamwork_next` revalidates tournament evidence before accepting a stamped PASS, and cancellation retries repair the run checkpoint.
+- Committed tournament budgets persist, missing `costs.json` blocks work instead of skipping enforcement, and referee authorization follows the trusted session identity.
+- `events.jsonl` sequence counting uses one descriptor, and a non-regular file can no longer block or redirect a read.
+
+### Security
+
+- CodeQL: no open alerts on `main`. Four vendored `docs/re/**` alerts are dismissed as test/documentation evidence, and four `js/file-access-to-http` findings are dismissed as accepted risk (session identifiers sent only to the authenticated localhost service).
+
 ## [0.5.9] - 2026-11-22
 
 ### Added
