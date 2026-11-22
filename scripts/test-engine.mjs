@@ -18,6 +18,7 @@ import {
   verifyLeanFile,
 } from "../plugins/opencode-teamwork/lemma.ts"
 import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
+import { renderGateStatus } from "../plugins/opencode-teamwork/strict.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import {
   currentModels,
@@ -1712,6 +1713,62 @@ try {
   assert.strictEqual(reworkFinalJson.evidence.strict.tasks[0].audit.reportHash, sha256(reworkedReportText))
 
   console.log("✓ strict wave is report-hash bound: reworked reports make old verdicts stale, and only a new-report re-record can pass")
+
+  // GATE_STATUS cells escape backslashes before pipes, so a value like
+  // `PASS\|INJECT` cannot terminate or split the Markdown table.
+  const hostileVerdict = "PASS\\|INJECT"
+  const escapedVerdict = "PASS" + "\\".repeat(3) + "|INJECT"
+  const hostileGateMd = renderGateStatus({
+    sessionId: "sess\\|id",
+    finalStatus: "FAIL",
+    reasons: ["stale \\| reason"],
+    gate: {
+      mode: "strict",
+      skipped: false,
+      ok: false,
+      status: "FAIL",
+      reasons: [],
+      missing: [],
+      tasks: [
+        {
+          id: "T1",
+          workerStatus: "verified_pass",
+          reportStatus: "PASS",
+          challenge: {
+            path: "verify/challenge-T1.json",
+            present: true,
+            verdict: hostileVerdict,
+            agent: "team/falsifier",
+            reportHash: null,
+            ok: true,
+            reasons: [],
+          },
+          audit: {
+            path: "verify/audit-T1.json",
+            present: true,
+            verdict: "CLEAN",
+            agent: "team/security-auditor",
+            reportHash: null,
+            ok: true,
+            reasons: [],
+          },
+        },
+      ],
+    },
+  })
+  assert(
+    hostileGateMd.includes(`| team/falsifier | challenger | ${escapedVerdict} | verify/challenge-T1.json |`),
+    `the challenger cell must escape backslash then pipe: ${hostileGateMd}`,
+  )
+  assert(
+    hostileGateMd.includes(`| team/security-auditor | auditor | CLEAN | verify/audit-T1.json |`),
+    "the audit row must still render normally",
+  )
+  assert(
+    !hostileGateMd.split("\n").some((line) => line.includes("| challenger | PASS|INJECT |")),
+    "an unescaped pipe must never appear in the challenger row",
+  )
+  console.log("✓ GATE_STATUS cell escaping neutralizes backslash+pipe table injection")
 
   const seedStrictGateRun = async (runId, taskId) => {
     await seedVerifiedRun(runId, [taskId], {
