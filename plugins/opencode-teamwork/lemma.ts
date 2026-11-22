@@ -465,7 +465,8 @@ export function formatMissingToolchainRefusal(probe: LemmaProbeResult): string {
 
 function describeProbe(t: BinaryProbeResult): string {
   if (t.available) return `READY (${t.version ?? t.path})`
-  return `${t.status}${t.path ? ` at ${t.path}` : ""} (${t.error ?? "unavailable"})`
+  const location = t.path ? ` at ${t.path}` : ""
+  return `${t.status}${location} (${t.error ?? "unavailable"})`
 }
 
 // ---------------------------------------------------------------------------
