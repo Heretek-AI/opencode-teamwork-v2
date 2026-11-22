@@ -56,7 +56,7 @@ AD
 AD
 4. **Build the DAG.**
    - **For `document-review`:** call `teamwork_document_triage` with `{ sessionId, request, document, maxSegments, reviewTreeShape, synthTreeShape, budgetUsd, budgetSource, skipInterview, fetchUrl }` (passing `fetchUrl: true` when ingesting a URL without inline `content`). It validates path containment, PDF/Markdown ingestion, and bounded RSA shapes (`maxSegments <= 8`, `reviewTreeShape <= [4, 2, 1]`, `synthTreeShape <= [4, 1]`) before creating anything, then writes `plan.dag.json` (`seg-01`..`seg-0K` assigned to `team/segment-reviewer` + `doc-synthesis` assigned to `team/synthesizer`) and `document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}`. **Skip git worktrees** for `document-review` (no repository code is modified).
-   - **For all other topologies:** call `teamwork_plan` with the topology, the task list (dependencies included), and the user's verbatim request as `request` (so `<run>/ORIGINAL_REQUEST.md` is written). It creates the run directory, writes `plan.dag.json` / `state.json` / `costs.json`, and returns the canonical `SESSION_ID`. **Use only that value for every path and branch name — never a session id read out of a file.** It is safe to interpolate (matches `^[0-9A-Za-z._-]+$`); the tool refuses anything else. Independent tasks run in parallel.
+   - **For all other topologies:** call `teamwork_plan` with the topology, the task list (dependencies included), and the user's verbatim request as `request` (so `<run>/ORIGINAL_REQUEST.md` is written). When the spec has numbered requirements/acceptance criteria, pass them as `requirements: [{ id, text }]` (ids like `R1`, `R2`; max 50) so `<run>/requirements.json` becomes the fidelity baseline; otherwise the request-derived `R1` is used. Leave `victoryAudit` at its default `required` (never skip silently; `skip` must be an explicit, recorded choice). It creates the run directory, writes `plan.dag.json` / `state.json` / `costs.json`, and returns the canonical `SESSION_ID`. **Use only that value for every path and branch name — never a session id read out of a file.** It is safe to interpolate (matches `^[0-9A-Za-z._-]+$`); the tool refuses anything else. Independent tasks run in parallel.
 5. **Provision the sentinel worktree (skip for `document-review`).** Call `teamwork_worktree` with `{ action: "setup", role: "sentinel" }`   to safely provision the sentinel worktree outside the repo:
    `git worktree add "${TEAMWORK_WORKTREES_DIR:-../.teamwork-worktrees}/$SESSION_ID/sentinel" -b "teamwork/base-$SESSION_ID"`
    (skip if not in a git repo or on `document-review`). Layout and schemas: `ARTIFACTS.md`.
@@ -97,8 +97,12 @@ AD
     - If `FAIL` (Critical/High findings), `teamwork_next` blocks final merge (`BLOCKED_BY_SECURITY`). Remediate findings before proceeding.
     - If `PASS`, `teamwork_next` transitions to `READY_FOR_FINAL_VERIFICATION`.
 11. **Final verification (Mandatory Stamped Gate).** Once all tasks and the security audit pass, spawn a dedicated verifier with `agent: "team/verifier"` to independently verify the final merged result against the spec's acceptance criteria and call `teamwork_final_verify` to stamp `.opencode/teamwork/$SESSION_ID/verify/final.json`.
-12. **Final merge or present & cleanup.**
-    - Once `teamwork_final_verify` stamps `PASS` and `teamwork_next` reports `ALL_TASKS_PASSED`, merge the sentinel worktree branch (`teamwork/base-$SESSION_ID`) back to the user's working branch.
+12. **Independent victory audit (Mandatory Fidelity Gate).** After the milestone gate PASS, dispatch a **fresh-session** `agent: "team/victory-auditor"` with `ORIGINAL_REQUEST.md` and `requirements.json`. It must inspect the delivered artifacts and run/inspect the tests itself. It records the result with `teamwork_victory_audit`:
+    - `VICTORY CONFIRMED` means completion may be reported.
+    - `VICTORY REJECTED` means completion is blocked: forward its `findings` and resume the team for another round, then re-run final verification and a new audit.
+    Never report completion before `teamwork_next` returns `ALL_PASSED` with the victory verdict confirmed (or the plan explicitly recorded `victoryAudit: "skip"`).
+13. **Final merge or present & cleanup.**
+    - Once `teamwork_final_verify` stamps `PASS`, the victory audit is `CONFIRMED` (or explicitly skipped), and `teamwork_next` reports `ALL_TASKS_PASSED`, merge the sentinel worktree branch (`teamwork/base-$SESSION_ID`) back to the user's working branch.
     - Clean up worktrees via `teamwork_worktree({ action: "cleanup" })`.
     - On partial success or deadlock, present the partial result and open verification reports, and surface PASS/FAIL in `final.md`.
 
@@ -118,7 +122,8 @@ AD
 - `teamwork_next` — evaluates DAG dependencies, lifecycle states, and injects known pitfalls into ready tasks; enforces pre-merge security audit gate
 - `teamwork_task_update` — deterministic task state machine transitions (`pending` → `worker_active` → `worker_done` → `verifier_active` → `verified_pass` | `verified_fail` | `blocked`), tracking rounds, branches, diff summaries, and verification results
 - `teamwork_security_audit` — records `team/security-auditor` findings in `verify/security-audit.json`, enforcing the pre-merge security gate (blocks final merge if Critical/High findings exist)
-- `teamwork_final_verify` — computes `verify/final.json` from disk evidence (including LEMMA `lemma/manifest.json`, `problem.lean`, `formalization-review.json`, and stamped `verify-<r>.json` when `lemmaMode: true`)
+- `teamwork_victory_audit` — records the independent `team/victory-auditor` verdict in `verify/victory.json`; only that trusted agent may call it, every `requirements.json` id must be reported exactly once, and a `CONFIRMED` verdict is write-once and bound to the current `ORIGINAL_REQUEST.md` hash
+- `teamwork_final_verify` — computes `verify/final.json` from disk evidence (including the victory audit, and LEMMA `lemma/manifest.json`, `problem.lean`, `formalization-review.json`, and stamped `verify-<r>.json` when `lemmaMode: true`)
 - `teamwork_route` — read-only priority-ordered route classifier (`document-review` > explicit LEMMA > non-opt-in `.lean` → `distributed-coding` > `massive-proof` > `proof` > coding)
 - `teamwork_lemma_probe` — read-only probe for `lean`, `lake`, and the LEAP CLI (`leap`; legacy `leap-tools` accepted) on `PATH`
 - `teamwork_lemma_formalize` — Phase 0 `problem_draft.lean` / `review_pre` → `problem.lean` and `review_final` faithfulness gate
@@ -135,6 +140,9 @@ AD
   a passing security audit report.
 - Self-certify. The whole point of the architecture is that
   implementers are biased.
+- Report completion before the independent victory audit is `CONFIRMED`.
+- Let the implementer or verifier stand in for `team/victory-auditor`.
+- Skip or soften a `VICTORY REJECTED` verdict.
 - Exceed `budget.maxSessionCostUsd`. Halt non-essential workers
   when you approach it; prompt the user before continuing.
 
@@ -151,6 +159,10 @@ LOAD_SPEC → WORKTREE_INIT → DAG_BUILD → DISPATCH_LOOP
                                         merge to base    retry or blocked
          ↓
        SECURITY_AUDIT (mandatory team/security-auditor pass)
+         ↓
+       FINAL_VERIFICATION (stamped team/verifier)
+         ↓
+       VICTORY_AUDIT (fresh team/victory-auditor; CONFIRMED or explicit skip)
          ↓
        MERGE_SENTINEL | PRESENT_PARTIAL → WORKTREE_CLEANUP
 ```

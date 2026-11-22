@@ -12,7 +12,8 @@ Every run writes under one root:
 .opencode/teamwork/<session-id>/
 ├── prompt_draft.md          # spec (from the crafter, or inlined by the sentinel); required by teamwork_plan unless bypassed
 ├── ORIGINAL_REQUEST.md      # verbatim routed request + integrity mode (write-once; absent on legacy runs)
-├── plan.dag.json            # task DAG (+ preflight gate result)
+├── requirements.json        # plan-time requirements baseline (caller or request-derived; absent when neither exists)
+├── plan.dag.json            # task DAG (+ preflight gate result + victoryAudit mode)
 ├── preflight.json           # input-checks report (written by teamwork_preflight)
 ├── state.json               # resumable coordinator state
 ├── costs.json               # coordinator-maintained budget tracker
@@ -34,6 +35,7 @@ Every run writes under one root:
 ├── verify/report-<task>.json
 ├── verify/summary.json
 ├── verify/security-audit.json # pre-merge security gate report
+├── verify/victory.json        # independent final acceptance verdict (team/victory-auditor)
 ├── verify/final.json          # stamped final verification verdict
 ├── lemma/                     # optional: LEMMA (Lean 4) formal-proof state when lemmaMode=true
 │   ├── manifest.json          # bounds, toolchain snapshot, phase, node index
@@ -150,6 +152,27 @@ Format:
 <verbatim request>
 ~~~
 
+### `requirements.json` — plan-time requirements baseline
+
+`teamwork_plan` writes this once per run when the caller supplies
+`requirements`, or derives a single `R1` item from a supplied verbatim
+`request`. When neither exists (legacy/tiny path), no file is written and the
+plan records `victoryAudit: "skip"` explicitly.
+
+```json
+{
+  "version": 1,
+  "source": "caller|request",
+  "items": [{ "id": "R1", "text": "Behaviour-focused requirement" }]
+}
+```
+
+- `source: "caller"` — the exact validated `requirements` array (order kept).
+- `source: "request"` — one `R1` item containing the request text (≤2,000 chars).
+- **Immutable once written.** A re-plan with a different baseline is refused;
+  the same baseline is idempotent. This stops a confirmed verdict from being
+  invalidated by editing the requirements afterwards.
+
 ### `spec.json` — one per dispatched worker (written by the sentinel)
 
 ```json
@@ -181,6 +204,10 @@ Format:
   "sessionId": "20260112-101500-a1b2",
   "topology": "distributed-coding",
   "integrityMode": "development",
+  "victoryAudit": "required",
+  "victoryAuditSource": "default",
+  "requirementsSource": "request",
+  "requirementsCount": 1,
   "preflight": { "status": "READY", "bypassed": false },
   "tasks": [
     {
@@ -203,6 +230,7 @@ Format:
   "version": 1,
   "sessionId": "20260112-101500-a1b2",
   "integrityMode": "development",
+  "victoryAudit": "required|skip",
   "phase": "LOAD_SPEC|WORKTREE_INIT|DAG_BUILD|DISPATCH|SECURITY_AUDIT|FINAL_VERIFICATION|MERGE|PRESENT_PARTIAL|DONE",
   "tasks": {
     "R1-impl": {
@@ -283,9 +311,10 @@ The plugin provides deterministic orchestration tools for the Sentinel coordinat
 - `teamwork_route`: Deterministic read-only route classifier checking `document-review` FIRST (before Math/Proof) when a supplied document has critique intent while rejecting PR/code reviews, bare filenames without supplied docs, and problem-solving/coding tasks.
 - `teamwork_document_triage`: Validates bounds (`maxSegments <= 8`, `reviewTreeShape <= [4,2,1]`, `synthTreeShape <= [4,1]`), path containment (`realpathSync` + `O_NOFOLLOW`), URL/inline limits, and PDF headers **before** creating any directory, ingests and partitions the document into `seg-01`..`seg-0K` + `doc-synthesis`, and writes `document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}`.
 - `teamwork_document_record`: Persists bounded RSA node outputs (`level-<L>-node-<I>.json`), `unit-report.md`, `synthesis/candidate-<I>.md`, and `DOCUMENT_REVIEW_REPORT.md` with `SEGMENT_ID` allowlist, manifest bounds, symlink refusal, and `clean()`/`cleanBlock()` sanitisation.
-- `teamwork_next`: Evaluates the DAG dependencies against current task lifecycle statuses. Categorizes tasks into `readyForWorker`, `readyForVerifier`, `inProgress`, or terminal conditions (`ALL_TASKS_PASSED` / `DEADLOCK`). Completion additionally requires a stamped `verify/final.json` from `teamwork_final_verify`, unless the caller passes the recorded `allowUnstamped: true` legacy bypass.
+- `teamwork_next`: Evaluates the DAG dependencies against current task lifecycle statuses. Categorizes tasks into `readyForWorker`, `readyForVerifier`, `inProgress`, or terminal conditions (`ALL_TASKS_PASSED` / `DEADLOCK`). Completion additionally requires a stamped `verify/final.json` from `teamwork_final_verify` (unless the caller passes the recorded `allowUnstamped: true` legacy bypass) **and** a `CONFIRMED` `verify/victory.json` bound to the current `ORIGINAL_REQUEST.md`, unless the plan explicitly recorded `victoryAudit: "skip"`. Before a confirmed verdict it returns `READY_FOR_VICTORY_AUDIT` (or `BLOCKED_BY_VICTORY_AUDIT` for a rejection).
 - `teamwork_task_update`: Enforces deterministic state transitions, tracks worker branch names and diff summaries, updates verifier metrics, and advances run `phase` to `MERGE` or `PRESENT_PARTIAL`.
-- `teamwork_final_verify`: Computes the run's final verdict from the artifacts on disk — every task must be `verified_pass`, every `verify/report-<taskId>.json` must be `PASS`, `verify/security-audit.json` must be `PASS`, and when `document-review/manifest.json` exists, every segment's `unit-report.md` and `DOCUMENT_REVIEW_REPORT.md` must exist as non-empty regular files — then writes `verify/final.json` atomically and appends a `final_verification` event. The verdict is computed from evidence; no input can turn a failing run into `PASS` (a caller-supplied `failReason` can only force `FAIL`). See [`verify/final.json`](#verifyfinaljson-final-verification-verdict).
+- `teamwork_victory_audit`: Records the independent final acceptance verdict from `team/victory-auditor`. Only a trusted session whose agent resolves to `team/victory-auditor` may call it; there is no caller-supplied `agent` label. Every `requirements.json` id must appear exactly once, `met: true` needs non-empty evidence, and `VICTORY CONFIRMED` needs a current `ORIGINAL_REQUEST.md` (the verdict stores its sha256). Writes `verify/victory.json`; a confirmed verdict is write-once.
+- `teamwork_final_verify`: Computes the run's final verdict from the artifacts on disk — every task must be `verified_pass`, every `verify/report-<taskId>.json` must be `PASS`, `verify/security-audit.json` must be `PASS`, the victory audit must be `CONFIRMED` (unless explicitly skipped), and when `document-review/manifest.json` exists, every segment's `unit-report.md` and `DOCUMENT_REVIEW_REPORT.md` must exist as non-empty regular files — then writes `verify/final.json` atomically and appends a `final_verification` event. The verdict is computed from evidence; no input can turn a failing run into `PASS` (a caller-supplied `failReason` can only force `FAIL`). See [`verify/final.json`](#verifyfinaljson-final-verification-verdict).
 - `teamwork_worktree`: Isolates git worktrees outside the project repo (`setup` for sentinel and worker), inspects branch diffs (`diff`), performs clean merges into `teamwork/base-$SESSION_ID` with automatic conflict abort (`merge`), and prunes worktrees (`cleanup`).
 - `teamwork_preflight`: Re-checks the inputs named by an existing run's `ORIGINAL_REQUEST.md` (plus optional `inputs`), writes `<run>/preflight.json`, and appends a `preflight` event. It never throws and never blocks; it reports.
 
@@ -304,6 +333,8 @@ With no spec and neither override, the call is refused with an actionable messag
 | --- | --- | --- | --- |
 | `request` | string | omitted | The verbatim text the run was routed on (≤20,000 chars). Recorded once in `ORIGINAL_REQUEST.md` before any plan file; omitting it creates no artifact. |
 | `integrityMode` | `development \| demo \| benchmark` | `development` | Recorded in `ORIGINAL_REQUEST.md`, `state.json` and `plan.dag.json`. Any other value refuses the plan before anything is written. |
+| `requirements` | `Array<{id, text}>` | omitted | Up to 50 plan-time requirements. `id` matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$` and must be unique; `text` is non-empty and ≤2,000 chars. Persisted to `requirements.json` (source `caller`). Invalid/duplicate items refuse the plan before anything is written. |
+| `victoryAudit` | `required \| skip` | `required` when a request/requirements baseline exists | Recorded in `plan.dag.json` and `state.json`. A run with no request and no requirements records `skip`; `required` without a baseline is refused. An explicit `skip` makes `final_verify` record `victory: "SKIPPED (explicit)"`. |
 
 The request record is a separate artifact from the approved spec: it does not
 satisfy the spec gate, and the spec gate does not replace it. `teamwork_security_audit`
@@ -505,7 +536,7 @@ plus `agentSource` when an actor exists:
   **Optional on legacy lines**: logs written before `seq` existed have no
   `seq`, and they remain valid.
 - `event` (string): `run_created`, `task_transition`, `security_audit`,
-  `final_verification`, `final_verification_bypass`, or `preflight`
+  `victory_audit`, `final_verification`, `final_verification_bypass`, or `preflight`
 - `sessionId` (string): Run session id (≤64 chars)
 - `taskId` (string or null): Task id (≤64 chars); `null` for run-level events
 - `from` (string or null): Previous task status (≤32 chars)
@@ -528,7 +559,7 @@ plus `agentSource` when an actor exists:
   input-preflight gate was bypassed. Every other event omits it. Sanitised with
   `clean()`.
 
-The six event kinds:
+The seven event kinds:
 
 - `run_created`: written by `teamwork_plan` once the run is created. `taskId` and
   `from` are `null`, `to` is `"pending"`, `round` is `0`, `phase` is `"DAG_BUILD"`.
@@ -548,6 +579,10 @@ The six event kinds:
 - `security_audit`: written by `teamwork_security_audit`. `to` is `"PASS"` or
   `"FAIL"`, and `phase` is the run phase. `taskId`, `from`, `branch`, `worktree` and
   `agent` are `null`, `round` is `0`, and `agentSource` is omitted.
+- `victory_audit`: written by `teamwork_victory_audit` after
+  `verify/victory.json` is saved. `to` is `"VICTORY CONFIRMED"` or
+  `"VICTORY REJECTED"`, `taskId` and `from` are `null`, `round` is `0`, and
+  `agent` is always `"team/victory-auditor"` with `agentSource: "session"`.
 - `preflight`: written by `teamwork_preflight` after `preflight.json` is
   saved. `to` is the overall preflight status (`READY`, `MISSING`, or
   `OUTAGE`); `taskId` and `from` are `null`, `round` is `0`, and `phase` is the
@@ -675,6 +710,38 @@ violation forces `status` to `FAIL`, independently of severity counts.
 
 If `critical` > 0 or `high` > 0, `status` is forced to `FAIL` and `teamwork_next` blocks final merge (`BLOCKED_BY_SECURITY`).
 
+### `verify/victory.json` (independent final acceptance verdict)
+
+```json
+{
+  "version": 1,
+  "sessionId": "20260112-101500-a1b2",
+  "verdict": "VICTORY CONFIRMED|VICTORY REJECTED",
+  "auditor": "team/victory-auditor",
+  "auditorSessionId": "ses_abc123",
+  "requestHash": "<sha256 of ORIGINAL_REQUEST.md>",
+  "requirements": [
+    { "id": "R1", "met": true, "evidence": "npm test tail + src/api.ts:42" }
+  ],
+  "findings": ["Optional concrete gap"],
+  "summary": "Independent acceptance audit prose.",
+  "generatedAt": "ISO8601"
+}
+```
+
+Written only by `teamwork_victory_audit`, which derives the caller from the
+trusted session identity (a caller-supplied label cannot self-authorize). It
+validates that every `requirements.json` id appears exactly once, that
+`met: true` carries non-empty evidence, and that a `CONFIRMED` verdict has a
+current `ORIGINAL_REQUEST.md`; it then stores the request's sha256. A confirmed
+verdict is **write-once** (a later audit cannot overwrite it). On `REJECTED` the
+Sentinel forwards `findings` and resumes the team.
+
+The audit is an ordinary run artifact and therefore unauthenticated: a writer
+already inside the run directory could forge one. `teamwork_final_verify` and
+`teamwork_next` recompute the auditor label, requirement ids, and current
+request hash, which catches stale, mislabelled, or partially edited verdicts.
+
 ### `verify/final.json` (final verification verdict)
 
 ```json
@@ -683,6 +750,7 @@ If `critical` > 0 or `high` > 0, `status` is forced to `FAIL` and `teamwork_next
   "generatedBy": { "agent": "team/verifier", "session": "ses_abc123" },
   "generatedAt": "ISO8601",
   "integrityMode": "development",
+  "victory": "CONFIRMED|FAILED|SKIPPED (explicit)",
   "evidence": {
     "tasks": [
       {
@@ -693,7 +761,8 @@ If `critical` > 0 or `high` > 0, `status` is forced to `FAIL` and `teamwork_next
       }
     ],
     "securityAudit": { "path": "verify/security-audit.json", "status": "PASS" },
-    "allTasksVerifiedPass": true
+    "allTasksVerifiedPass": true,
+    "victory": { "mode": "required", "status": "CONFIRMED", "auditor": "team/victory-auditor", "requestHash": "..." }
   },
   "reasons": [],
   "summary": "Independent final check passed.",
@@ -706,10 +775,15 @@ If `critical` > 0 or `high` > 0, `status` is forced to `FAIL` and `teamwork_next
 `teamwork_final_verify` writes this file atomically. `status` is `PASS` **only**
 when every task in `state.json` is `verified_pass`, every task report
 (`verify/report-<taskId>.json`, task ids validated with the same safe-id
-allowlist) reports `PASS`, and `verify/security-audit.json` reports `PASS`. Any
-unmet condition yields `FAIL` with one entry per condition in `reasons` (capped
-at 100). The verdict is computed from these artifacts and cannot be overridden
-by input: a supplied `failReason` only appends a reason and forces `FAIL`.
+allowlist) reports `PASS`, `verify/security-audit.json` reports `PASS`, and the
+independent victory audit is `CONFIRMED` with every requirement met and a
+`requestHash` matching the current `ORIGINAL_REQUEST.md`. A plan that explicitly
+recorded `victoryAudit: "skip"` records `victory: "SKIPPED (explicit)"` instead.
+Any unmet condition yields `FAIL` with one entry per condition in `reasons`
+(capped at 100), including named victory reasons (`missing`, `VICTORY REJECTED`,
+unmet requirement, stale hash, forged auditor). The verdict is computed from
+these artifacts and cannot be overridden by input: a supplied `failReason` only
+appends a reason and forces `FAIL`.
 
 `generatedBy` records provenance: `agent` is the calling session's agent (or
 `null` when it could not be resolved) and `session` is the calling OpenCode
@@ -732,9 +806,11 @@ unstamped/legacy and cannot complete a run by default. Recompute it with
 | --- | --- | --- |
 | missing/unreadable/malformed | `READY_FOR_FINAL_VERIFICATION` | `FINAL_VERIFICATION` |
 | `status: "FAIL"` | `BLOCKED_BY_FINAL_VERIFICATION` | unchanged |
-| `status: "PASS"`, stamped | `ALL_PASSED` with `stamped: true` | `MERGE` |
+| `status: "PASS"`, stamped | victory check (below) | `MERGE` after it passes |
 | `status: "PASS"`, unstamped, default | `FINAL_VERIFICATION_UNVERIFIED` | `FINAL_VERIFICATION` |
-| `status: "PASS"`, unstamped, `allowUnstamped: true` | `ALL_PASSED` with `stamped: false`, `unstampedBypass: true` | `MERGE` |
+| `status: "PASS"`, unstamped, `allowUnstamped: true` | victory check (below) | `MERGE` after it passes |
+| victory `required`, missing/rejected/stale/forged | `READY_FOR_VICTORY_AUDIT` / `BLOCKED_BY_VICTORY_AUDIT` | `FINAL_VERIFICATION` |
+| victory confirmed (or explicit plan `skip`) | `ALL_PASSED` | `MERGE` |
 
 `allowUnstamped` (boolean, default `false`) is a legacy migration escape hatch.
 It accepts a hand-written report and appends one `final_verification_bypass`

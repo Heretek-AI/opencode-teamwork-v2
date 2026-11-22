@@ -47,6 +47,9 @@ that the Sentinel will reject.
 
 4. **Draft Requirements ($R_1 \dots R_N$)** — 2-5 functional
    requirements focused strictly on *behavior*, not implementation.
+   These become the plan-time `requirements: [{ id, text }]` baseline the
+   Sentinel passes to `teamwork_plan` (and therefore `requirements.json`);
+   the independent `team/victory-auditor` checks each one after delivery.
 
 5. **Design Verification (the Forcing Function)** — How will the
    verifier know the work is done? Automated test? Property test?
