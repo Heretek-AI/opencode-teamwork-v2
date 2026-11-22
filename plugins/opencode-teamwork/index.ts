@@ -31,7 +31,7 @@ const COMMANDS: CommandSpec[] = [
   {
     name: "teamwork",
     description:
-      "Sentinel — main dispatcher. Loads a spec (or asks 1-2 questions), provisions a worktree, builds the DAG, dispatches workers + verifiers, iterates, merges. This is the user-facing /teamwork command.",
+      "Sentinel — main dispatcher. Routes requests (explicit opt-in for massive-proof tournaments), provisions a worktree, builds the DAG, dispatches workers/verifiers/referees, iterates, merges. This is the user-facing /teamwork command.",
     agent: "team/sentinel",
     template: `$ARGUMENTS
 
@@ -54,7 +54,7 @@ Then:
 7. After the run completes (full or partial), perform the independent final verification: spawn a \`team/verifier\` agent to check the final merged result against the spec's acceptance criteria, then have it call \`teamwork_final_verify\`. That tool computes the verdict from the per-task reports and the security audit, stamps provenance, and writes \`.opencode/teamwork/$SESSION_ID/verify/final.json\` — it is the writer, so never hand-write that file. (\`teamwork_next\` only completes a run on a stamped report; a hand-written legacy report needs the explicit \`allowUnstamped: true\` bypass, which is recorded.)
 
 Hard caps (override in the spec if the user asks):
-- 4 rounds per task (6 for proof, 1 for small-focused, 24h for massive-proof)
+- 4 rounds per task (6 for proof, 1 for small-focused, 24h for massive-proof — explicit opt-in only, bounded tournament levels + budget preflight)
 - Budget: derived from opencode_console credits when available (full or partial, per the user), else the default $20 session budget
 
 When done, write \`.opencode/teamwork/<session-id>/final.md\` and present. Tell the user:

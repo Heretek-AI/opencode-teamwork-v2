@@ -42,7 +42,7 @@ import {
   MAX_SEGMENT_CHARS,
   MAX_TEXT_MAP_CHARS,
   SEGMENT_ID,
-  classifyRoute,
+  classifyRoute as classifyDocumentRoute,
   ingestDocument,
   isSafeSegmentId,
   resolveAndReadDocument,
@@ -65,6 +65,35 @@ import {
   type LemmaBounds,
   type LemmaProbeResult,
 } from "./lemma.ts"
+import {
+  TOURNAMENT_ACTIVE_PHASES,
+  TOURNAMENT_PHASES,
+  MAX_MANIFEST_BYTES,
+  MAX_REPORT_BYTES,
+  auditTournament,
+  classifyRoute as classifyTournamentRoute,
+  ensureSafeRunSubpath as ensureSafeTournamentSubpath,
+  estimateTournamentBudget,
+  falsifyCandidate,
+  finalizeTournamentPartial,
+  hasExplicitMassiveProofOptIn,
+  initTournamentManifest,
+  manifestPathOf,
+  mergeCandidates,
+  proposeCandidate,
+  readBoundedFileNoFollow,
+  readBoundedRunFile,
+  readBoundedRunJson,
+  readTournamentManifest,
+  readTournamentVerdict,
+  reportPathOf,
+  resolveAndValidateTournamentConfig,
+  scoreCandidates,
+  tournamentConfigsEqual,
+  tournamentDir,
+  validateTournamentConfig,
+} from "./tournament.ts"
+import type { BudgetEstimate, TournamentConfig, TournamentManifest } from "./tournament.ts"
 
 // ---------------------------------------------------------------------------
 // OpenCode native cost tracking
@@ -144,13 +173,31 @@ function readSnapshots(file: string): SnapshotsFile | undefined {
   }
 }
 
-function writeSnapshots(file: string, value: SnapshotsFile) {
+/**
+ * Write `content` to `file` atomically. The temp file is created with a fresh
+ * random suffix and `O_CREAT|O_EXCL` (`wx`), so a symlink or hard link planted
+ * at the old predictable `<file>.tmp` path cannot redirect the write; the
+ * `renameSync` replaces the destination directory entry itself.
+ */
+function writeTextAtomicSafe(file: string, content: string) {
   refuseSymlink(file)
   mkdirSync(dirname(file), { recursive: true })
-  const tmp = file + ".tmp"
-  refuseSymlink(tmp)
-  writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n")
-  renameSync(tmp, file)
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const tmp = `${file}.${randomBytes(6).toString("hex")}.tmp`
+    try {
+      writeFileSync(tmp, content, { encoding: "utf8", flag: "wx" })
+    } catch (err: any) {
+      if (err?.code === "EEXIST") continue
+      throw err
+    }
+    renameSync(tmp, file)
+    return
+  }
+  throw new Error(`refused: could not create a unique temp file for "${basename(file)}"`)
+}
+
+function writeSnapshots(file: string, value: SnapshotsFile) {
+  writeTextAtomicSafe(file, JSON.stringify(value, null, 2) + "\n")
 }
 
 function getOpencodeDbPath(): string | undefined {
@@ -618,65 +665,21 @@ function isIntegrityRuleForbidden(rule: IntegrityRule, mode: IntegrityMode): boo
 const MAX_RUN_FILE_BYTES = 512 * 1024
 
 
-function readBoundedRunFile(
-  run: string,
-  file: string,
-  maxBytes = MAX_RUN_FILE_BYTES,
-): { status: "ok"; text: string } | { status: "absent" } | { status: "error"; error: string } {
-  try {
-    ensureSafeRunSubpath(run, file)
-  } catch (err: any) {
-    return { status: "error", error: String(err?.message ?? "refused: unsafe path") }
-  }
-  const flags = fsConstants.O_RDONLY | (typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0)
-  let fd: number
-  try {
-    fd = openSync(file, flags)
-  } catch (err: any) {
-    if (err?.code === "ENOENT") return { status: "absent" }
-    if (err?.code === "ELOOP") {
-      return { status: "error", error: `refused: refusing to read through symlink "${basename(file)}"` }
-    }
-    return { status: "error", error: `refused: cannot open "${basename(file)}"` }
-  }
-  try {
-    const fst = fstatSync(fd)
-    if (!fst.isFile()) {
-      return { status: "error", error: `refused: "${basename(file)}" is not a regular file` }
-    }
-    if (fst.size > maxBytes) {
-      return { status: "error", error: `refused: "${basename(file)}" exceeds size cap (${fst.size} > ${maxBytes})` }
-    }
-    const buf = Buffer.alloc(fst.size)
-    let offset = 0
-    while (offset < fst.size) {
-      const n = readSync(fd, buf, offset, fst.size - offset, offset)
-      if (n <= 0) break
-      offset += n
-    }
-    return { status: "ok", text: buf.subarray(0, offset).toString("utf8") }
-  } catch {
-    return { status: "error", error: `refused: failed reading "${basename(file)}"` }
-  } finally {
-    try {
-      closeSync(fd)
-    } catch {}
-  }
-}
 
 function readIntegrityMode(run: string): { mode: IntegrityMode; source: "artifact" | "default" } {
   const file = join(run, "ORIGINAL_REQUEST.md")
-  const res = readBoundedRunFile(run, file)
-  if (res.status === "ok") {
-    const text = res.text
-    // Only the metadata block counts: a "- Integrity mode:" line inside the
-    // verbatim request body must never override the header.
-    const splitAt = text.indexOf("\n## Request")
-    const header = splitAt === -1 ? text : text.slice(0, splitAt)
-    const m = header.match(/^- Integrity mode:[ \t]*(\S+)[ \t]*$/m)
-    const mode = m && normalizeIntegrityMode(m[1])
-    if (mode) return { mode, source: "artifact" }
-  }
+  try {
+    const text = readRunText(file)
+    if (text !== undefined) {
+      // Only the metadata block counts: a "- Integrity mode:" line inside the
+      // verbatim request body must never override the header.
+      const splitAt = text.indexOf("\n## Request")
+      const header = splitAt === -1 ? text : text.slice(0, splitAt)
+      const m = header.match(/^- Integrity mode:[ \t]*(\S+)[ \t]*$/m)
+      const mode = m && normalizeIntegrityMode(m[1])
+      if (mode) return { mode, source: "artifact" }
+    }
+  } catch {}
   return { mode: DEFAULT_INTEGRITY_MODE, source: "default" }
 }
 
@@ -833,38 +836,30 @@ function summarizePreflight(items: PreflightItem[]) {
 
 /** Read the verbatim request body back out of `<run>/ORIGINAL_REQUEST.md`. */
 function readRecordedRequest(run: string): string | undefined {
-  const file = join(run, "ORIGINAL_REQUEST.md")
-  const res = readBoundedRunFile(run, file)
-  if (res.status !== "ok") return undefined
-  const text = res.text
-  const marker = "\n## Request\n"
-  const at = text.indexOf(marker)
-  if (at === -1) return undefined
-  let body = text.slice(at + marker.length)
-  if (body.startsWith("\n")) body = body.slice(1)
-  return body
+  try {
+    const text = readRunText(join(run, "ORIGINAL_REQUEST.md"))
+    if (text === undefined) return undefined
+    const marker = "\n## Request\n"
+    const at = text.indexOf(marker)
+    if (at === -1) return undefined
+    let body = text.slice(at + marker.length)
+    if (body.startsWith("\n")) body = body.slice(1)
+    return body
+  } catch {
+    return undefined
+  }
 }
 
 /**
  * Write `<run>/ORIGINAL_REQUEST.md` exactly once, before any plan files.
  * `request` is preserved byte-for-byte (no reflow, no trimming). Returns an
  * actionable error string on refusal; the caller must then write nothing else.
- * The open with `wx` makes "once" true even across two concurrent planners.
+ * The open with `wx` (O_CREAT|O_EXCL) makes "once" true even across two
+ * concurrent planners and refuses an existing file/symlink: there is deliberately
+ * no exists/read pre-check, which would be a redundant check-then-use race.
  */
 function writeOriginalRequest(run: string, request: string, mode: IntegrityMode, sessionId: string): string | undefined {
   const file = join(run, "ORIGINAL_REQUEST.md")
-  try {
-    refuseSymlink(file)
-  } catch (err: any) {
-    return `refused: ${clean(err?.message, 160)}; nothing else was written`
-  }
-  const existingRes = readBoundedRunFile(run, file)
-  if (existingRes.status === "error") {
-    return `refused: cannot read ${file}; refusing to overwrite a request that may already be recorded`
-  }
-  if (existingRes.status === "ok" && existingRes.text.trim()) {
-    return `refused: ${file} already records this run's request and is write-once.\nUse a new session (a new teamwork_plan sessionId) for a different request. Nothing was written.`
-  }
   const body = `# Original Request\n\n- Integrity mode: ${mode}\n- Recorded: ${new Date().toISOString()}\n- Session: ${sessionId}\n\n## Request\n\n${request}`
   try {
     writeFileSync(file, body.endsWith("\n") ? body : body + "\n", { flag: "wx" })
@@ -903,6 +898,7 @@ const READ_ONLY_ACTIONS: Record<string, Set<string>> = {
   "team/security-auditor": new Set(["edit", "webfetch", "subagent"]),
   "team/segment-reviewer": new Set(["edit", "shell", "subagent", "webfetch"]),
   "team/formalization-reviewer": new Set(["edit", "shell", "subagent", "webfetch"]),
+  "team/referee": new Set(["edit", "shell", "subagent", "webfetch"]),
 }
 
 const pad = (n: number) => String(n).padStart(2, "0")
@@ -910,7 +906,7 @@ const pad = (n: number) => String(n).padStart(2, "0")
 function newSessionId(): string {
   const d = new Date()
   const ts = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
-  const hex = randomBytes(2).toString("hex")
+  const hex = randomBytes(4).toString("hex")
   return `${ts}-${hex}`
 }
 
@@ -973,18 +969,42 @@ function runsDir(root: string) {
   return join(root, RUN_ROOT)
 }
 
+/**
+ * Caps for run-dir reads. These are local artifacts (state, plans, reports,
+ * specs, free text); a larger file is treated as unreadable rather than loaded.
+ */
+const MAX_RUN_JSON_BYTES = 8 * 1024 * 1024
+const MAX_RUN_TEXT_BYTES = 1 * 1024 * 1024
+
+/**
+ * Bounded, symlink- and FIFO-safe text read for a run artifact. Returns
+ * `undefined` for absent/refused/unreadable files so callers fall back exactly
+ * as before, but an outside file can never be pulled into run context. The
+ * underlying reader is `readBoundedFileNoFollow` (O_NOFOLLOW|O_NONBLOCK +
+ * fstat in tournament.ts). Known gap: authn of run content is out of scope —
+ * a writer already inside the run dir can still influence context, never a
+ * verdict (verdicts are recomputed from evidence).
+ */
+function readRunText(file: string, maxBytes = MAX_RUN_TEXT_BYTES): string | undefined {
+  const res = readBoundedFileNoFollow(file, maxBytes)
+  return res.status === "ok" ? res.text : undefined
+}
+
 function readPitfalls(run: string, taskId?: string): string[] {
-  const file = join(run, "pitfalls.md")
-  const res = readBoundedRunFile(run, file)
-  if (res.status !== "ok") return []
-  const lines = res.text
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l.startsWith("-"))
-    .map((l) => clean(l.replace(/^-\s*/, ""), 200))
-  if (!taskId) return lines
-  const targetTag = `seen in ${clean(taskId, 64)}`
-  return lines.filter((l) => !l.includes("seen in ") || l.includes(targetTag))
+  try {
+    const content = readRunText(join(run, "pitfalls.md"))
+    if (content === undefined) return []
+    const lines = content
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith("-"))
+      .map((l) => clean(l.replace(/^-\s*/, ""), 200))
+    if (!taskId) return lines
+    const targetTag = `seen in ${clean(taskId, 64)}`
+    return lines.filter((l) => !l.includes("seen in ") || l.includes(targetTag))
+  } catch {
+    return []
+  }
 }
 
 /**
@@ -1086,20 +1106,17 @@ function resolveRun(root: string, sessionId?: string): { run?: string; error?: s
 }
 
 function readJson<T>(file: string, fallback: T): T {
+  const text = readRunText(file, MAX_RUN_JSON_BYTES)
+  if (text === undefined) return fallback
   try {
-    return JSON.parse(readFileSync(file, "utf8")) as T
+    return JSON.parse(text) as T
   } catch {
     return fallback
   }
 }
 
 function writeJson(file: string, value: unknown) {
-  refuseSymlink(file)
-  mkdirSync(dirname(file), { recursive: true })
-  const tmp = file + ".tmp"
-  refuseSymlink(tmp)
-  writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n")
-  renameSync(tmp, file)
+  writeTextAtomicSafe(file, JSON.stringify(value, null, 2) + "\n")
 }
 
 function touch(file: string, content: string) {
@@ -1170,7 +1187,15 @@ function nextEventSeq(file: string): number {
 async function appendEvent(
   run: string,
   ev: {
-    event: "run_created" | "task_transition" | "security_audit" | "final_verification" | "final_verification_bypass" | "preflight"
+    event:
+      | "run_created"
+      | "task_transition"
+      | "security_audit"
+      | "final_verification"
+      | "final_verification_bypass"
+      | "preflight"
+      | "tournament_step"
+      | "tournament_cancelled"
     sessionId: string
     taskId?: string | null
     from?: string | null
@@ -1255,6 +1280,17 @@ function withFileLock<T>(key: string, fn: () => Promise<T> | T): Promise<T> {
  * Compact, sanitised run summary injected into team agents' system prompt.
  * Only whitelisted/enumerated fields are emitted; no raw file content.
  */
+const UNSAFE_PATH_RE =
+  /symlink|escapes|outside|containment|not a regular file|not accessible|not resolvable|unreadable|invalid path segment|intermediate path/i
+
+function isUnsafePathError(msg: string): boolean {
+  return /^refused:/i.test(msg) || UNSAFE_PATH_RE.test(msg)
+}
+
+function isUnsafePathDetail(msg: string): boolean {
+  return UNSAFE_PATH_RE.test(msg)
+}
+
 export function describeRun(root: string): string | undefined {
   const { run } = resolveRun(root)
   if (!run) return undefined
@@ -1278,9 +1314,19 @@ export function describeRun(root: string): string | undefined {
     const pct = budget ? Math.floor((spent / budget) * 100) : 0
     costLine = `Cost: $${spent} of $${budget} (${pct}%)${pct >= 80 ? " — near budget, halt non-essential workers" : ""}.`
   }
+  let tournamentLine: string | undefined
+  const mRes = readTournamentManifest(run)
+  if (mRes.status === "ok") {
+    const m = mRes.manifest
+    const mPhase = TOURNAMENT_PHASES.has(m.phase) ? m.phase : "UNKNOWN"
+    const candList = Object.values(m.candidates || {})
+    const surviving = candList.filter((c) => c && c.status !== "pruned").length
+    tournamentLine = `Tournament: phase ${mPhase}, iter ${Number(m.iteration) || 0}/${Number(m.config?.maxIterations) || 0}, level ${Number(m.currentLevel) || 0}/${Number(m.config?.levels) || 0}, candidates ${candList.length} (${surviving} surviving).`
+  }
   return [
     `[teamwork] active run ${id} — phase ${phase}.`,
     `Tasks: ${pass}/${tasks.length} pass, ${fail} fail. Open pitfalls: ${pitfalls}${pitfallSuffix}.`,
+    ...(tournamentLine ? [tournamentLine] : []),
     costLine,
     `State: ${join(runsDir(root), id, "state.json")} (read it before dispatching).`,
   ].join("\n")
@@ -1329,7 +1375,7 @@ function writeJsonSafe(run: string, targetFile: string, value: unknown) {
 }
 
 function readRegularJson<T>(run: string, targetFile: string): { ok: true; data: T } | { ok: false; reason: "missing" | "symlink" | "invalid" } {
-  const res = readBoundedRunFile(run, targetFile)
+  const res = readBoundedRunFile(run, targetFile, MAX_RUN_FILE_BYTES)
   if (res.status === "absent") return { ok: false, reason: "missing" }
   if (res.status === "error") {
     return res.error.includes("symlink") || res.error.includes("escapes") || res.error.includes("not a regular file")
@@ -1349,7 +1395,7 @@ async function createPlanRun(
   input: any,
   context: any,
   beforeMkdir?: (info: { sessionId: string; run: string; integrityMode: IntegrityMode; topology: string }) => Promise<string | undefined> | string | undefined,
-): Promise<{ ok: true; sessionId: string; run: string; tasks: any[]; topology: string; integrityMode: IntegrityMode; content: string } | { ok: false; content: string }> {
+): Promise<{ ok: true; sessionId: string; run: string; tasks: any[]; topology: string; integrityMode: IntegrityMode; content: string } | { ok: false; content: string; refused?: string; aborted?: boolean }> {
   const sessionId = input.sessionId || newSessionId()
   const resolved = resolveRun(root, sessionId)
   if (resolved.error) return { ok: false, content: resolved.error }
@@ -1408,7 +1454,7 @@ async function createPlanRun(
           return { ok: false, content: `${clean(err?.message, 200)}; nothing was written.` }
         }
       }
-      const existingManRes = readBoundedRunFile(run, join(run, "lemma", "manifest.json"))
+      const existingManRes = readBoundedRunFile(run, join(run, "lemma", "manifest.json"), MAX_RUN_FILE_BYTES)
       if (existingManRes.status === "ok") {
         try {
           const parsedMan = JSON.parse(existingManRes.text)
@@ -1483,21 +1529,94 @@ async function createPlanRun(
       return { ok: false, content: `refused: invalid task id "${clean(ids[i], 32)}" (must be a single segment matching ${TASK_ID})` }
     }
   }
-  // ORIGINAL_REQUEST.md is write-once. Check before the spec gate so a
-  // second request is refused for the right reason and writes nothing.
-  const originalRequestFile = join(run, "ORIGINAL_REQUEST.md")
-  if (request !== undefined) {
-    try {
-      if (existsSync(originalRequestFile) && readFileSync(originalRequestFile, "utf8").trim()) {
+  // Tournament context: explicit opt-in, active-bounds reconciliation, and
+  // budget preflight all run before mkdir. Document-review and LEMMA branches
+  // never enter this block.
+  const isBareLegacyMassiveProofAlias =
+    input.topology === "massive-proof-swarm" &&
+    input.tournamentMode === undefined &&
+    input.massiveProofOptIn === undefined &&
+    input.tournament === undefined &&
+    input.tournamentBounds === undefined &&
+    request === undefined &&
+    input.budgetUsd === undefined &&
+    existsSync(run)
+  const tournamentContextActive = topology === "massive-proof" && !isBareLegacyMassiveProofAlias
+  let validatedTournamentConfig: TournamentConfig | undefined
+  let activeManifestConfig: TournamentConfig | undefined
+  let tournamentEstimate: BudgetEstimate | undefined
+  let existingBudget: number | undefined
+  let optInExplicitFlag = false
+  let optInExplicitSignal = false
+  if (tournamentContextActive) {
+    optInExplicitFlag = input.massiveProofOptIn === true
+    optInExplicitSignal = typeof request === "string" && hasExplicitMassiveProofOptIn(request)
+    const optInGranted = optInExplicitFlag || (input.massiveProofOptIn !== false && optInExplicitSignal)
+    if (!optInGranted) {
+      return {
+        ok: false,
+        content:
+          "refused: massive-proof requires explicit large-team opt-in (massiveProofOptIn: true or explicit large-team request); use topology 'proof' for standard math/proof runs. Nothing was written.",
+        refused: "opt_in_required",
+      }
+    }
+    const cfgRes = resolveAndValidateTournamentConfig(input.tournament, input.tournamentBounds)
+    if (!cfgRes.ok) {
+      return {
+        ok: false,
+        content: cfgRes.conflict
+          ? `refused: ${cfgRes.error}. Nothing was written.`
+          : `refused: invalid tournament config (${cfgRes.error}); nothing was written.`,
+        refused: "invalid_tournament_config",
+      }
+    }
+    validatedTournamentConfig = cfgRes.config
+    const runExistsOrSymlink = existsSync(run)
+    let existingSpent = 0
+    if (runExistsOrSymlink) {
+      const tourDirCheck = ensureSafeTournamentSubpath(run, tournamentDir(run))
+      if (!tourDirCheck.ok) return { ok: false, content: `${tourDirCheck.error}; nothing was written.`, refused: "unsafe_path" }
+      const manifestCheck = ensureSafeTournamentSubpath(run, manifestPathOf(run))
+      if (!manifestCheck.ok) return { ok: false, content: `${manifestCheck.error}; nothing was written.`, refused: "unsafe_path" }
+      const existingCostsRes = readBoundedRunJson<any>(run, join(run, "costs.json"), MAX_MANIFEST_BYTES)
+      if (existingCostsRes.status === "error") return { ok: false, content: `${existingCostsRes.error}; nothing was written.`, refused: "unsafe_path" }
+      if (existingCostsRes.status === "ok") {
+        existingSpent = Number(existingCostsRes.value?.spentUsd) || 0
+        if (typeof existingCostsRes.value?.budgetUsd === "number") existingBudget = existingCostsRes.value.budgetUsd
+      }
+      const activeManifest = readTournamentManifest(run)
+      if (activeManifest.status === "error") return { ok: false, content: `${activeManifest.error}; nothing was written.`, refused: "unsafe_path" }
+      if (activeManifest.status === "ok") activeManifestConfig = activeManifest.manifest.config
+    }
+    if (activeManifestConfig) {
+      const configOmitted = input.tournament === undefined && input.tournamentBounds === undefined
+      if (configOmitted) {
+        validatedTournamentConfig = activeManifestConfig
+      } else if (!tournamentConfigsEqual(validatedTournamentConfig, activeManifestConfig)) {
         return {
           ok: false,
-          content: `refused: ${originalRequestFile} already records this run's request and is write-once.\nUse a new session (a new teamwork_plan sessionId) for a different request. Nothing was written.`,
+          content:
+            "refused: a re-plan cannot change the bounds of an active tournament; omit tournament/tournamentBounds to retain the existing config. Nothing was written.",
+          refused: "invalid_tournament_config",
         }
       }
-    } catch {
-      return { ok: false, content: `refused: cannot read ${originalRequestFile}; refusing to overwrite a request that may already be recorded. Nothing was written.` }
+    }
+    const rawBudget = input.budgetUsd === undefined ? (existingBudget ?? 20) : input.budgetUsd
+    if (typeof rawBudget !== "number" || !Number.isFinite(rawBudget) || rawBudget <= 0) {
+      return { ok: false, content: "refused: massive-proof requires a positive budgetUsd (> 0); nothing was written.", refused: "budget_preflight" }
+    }
+    tournamentEstimate = estimateTournamentBudget(validatedTournamentConfig, existingSpent, rawBudget)
+    if (!tournamentEstimate.sufficient) {
+      return {
+        ok: false,
+        content: `refused: ${tournamentEstimate.refusalReason} (remaining $${tournamentEstimate.remainingUsd.toFixed(2)}, minimum 1-iteration estimate $${tournamentEstimate.estimatedMinUsd.toFixed(2)}, worst-case $${tournamentEstimate.estimatedMaxUsd.toFixed(2)}). Increase budgetUsd or reduce tournament bounds; nothing was written.`,
+        refused: "budget_preflight",
+      }
     }
   }
+  // ORIGINAL_REQUEST.md is write-once. No exists/read pre-check here: the `wx`
+  // write in writeOriginalRequest is the atomic authority (CodeQL #19).
+  const originalRequestFile = join(run, "ORIGINAL_REQUEST.md")
   // 3.4: a run starts from an approved spec (`<run>/prompt_draft.md`). The
   // gate runs BEFORE mkdir, so a refusal leaves no run dir and no plan files
   // behind. `skipInterview` is the explicit, recorded bypass.
@@ -1554,6 +1673,9 @@ async function createPlanRun(
     preflightLine = `Preflight: ${summary.status}${preflight.bypassed ? " (bypassed: allowMissingInputs)" : ""} (${summary.total} item(s); ${summary.unchecked} unchecked)${advisory.length ? `; ${advisory.length} advisory path missing (non-blocking): ${advisory.join(", ")}` : ""}.`
   }
 
+  if (context?.signal?.aborted) {
+    return { ok: false, content: "refused: request aborted before run creation; nothing was written.", aborted: true }
+  }
   if (beforeMkdir) {
     const preErr = await beforeMkdir({ sessionId, run, integrityMode, topology })
     if (preErr) return { ok: false, content: preErr }
@@ -1582,6 +1704,9 @@ async function createPlanRun(
     integrityMode,
     preflight,
     ...(isLemma ? { lemmaMode: true, route: "lemma", lemmaBounds } : rawRoute ? { route: rawRoute } : {}),
+    ...(validatedTournamentConfig && tournamentEstimate
+      ? { tournament: { config: validatedTournamentConfig, estimate: tournamentEstimate } }
+      : {}),
     tasks,
     ...(routingReason ? { routingReason } : {}),
   })
@@ -1617,7 +1742,7 @@ async function createPlanRun(
     }
   }
   // Use ?? (nullish coalescing) so budgetUsd: 0 is respected as "no budget"
-  const budget = input.budgetUsd ?? 20
+  const budget = input.budgetUsd ?? (tournamentContextActive && existingBudget !== undefined ? existingBudget : 20)
   const costsFile = join(run, "costs.json")
   const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
   // Same lock as the cost tool so a re-plan cannot race a concurrent cost call.
@@ -1671,6 +1796,30 @@ async function createPlanRun(
     writeSnapshots(join(run, "snapshots.json"), snaps)
   })
   touch(join(run, "pitfalls.md"), "# Pitfalls\n\n_answer-agnostic failure modes; one per line_\n")
+  if (validatedTournamentConfig && tournamentEstimate) {
+    try {
+      await withFileLock(manifestPathOf(run), async () => {
+        const current = readTournamentManifest(run)
+        if (current.status === "absent") {
+          initTournamentManifest({
+            run,
+            sessionId,
+            config: validatedTournamentConfig!,
+            budgetEstimate: tournamentEstimate!,
+            explicitFlag: optInExplicitFlag,
+            explicitRequestSignal: optInExplicitSignal,
+          })
+        } else if (current.status === "error") {
+          throw new Error(current.error)
+        } else if (!tournamentConfigsEqual(validatedTournamentConfig!, current.manifest.config)) {
+          throw new Error("refused: active tournament bounds cannot be changed by a re-plan.")
+        }
+      })
+    } catch (err: any) {
+      const msg = typeof err?.message === "string" ? err.message : String(err)
+      return { ok: false, content: msg.startsWith("refused:") ? msg : `refused: ${msg}` }
+    }
+  }
   await appendEvent(run, { event: "run_created", sessionId, taskId: null, from: null, to: "pending", round: 0, phase: "DAG_BUILD", specGate, ...(specGate === "satisfied" ? { specPath: specFile } : {}), ...(preflightNote ? { note: preflightNote } : {}) })
   // Backstop: if console credits apply but the budget wasn't derived from
   // them, warn (advisory — the sentinel is instructed to run the preflight).
@@ -1745,6 +1894,24 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             },
             additionalProperties: false,
           },
+          massiveProofOptIn: {
+            type: "boolean",
+            description: "Explicit opt-in required for massive-proof tournaments when tournament context is active.",
+          },
+          tournamentMode: {
+            type: "boolean",
+            description: "Enable bounded massive-proof tournament initialization under tournament/manifest.json.",
+          },
+          tournament: {
+            type: "object",
+            additionalProperties: true,
+            description: "Optional bounded tournament config (levels, branchingFactor/width, maxCandidates, maxIterations, unitCostUsd, passScoreThreshold).",
+          },
+          tournamentBounds: {
+            type: "object",
+            additionalProperties: true,
+            description: "Alias for bounded tournament configuration.",
+          },
           tasks: {
             type: "array",
             items: {
@@ -1766,7 +1933,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       },
       execute: async (input: any, context: any) => {
         const res = await createPlanRun(ctx, root, input, context)
-        return { content: res.content }
+        return { content: res.content, ...(res.ok ? {} : { ...(res.refused ? { refused: res.refused } : {}), ...(res.aborted ? { aborted: true } : {}) }) }
       },
     })
 
@@ -1795,9 +1962,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       },
       execute: (input: any) => {
         // Document Review is the authority for Priority 1; LEMMA owns the
-        // non-document opt-in/gating decision for Priorities 2-7. Both features
-        // must return route + lemmaMode so either caller's tests can assert.
-        const doc = classifyRoute(input || {}, root)
+        // explicit Lean 4 gate for Priority 2; the tournament classifier owns
+        // the explicit massive-proof opt-in for Priority 3. All three features
+        // return route/topology/lemmaMode so any caller's tests can assert.
+        const doc = classifyDocumentRoute(input || {}, root)
         const request = String(input?.request ?? "")
         const lemma = classifyLemmaRoute(
           {
@@ -1805,23 +1973,51 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             inputs: Array.isArray(input?.inputs) ? input.inputs.map(String) : undefined,
             hasDocument: false,
           },
-          root,        )
+          root,
+        )
+        const tournament = classifyTournamentRoute(
+          {
+            request,
+            inputs: Array.isArray(input?.inputs) ? input.inputs.map(String) : undefined,
+            hasDocument: false,
+          },
+          root,
+        )
         let result: any
         if (doc.topology === "document-review") {
           result = {
             ...lemma,
+            ...tournament,
             topology: "document-review",
             route: "document-review",
             lemmaMode: false,
+            massiveProofOptIn: false,
             reason: doc.routingReason,
             routingReason: doc.routingReason,
             documentDetected: true,
           }
         } else if (lemma.lemmaMode) {
           result = {
+            ...tournament,
             ...lemma,
+            topology: "proof",
+            route: "lemma",
+            lemmaMode: true,
+            massiveProofOptIn: false,
             documentDetected: doc.documentDetected,
             routingReason: lemma.reason,
+          }
+        } else if (tournament.topology === "massive-proof") {
+          result = {
+            ...lemma,
+            ...tournament,
+            topology: "massive-proof",
+            route: "massive-proof",
+            massiveProofOptIn: true,
+            lemmaMode: false,
+            documentDetected: doc.documentDetected,
+            reason: tournament.reason,
+            routingReason: tournament.routingReason,
           }
         } else if (
           doc.topology === "proof" &&
@@ -1831,18 +2027,36 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // Bare `.lean`/Lean syntax without an explicit opt-in must not become
           // a proof run; the LEMMA classifier owns this negative-gate decision.
           result = {
+            ...tournament,
             ...lemma,
+            topology: "distributed-coding",
+            route: "general",
+            lemmaMode: false,
             documentDetected: doc.documentDetected,
+            massiveProofOptIn: false,
             routingReason: lemma.reason,
           }
         } else {
+          // The tournament classifier is the full non-document router (proof,
+          // small-focused, iterative, distributed) and owns the massive-proof
+          // opt-in decision. Document Review is owned by the document classifier,
+          // whose negative-trigger guards are stricter. Either classifier can
+          // surface a proof route; non-distributed coding routes prefer the
+          // document classifier's more specific negative-trigger handling.
+          let fallbackTopology = tournament.topology
+          if (doc.topology === "massive-proof") fallbackTopology = tournament.topology
+          else if (tournament.topology === "document-review" || tournament.topology === "massive-proof") fallbackTopology = doc.topology
+          else if (doc.topology === "proof" || tournament.topology === "proof") fallbackTopology = "proof"
+          else if (doc.topology !== "distributed-coding") fallbackTopology = doc.topology
           result = {
             ...lemma,
-            topology: doc.topology,
-            route: doc.topology === "distributed-coding" ? "general" : doc.topology,
+            ...tournament,
+            topology: fallbackTopology,
+            route: fallbackTopology === "distributed-coding" ? "general" : fallbackTopology,
             lemmaMode: false,
-            reason: doc.routingReason,
-            routingReason: doc.routingReason,
+            massiveProofOptIn: false,
+            reason: tournament.reason,
+            routingReason: tournament.routingReason,
             documentDetected: doc.documentDetected,
           }
         }
@@ -2578,6 +2792,662 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     })
 
     editor.add({
+      name: "tournament",
+      description:
+        "Bounded massive-proof tournament state machine (`estimate`, `init`, `propose`, `falsify`, `merge`, `score`, `audit`, `cancel`, `status`). Enforces explicit opt-in, bounded levels/width/candidates, budget preflight, deterministic candidate ranking, AbortSignal/budget-halt cancellation, and team/referee verdict gating.",
+      input: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            description: "estimate | init | propose | falsify | merge | score | audit | cancel | status",
+          },
+          sessionId: { type: "string" },
+          topology: { type: "string" },
+          request: { type: "string" },
+          massiveProofOptIn: { type: "boolean" },
+          budgetUsd: { type: "number" },
+          budgetSource: { type: "string" },
+          tournament: { type: "object", additionalProperties: true },
+          tournamentBounds: { type: "object", additionalProperties: true },
+          tasks: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string" },
+                dependsOn: { type: "array", items: { type: "string" } },
+                requirements: { type: "array", items: { type: "string" } },
+                agent: { type: "string" },
+                maxRounds: { type: "number" },
+              },
+              required: ["id"],
+              additionalProperties: true,
+            },
+          },
+          candidateId: { type: "string" },
+          parentIds: { type: "array", items: { type: "string" } },
+          summary: { type: "string" },
+          proofSketch: { type: "string" },
+          agent: { type: "string" },
+          closeRound: { type: "boolean" },
+          closeLevel: { type: "boolean" },
+          verdict: { type: "string" },
+          reason: { type: "string" },
+          counterexample: { type: "string" },
+          scores: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                candidateId: { type: "string" },
+                soundness: { type: "number" },
+                completeness: { type: "number" },
+                clarity: { type: "number" },
+                verdict: { type: "string" },
+                notes: { type: "string" },
+              },
+              required: ["candidateId", "soundness", "completeness", "clarity", "verdict"],
+              additionalProperties: false,
+            },
+          },
+          finalize: { type: "boolean" },
+          winnerId: { type: "string" },
+        },
+        required: ["action"],
+        additionalProperties: false,
+      },
+      execute: async (input: any, context: any) => {
+        const action = clean(input?.action, 32).trim()
+        const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+
+        if (action === "estimate") {
+          const cfgRes = resolveAndValidateTournamentConfig(input?.tournament, input?.tournamentBounds)
+          if (!cfgRes.ok) {
+            return {
+              content: cfgRes.conflict ? `refused: ${cfgRes.error}` : `refused: invalid tournament config (${cfgRes.error})`,
+              ok: false,
+              refused: "invalid_tournament_config",
+            }
+          }
+          let existingSpent = 0
+          let existingBudget: number | undefined
+          if (input?.sessionId) {
+            const resolved = resolveRun(root, input.sessionId)
+            if (resolved.error) return { content: resolved.error, ok: false }
+            const run = resolved.run as string
+            if (existsSync(run)) {
+              const costsRes = readBoundedRunJson<any>(run, join(run, "costs.json"), MAX_MANIFEST_BYTES)
+              if (costsRes.status === "error") return { content: costsRes.error, ok: false, refused: "unsafe_path" }
+              if (costsRes.status === "ok") {
+                existingSpent = Number(costsRes.value?.spentUsd) || 0
+                if (typeof costsRes.value?.budgetUsd === "number") existingBudget = costsRes.value.budgetUsd
+              }
+            }
+          }
+          const rawBudget = input?.budgetUsd === undefined ? (existingBudget ?? 20) : input.budgetUsd
+          if (typeof rawBudget !== "number" || !Number.isFinite(rawBudget) || rawBudget <= 0) {
+            return {
+              content: "refused: massive-proof requires a positive budgetUsd (> 0)",
+              ok: false,
+              refused: "budget_preflight",
+            }
+          }
+          const estimate = estimateTournamentBudget(cfgRes.config, existingSpent, rawBudget)
+          return {
+            content: estimate.sufficient
+              ? `Estimate OK: min $${estimate.estimatedMinUsd.toFixed(2)}, max $${estimate.estimatedMaxUsd.toFixed(2)}, remaining $${estimate.remainingUsd.toFixed(2)} (${estimate.spentPct}% spent).`
+              : `refused: ${estimate.refusalReason}`,
+            ok: estimate.sufficient,
+            sufficient: estimate.sufficient,
+            config: cfgRes.config,
+            estimate,
+            ...(estimate.refusalReason ? { refused: "budget_preflight" } : {}),
+          }
+        }
+
+        if (action === "init") {
+          if (context?.signal?.aborted) {
+            return { content: "refused: request aborted before tournament init; nothing was written.", aborted: true }
+          }
+          const sessionId = input?.sessionId || newSessionId()
+          const resolved = resolveRun(root, sessionId)
+          if (resolved.error) return { content: resolved.error }
+          const run = resolved.run as string
+
+          if (input?.topology !== undefined) {
+            const normTop = normalizeTopology(input.topology)
+            if (normTop !== "massive-proof") {
+              return { content: `refused: tournament init requires topology "massive-proof" (got "${clean(input.topology, 32)}")` }
+            }
+          }
+
+          const request = typeof input?.request === "string" ? input.request : undefined
+          if (request !== undefined && request.length > REQUEST_MAX) {
+            return { content: `refused: request exceeds ${REQUEST_MAX} chars; nothing was written.` }
+          }
+
+          const explicitFlag = input?.massiveProofOptIn === true
+          const explicitSignal = typeof request === "string" && hasExplicitMassiveProofOptIn(request)
+          if (!explicitFlag && !(input?.massiveProofOptIn !== false && explicitSignal)) {
+            return {
+              content: "refused: massive-proof tournament init requires massiveProofOptIn: true (or explicit large-team request); nothing was written.",
+              refused: "opt_in_required",
+            }
+          }
+
+          const cfgRes = resolveAndValidateTournamentConfig(input?.tournament, input?.tournamentBounds)
+          if (!cfgRes.ok) {
+            return {
+              content: cfgRes.conflict
+                ? `refused: ${cfgRes.error}; nothing was written.`
+                : `refused: invalid tournament config (${cfgRes.error}); nothing was written.`,
+              refused: "invalid_tournament_config",
+            }
+          }
+
+          for (const t of input?.tasks || []) {
+            const ids = [t?.id, ...(Array.isArray(t?.dependsOn) ? t.dependsOn : [])]
+            const i = ids.findIndex((id: unknown) => typeof id !== "string" || !isSafeTaskId(id))
+            if (i !== -1) {
+              return { content: `refused: invalid task id "${clean(ids[i], 32)}"; nothing was written.` }
+            }
+          }
+
+          return await withFileLock(manifestPathOf(run), async () => {
+          let existingPlan: any
+          let existingCosts: any
+          let runExistsOrSymlink = existsSync(run)
+          if (!runExistsOrSymlink) {
+            try {
+              lstatSync(run)
+              runExistsOrSymlink = true
+            } catch {}
+          }
+          if (runExistsOrSymlink) {
+            const dirCheck = ensureSafeTournamentSubpath(run, tournamentDir(run))
+            if (!dirCheck.ok) return { content: `${dirCheck.error}; nothing was written.`, refused: "unsafe_path" }
+            const safeCheck = ensureSafeTournamentSubpath(run, manifestPathOf(run))
+            if (!safeCheck.ok) return { content: `${safeCheck.error}; nothing was written.`, refused: "unsafe_path" }
+            if (existsSync(manifestPathOf(run))) {
+              return { content: "refused: tournament/manifest.json already exists for this run." }
+            }
+            const planRes = readBoundedRunJson<any>(run, join(run, "plan.dag.json"), MAX_MANIFEST_BYTES)
+            if (planRes.status === "error") return { content: planRes.error, refused: "unsafe_path" }
+            if (planRes.status === "ok") {
+              existingPlan = planRes.value
+              if (existingPlan.topology && existingPlan.topology !== "massive-proof") {
+                return { content: `refused: run ${sessionId} has topology "${clean(existingPlan.topology, 32)}", expected "massive-proof".` }
+              }
+            }
+            const costsRes = readBoundedRunJson<any>(run, join(run, "costs.json"), MAX_MANIFEST_BYTES)
+            if (costsRes.status === "error") return { content: costsRes.error, refused: "unsafe_path" }
+            if (costsRes.status === "ok") existingCosts = costsRes.value
+          }
+
+          const rawBudget = input?.budgetUsd === undefined ? (existingCosts?.budgetUsd ?? 20) : input.budgetUsd
+          if (typeof rawBudget !== "number" || !Number.isFinite(rawBudget) || rawBudget <= 0) {
+            return { content: "refused: massive-proof requires a positive budgetUsd (> 0); nothing was written.", refused: "budget_preflight" }
+          }
+          const existingSpent = Number(existingCosts?.spentUsd) || 0
+          const estimate = estimateTournamentBudget(cfgRes.config, existingSpent, rawBudget)
+          if (!estimate.sufficient) {
+            return {
+              content: `refused: ${estimate.refusalReason}; nothing was written.`,
+              refused: "budget_preflight",
+              estimate,
+            }
+          }
+
+          try {
+            mkdirSync(run, { recursive: true })
+            if (request !== undefined && !existsSync(join(run, "ORIGINAL_REQUEST.md"))) {
+              const refused = writeOriginalRequest(run, request, DEFAULT_INTEGRITY_MODE, sessionId)
+              if (refused) return { content: refused }
+            }
+            if (!existingPlan) {
+              const tasks = (Array.isArray(input?.tasks) && input.tasks.length ? input.tasks : [{ id: "tournament", agent: "team/proposer" }]).map((t: any) => ({
+                id: clean(t.id, 64),
+                dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.map((d: any) => clean(d, 64)) : [],
+                requirements: Array.isArray(t.requirements) ? t.requirements.map((r: any) => clean(r, 120)) : [],
+                agent: clean(t.agent || "team/proposer", 64),
+                status: "pending",
+                round: 0,
+                maxRounds: Number.isFinite(t.maxRounds) ? t.maxRounds : 4,
+              }))
+              writeJson(join(run, "plan.dag.json"), {
+                sessionId,
+                topology: "massive-proof",
+                integrityMode: DEFAULT_INTEGRITY_MODE,
+                preflight: { status: "SKIPPED" },
+                tasks,
+                tournament: { config: cfgRes.config, estimate },
+              })
+              if (!existsSync(join(run, "state.json"))) {
+                writeJson(join(run, "state.json"), {
+                  version: 1,
+                  sessionId,
+                  integrityMode: DEFAULT_INTEGRITY_MODE,
+                  phase: "DISPATCH",
+                  tasks: nullMap(Object.fromEntries(tasks.map((t: any) => [t.id, { status: "pending", round: 0 }]))),
+                  updatedAt: new Date().toISOString(),
+                })
+              }
+              touch(join(run, "pitfalls.md"), "# Pitfalls\n\n_answer-agnostic failure modes; one per line_\n")
+              await appendEvent(run, {
+                event: "run_created",
+                sessionId,
+                taskId: null,
+                from: null,
+                to: "pending",
+                round: 0,
+                phase: "DAG_BUILD",
+                specGate: "bypassed",
+              })
+            } else {
+              existingPlan.tournament = { config: cfgRes.config, estimate }
+              writeJson(join(run, "plan.dag.json"), existingPlan)
+            }
+
+            // Repair a missing cost record even on a retry (plan may already
+            // exist), and persist the budget this init approved while preserving
+            // accumulated spend and buckets.
+            const costsFile = join(run, "costs.json")
+            await withFileLock(costsFile, async () => {
+              const current = readJson<any>(costsFile, undefined)
+              if (!current) {
+                writeJson(costsFile, {
+                  sessionId,
+                  rootSessionIds: callSession ? [callSession] : [],
+                  budgetUsd: rawBudget,
+                  budgetSource: input?.budgetSource ? clean(input.budgetSource, 32) : "default",
+                  spentUsd: 0,
+                  byTask: nullMap(),
+                  byTaskTokens: nullMap(),
+                  updatedAt: new Date().toISOString(),
+                })
+                return
+              }
+              current.byTask = nullMap(current.byTask)
+              current.byTaskTokens = nullMap(current.byTaskTokens)
+              let changed = false
+              if (callSession) {
+                const roots = Array.isArray(current.rootSessionIds) ? current.rootSessionIds : []
+                if (!roots.includes(callSession)) {
+                  current.rootSessionIds = [...roots, callSession]
+                  changed = true
+                }
+              }
+              if (current.budgetUsd !== rawBudget) {
+                current.budgetUsd = rawBudget
+                changed = true
+              }
+              if (input?.budgetSource && current.budgetSource !== clean(input.budgetSource, 32)) {
+                current.budgetSource = clean(input.budgetSource, 32)
+                changed = true
+              }
+              if (changed) {
+                current.updatedAt = new Date().toISOString()
+                writeJson(costsFile, current)
+              }
+            })
+
+            const manifest = initTournamentManifest({
+              run,
+              sessionId,
+              config: cfgRes.config,
+              budgetEstimate: estimate,
+              explicitFlag,
+              explicitRequestSignal: explicitSignal,
+            })
+            await appendEvent(run, {
+              event: "tournament_step",
+              sessionId,
+              taskId: null,
+              from: null,
+              to: "PROPOSE",
+              round: 1,
+              phase: "PROPOSE",
+            })
+            return {
+              content: `Tournament initialized for ${sessionId} (phase=${manifest.phase}, levels=${manifest.config.levels}, branchingFactor=${manifest.config.branchingFactor}, maxCandidates=${manifest.config.maxCandidates}, maxIterations=${manifest.config.maxIterations}).`,
+              sessionId,
+              manifest,
+            }
+          } catch (err: any) {
+            const msg = typeof err?.message === "string" ? err.message : String(err)
+            if (/^refused:/i.test(msg) || /symlink|escapes|outside|containment/i.test(msg)) {
+              return { content: msg.startsWith("refused:") ? msg : `refused: ${msg}`, refused: "unsafe_path" }
+            }
+            throw err
+          }
+          })
+        }
+
+        const resolved = resolveRun(root, input?.sessionId)
+        if (resolved.error) return { content: resolved.error }
+        const run = resolved.run as string
+        const sessionId = basename(run)
+
+        if (action === "status") {
+          const mRes = readTournamentManifest(run)
+          if (mRes.status === "absent") return { content: `No tournament/manifest.json found for run ${sessionId}.` }
+          if (mRes.status === "error") {
+            return isUnsafePathDetail(mRes.error)
+              ? { content: mRes.error, refused: "unsafe_path" }
+              : { content: mRes.error }
+          }
+          const vRes = readTournamentVerdict(run)
+          const m = mRes.manifest
+          const cands = Object.values(m.candidates || {})
+          const surviving = cands.filter((c) => c && c.status !== "pruned").length
+          return {
+            content: `Tournament ${sessionId}: phase=${m.phase}, iter=${m.iteration}/${m.config.maxIterations}, level=${m.currentLevel}/${m.config.levels}, candidates=${cands.length} (${surviving} surviving).`,
+            phase: m.phase,
+            iteration: m.iteration,
+            currentLevel: m.currentLevel,
+            totalCandidates: cands.length,
+            survivingCandidates: surviving,
+            rankedCandidates: m.rankedCandidates,
+            verdict: vRes.status === "ok" ? vRes.verdict : m.verdict,
+            cancelled: m.cancelled,
+          }
+        }
+
+        const mFile = manifestPathOf(run)
+        try {
+          return await withFileLock(mFile, async () => {
+            const mRes = readTournamentManifest(run)
+            if (mRes.status === "absent") return { content: `No tournament/manifest.json found for run ${sessionId}.` }
+            if (mRes.status === "error") {
+              return isUnsafePathDetail(mRes.error)
+                ? { content: mRes.error, refused: "unsafe_path" }
+                : { content: mRes.error }
+            }
+          const manifest = mRes.manifest
+          const caller = await deriveCallerAgent(ctx, run, callSession)
+
+          if (action === "cancel") {
+            if (manifest.phase === "COMPLETED" || manifest.phase === "FAILED") {
+              return { content: `refused: tournament already finalized with phase ${manifest.phase}.` }
+            }
+            const partial = finalizeTournamentPartial(run, manifest, {
+              trigger: "explicit",
+              reason: typeof input?.reason === "string" && input.reason.trim() ? input.reason : "Cancelled explicitly",
+              phase: "CANCELLED",
+              cancelledBy: caller?.agent ?? null,
+            })
+            if (!partial.alreadyFinalized) {
+              await appendEvent(run, {
+                event: "tournament_cancelled",
+                sessionId,
+                taskId: null,
+                from: null,
+                to: "CANCELLED",
+                round: manifest.iteration,
+                agent: caller?.agent ?? null,
+                agentSource: caller?.agent ? "session" : undefined,
+                phase: "PRESENT_PARTIAL",
+                note: partial.manifest.cancelled?.reason ?? "Cancelled explicitly",
+              })
+            }
+            return {
+              content: `Tournament ${sessionId} ${partial.manifest.phase} (partial report: ${partial.reportPath}).`,
+              phase: partial.manifest.phase,
+              partial: true,
+              alreadyFinalized: partial.alreadyFinalized,
+              reportPath: partial.reportPath,
+              verdict: partial.verdict,
+            }
+          }
+
+          if (!TOURNAMENT_ACTIVE_PHASES.has(manifest.phase)) {
+            return {
+              content: `refused: tournament is ${manifest.phase}; no further dispatch allowed. Report: ${reportPathOf(run)}`,
+              refused: "tournament_terminal",
+              phase: manifest.phase,
+            }
+          }
+
+          if (context?.signal?.aborted) {
+            const partial = finalizeTournamentPartial(run, manifest, {
+              trigger: "signal",
+              reason: "Aborted via AbortSignal",
+              phase: "CANCELLED",
+              cancelledBy: caller?.agent ?? null,
+            })
+            if (!partial.alreadyFinalized) {
+              await appendEvent(run, {
+                event: "tournament_cancelled",
+                sessionId,
+                taskId: null,
+                from: null,
+                to: "CANCELLED",
+                round: manifest.iteration,
+                agent: caller?.agent ?? null,
+                agentSource: caller?.agent ? "session" : undefined,
+                phase: "PRESENT_PARTIAL",
+                note: "Aborted via AbortSignal",
+              })
+            }
+            return {
+              content: `refused: tournament aborted via AbortSignal; partial report written to ${partial.reportPath}.`,
+              aborted: true,
+              partial: true,
+              phase: "CANCELLED",
+              reportPath: partial.reportPath,
+              verdict: partial.verdict,
+            }
+          }
+
+          const costsRes = readBoundedRunJson<any>(run, join(run, "costs.json"), MAX_MANIFEST_BYTES)
+          if (costsRes.status === "error") {
+            return isUnsafePathDetail(costsRes.error)
+              ? { content: costsRes.error, refused: "unsafe_path" }
+              : { content: costsRes.error }
+          }
+          if (costsRes.status === "absent") {
+            return {
+              content: "refused: missing costs.json for this run; restore a valid budget record before continuing tournament work.",
+              refused: "budget_preflight",
+            }
+          }
+          if (costsRes.status === "ok") {
+            const budget = Number(costsRes.value?.budgetUsd) || 0
+            const spent = Number(costsRes.value?.spentUsd) || 0
+            const pct = budget > 0 ? Math.floor((spent / budget) * 100) : 100
+            if (budget <= 0 || spent >= budget || pct >= 80) {
+              const reason = `Budget threshold reached (${pct}% of $${budget})`
+              const partial = finalizeTournamentPartial(run, manifest, {
+                trigger: "budget_exhausted",
+                reason,
+                phase: "BUDGET_HALTED",
+                cancelledBy: caller?.agent ?? null,
+              })
+              if (!partial.alreadyFinalized) {
+                await appendEvent(run, {
+                  event: "tournament_cancelled",
+                  sessionId,
+                  taskId: null,
+                  from: null,
+                  to: "BUDGET_HALTED",
+                  round: manifest.iteration,
+                  agent: caller?.agent ?? null,
+                  agentSource: caller?.agent ? "session" : undefined,
+                  phase: "PRESENT_PARTIAL",
+                  note: reason,
+                })
+              }
+              return {
+                content: `refused: ${reason}; tournament halted and partial report written to ${partial.reportPath}.`,
+                halted: true,
+                shouldHalt: true,
+                partial: true,
+                phase: "BUDGET_HALTED",
+                reportPath: partial.reportPath,
+                verdict: partial.verdict,
+              }
+            }
+          }
+
+          const prevPhase = manifest.phase
+          if (action === "propose") {
+            const res = proposeCandidate(run, manifest, {
+              candidateId: input?.candidateId,
+              summary: input?.summary,
+              proofSketch: input?.proofSketch,
+              agent: input?.agent ?? caller?.agent,
+              closeRound: input?.closeRound === true,
+            })
+            if (!res.ok) return { content: res.error }
+            await appendEvent(run, {
+              event: "tournament_step",
+              sessionId,
+              taskId: res.candidate.id,
+              from: prevPhase,
+              to: res.manifest.phase,
+              round: res.manifest.iteration,
+              agent: res.candidate.agent,
+              agentSource: input?.agent ? "explicit" : caller?.agent ? "session" : "plan",
+              phase: res.manifest.phase,
+            })
+            return {
+              content: `Proposed candidate ${res.candidate.id} (iter=${res.candidate.iteration}, level=0). Phase: ${res.manifest.phase}.`,
+              candidate: res.candidate,
+              phase: res.manifest.phase,
+              iteration: res.manifest.iteration,
+            }
+          }
+
+          if (action === "falsify") {
+            const res = falsifyCandidate(run, manifest, {
+              candidateId: input?.candidateId,
+              verdict: input?.verdict,
+              reason: input?.reason,
+              counterexample: input?.counterexample,
+              agent: input?.agent ?? caller?.agent,
+            })
+            if (!res.ok) return { content: res.error }
+            await appendEvent(run, {
+              event: "tournament_step",
+              sessionId,
+              taskId: res.candidate.id,
+              from: prevPhase,
+              to: res.manifest.phase,
+              round: res.manifest.iteration,
+              agent: "team/falsifier",
+              agentSource: input?.agent ? "explicit" : caller?.agent ? "session" : "plan",
+              phase: res.manifest.phase,
+            })
+            return {
+              content: `Falsified ${res.candidate.id} -> ${res.candidate.status}. Phase: ${res.manifest.phase}, iter=${res.manifest.iteration}, level=${res.manifest.currentLevel}.`,
+              candidate: res.candidate,
+              phase: res.manifest.phase,
+              iteration: res.manifest.iteration,
+              currentLevel: res.manifest.currentLevel,
+            }
+          }
+
+          if (action === "merge") {
+            const res = mergeCandidates(run, manifest, {
+              candidateId: input?.candidateId,
+              parentIds: input?.parentIds,
+              summary: input?.summary,
+              proofSketch: input?.proofSketch,
+              agent: input?.agent ?? caller?.agent,
+              closeLevel: input?.closeLevel === true,
+            })
+            if (!res.ok) return { content: res.error }
+            await appendEvent(run, {
+              event: "tournament_step",
+              sessionId,
+              taskId: res.candidate.id,
+              from: prevPhase,
+              to: res.manifest.phase,
+              round: res.manifest.iteration,
+              agent: "team/synthesizer",
+              agentSource: input?.agent ? "explicit" : caller?.agent ? "session" : "plan",
+              phase: res.manifest.phase,
+            })
+            return {
+              content: `Merged ${res.candidate.parentIds.join("+")} -> ${res.candidate.id} (level=${res.candidate.level}). Phase: ${res.manifest.phase}.`,
+              candidate: res.candidate,
+              phase: res.manifest.phase,
+              currentLevel: res.manifest.currentLevel,
+            }
+          }
+
+          if (action === "score") {
+            const res = scoreCandidates(run, manifest, {
+              scores: input?.scores,
+              // Trusted session identity wins over a caller-supplied label; the
+              // explicit label is only a legacy fallback when identity is unknown.
+              agent: caller?.agent ?? input?.agent,
+              finalize: input?.finalize === true,
+            })
+            if (!res.ok) return { content: res.error }
+            await appendEvent(run, {
+              event: "tournament_step",
+              sessionId,
+              taskId: null,
+              from: prevPhase,
+              to: res.manifest.phase,
+              round: res.manifest.iteration,
+              agent: "team/referee",
+              agentSource: input?.agent ? "explicit" : caller?.agent ? "session" : "plan",
+              phase: res.manifest.phase,
+            })
+            return {
+              content: `Referee scored ${input.scores.length} candidate(s). Top: ${res.manifest.rankedCandidates[0]?.id ?? "none"} (${res.manifest.rankedCandidates[0]?.score ?? "n/a"}). Phase: ${res.manifest.phase}.`,
+              phase: res.manifest.phase,
+              iteration: res.manifest.iteration,
+              rankedCandidates: res.manifest.rankedCandidates,
+            }
+          }
+
+          if (action === "audit") {
+            const res = auditTournament(run, manifest, {
+              verdict: input?.verdict,
+              summary: input?.summary,
+              winnerId: input?.winnerId,
+              // Same rule as score: authorization follows the session, not the label.
+              agent: caller?.agent ?? input?.agent,
+            })
+            if (!res.ok) return { content: res.error }
+            await appendEvent(run, {
+              event: "tournament_step",
+              sessionId,
+              taskId: res.verdict.winnerId,
+              from: prevPhase,
+              to: res.manifest.phase,
+              round: res.manifest.iteration,
+              agent: "team/referee",
+              agentSource: input?.agent ? "explicit" : caller?.agent ? "session" : "plan",
+              phase: res.manifest.phase,
+            })
+            return {
+              content: `Victory audit ${res.verdict.status} (${res.verdict.verdict}), winner=${res.verdict.winnerId ?? "none"}. Report: ${reportPathOf(run)}.`,
+              phase: res.manifest.phase,
+              verdict: res.verdict,
+              reportPath: reportPathOf(run),
+            }
+          }
+
+          return {
+            content: `Error: unknown tournament action "${action}". Allowed: estimate | init | propose | falsify | merge | score | audit | cancel | status`,
+          }
+          })
+        } catch (err: any) {
+          const msg = typeof err?.message === "string" ? err.message : String(err)
+          if (/^refused:/i.test(msg) || /symlink|escapes|outside|containment/i.test(msg)) {
+            return { content: msg.startsWith("refused:") ? msg : `refused: ${msg}`, refused: "unsafe_path" }
+          }
+          throw err
+        }
+      },
+    })
+
+    editor.add({
       name: "pitfall",
       description: "Append an answer-agnostic failure mode to the run's pitfall registry.",
       input: {
@@ -2626,6 +3496,195 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         }
         if (!state || typeof state.tasks !== "object") {
           return { content: `No valid state.json found for run ${basename(run)}.` }
+        }
+
+        const tournamentPresent =
+          plan.topology === "massive-proof" &&
+          (!!plan.tournament ||
+            existsSync(join(run, "tournament")) ||
+            (() => {
+              try {
+                return lstatSync(join(run, "tournament")).isSymbolicLink()
+              } catch {
+                return false
+              }
+            })())
+        if (tournamentPresent) {
+          const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+          let tOutcome: any
+          try {
+            tOutcome = await withFileLock(manifestPathOf(run), async () => {
+              const mRes = readTournamentManifest(run)
+              if (mRes.status === "error") {
+                return {
+                  content: `BLOCKED_BY_TOURNAMENT: ${mRes.error}`,
+                  status: "BLOCKED",
+                  ...(isUnsafePathDetail(mRes.error) ? { refused: "unsafe_path" } : {}),
+                }
+              }
+              if (mRes.status === "absent") {
+                return {
+                  content: `BLOCKED_BY_TOURNAMENT: missing tournament/manifest.json for massive-proof tournament run.`,
+                  status: "BLOCKED",
+                }
+              }
+              const manifest = mRes.manifest
+              const caller = await deriveCallerAgent(ctx, run, callSession)
+
+              if (TOURNAMENT_ACTIVE_PHASES.has(manifest.phase) && context?.signal?.aborted) {
+                const partial = finalizeTournamentPartial(run, manifest, {
+                  trigger: "signal",
+                  reason: "Aborted via AbortSignal",
+                  phase: "CANCELLED",
+                  cancelledBy: caller?.agent ?? null,
+                })
+                if (!partial.alreadyFinalized) {
+                  await appendEvent(run, {
+                    event: "tournament_cancelled",
+                    sessionId: basename(run),
+                    taskId: null,
+                    from: null,
+                    to: "CANCELLED",
+                    round: manifest.iteration,
+                    agent: caller?.agent ?? null,
+                    agentSource: caller?.agent ? "session" : undefined,
+                    phase: "PRESENT_PARTIAL",
+                    note: "Aborted via AbortSignal",
+                  })
+                }
+                return {
+                  content: `TOURNAMENT_CANCELLED: aborted via AbortSignal. Partial report: ${partial.reportPath}`,
+                  status: "CANCELLED",
+                  phase: "PRESENT_PARTIAL",
+                  aborted: true,
+                  partialReport: partial.reportPath,
+                }
+              }
+
+              if (TOURNAMENT_ACTIVE_PHASES.has(manifest.phase)) {
+                const costsRes = readBoundedRunJson<any>(run, join(run, "costs.json"), MAX_MANIFEST_BYTES)
+                if (costsRes.status === "error") {
+                  return {
+                    content: `BLOCKED_BY_TOURNAMENT: ${costsRes.error}`,
+                    status: "BLOCKED",
+                    ...(isUnsafePathDetail(costsRes.error) ? { refused: "unsafe_path" } : {}),
+                  }
+                }
+                if (costsRes.status === "absent") {
+                  return {
+                    content: "BLOCKED_BY_TOURNAMENT: missing costs.json for this run; restore a valid budget record before dispatching tournament work.",
+                    status: "BLOCKED",
+                  }
+                }
+                if (costsRes.status === "ok") {
+                  const budget = Number(costsRes.value?.budgetUsd) || 0
+                  const spent = Number(costsRes.value?.spentUsd) || 0
+                  const pct = budget > 0 ? Math.floor((spent / budget) * 100) : 100
+                  if (budget <= 0 || spent >= budget || pct >= 80) {
+                    const reason = `Budget threshold reached (${pct}% of $${budget})`
+                    const partial = finalizeTournamentPartial(run, manifest, {
+                      trigger: "budget_exhausted",
+                      reason,
+                      phase: "BUDGET_HALTED",
+                      cancelledBy: caller?.agent ?? null,
+                    })
+                    if (!partial.alreadyFinalized) {
+                      await appendEvent(run, {
+                        event: "tournament_cancelled",
+                        sessionId: basename(run),
+                        taskId: null,
+                        from: null,
+                        to: "BUDGET_HALTED",
+                        round: manifest.iteration,
+                        agent: caller?.agent ?? null,
+                        agentSource: caller?.agent ? "session" : undefined,
+                        phase: "PRESENT_PARTIAL",
+                        note: reason,
+                      })
+                    }
+                    return {
+                      content: `TOURNAMENT_BUDGET_HALTED: ${reason}. Partial report: ${partial.reportPath}`,
+                      status: "BUDGET_HALTED",
+                      phase: "PRESENT_PARTIAL",
+                      shouldHalt: true,
+                      partialReport: partial.reportPath,
+                    }
+                  }
+                }
+              }
+
+              if (manifest.phase === "CANCELLED" || manifest.phase === "BUDGET_HALTED") {
+                return {
+                  content: `TOURNAMENT_${manifest.phase}: ${manifest.cancelled?.reason ?? "halted"}. Partial report: ${reportPathOf(run)}`,
+                  status: manifest.phase,
+                  phase: "PRESENT_PARTIAL",
+                  partialReport: reportPathOf(run),
+                }
+              }
+              if (manifest.phase === "FAILED") {
+                return {
+                  content: `BLOCKED_BY_TOURNAMENT: tournament ended in FAILED phase. Report: ${reportPathOf(run)}`,
+                  status: "BLOCKED",
+                }
+              }
+              if (manifest.phase === "COMPLETED") {
+                // A stamped final PASS must not outlive the evidence it was based
+                // on. Revalidate the current verdict/report before generic completion.
+                const vRes = readTournamentVerdict(run)
+                const rRes = readBoundedRunFile(run, reportPathOf(run), MAX_REPORT_BYTES)
+                if (
+                  vRes.status !== "ok" ||
+                  vRes.verdict.status !== "PASS" ||
+                  vRes.verdict.verdict !== "ACCEPT" ||
+                  rRes.status !== "ok" ||
+                  !rRes.text.trim()
+                ) {
+                  return {
+                    content: `BLOCKED_BY_TOURNAMENT: completed tournament evidence is missing or invalid (verdict: ${
+                      vRes.status === "ok" ? `${vRes.verdict.status}/${vRes.verdict.verdict}` : vRes.status === "error" ? vRes.error : "missing"
+                    }; report: ${rRes.status === "ok" && rRes.text.trim() ? "present" : "missing or empty"}). Re-run tournament audit before merging.`,
+                    status: "BLOCKED",
+                  }
+                }
+              }
+              if (TOURNAMENT_ACTIVE_PHASES.has(manifest.phase)) {
+                const nextActionMap: Record<string, string> = {
+                  PROPOSE: "propose",
+                  FALSIFY_PRUNE: "falsify",
+                  MERGE: "merge",
+                  REFEREE_SCORE: "score",
+                  VICTORY_AUDIT: "audit",
+                }
+                const nextAction = nextActionMap[manifest.phase] || "propose"
+                const candidateIds = Object.values(manifest.candidates || {})
+                  .filter((c) => c && c.iteration === manifest.iteration && c.level === manifest.currentLevel && c.status !== "pruned")
+                  .map((c) => c.id)
+                return {
+                  content: `TOURNAMENT_ACTIVE: phase=${manifest.phase}, iteration=${manifest.iteration}/${manifest.config.maxIterations}, level=${manifest.currentLevel}/${manifest.config.levels}. Next teamwork_tournament action: ${nextAction}.`,
+                  status: "TOURNAMENT_ACTIVE",
+                  tournamentPhase: manifest.phase,
+                  iteration: manifest.iteration,
+                  level: manifest.currentLevel,
+                  nextAction,
+                  candidateIds,
+                }
+              }
+              return undefined
+            })
+          } catch (err: any) {
+            const msg = typeof err?.message === "string" ? err.message : String(err)
+            if (isUnsafePathError(msg)) {
+              return {
+                status: "BLOCKED",
+                content: msg.startsWith("refused:") ? msg : `refused: ${msg}`,
+                refused: "unsafe_path",
+              }
+            }
+            throw err
+          }
+          if (tOutcome) return tOutcome
+        } else if (context?.signal?.aborted) {
+          return { content: "refused: request aborted via AbortSignal.", status: "CANCELLED", aborted: true }
         }
 
         const taskDefs = new Map<string, any>(plan.tasks.map((t: any) => [t.id, t]))
@@ -3473,7 +4532,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 }
               }
               const isRegularNonEmpty = (file: string): boolean => {
-                const res = readBoundedRunFile(run, file)
+                const res = readBoundedRunFile(run, file, MAX_RUN_FILE_BYTES)
                 return res.status === "ok" && res.text.trim().length > 0
               }
               for (const seg of segs) {
@@ -3514,16 +4573,147 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (lemmaEvidence) {
             reasons.push(...lemmaEvidence.reasons)
           }
+          if (context?.signal?.aborted) {
+            reasons.push("request aborted via AbortSignal")
+          }
+
+          let tournamentEvidence: Record<string, unknown> | undefined
+          const tournamentPresent =
+            plan?.topology === "massive-proof" &&
+            (!!plan?.tournament ||
+              existsSync(join(run, "tournament")) ||
+              (() => {
+                try {
+                  return lstatSync(join(run, "tournament")).isSymbolicLink()
+                } catch {
+                  return false
+                }
+              })())
+          if (tournamentPresent) {
+            const mFile = manifestPathOf(run)
+            try {
+              await withFileLock(mFile, async () => {
+                const mRes = readTournamentManifest(run)
+                if (mRes.status === "ok" && TOURNAMENT_ACTIVE_PHASES.has(mRes.manifest.phase) && context?.signal?.aborted) {
+                  const callerAbort = await deriveCallerAgent(ctx, run, callSession)
+                  const partial = finalizeTournamentPartial(run, mRes.manifest, {
+                    trigger: "signal",
+                    reason: "Aborted via AbortSignal",
+                    phase: "CANCELLED",
+                    cancelledBy: callerAbort?.agent ?? null,
+                  })
+                  if (!partial.alreadyFinalized) {
+                    await appendEvent(run, {
+                      event: "tournament_cancelled",
+                      sessionId: basename(run),
+                      taskId: null,
+                      from: null,
+                      to: "CANCELLED",
+                      round: mRes.manifest.iteration,
+                      agent: callerAbort?.agent ?? null,
+                      agentSource: callerAbort?.agent ? "session" : undefined,
+                      phase: "PRESENT_PARTIAL",
+                      note: "Aborted via AbortSignal",
+                    })
+                  }
+                }
+              })
+            } catch (err: any) {
+              const msg = typeof err?.message === "string" ? err.message : String(err)
+              if (isUnsafePathError(msg)) {
+                return {
+                  status: "FAIL",
+                  content: msg.startsWith("refused:") ? msg : `refused: ${msg}`,
+                  refused: "unsafe_path",
+                }
+              }
+              throw err
+            }
+
+            const mRes = readTournamentManifest(run)
+            const vRes = readTournamentVerdict(run)
+            const rRes = readBoundedRunFile(run, reportPathOf(run), MAX_REPORT_BYTES)
+
+            if (mRes.status !== "ok") {
+              reasons.push(mRes.status === "error" ? mRes.error : "tournament/manifest.json missing")
+              tournamentEvidence = {
+                phase: "MISSING",
+                partial: true,
+                cancellationReason: mRes.status === "error" ? mRes.error : null,
+                totalCandidates: 0,
+                survivingCandidates: 0,
+                winnerId: null,
+                topScore: null,
+                refereeAgent: null,
+                verdictPath: "tournament/verdict.json",
+                reportPath: "TOURNAMENT_REPORT.md",
+              }
+            } else {
+              const m = mRes.manifest
+              const cands = Object.values(m.candidates || {})
+              const surviving = cands.filter((c) => c && c.status !== "pruned").length
+              const v = vRes.status === "ok" ? vRes.verdict : null
+              const ranked = Array.isArray(v?.rankedCandidates) ? v.rankedCandidates : m.rankedCandidates
+              const winnerId = v?.winnerId ?? null
+              const winnerNode = winnerId && Object.prototype.hasOwnProperty.call(m.candidates, winnerId) ? m.candidates[winnerId] : null
+              const topScore = ranked.length > 0 && typeof ranked[0].score === "number" ? ranked[0].score : null
+
+              if (m.phase !== "COMPLETED") {
+                reasons.push(
+                  m.cancelled
+                    ? `tournament ${m.phase}: ${m.cancelled.reason}`
+                    : `tournament incomplete (phase ${m.phase})`,
+                )
+              }
+              if (vRes.status !== "ok") {
+                reasons.push(vRes.status === "error" ? vRes.error : "tournament/verdict.json missing")
+              } else {
+                if (v!.status !== "PASS" || v!.verdict !== "ACCEPT") {
+                  reasons.push(`tournament verdict is ${v!.status} (${v!.verdict})`)
+                }
+                if (v!.refereeAgent !== "team/referee") {
+                  reasons.push(`tournament verdict refereeAgent must be team/referee (got ${clean(v!.refereeAgent, 32)})`)
+                }
+                if (!Array.isArray(v!.rankedCandidates) || v!.rankedCandidates.length === 0) {
+                  reasons.push("tournament verdict has no rankedCandidates")
+                }
+                if (!winnerId || !winnerNode || winnerNode.status === "pruned") {
+                  reasons.push("tournament verdict has no valid non-pruned winnerId")
+                }
+              }
+              if (rRes.status !== "ok" || !rRes.text.trim()) {
+                reasons.push(rRes.status === "error" ? rRes.error : "TOURNAMENT_REPORT.md missing or empty")
+              }
+
+              tournamentEvidence = {
+                phase: m.phase,
+                partial: m.phase !== "COMPLETED",
+                cancellationReason: m.cancelled?.reason ?? null,
+                totalCandidates: cands.length,
+                survivingCandidates: surviving,
+                winnerId,
+                topScore,
+                refereeAgent: v?.refereeAgent ?? null,
+                verdictPath: "tournament/verdict.json",
+                reportPath: "TOURNAMENT_REPORT.md",
+              }
+            }
+          }
 
           // A supplied failReason can only make the verdict fail, never pass it.
           const failReason = typeof input?.failReason === "string" ? clean(input.failReason, 500).trim() : ""
           if (failReason) reasons.push(failReason)
 
-          const status = reasons.length === 0 ? "PASS" : "FAIL"
           // Bound both the artifact and the message; 100 conditions is already far
           // beyond a useful verdict.
-          const cappedReasons = reasons.slice(0, 100)
           const integrity = readIntegrityMode(run)
+          // The signal can abort while deriveCallerAgent waits; never stamp PASS
+          // from a request that was cancelled after the first check.
+          if (context?.signal?.aborted && !reasons.includes("request aborted via AbortSignal")) {
+            reasons.push("request aborted via AbortSignal")
+          }
+          const status = reasons.length === 0 ? "PASS" : "FAIL"
+          const cappedReasons = reasons.slice(0, 100)
           const summary = typeof input?.summary === "string" ? clean(input.summary, 2000).trim() : ""
           const findings = Array.isArray(input?.findings)
             ? input.findings.slice(0, 50).map((f: any) => ({
@@ -3545,6 +4735,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               allTasksVerifiedPass,
               ...(documentReviewEvidence ? { documentReview: documentReviewEvidence } : {}),
               ...(lemmaEvidence ? { lemma: lemmaEvidence } : {}),
+              ...(tournamentEvidence ? { tournament: tournamentEvidence } : {}),
             },
             reasons: cappedReasons,
             ...(summary ? { summary } : {}),
@@ -4114,16 +5305,11 @@ export async function registerTeamworkHooks(ctx: any, root: string) {
     if (event.action === "webfetch" && (event.agent === "team/worker" || event.agent === "team/verifier")) {
       const { run } = resolveRun(root)
       if (run) {
-        try {
-          const specPath = join(run, "prompt_draft.md")
-          if (existsSync(specPath)) {
-            const specText = readFileSync(specPath, "utf8")
-            if (/network:\s*["']?denied["']?/i.test(specText)) {
-              event.effect = "deny"
-              event.message = "Network access is denied by run spec constraints."
-            }
-          }
-        } catch {}
+        const specText = readRunText(join(run, "prompt_draft.md"))
+        if (specText && /network:\s*["']?denied["']?/i.test(specText)) {
+          event.effect = "deny"
+          event.message = "Network access is denied by run spec constraints."
+        }
       }
     }
   })

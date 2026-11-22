@@ -47,7 +47,7 @@ Look at the user's prompt (or call `teamwork_route`) and pick exactly one in str
 | 1 | **Supplied document** (path, URL, attachment, or inline doc) **AND** deliverable is a critique/review/assessment of that document — **checked BEFORE Math/Proof** (reject PR/diff/code reviews, bare filenames without a supplied doc, mentions, and theorem-solving/implementation tasks) | `document-review` |
 | 2 | Explicit Lean 4 / `.lean` prove, formalize, verify, or check-proof opt-in request (checked via `teamwork_route`; requires `teamwork_lemma_probe` READY; never bare `.lean` syntax alone) | `proof` (`lemmaMode: true`) |
 | 3 | `.lean` file or Lean syntax **without** an explicit Lean prove/verify request (e.g. rename, explain, grep, or fenced snippet) | `distributed-coding` (never `proof`) |
-| 4 | Math/proof signals + explicit large-team opt-in ("100+ searchers", "very large team", "massively parallel proof search") | `massive-proof` |
+| 4 | Math/proof signals + explicit large-team opt-in ("100+ searchers", "very large team", "massively parallel proof search", "massive-proof") + budget preflight | `massive-proof` (explicit `massiveProofOptIn` only) |
 | 5 | "prove", "conjecture", "show that", "∀", "∃", "coq", "isabelle", "open problem" (non-Lean natural-language proof, without a supplied critique document) | `proof` (`lemmaMode: false`) |
 | 6a | single small fix + explicit lightness signal ("quick fix", "small change", "rename this", "tweak this one function") | `small-focused` |
 | 6b | "implement", "fix bug", "make it work", tests, tight loop, single file or module | `iterative-coding` |

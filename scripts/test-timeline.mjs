@@ -18,6 +18,9 @@ import { fileURLToPath } from "node:url"
 import { spawnSync, execFileSync } from "node:child_process"
 import assert from "node:assert"
 
+// Sonar S6324: build ESC without embedding a control character in a regex literal.
+const ESC_CHAR = String.fromCharCode(27)
+
 const here = dirname(fileURLToPath(import.meta.url))
 const cliPath = join(here, "..", "bin", "opencode-teamwork.mjs")
 const ESC = "\u001b["
@@ -1142,6 +1145,72 @@ await check("LEMMA: buildTimeline & renderTimeline surface lemma/manifest.json a
   assert(timelineWarnings(symTl).some((w) => w.includes("lemma/")), "symlinked lemma/ must emit warning")
 })
 
+// 7. Massive-proof tournament & cancellation timeline checks
+// ==========================================
+
+await check("tournament: completed and cancelled runs surface tournament summary without breaking non-tournament TIMELINE_KEYS", () => {
+  assertShape(eventsTimeline)
+
+  const root = makeRoot()
+  const sid = "20261018-120000-tour"
+  const dir = runDirOf(root, sid)
+  writeJson(join(dir, "state.json"), { version: 1, sessionId: sid, phase: "PRESENT_PARTIAL", tasks: {}, updatedAt: "2026-10-18T12:05:00.000Z" })
+  writeJson(join(dir, "plan.dag.json"), { sessionId: sid, topology: "massive-proof", tasks: [] })
+  writeJson(join(dir, "costs.json"), { sessionId: sid, budgetUsd: 20, spentUsd: 2.5, byTask: {} })
+  writeFileSync(
+    join(dir, "events.jsonl"),
+    [
+      JSON.stringify({ ts: "2026-10-18T12:00:00.000Z", seq: 1, event: "run_created", sessionId: sid, to: "pending" }),
+      JSON.stringify({ ts: "2026-10-18T12:01:00.000Z", seq: 2, event: "tournament_step", sessionId: sid, to: "FALSIFY_PRUNE", agent: "team/proposer" }),
+      JSON.stringify({ ts: "2026-10-18T12:05:00.000Z", seq: 3, event: "tournament_cancelled", sessionId: sid, to: "CANCELLED", phase: "PRESENT_PARTIAL" }),
+    ].join("\n") + "\n",
+  )
+  writeJson(join(dir, "tournament", "manifest.json"), {
+    version: 1,
+    sessionId: sid,
+    phase: "CANCELLED",
+    iteration: 1,
+    currentLevel: 0,
+    config: { levels: 2, branchingFactor: 4, maxCandidates: 16, maxIterations: 4 },
+    candidates: {
+      "cand-1": { id: "cand-1", status: "survives" },
+      "cand-2": { id: "cand-2", status: "pruned" },
+    },
+    rankedCandidates: [{ rank: 1, id: "cand-1", status: "survives" }],
+    verdict: { status: "PARTIAL", winnerId: "cand-1" },
+    cancelled: { trigger: "explicit", reason: "Stopped\u2028by\u2029user\x1b[31m" },
+  })
+
+  const tl = buildTimeline(root, sid)
+  assert.strictEqual(tl.mode, "events")
+  assert.strictEqual(tl.durationMs, 300000)
+  assert.strictEqual(tl.tournament.phase, "CANCELLED")
+  assert.strictEqual(tl.tournament.totalCandidates, 2)
+  assert.strictEqual(tl.tournament.survivingCandidates, 1)
+  assert.strictEqual(tl.tournament.winnerId, "cand-1")
+
+  const lines = renderTimeline(tl)
+  const joined = lines.join("\n")
+  assert(joined.includes("tournament: phase=CANCELLED"), `must render tournament line: ${joined}`)
+  assert(!joined.includes(ESC_CHAR) && !/[\u2028\u2029]/.test(joined), "control chars and Unicode line separators must be stripped")
+})
+
+await check("tournament: symlinked tournament/ dir is refused with diagnostic warning", () => {
+  const root = makeRoot()
+  const sid = "20261018-120100-tsym"
+  const dir = runDirOf(root, sid)
+  const outside = uniq("outside-tour")
+  writeJson(join(outside, "manifest.json"), { phase: "COMPLETED", candidates: {} })
+  writeJson(join(dir, "state.json"), { version: 1, sessionId: sid, phase: "DONE", tasks: {} })
+  writeJson(join(dir, "plan.dag.json"), { sessionId: sid, topology: "massive-proof", tasks: [] })
+  writeJson(join(dir, "costs.json"), { sessionId: sid, budgetUsd: 20, spentUsd: 0, byTask: {} })
+  symlinkSync(outside, join(dir, "tournament"))
+
+  const tl = buildTimeline(root, sid)
+  assert(!("tournament" in tl), "symlinked tournament/ must not populate tl.tournament")
+  const warns = timelineWarnings(tl)
+  assert(warns.some((w) => w.includes("tournament/") && w.includes("symlink")), `must record symlink warning: ${JSON.stringify(warns)}`)
+})
 // ---------------------------------------------------------------- cleanup
 
 rmSync(testDir, { recursive: true, force: true })

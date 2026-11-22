@@ -1,9 +1,9 @@
-import { registerTeamworkTools, registerTeamworkHooks } from "../plugins/opencode-teamwork/tools.ts"
+import { registerTeamworkTools, registerTeamworkHooks, describeRun } from "../plugins/opencode-teamwork/tools.ts"
 import {
   analyzeLeanDeclarations,
   bindVerifiedDeclaration,
   checkLeanAxiomDependencies,
-  classifyRoute,
+  classifyRoute as classifyLemmaRoute,
   detectAxiomProbeHijacks,
   detectLeanProofHoles,
   formatMissingToolchainRefusal,
@@ -15,18 +15,22 @@ import {
   stripLeanCommentsAndStrings,
   verifyLeanFile,
 } from "../plugins/opencode-teamwork/lemma.ts"
+import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import { currentModels, readRawModelMap, writeModelMap, installAgents, DEFAULT_MODELS } from "../lib/team.mjs"
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync, chmodSync, symlinkSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync, chmodSync, symlinkSync, linkSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { createServer } from "node:http"
-import { execFileSync } from "node:child_process"
+import { execFileSync, spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { deflateSync } from "node:zlib"
+import { randomBytes } from "node:crypto"
 import assert from "node:assert"
 
 const testDir = mkdtempSync(join(tmpdir(), "teamwork-engine-test-"))
+// Sonar S6324: build ESC without embedding a control character in a regex literal.
+const ESC_CHAR = String.fromCharCode(27)
 
 try {
   let registeredTools = {}
@@ -259,7 +263,13 @@ try {
   }
   for (const [alias, canonical] of Object.entries(aliases)) {
     const id = `20261018-000000-alias-${alias}`
-    const r = await registeredTools.plan.execute({ sessionId: id, topology: alias, skipInterview: true, tasks: [{ id: "T1" }] })
+    const r = await registeredTools.plan.execute({
+      sessionId: id,
+      topology: alias,
+      skipInterview: true,
+      ...(canonical === "massive-proof" ? { massiveProofOptIn: true, budgetUsd: 20 } : {}),
+      tasks: [{ id: "T1" }],
+    })
     assert(r.content.startsWith("Planned"), `alias ${alias} must be accepted: ${r.content}`)
     const persisted = JSON.parse(readFileSync(planFileOf(id), "utf8"))
     assert.strictEqual(persisted.topology, canonical, `${alias} must be persisted as ${canonical}`)
@@ -425,6 +435,39 @@ try {
   assert.strictEqual(readFileSync(requestFileOf(reqRun), "utf8"), reqMd, "the recorded request must be unchanged")
   assert.strictEqual(readFileSync(planFileOf(reqRun), "utf8"), planBefore, "a refused request must not rewrite plan.dag.json")
   assert.strictEqual(readFileSync(stateFileOf(reqRun), "utf8"), stateBefore, "a refused request must not rewrite state.json")
+
+  // (b2) existence is decided by O_EXCL, not a pre-read: an empty file refuses too.
+  const emptyReqRun = "20261018-000000-request-empty"
+  mkdirSync(join(testDir, ".opencode", "teamwork", emptyReqRun), { recursive: true })
+  writeFileSync(requestFileOf(emptyReqRun), "")
+  const emptyReq = await registeredTools.plan.execute({
+    sessionId: emptyReqRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: "a new request over an empty file",
+    tasks: [{ id: "E1" }],
+  })
+  assert(emptyReq.content.startsWith("refused:"), `an existing empty request file must be refused: ${emptyReq.content}`)
+  assert(/write-once/i.test(emptyReq.content), "empty-file refusal must state write-once")
+  assert.strictEqual(readFileSync(requestFileOf(emptyReqRun), "utf8"), "", "the empty request file must be left untouched")
+  assert(!existsSync(planFileOf(emptyReqRun)), "a refused empty-file request must not write a plan")
+
+  // (b3) a symlink at the request path is refused and its target is untouched.
+  const symReqRun = "20261018-000000-request-symlink"
+  mkdirSync(join(testDir, ".opencode", "teamwork", symReqRun), { recursive: true })
+  const requestVictim = join(testDir, "request-victim.txt")
+  writeFileSync(requestVictim, "VICTIM")
+  symlinkSync(requestVictim, requestFileOf(symReqRun))
+  const symReq = await registeredTools.plan.execute({
+    sessionId: symReqRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: "write through a symlink",
+    tasks: [{ id: "S1" }],
+  })
+  assert(symReq.content.startsWith("refused:"), `a symlinked request path must be refused: ${symReq.content}`)
+  assert.strictEqual(readFileSync(requestVictim, "utf8"), "VICTIM", "the symlink target must remain untouched")
+  assert(!existsSync(planFileOf(symReqRun)), "a refused symlink request must not write a plan")
 
   // (c) an invalid mode is refused before anything is written.
   const badModeRun = "20261018-000000-badmode"
@@ -1248,7 +1291,7 @@ try {
       gitRepoDir,
     )
 
-    const gitSessionId = `20261018-000000-${Math.random().toString(16).slice(2, 6)}`
+    const gitSessionId = `20261018-000000-${randomBytes(4).toString("hex")}`
     await gitTools.plan.execute({
       sessionId: gitSessionId,
       topology: "distributed-coding",
@@ -2004,6 +2047,7 @@ try {
     { id: "team/security-auditor", deny: ["edit", "subagent", "webfetch"] },
     { id: "team/segment-reviewer", deny: ["edit", "shell", "subagent", "webfetch"] },
     { id: "team/formalization-reviewer", deny: ["edit", "shell", "subagent", "webfetch"] },
+    { id: "team/referee", deny: ["edit", "shell", "subagent", "webfetch"] },
   ].map((p) => ({ ...p, deny: [...p.deny].sort() }))
 
   // --- 8a: READ_ONLY_ACTIONS holds exactly the documented deny sets.
@@ -2022,7 +2066,7 @@ try {
   for (const p of POLICY) {
     assert.deepStrictEqual(enforced[p.id], p.deny, `${p.id}: code deny set drifted: ${JSON.stringify(enforced[p.id])}`)
   }
-  console.log(`✓ READ_ONLY_ACTIONS matches the expected deny set for all ${POLICY.length} read-only agents`)
+  console.log("✓ READ_ONLY_ACTIONS matches the expected deny set for all five read-only agents")
 
   // --- 8b: every agent whose code policy denies `edit` is documented in the
   // README read-only paragraph (parsed, not a duplicate hard-coded list).
@@ -2850,6 +2894,933 @@ try {
   } finally {
     rmSync(docRoot, { recursive: true, force: true })
     rmSync(outsideDir, { recursive: true, force: true })
+  }
+}
+
+// Part 9: Math/Proof tournament (Issue #3)
+// ==========================================
+{
+  console.log("Testing Math/Proof tournament (explicit opt-in, preflight, E2E, cancellation, security)...")
+  const testDir9 = mkdtempSync(join(tmpdir(), "teamwork-engine-m3-"))
+  try {
+    const tools9 = {}
+    let evaluateHook = null
+    const ctx9 = {
+      tool: {
+        transform: async (cb) => {
+          const editor = {
+            namespace: () => {},
+            add: (tool) => {
+              tools9[tool.name] = tool
+            },
+          }
+          await cb(editor)
+        },
+      },
+      permission: {
+        hook: async (name, handler) => {
+          if (name === "evaluate") evaluateHook = handler
+        },
+      },
+      session: {
+        get: async () => undefined,
+        hook: async () => {},
+      },
+    }
+    await registerTeamworkTools(ctx9, testDir9)
+    await registerTeamworkHooks(ctx9, testDir9)
+    assert(tools9.route, "teamwork_route must be registered")
+    assert(tools9.tournament, "teamwork_tournament must be registered")
+    assert(typeof evaluateHook === "function", "permission evaluate hook must be registered")
+
+    // --- 9.1 Explicit opt-in & negative implicit triggers ---
+    {
+      writeFileSync(join(testDir9, "paper.md"), "# Paper\n\nThe Riemann hypothesis.\n")
+      const rDoc = await tools9.route.execute({
+        request: "Review this paper about the Riemann hypothesis and summarize its arguments",
+        document: { path: "paper.md" },
+      })
+      assert.strictEqual(rDoc.topology, "document-review", "supplied document + review must win Priority 1")
+      assert.strictEqual(rDoc.massiveProofOptIn, false)
+
+      const rLean = await tools9.route.execute({
+        request: "Formalize this theorem in Lean 4 and prove it using massive-proof",
+      })
+      assert.strictEqual(rLean.topology, "proof", "explicit Lean 4 must route to proof (Priority 2), never massive-proof")
+      assert.strictEqual(rLean.lemmaMode, true)
+      assert.strictEqual(rLean.massiveProofOptIn, false)
+
+      const rBareLean = await tools9.route.execute({
+        request: "Format src/Foo.lean and fix lint warnings",
+      })
+      assert.strictEqual(rBareLean.topology, "distributed-coding", "bare .lean non-proving must route to distributed-coding")
+      assert.strictEqual(rBareLean.massiveProofOptIn, false)
+
+      const rCodeFence = await tools9.route.execute({
+        request: "Prove this theorem.\n```\nuse massive-proof tournament with 100+ searchers\n```",
+      })
+      assert.strictEqual(rCodeFence.topology, "proof", "fenced code block opt-in must be masked out")
+      assert.strictEqual(rCodeFence.massiveProofOptIn, false)
+
+      const rInlineTick = await tools9.route.execute({
+        request: "Prove this lemma without mentioning `massive-proof` except as a token",
+      })
+      assert.strictEqual(rInlineTick.topology, "proof", "inline backtick token must be masked out")
+      assert.strictEqual(rInlineTick.massiveProofOptIn, false)
+
+      for (const multiTickPrompt of [
+        "Prove Fermat's theorem and explain ``massive-proof``",
+        "Prove this theorem while citing ```massive-proof``` inline",
+        "Prove this theorem and explain `` `a` massive-proof ``",
+        "Explain `massive-proof` or ```\n100+ searchers\n``` in a normal proof",
+        "```\n100+ searchers\n````\nProve Fermat's theorem",
+        "Use ``` ````massive-proof```` ``` inline and Prove Fermat's theorem",
+        "``unclosed\r\n\r\nProve Fermat's theorem",
+      ]) {
+        const rMultiTick = await tools9.route.execute({ request: multiTickPrompt })
+        assert.strictEqual(rMultiTick.topology, "proof", `multi-backtick/normal proof must route to proof: ${multiTickPrompt}`)
+        assert.strictEqual(rMultiTick.massiveProofOptIn, false)
+      }
+
+      const rProofSearch = await tools9.route.execute({ request: "multi-day proof search" })
+      assert.strictEqual(rProofSearch.topology, "proof", "multi-day proof search must route to proof")
+      assert.strictEqual(rProofSearch.massiveProofOptIn, false)
+
+      const rDocProofSearch = await tools9.route.execute({
+        request: "Review this paper.md describing a proof search and summarize its arguments",
+        document: { path: "paper.md" },
+      })
+      assert.strictEqual(rDocProofSearch.topology, "document-review", "document-review must win Priority 1 over proof search")
+      assert.strictEqual(rDocProofSearch.massiveProofOptIn, false)
+
+      for (const nonProofPrompt of [
+        "proofread this README.md",
+        "make this script foolproof and fix the bug",
+        "build a proof of concept web app",
+      ]) {
+        const rNonProof = await tools9.route.execute({ request: nonProofPrompt })
+        assert.notStrictEqual(rNonProof.topology, "proof", `must not false-positive on proof: ${nonProofPrompt}`)
+        assert.notStrictEqual(rNonProof.topology, "massive-proof")
+        assert.strictEqual(rNonProof.massiveProofOptIn, false)
+      }
+
+      for (const negatedProofPrompt of [
+        "Prove X without using massive-proof",
+        "Prove X without massively parallel proof",
+        "Prove X without using a proof tournament",
+        "Prove X without running 100+ searchers",
+        "Prove X, avoid using massive-proof",
+        "Prove X without a large-team proof",
+        "Prove this conjecture; do not use a large-team proof",
+      ]) {
+        const rNegProof = await tools9.route.execute({ request: negatedProofPrompt })
+        assert.strictEqual(rNegProof.topology, "proof", `negated opt-in must route to proof: ${negatedProofPrompt}`)
+        assert.strictEqual(rNegProof.massiveProofOptIn, false)
+      }
+
+      for (const implicitPrompt of [
+        "Prove Goldbach's conjecture with unlimited budget",
+        "Solve the Riemann hypothesis, hard open problem",
+        "Prove this difficult conjecture in a multi-day proof",
+        "Prove this theorem; do not use massive-proof or a very large team",
+        "Use a very large team to build a web dashboard",
+      ]) {
+        const rNeg = await tools9.route.execute({ request: implicitPrompt })
+        assert.notStrictEqual(rNeg.topology, "massive-proof", `must never implicitly route to massive-proof: ${implicitPrompt}`)
+        assert.strictEqual(rNeg.massiveProofOptIn, false)
+      }
+
+      const rOptIn = await tools9.route.execute({
+        request: "Prove this conjecture using a massive-proof tournament with 100+ searchers",
+      })
+      assert.strictEqual(rOptIn.topology, "massive-proof")
+      assert.strictEqual(rOptIn.massiveProofOptIn, true)
+
+      // Bare canonical topology: "massive-proof" without opt-in/budget/request is refused before mkdirSync
+      const sidBareCanonical = "20261018-190000-barecan"
+      const resBareCanonical = await tools9.plan.execute({
+        sessionId: sidBareCanonical,
+        topology: "massive-proof",
+        skipInterview: true,
+        tasks: [{ id: "T1" }],
+      })
+      assert(resBareCanonical.content.startsWith("refused:"), `bare canonical massive-proof must be refused: ${resBareCanonical.content}`)
+      assert.strictEqual(resBareCanonical.refused, "opt_in_required")
+      assert(!existsSync(join(testDir9, ".opencode", "teamwork", sidBareCanonical)), "bare canonical refusal must write zero files")
+
+      // teamwork_plan rejects massive-proof without opt-in before mkdirSync
+      const sidNoOpt = "20261018-190001-noopt"
+      const resNoOpt = await tools9.plan.execute({
+        sessionId: sidNoOpt,
+        topology: "massive-proof",
+        request: "Prove Goldbach's conjecture with unlimited budget",
+        skipInterview: true,
+        tasks: [{ id: "T1" }],
+      })
+      assert(resNoOpt.content.startsWith("refused:"), `must refuse massive-proof without opt-in: ${resNoOpt.content}`)
+      assert(!existsSync(join(testDir9, ".opencode", "teamwork", sidNoOpt)), "refusal must write zero files")
+
+      const sidExplicitFalse = "20261018-190002-optno"
+      const resExplicitFalse = await tools9.plan.execute({
+        sessionId: sidExplicitFalse,
+        topology: "massive-proof",
+        massiveProofOptIn: false,
+        request: "Prove this theorem with massive-proof tournament",
+        skipInterview: true,
+        tasks: [{ id: "T1" }],
+      })
+      assert(resExplicitFalse.content.startsWith("refused:"), "massiveProofOptIn: false must override prose")
+      assert(!existsSync(join(testDir9, ".opencode", "teamwork", sidExplicitFalse)), "must not create run dir")
+    }
+
+    // --- 9.2 Pre-mkdirSync budget, bounds, and AbortSignal refusal ---
+    {
+      const acPre = new AbortController()
+      acPre.abort()
+      const sidAbortPre = "20261018-190003-abpre"
+      const resAbortPre = await tools9.plan.execute(
+        {
+          sessionId: sidAbortPre,
+          topology: "massive-proof",
+          massiveProofOptIn: true,
+          skipInterview: true,
+          tasks: [{ id: "T1" }],
+        },
+        { signal: acPre.signal },
+      )
+      assert.strictEqual(resAbortPre.aborted, true)
+      assert(!existsSync(join(testDir9, ".opencode", "teamwork", sidAbortPre)), "aborted plan must not mkdir")
+
+      for (const [label, extra] of [
+        ["zero-budget", { budgetUsd: 0 }],
+        ["neg-budget", { budgetUsd: -5 }],
+        ["low-budget", { budgetUsd: 1 }],
+        ["levels-oob", { budgetUsd: 20, tournament: { levels: 5 } }],
+        ["width-oob", { budgetUsd: 20, tournament: { branchingFactor: 9 } }],
+        ["cands-oob", { budgetUsd: 20, tournament: { maxCandidates: 65 } }],
+        ["iter-oob", { budgetUsd: 20, tournament: { maxIterations: 33 } }],
+        ["unit-cost-low", { budgetUsd: 20, tournament: { unitCostUsd: 0.01 } }],
+        ["float-levels", { budgetUsd: 20, tournament: { levels: 1.5 } }],
+        ["nan-budget", { budgetUsd: Number.NaN }],
+      ]) {
+        const sid = `20261018-190010-${label}`
+        const r = await tools9.plan.execute({
+          sessionId: sid,
+          topology: "massive-proof",
+          massiveProofOptIn: true,
+          skipInterview: true,
+          tasks: [{ id: "T1" }],
+          ...extra,
+        })
+        assert(r.content.startsWith("refused:"), `${label} must be refused: ${r.content}`)
+        assert(!existsSync(join(testDir9, ".opencode", "teamwork", sid)), `${label} must not create run dir`)
+      }
+
+      // estimate action is read-only
+      const estFail = await tools9.tournament.execute({ action: "estimate", budgetUsd: 1 })
+      assert.strictEqual(estFail.sufficient, false)
+      assert.strictEqual(estFail.refused, "budget_preflight")
+
+      // Pre-existing costs.json at >= 80% refuses init before writing manifest
+      const sidHighSpent = "20261018-190011-hispt"
+      const highRun = join(testDir9, ".opencode", "teamwork", sidHighSpent)
+      mkdirSync(highRun, { recursive: true })
+      writeFileSync(join(highRun, "costs.json"), JSON.stringify({ sessionId: sidHighSpent, budgetUsd: 20, spentUsd: 16 }))
+      const resHigh = await tools9.tournament.execute({
+        action: "init",
+        sessionId: sidHighSpent,
+        massiveProofOptIn: true,
+        budgetUsd: 20,
+      })
+      assert(resHigh.content.startsWith("refused:"), `>=80% spent must refuse init: ${resHigh.content}`)
+      assert(!existsSync(join(highRun, "tournament", "manifest.json")), "must not write tournament/manifest.json on preflight failure")
+
+      // teamwork_plan respects existingCosts.budgetUsd ($8/$10 = 80%) when input.budgetUsd is omitted
+      const sidExistingBudget = "20261018-190012-exbud"
+      const exBudRun = join(testDir9, ".opencode", "teamwork", sidExistingBudget)
+      mkdirSync(exBudRun, { recursive: true })
+      const origCosts = JSON.stringify({ sessionId: sidExistingBudget, budgetUsd: 10, spentUsd: 8 })
+      writeFileSync(join(exBudRun, "costs.json"), origCosts)
+      const resExBud = await tools9.plan.execute({
+        sessionId: sidExistingBudget,
+        topology: "massive-proof",
+        massiveProofOptIn: true,
+        skipInterview: true,
+        tasks: [{ id: "T1" }],
+      })
+      assert.strictEqual(resExBud.refused, "budget_preflight", `existing $8/$10 must refuse plan when budgetUsd omitted: ${resExBud.content}`)
+      assert.strictEqual(readFileSync(join(exBudRun, "costs.json"), "utf8"), origCosts, "costs.json must not be overwritten on refusal")
+      assert(!existsSync(join(exBudRun, "plan.dag.json")), "must not write plan.dag.json on budget refusal")
+
+      // Order-insensitive tournament vs tournamentBounds comparison
+      const sidOrderEq = "20261018-190013-ordeq"
+      const resOrderEq = await tools9.plan.execute({
+        sessionId: sidOrderEq,
+        topology: "massive-proof",
+        massiveProofOptIn: true,
+        budgetUsd: 20,
+        skipInterview: true,
+        tournament: { levels: 2, width: 3 },
+        tournamentBounds: { branchingFactor: 3, levels: 2 },
+        tasks: [{ id: "T1" }],
+      })
+      assert(resOrderEq.content.startsWith("Planned"), `equivalent tournament & tournamentBounds in different key order must succeed: ${resOrderEq.content}`)
+
+      const sidOrderConflict = "20261018-190014-ordcf"
+      const resOrderConflict = await tools9.plan.execute({
+        sessionId: sidOrderConflict,
+        topology: "massive-proof",
+        massiveProofOptIn: true,
+        budgetUsd: 20,
+        skipInterview: true,
+        tournament: { levels: 2, width: 3 },
+        tournamentBounds: { levels: 3, width: 3 },
+        tasks: [{ id: "T1" }],
+      })
+      assert.strictEqual(resOrderConflict.refused, "invalid_tournament_config", "conflicting tournament vs tournamentBounds must be refused")
+      assert(!existsSync(join(testDir9, ".opencode", "teamwork", sidOrderConflict)), "conflicting bounds must not mkdir")
+    }
+
+    // --- 9.3 Bounded synthetic tournament E2E + team/referee evaluateHook check ---
+    {
+      for (const act of ["edit", "shell", "subagent", "webfetch"]) {
+        const ev = { agent: "team/referee", action: act }
+        evaluateHook(ev)
+        assert.strictEqual(ev.effect, "deny", `team/referee must deny ${act} in evaluateHook`)
+      }
+
+      const sid = "20261018-190020-e2e"
+      const planRes = await tools9.plan.execute({
+        sessionId: sid,
+        topology: "massive-proof",
+        massiveProofOptIn: true,
+        request: "Prove synthetic lemma via massive-proof tournament",
+        budgetUsd: 20,
+        skipInterview: true,
+        tournament: { levels: 2, branchingFactor: 3, maxCandidates: 8, maxIterations: 2 },
+        tasks: [{ id: "T1", agent: "team/proposer" }],
+      })
+      assert(planRes.content.startsWith("Planned"), `bounded plan must succeed: ${planRes.content}`)
+
+      const nextInit = await tools9.next.execute({ sessionId: sid })
+      assert.strictEqual(nextInit.status, "TOURNAMENT_ACTIVE")
+      assert.strictEqual(nextInit.tournamentPhase, "PROPOSE")
+      assert.strictEqual(nextInit.nextAction, "propose")
+
+      // Propose 3 candidates -> transitions to FALSIFY_PRUNE
+      for (const [cid, summary] of [
+        ["cand-a", "Direct inductive proof"],
+        ["cand-b", "Contradiction proof with helper bound"],
+        ["cand-c", "Heuristic leap without base case"],
+      ]) {
+        const pr = await tools9.tournament.execute({
+          action: "propose",
+          sessionId: sid,
+          candidateId: cid,
+          summary,
+          proofSketch: `Sketch for ${cid}`,
+        })
+        assert.strictEqual(pr.candidate.id, cid)
+      }
+
+      // Falsify: prune cand-c, cand-a survives, cand-b weakened -> transitions to MERGE
+      await tools9.tournament.execute({ action: "falsify", sessionId: sid, candidateId: "cand-c", verdict: "FALSIFIED", reason: "Fails n=0" })
+      await tools9.tournament.execute({ action: "falsify", sessionId: sid, candidateId: "cand-a", verdict: "SURVIVES", reason: "Base and inductive steps hold" })
+      const fB = await tools9.tournament.execute({ action: "falsify", sessionId: sid, candidateId: "cand-b", verdict: "WEAKENED", reason: "Needs explicit constant" })
+      assert.strictEqual(fB.phase, "MERGE")
+
+      // Cannot merge pruned candidate
+      const badMerge = await tools9.tournament.execute({
+        action: "merge",
+        sessionId: sid,
+        candidateId: "merge-bad",
+        parentIds: ["cand-a", "cand-c"],
+        summary: "Should fail",
+      })
+      assert(badMerge.content.startsWith("refused:"), "merging pruned parent must be refused")
+
+      // Merge surviving parents -> level 1 FALSIFY_PRUNE
+      const mRes = await tools9.tournament.execute({
+        action: "merge",
+        sessionId: sid,
+        candidateId: "merge-ab",
+        parentIds: ["cand-a", "cand-b"],
+        summary: "Combined inductive proof with explicit bound",
+        proofSketch: "Full proof combining cand-a and cand-b",
+      })
+      assert.strictEqual(mRes.phase, "FALSIFY_PRUNE")
+      assert.strictEqual(mRes.currentLevel, 1)
+
+      // Falsify merged candidate -> REFEREE_SCORE
+      const fM = await tools9.tournament.execute({
+        action: "falsify",
+        sessionId: sid,
+        candidateId: "merge-ab",
+        verdict: "SURVIVES",
+        reason: "Survives all counterexample probes",
+      })
+      assert.strictEqual(fM.phase, "REFEREE_SCORE")
+
+      // final_verify while tournament incomplete MUST stamp FAIL
+      const runPath = join(testDir9, ".opencode", "teamwork", sid)
+      mkdirSync(join(runPath, "verify"), { recursive: true })
+      writeFileSync(join(runPath, "verify", "report-T1.json"), JSON.stringify({ status: "PASS" }))
+      await tools9.task_update.execute({ sessionId: sid, taskId: "T1", status: "worker_active", agent: "team/proposer" })
+      await tools9.task_update.execute({ sessionId: sid, taskId: "T1", status: "worker_done", agent: "team/proposer" })
+      await tools9.task_update.execute({ sessionId: sid, taskId: "T1", status: "verifier_active", agent: "team/verifier" })
+      await tools9.task_update.execute({ sessionId: sid, taskId: "T1", status: "verified_pass", agent: "team/verifier" })
+      await tools9.security_audit.execute({ sessionId: sid, status: "PASS", summary: "Clean" })
+      const fvIncomplete = await tools9.final_verify.execute({ sessionId: sid })
+      assert.strictEqual(fvIncomplete.status, "FAIL", "final_verify must refuse PASS while tournament is incomplete")
+
+      // Non-referee refused on score
+      const badActor = await tools9.tournament.execute({
+        action: "score",
+        sessionId: sid,
+        agent: "team/proposer",
+        scores: [{ candidateId: "merge-ab", soundness: 90, completeness: 90, clarity: 90, verdict: "PASS" }],
+      })
+      assert(badActor.content.startsWith("refused:"), "non-referee must be refused on score")
+
+      // Score with tie-breaking check (cand-a and merge-ab tied at 90 -> merge-ab wins by higher level!)
+      const scRes = await tools9.tournament.execute({
+        action: "score",
+        sessionId: sid,
+        agent: "team/referee",
+        scores: [
+          { candidateId: "cand-a", soundness: 90, completeness: 90, clarity: 90, verdict: "PASS" },
+          { candidateId: "merge-ab", soundness: 90, completeness: 90, clarity: 90, verdict: "PASS" },
+          { candidateId: "cand-b", soundness: 80, completeness: 80, clarity: 80, verdict: "NEEDS_REVISION" },
+        ],
+      })
+      assert.strictEqual(scRes.phase, "VICTORY_AUDIT")
+      assert.strictEqual(scRes.rankedCandidates[0].id, "merge-ab", "level 1 candidate must outrank tied level 0 candidate")
+
+      // Deterministic lexicographical tie-breaker check on compareCandidates
+      const baseTie = {
+        iteration: 1,
+        level: 0,
+        parentIds: [],
+        agent: "team/proposer",
+        status: "survives",
+        summary: "x",
+        proofSketch: "x",
+        refutations: [{ agent: "team/falsifier", verdict: "SURVIVES", reason: "ok", at: "2026-01-01T00:00:00Z" }],
+        score: 85,
+        rubric: { soundness: 85, completeness: 85, clarity: 85 },
+        refereeVerdict: "PASS",
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:00:00Z",
+      }
+      assert(compareCandidates({ ...baseTie, id: "cand-1" }, { ...baseTie, id: "cand-2" }) < 0, "lexicographical tie-break asc")
+
+      // Victory audit by team/referee
+      const audRes = await tools9.tournament.execute({
+        action: "audit",
+        sessionId: sid,
+        agent: "team/referee",
+        verdict: "PASS",
+        summary: "Synthesized proof verified cleanly.",
+      })
+      assert.strictEqual(audRes.phase, "COMPLETED")
+      assert.strictEqual(audRes.verdict.verdict, "ACCEPT")
+      assert.strictEqual(audRes.verdict.refereeAgent, "team/referee")
+      assert.strictEqual(audRes.verdict.winnerId, "merge-ab")
+      assert(existsSync(join(runPath, "TOURNAMENT_REPORT.md")))
+
+      const fvDone = await tools9.final_verify.execute({ sessionId: sid })
+      assert.strictEqual(fvDone.status, "PASS")
+      const finalObj = JSON.parse(readFileSync(join(runPath, "verify", "final.json"), "utf8"))
+      assert.strictEqual(finalObj.evidence.tournament.phase, "COMPLETED")
+      assert.strictEqual(finalObj.evidence.tournament.winnerId, "merge-ab")
+      assert.strictEqual(finalObj.evidence.tournament.refereeAgent, "team/referee")
+
+      const nextDone = await tools9.next.execute({ sessionId: sid })
+      assert.strictEqual(nextDone.status, "ALL_PASSED")
+      assert.strictEqual(nextDone.stamped, true)
+
+      // mF4f: a stamped PASS must not outlive the tournament evidence it rested on.
+      {
+        const vFile = join(runPath, "tournament", "verdict.json")
+        const rFile = join(runPath, "TOURNAMENT_REPORT.md")
+        const savedVerdict = readFileSync(vFile, "utf8")
+        const savedReport = readFileSync(rFile, "utf8")
+        rmSync(vFile)
+        rmSync(rFile)
+        const stale = await tools9.next.execute({ sessionId: sid })
+        assert.strictEqual(stale.status, "BLOCKED", "deleted tournament verdict/report must block merge")
+        assert(/completed tournament evidence/i.test(stale.content), `stale evidence refusal must be explicit: ${stale.content}`)
+        writeFileSync(vFile, savedVerdict)
+        writeFileSync(rFile, savedReport)
+        const restored = await tools9.next.execute({ sessionId: sid })
+        assert.strictEqual(restored.status, "ALL_PASSED", "restored evidence must allow completion again")
+      }
+
+      // mF4l: an AbortSignal that fires during deriveCallerAgent must not stamp PASS.
+      {
+        const midAbort = new AbortController()
+        const originalGet = ctx9.session.get
+        ctx9.session.get = async () => {
+          midAbort.abort()
+          return undefined
+        }
+        try {
+          const fvMidAbort = await tools9.final_verify.execute({ sessionId: sid }, { signal: midAbort.signal, sessionID: sid })
+          assert.strictEqual(fvMidAbort.status, "FAIL", "abort after the last await must fail closed")
+          assert(/aborted/i.test(fvMidAbort.content), `aborted verdict must say so: ${fvMidAbort.content}`)
+        } finally {
+          ctx9.session.get = originalGet
+        }
+      }
+
+      // All-falsified tournament refuses PASS audit
+      const sidAllFail = "20261018-190021-allfail"
+      await tools9.tournament.execute({
+        action: "init",
+        sessionId: sidAllFail,
+        massiveProofOptIn: true,
+        budgetUsd: 20,
+        tournament: { levels: 1, branchingFactor: 2, maxCandidates: 4, maxIterations: 1 },
+      })
+      await tools9.tournament.execute({ action: "propose", sessionId: sidAllFail, candidateId: "c1", summary: "bad 1" })
+      await tools9.tournament.execute({ action: "propose", sessionId: sidAllFail, candidateId: "c2", summary: "bad 2" })
+      await tools9.tournament.execute({ action: "falsify", sessionId: sidAllFail, candidateId: "c1", verdict: "FALSIFIED", reason: "wrong" })
+      await tools9.tournament.execute({ action: "falsify", sessionId: sidAllFail, candidateId: "c2", verdict: "FALSIFIED", reason: "wrong" })
+      await tools9.tournament.execute({
+        action: "score",
+        sessionId: sidAllFail,
+        scores: [{ candidateId: "c1", soundness: 10, completeness: 10, clarity: 10, verdict: "FAIL" }],
+      })
+      const refusePassAudit = await tools9.tournament.execute({
+        action: "audit",
+        sessionId: sidAllFail,
+        verdict: "PASS",
+      })
+      assert(refusePassAudit.content.startsWith("refused:"), "must refuse PASS when all candidates are pruned")
+    }
+
+    // --- 9.4 Cancellation & partial-report handling ---
+    {
+      // (a) AbortSignal mid-tournament
+      const sidSig = "20261018-190030-sig"
+      await tools9.tournament.execute({
+        action: "init",
+        sessionId: sidSig,
+        massiveProofOptIn: true,
+        budgetUsd: 20,
+        tournament: { levels: 2, branchingFactor: 2, maxCandidates: 8, maxIterations: 2 },
+      })
+      await tools9.tournament.execute({ action: "propose", sessionId: sidSig, candidateId: "s1", summary: "Candidate S1" })
+      const ac = new AbortController()
+      ac.abort()
+      const abortedRes = await tools9.tournament.execute(
+        { action: "propose", sessionId: sidSig, candidateId: "s2", summary: "Should abort" },
+        { signal: ac.signal },
+      )
+      assert.strictEqual(abortedRes.aborted, true)
+      assert.strictEqual(abortedRes.phase, "CANCELLED")
+      const sigRun = join(testDir9, ".opencode", "teamwork", sidSig)
+      assert(existsSync(join(sigRun, "TOURNAMENT_REPORT.md")))
+      assert(existsSync(join(sigRun, "interrupted.md")))
+      const sigVerdict = JSON.parse(readFileSync(join(sigRun, "tournament", "verdict.json"), "utf8"))
+      assert.strictEqual(sigVerdict.status, "PARTIAL")
+      const sigState = JSON.parse(readFileSync(join(sigRun, "state.json"), "utf8"))
+      assert.strictEqual(sigState.phase, "PRESENT_PARTIAL")
+      const sigEvents = readFileSync(join(sigRun, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l))
+      assert(sigEvents.some((e) => e.event === "tournament_cancelled"), "must append tournament_cancelled event")
+      for (let i = 1; i < sigEvents.length; i++) {
+        assert(sigEvents[i].seq > sigEvents[i - 1].seq, "events seq must remain monotonic")
+      }
+      const refusedAfter = await tools9.tournament.execute({ action: "propose", sessionId: sidSig, candidateId: "s3", summary: "After cancel" })
+      assert(refusedAfter.content.startsWith("refused:"), "subsequent dispatch must be refused after cancel")
+      const fvSig = await tools9.final_verify.execute({ sessionId: sidSig })
+      assert.strictEqual(fvSig.status, "FAIL")
+
+      // (b) Explicit cancel + idempotency
+      const sidCan = "20261018-190031-can"
+      await tools9.tournament.execute({ action: "init", sessionId: sidCan, massiveProofOptIn: true, budgetUsd: 20 })
+      await tools9.tournament.execute({ action: "propose", sessionId: sidCan, candidateId: "c1", summary: "Partial cand" })
+      const c1 = await tools9.tournament.execute({ action: "cancel", sessionId: sidCan, reason: "User stopped early" })
+      assert.strictEqual(c1.phase, "CANCELLED")
+      assert.strictEqual(c1.alreadyFinalized, false)
+      const c2 = await tools9.tournament.execute({ action: "cancel", sessionId: sidCan, reason: "Repeat" })
+      assert.strictEqual(c2.phase, "CANCELLED")
+      assert.strictEqual(c2.alreadyFinalized, true)
+      assert.strictEqual(c2.verdict.generatedAt, c1.verdict.generatedAt, "idempotent cancel must preserve timestamp")
+
+      // (c) Budget exhaustion -> BUDGET_HALTED
+      const sidBud = "20261018-190032-bud"
+      await tools9.tournament.execute({ action: "init", sessionId: sidBud, massiveProofOptIn: true, budgetUsd: 10 })
+      await tools9.tournament.execute({ action: "propose", sessionId: sidBud, candidateId: "b1", summary: "Before halt" })
+      const costRes = await tools9.cost.execute({ sessionId: sidBud, addUsd: 8.5, taskId: "tournament" })
+      assert.strictEqual(costRes.shouldHalt, true)
+      const haltedNext = await tools9.next.execute({ sessionId: sidBud })
+      assert.strictEqual(haltedNext.status, "BUDGET_HALTED")
+      assert.strictEqual(haltedNext.phase, "PRESENT_PARTIAL")
+      const refusedBud = await tools9.tournament.execute({ action: "propose", sessionId: sidBud, candidateId: "b2", summary: "Over budget" })
+      assert(refusedBud.content.startsWith("refused:"), "must refuse dispatch after BUDGET_HALTED")
+    }
+
+    // --- 9.5 Security & containment ---
+    {
+      const sidSec = "20261018-190040-sec"
+      await tools9.tournament.execute({ action: "init", sessionId: sidSec, massiveProofOptIn: true, budgetUsd: 20 })
+      for (const badId of ["../x", "a/b", ".hidden", "__proto__", "constructor", "prototype", "x".repeat(65)]) {
+        const r = await tools9.tournament.execute({ action: "propose", sessionId: sidSec, candidateId: badId, summary: "bad id" })
+        assert(r.content.startsWith("refused:"), `bad candidateId ${badId} must be refused: ${r.content}`)
+      }
+      assert.strictEqual(({}).polluted, undefined, "Object.prototype must remain clean")
+
+      // Control chars in summary/reason cannot inject physical lines in events.jsonl or raw escapes in describeRun
+      await tools9.tournament.execute({
+        action: "propose",
+        sessionId: sidSec,
+        candidateId: "ctrl-1",
+        summary: "Line1\r\nLine2\u2028Line3\u2029\x1b[31m",
+      })
+      const desc = describeRun(testDir9)
+      assert(desc && desc.includes("Tournament: phase"), "describeRun must include sanitized tournament line")
+      assert(!desc.includes(ESC_CHAR) && !/[\u2028\u2029]/.test(desc), "describeRun must never contain raw ESC or Unicode line separators")
+
+      // Symlinked tournament/ dir and dangling symlinked report refused cleanly without throwing or touching outside files
+      const sidSym = "20261018-190041-sym"
+      await tools9.tournament.execute({ action: "init", sessionId: sidSym, massiveProofOptIn: true, budgetUsd: 20 })
+      const symRun = join(testDir9, ".opencode", "teamwork", sidSym)
+      const outsideTarget = join(testDir9, "outside-secret.txt")
+      writeFileSync(outsideTarget, "ORIGINAL")
+      rmSync(join(symRun, "TOURNAMENT_REPORT.md"), { force: true })
+      symlinkSync(outsideTarget, join(symRun, "TOURNAMENT_REPORT.md"))
+      const symCancel = await tools9.tournament.execute({ action: "cancel", sessionId: sidSym, reason: "Symlink check" })
+      assert.strictEqual(symCancel.refused, "unsafe_path", `symlinked TOURNAMENT_REPORT.md must return refused: "unsafe_path": ${JSON.stringify(symCancel)}`)
+      assert(/refused/i.test(symCancel.content), `symlinked TOURNAMENT_REPORT.md must be refused: ${symCancel.content}`)
+      assert.strictEqual(readFileSync(outsideTarget, "utf8"), "ORIGINAL", "outside target must remain untouched")
+
+      // teamwork_plan refuses before writing plan.dag.json/state.json/costs.json when tournament/ is a symlink
+      const sidPlanSym = "20261018-190043-plansym"
+      const planSymRun = join(testDir9, ".opencode", "teamwork", sidPlanSym)
+      mkdirSync(planSymRun, { recursive: true })
+      symlinkSync(join(testDir9, "nonexistent-outside-tournament"), join(planSymRun, "tournament"))
+      const resPlanSym = await tools9.plan.execute({
+        sessionId: sidPlanSym,
+        topology: "massive-proof",
+        massiveProofOptIn: true,
+        budgetUsd: 20,
+        skipInterview: true,
+        tasks: [{ id: "T1" }],
+      })
+      assert.strictEqual(resPlanSym.refused, "unsafe_path", `plan with symlinked tournament/ must return refused: "unsafe_path": ${JSON.stringify(resPlanSym)}`)
+      assert(!existsSync(join(planSymRun, "plan.dag.json")), "must not write plan.dag.json when tournament/ is symlink")
+      assert(!existsSync(join(planSymRun, "state.json")), "must not write state.json when tournament/ is symlink")
+      assert(!existsSync(join(planSymRun, "costs.json")), "must not write costs.json when tournament/ is symlink")
+
+      const sidSymDir = "20261018-190042-symdir"
+      await tools9.tournament.execute({ action: "init", sessionId: sidSymDir, massiveProofOptIn: true, budgetUsd: 20 })
+      const symDirRun = join(testDir9, ".opencode", "teamwork", sidSymDir)
+      const outsideDir = join(testDir9, "outside-dir")
+      mkdirSync(outsideDir, { recursive: true })
+      writeFileSync(join(outsideDir, "manifest.json"), JSON.stringify({ phase: "COMPLETED", config: {} }))
+      rmSync(join(symDirRun, "tournament"), { recursive: true, force: true })
+      symlinkSync(outsideDir, join(symDirRun, "tournament"))
+      const symStatus = await tools9.tournament.execute({ action: "status", sessionId: sidSymDir })
+      assert.strictEqual(symStatus.refused, "unsafe_path")
+      assert(/refused/i.test(symStatus.content), `symlinked tournament/ dir must be refused: ${symStatus.content}`)
+
+      // teamwork_next (AbortSignal & budget_exhausted) and teamwork_final_verify (AbortSignal) return clean refused: "unsafe_path"
+      // without throwing or touching symlink targets when TOURNAMENT_REPORT.md, interrupted.md, or tournament/verdict.json is a symlink
+      for (const relTarget of ["TOURNAMENT_REPORT.md", "interrupted.md", join("tournament", "verdict.json")]) {
+        const sidNextSig = `20261018-190044-${relTarget.replace(/[^a-z0-9]/gi, "").slice(0, 6).toLowerCase()}`
+        await tools9.tournament.execute({ action: "init", sessionId: sidNextSig, massiveProofOptIn: true, budgetUsd: 20 })
+        const rDir = join(testDir9, ".opencode", "teamwork", sidNextSig)
+        const canary = join(testDir9, `canary-${sidNextSig}.txt`)
+        writeFileSync(canary, "DO_NOT_TOUCH")
+        rmSync(join(rDir, relTarget), { force: true })
+        symlinkSync(canary, join(rDir, relTarget))
+
+        const acNext = new AbortController()
+        acNext.abort()
+        const nextSigRes = await tools9.next.execute({ sessionId: sidNextSig }, { signal: acNext.signal })
+        assert.strictEqual(nextSigRes.status, "BLOCKED", `teamwork_next AbortSignal with symlinked ${relTarget} must return BLOCKED`)
+        assert.strictEqual(nextSigRes.refused, "unsafe_path", `teamwork_next AbortSignal with symlinked ${relTarget} must return refused: unsafe_path`)
+        assert(/refused/i.test(nextSigRes.content))
+        assert.strictEqual(readFileSync(canary, "utf8"), "DO_NOT_TOUCH", "canary must remain untouched")
+
+        const fvSigRes = await tools9.final_verify.execute({ sessionId: sidNextSig }, { signal: acNext.signal })
+        assert.strictEqual(fvSigRes.status, "FAIL", `teamwork_final_verify AbortSignal with symlinked ${relTarget} must return FAIL`)
+        assert.strictEqual(fvSigRes.refused, "unsafe_path", `teamwork_final_verify AbortSignal with symlinked ${relTarget} must return refused: unsafe_path`)
+        assert(/refused/i.test(fvSigRes.content))
+        assert.strictEqual(readFileSync(canary, "utf8"), "DO_NOT_TOUCH", "canary must remain untouched")
+      }
+
+      // teamwork_next budget_exhausted + teamwork_tournament locked costs.json symlink handling
+      const sidNextBud = "20261018-190045-nbudsym"
+      await tools9.tournament.execute({ action: "init", sessionId: sidNextBud, massiveProofOptIn: true, budgetUsd: 10 })
+      const nBudDir = join(testDir9, ".opencode", "teamwork", sidNextBud)
+      await tools9.cost.execute({ sessionId: sidNextBud, addUsd: 8.5, taskId: "tournament" })
+      const budCanary = join(testDir9, "canary-nbud.txt")
+      writeFileSync(budCanary, "DO_NOT_TOUCH")
+      rmSync(join(nBudDir, "TOURNAMENT_REPORT.md"), { force: true })
+      symlinkSync(budCanary, join(nBudDir, "TOURNAMENT_REPORT.md"))
+      const nextBudRes = await tools9.next.execute({ sessionId: sidNextBud })
+      assert.strictEqual(nextBudRes.status, "BLOCKED", "teamwork_next budget_exhausted with symlinked TOURNAMENT_REPORT.md must return BLOCKED")
+      assert.strictEqual(nextBudRes.refused, "unsafe_path")
+      assert.strictEqual(readFileSync(budCanary, "utf8"), "DO_NOT_TOUCH")
+
+      // Locked teamwork_tournament propose with symlinked costs.json returns refused: "unsafe_path"
+      const sidCostsSym = "20261018-190046-costsym"
+      await tools9.tournament.execute({ action: "init", sessionId: sidCostsSym, massiveProofOptIn: true, budgetUsd: 20 })
+      const costsSymDir = join(testDir9, ".opencode", "teamwork", sidCostsSym)
+      const outsideCosts = join(testDir9, "outside-costs.json")
+      writeFileSync(outsideCosts, JSON.stringify({ budgetUsd: 20, spentUsd: 0 }))
+      rmSync(join(costsSymDir, "costs.json"), { force: true })
+      symlinkSync(outsideCosts, join(costsSymDir, "costs.json"))
+      const costsSymRes = await tools9.tournament.execute({ action: "propose", sessionId: sidCostsSym, candidateId: "c1", summary: "x" })
+      assert.strictEqual(costsSymRes.refused, "unsafe_path", `symlinked costs.json in locked action must return refused: unsafe_path: ${JSON.stringify(costsSymRes)}`)
+    }
+
+    // --- 9.4 CodeRabbit review threads (tournament/PR #10).
+    {
+      const run9 = (id) => join(testDir9, ".opencode", "teamwork", id)
+      const readJson9 = (file) => JSON.parse(readFileSync(file, "utf8"))
+
+      // mF44: quoted examples are documentation, not consent (route + plan).
+      const rQuoted = await tools9.route.execute({
+        request: 'Prove this theorem. The example says “use a proof tournament”.',
+      })
+      assert.notStrictEqual(rQuoted.topology, "massive-proof", "quoted opt-in must not route to massive-proof")
+      assert.strictEqual(rQuoted.massiveProofOptIn, false)
+      const rAffirm = await tools9.route.execute({ request: "Use a proof tournament to prove this theorem" })
+      assert.strictEqual(rAffirm.topology, "massive-proof", "unquoted opt-in must still route to massive-proof")
+      assert.strictEqual(rAffirm.massiveProofOptIn, true)
+      const sidQuoted = "20261018-190100-qconsent"
+      const planQuoted = await tools9.plan.execute({
+        sessionId: sidQuoted,
+        topology: "massive-proof",
+        request: 'Prove this theorem. The example says “use a proof tournament”.',
+        skipInterview: true,
+        tasks: [{ id: "T1" }],
+      })
+      assert.strictEqual(planQuoted.refused, "opt_in_required", "quoted prose must not pass plan preflight")
+      assert(!existsSync(run9(sidQuoted)), "refused plan must write nothing")
+      const sidAffirm = "20261018-190101-affirm"
+      const planAffirm = await tools9.plan.execute({
+        sessionId: sidAffirm,
+        topology: "massive-proof",
+        request: "Use a proof tournament to prove this theorem",
+        budgetUsd: 20,
+        skipInterview: true,
+        tasks: [{ id: "T1" }],
+      })
+      assert(planAffirm.content.startsWith("Planned"), `unquoted opt-in must still plan: ${planAffirm.content}`)
+
+      // mF4B: a NEW bare `massive-proof-swarm` run needs opt-in; an existing legacy run opens.
+      const sidAliasNew = "20261018-190102-aliasnew"
+      const aliasNew = await tools9.plan.execute({ sessionId: sidAliasNew, topology: "massive-proof-swarm", skipInterview: true, tasks: [{ id: "T1" }] })
+      assert.strictEqual(aliasNew.refused, "opt_in_required", "new bare alias must be gated")
+      assert(!existsSync(run9(sidAliasNew)), "gated alias must write nothing")
+      const sidAliasLegacy = "20261018-190103-aliasold"
+      mkdirSync(run9(sidAliasLegacy), { recursive: true })
+      const aliasLegacy = await tools9.plan.execute({ sessionId: sidAliasLegacy, topology: "massive-proof-swarm", skipInterview: true, tasks: [{ id: "T1" }] })
+      assert(aliasLegacy.content.startsWith("Planned"), `existing legacy alias run must still open: ${aliasLegacy.content}`)
+      assert.strictEqual(readJson9(join(run9(sidAliasLegacy), "plan.dag.json")).topology, "massive-proof")
+      assert(!existsSync(join(run9(sidAliasLegacy), "tournament", "manifest.json")), "legacy alias migration must not create tournament state")
+
+      // mF4E: re-plans cannot change active bounds; omitting them retains the manifest config.
+      const sidAffirmRun = run9(sidAffirm)
+      const manifestBefore = readJson9(join(sidAffirmRun, "tournament", "manifest.json"))
+      const boundsReplan = await tools9.plan.execute({
+        sessionId: sidAffirm,
+        topology: "massive-proof",
+        massiveProofOptIn: true,
+        budgetUsd: 20,
+        skipInterview: true,
+        tournament: { branchingFactor: 1 },
+        tasks: [{ id: "T1" }],
+      })
+      assert.strictEqual(boundsReplan.refused, "invalid_tournament_config", "changing active bounds must be refused")
+      const manifestAfter = readJson9(join(sidAffirmRun, "tournament", "manifest.json"))
+      assert.strictEqual(manifestAfter.config.branchingFactor, manifestBefore.config.branchingFactor)
+      const omittedReplan = await tools9.plan.execute({
+        sessionId: sidAffirm,
+        topology: "massive-proof",
+        massiveProofOptIn: true,
+        budgetUsd: 20,
+        skipInterview: true,
+        tasks: [{ id: "T1" }],
+      })
+      assert(omittedReplan.content.startsWith("Planned"), `re-plan without bounds must succeed: ${omittedReplan.content}`)
+      assert.strictEqual(readJson9(join(sidAffirmRun, "plan.dag.json")).tournament.config.branchingFactor, manifestBefore.config.branchingFactor, "plan must retain active bounds")
+
+      // mF4H: init persists an approved budget override while preserving spend.
+      const sidBudInit = "20261018-190104-budinit"
+      const budRun = run9(sidBudInit)
+      mkdirSync(budRun, { recursive: true })
+      writeFileSync(join(budRun, "costs.json"), JSON.stringify({ sessionId: sidBudInit, budgetUsd: 10, spentUsd: 8, byTask: {}, byTaskTokens: {} }))
+      const budInit = await tools9.tournament.execute({ action: "init", sessionId: sidBudInit, massiveProofOptIn: true, budgetUsd: 20 })
+      assert(budInit.content.startsWith("Tournament initialized"), `init with larger budget must succeed: ${budInit.content}`)
+      const budCosts = readJson9(join(budRun, "costs.json"))
+      assert.strictEqual(budCosts.budgetUsd, 20, "init must persist the approved budget")
+      assert.strictEqual(budCosts.spentUsd, 8, "init must preserve accumulated spend")
+      const budNext = await tools9.next.execute({ sessionId: sidBudInit })
+      assert.strictEqual(budNext.status, "TOURNAMENT_ACTIVE", "next must use the persisted budget, not halt")
+
+      // mF4N: an init retry repairs a missing costs.json even when the plan exists.
+      const sidRepair = "20261018-190105-repair"
+      const repairRun = run9(sidRepair)
+      mkdirSync(repairRun, { recursive: true })
+      writeFileSync(join(repairRun, "plan.dag.json"), JSON.stringify({ sessionId: sidRepair, topology: "massive-proof", tasks: [], tournament: { config: {} } }))
+      const repairInit = await tools9.tournament.execute({ action: "init", sessionId: sidRepair, massiveProofOptIn: true, budgetUsd: 20 })
+      assert(repairInit.content.startsWith("Tournament initialized"), `retry init must succeed: ${repairInit.content}`)
+      assert(existsSync(join(repairRun, "costs.json")), "retry init must repair a missing cost record")
+      assert.strictEqual(readJson9(join(repairRun, "costs.json")).budgetUsd, 20)
+
+      // mF4T: missing costs.json blocks tournament work instead of skipping the budget guard.
+      const sidNoCosts = "20261018-190106-nocosts"
+      await tools9.tournament.execute({ action: "init", sessionId: sidNoCosts, massiveProofOptIn: true, budgetUsd: 20 })
+      rmSync(join(run9(sidNoCosts), "costs.json"))
+      const noCostsNext = await tools9.next.execute({ sessionId: sidNoCosts })
+      assert.strictEqual(noCostsNext.status, "BLOCKED", "missing costs.json must block next")
+      assert(/costs\.json/i.test(noCostsNext.content))
+      const noCostsPropose = await tools9.tournament.execute({ action: "propose", sessionId: sidNoCosts, candidateId: "c1", summary: "x" })
+      assert.strictEqual(noCostsPropose.refused, "budget_preflight", "missing costs.json must refuse tournament work")
+
+      // mF4X: a known non-referee caller cannot self-certify with the agent label.
+      const sidTrust = "20261018-190107-trust"
+      await tools9.tournament.execute({
+        action: "init",
+        sessionId: sidTrust,
+        massiveProofOptIn: true,
+        budgetUsd: 20,
+        tournament: { levels: 1, branchingFactor: 1, maxCandidates: 4, maxIterations: 1 },
+      })
+      await tools9.tournament.execute({ action: "propose", sessionId: sidTrust, candidateId: "c1", summary: "Candidate" })
+      await tools9.tournament.execute({ action: "falsify", sessionId: sidTrust, candidateId: "c1", verdict: "SURVIVES", reason: "Survives" })
+      const originalSessionGet = ctx9.session.get
+      ctx9.session.get = async () => ({ agent: "team/worker" })
+      try {
+        const selfCert = await tools9.tournament.execute(
+          {
+            action: "score",
+            sessionId: sidTrust,
+            agent: "team/referee",
+            scores: [{ candidateId: "c1", soundness: 90, completeness: 90, clarity: 90, verdict: "PASS" }],
+          },
+          { sessionID: sidTrust },
+        )
+        assert(selfCert.content.startsWith("refused:"), "non-referee session identity must override the referee label")
+      } finally {
+        ctx9.session.get = originalSessionGet
+      }
+
+      // mF5O: score batches cannot repeat ids or exceed the candidate count.
+      const duplicateScores = await tools9.tournament.execute({
+        action: "score",
+        sessionId: sidTrust,
+        agent: "team/referee",
+        scores: [
+          { candidateId: "c1", soundness: 90, completeness: 90, clarity: 90, verdict: "PASS" },
+          { candidateId: "c1", soundness: 90, completeness: 90, clarity: 90, verdict: "PASS" },
+        ],
+      })
+      assert(duplicateScores.content.includes("duplicate candidateId"), `duplicate ids must be refused: ${duplicateScores.content}`)
+      const oversizeScores = await tools9.tournament.execute({
+        action: "score",
+        sessionId: sidTrust,
+        agent: "team/referee",
+        scores: [
+          { candidateId: "c1", soundness: 90, completeness: 90, clarity: 90, verdict: "PASS" },
+          { candidateId: "c2", soundness: 90, completeness: 90, clarity: 90, verdict: "PASS" },
+        ],
+      })
+      assert(oversizeScores.content.includes("exceeds the number of tournament candidates"), `oversize batch must be refused: ${oversizeScores.content}`)
+      const validScore = await tools9.tournament.execute({
+        action: "score",
+        sessionId: sidTrust,
+        agent: "team/referee",
+        scores: [{ candidateId: "c1", soundness: 90, completeness: 90, clarity: 90, verdict: "PASS" }],
+      })
+      assert.strictEqual(validScore.phase, "VICTORY_AUDIT", "one score per candidate must still work")
+
+      // mF4F: concurrent init calls cannot both publish a manifest.
+      const sidRace = "20261018-190108-race"
+      const [raceA, raceB] = await Promise.all([
+        tools9.tournament.execute({ action: "init", sessionId: sidRace, massiveProofOptIn: true, budgetUsd: 20 }),
+        tools9.tournament.execute({ action: "init", sessionId: sidRace, massiveProofOptIn: true, budgetUsd: 20, tournament: { maxIterations: 2 } }),
+      ])
+      const raceWins = [raceA, raceB].filter((r) => r.manifest)
+      const raceLosses = [raceA, raceB].filter((r) => !r.manifest)
+      assert.strictEqual(raceWins.length, 1, "exactly one concurrent init must win")
+      assert.strictEqual(raceLosses.length, 1, "the other concurrent init must refuse")
+      assert(/already exists/i.test(raceLosses[0].content), `losing init must explain: ${raceLosses[0].content}`)
+      const raceManifest = readJson9(join(run9(sidRace), "tournament", "manifest.json"))
+      assert.strictEqual(raceManifest.phase, "PROPOSE")
+
+      // mF5I: malformed COMPLETED evidence is rejected, not read as .length on undefined.
+      const sidBadEvidence = "20261018-190109-badev"
+      const badRun = run9(sidBadEvidence)
+      mkdirSync(join(badRun, "tournament"), { recursive: true })
+      mkdirSync(join(badRun, "verify"), { recursive: true })
+      writeFileSync(join(badRun, "plan.dag.json"), JSON.stringify({ sessionId: sidBadEvidence, topology: "massive-proof", tournament: { config: {} }, tasks: [{ id: "T1" }] }))
+      writeFileSync(join(badRun, "state.json"), JSON.stringify({ sessionId: sidBadEvidence, phase: "DISPATCH", tasks: { T1: { status: "verified_pass" } } }))
+      writeFileSync(join(badRun, "verify", "report-T1.json"), JSON.stringify({ status: "PASS" }))
+      writeFileSync(join(badRun, "verify", "security-audit.json"), JSON.stringify({ status: "PASS" }))
+      writeFileSync(
+        join(badRun, "tournament", "manifest.json"),
+        JSON.stringify({
+          version: 1,
+          sessionId: sidBadEvidence,
+          phase: "COMPLETED",
+          config: { levels: 2, branchingFactor: 4, maxCandidates: 16, maxIterations: 4, passScoreThreshold: 70, unitCostUsd: 0.25 },
+          candidates: {},
+        }),
+      )
+      const badEvidence = await tools9.final_verify.execute({ sessionId: sidBadEvidence })
+      assert.strictEqual(badEvidence.status, "FAIL", "malformed completed evidence must fail closed")
+      assert(/rankedCandidates|verdict/i.test(badEvidence.content), `schema failure must be named: ${badEvidence.content}`)
+
+      // mF49/mF5B: max estimate counts referee calls per iteration and preflight
+      // respects the same 80% dispatch halt threshold.
+      const estMax = await tools9.tournament.execute({
+        action: "estimate",
+        budgetUsd: 20,
+        tournament: { levels: 1, branchingFactor: 1, maxCandidates: 2, maxIterations: 2 },
+      })
+      assert.strictEqual(estMax.estimate.estimatedMinUsd, 1, "min estimate for width/level 1 should be $1.00")
+      assert.strictEqual(estMax.estimate.estimatedMaxUsd, 1.75, "max estimate must count a referee call per iteration")
+      const estTight = await tools9.tournament.execute({ action: "estimate", budgetUsd: 3.5 })
+      assert.strictEqual(estTight.ok, false, "budget equal to the estimate must fail the 80% dispatch-halt preflight")
+      const estSafe = await tools9.tournament.execute({ action: "estimate", budgetUsd: 4.5 })
+      assert.strictEqual(estSafe.ok, true, "a budget above the 80% cap must be sufficient")
+
+      // mF5V: a cancellation retry repairs state/artifacts without changing the reason/timestamp.
+      const sidCancelRetry = "20261018-190110-caretry"
+      await tools9.tournament.execute({ action: "init", sessionId: sidCancelRetry, massiveProofOptIn: true, budgetUsd: 20 })
+      await tools9.tournament.execute({ action: "propose", sessionId: sidCancelRetry, candidateId: "c1", summary: "Cancel me" })
+      const firstCancel = await tools9.tournament.execute({ action: "cancel", sessionId: sidCancelRetry, reason: "First reason" })
+      assert.strictEqual(firstCancel.alreadyFinalized, false)
+      const cancelRun = run9(sidCancelRetry)
+      const cancelledManifest = readJson9(join(cancelRun, "tournament", "manifest.json"))
+      const cancelledAt = cancelledManifest.cancelled.cancelledAt
+      const stateBefore = readJson9(join(cancelRun, "state.json"))
+      stateBefore.phase = "DISPATCH"
+      writeFileSync(join(cancelRun, "state.json"), JSON.stringify(stateBefore))
+      rmSync(join(cancelRun, "tournament", "verdict.json"))
+      rmSync(join(cancelRun, "TOURNAMENT_REPORT.md"))
+      rmSync(join(cancelRun, "interrupted.md"))
+      const retryCancel = await tools9.tournament.execute({ action: "cancel", sessionId: sidCancelRetry, reason: "Second reason" })
+      assert.strictEqual(retryCancel.alreadyFinalized, true, "retry must take the idempotent branch")
+      assert.strictEqual(readJson9(join(cancelRun, "state.json")).phase, "PRESENT_PARTIAL", "retry must repair the checkpoint")
+      assert(existsSync(join(cancelRun, "tournament", "verdict.json")), "retry must restore the verdict artifact")
+      assert(existsSync(join(cancelRun, "TOURNAMENT_REPORT.md")), "retry must restore the partial report")
+      assert(existsSync(join(cancelRun, "interrupted.md")), "retry must restore interrupted.md")
+      const repairedManifest = readJson9(join(cancelRun, "tournament", "manifest.json"))
+      assert.strictEqual(repairedManifest.cancelled.reason, cancelledManifest.cancelled.reason, "retry must preserve the original reason")
+      assert.strictEqual(repairedManifest.cancelled.cancelledAt, cancelledAt, "retry must preserve the original timestamp")
+      assert.strictEqual(readJson9(join(cancelRun, "tournament", "verdict.json")).generatedAt, cancelledAt, "restored verdict keeps original timestamp")
+    }
+
+    console.log("✓ Math/Proof tournament opt-in, preflight, E2E, cancellation & security verified")
+  } finally {
+    rmSync(testDir9, { recursive: true, force: true })
   }
 }
 
@@ -3909,5 +4880,246 @@ process.exit(0);
   } finally {
     process.env.PATH = savedPath
     rmSync(lemmaTestDir, { recursive: true, force: true })
+  }
+}
+
+// Part 10: PR #10 review regressions
+// ==========================================
+{
+  console.log("Testing PR #10 review regressions (FIFO refusal, tilde fences, clean, routing edges)...")
+
+  // --- 10.1 readBoundedRunFile must refuse a FIFO instead of blocking forever.
+  // A regression would hang the process synchronously, so run it in a child
+  // with a hard timeout that kills the child and fails the suite.
+  const tournamentUrl = new URL("../plugins/opencode-teamwork/tournament.ts", import.meta.url).href
+  const fifoCode = [
+    `import { readBoundedRunFile } from ${JSON.stringify(tournamentUrl)}`,
+    `import { execFileSync } from "node:child_process"`,
+    `import { mkdtempSync, rmSync } from "node:fs"`,
+    `import { tmpdir } from "node:os"`,
+    `import { join } from "node:path"`,
+    `const dir = mkdtempSync(join(tmpdir(), "teamwork-fifo-"))`,
+    `let made = true`,
+    `try {`,
+    `  execFileSync("mkfifo", [join(dir, "manifest.json")], { stdio: "ignore" })`,
+    `} catch (err) {`,
+    `  if (err && err.code === "ENOENT") made = false; else throw err`,
+    `}`,
+    `try {`,
+    `  if (!made) {`,
+    `    console.log("SKIP: mkfifo unavailable")`,
+    `  } else {`,
+    `    const res = readBoundedRunFile(dir, join(dir, "manifest.json"), 4096)`,
+    `    if (res.status !== "error") throw new Error("expected refusal, got " + JSON.stringify(res))`,
+    `    if (typeof res.error !== "string" || !/refused|not a regular file/i.test(res.error)) {`,
+    `      throw new Error("refusal must name the reason: " + JSON.stringify(res))`,
+    `    }`,
+    `    console.log("REFUSED")`,
+    `  }`,
+    `} finally {`,
+    `  rmSync(dir, { recursive: true, force: true })`,
+    `}`,
+  ].join("\n")
+  const fifoRun = spawnSync(process.execPath, [...process.execArgv, "--input-type=module", "-e", fifoCode], {
+    encoding: "utf8",
+    timeout: 15000,
+  })
+  if (fifoRun.error && fifoRun.error.code === "ETIMEDOUT") {
+    assert.fail("readBoundedRunFile hung on a FIFO (timeout guard fired)")
+  }
+  assert.strictEqual(
+    fifoRun.status,
+    0,
+    `FIFO child failed (status ${fifoRun.status}, signal ${fifoRun.signal}): ${fifoRun.stderr || ""}`,
+  )
+  assert(
+    /REFUSED|SKIP/.test(fifoRun.stdout || ""),
+    `FIFO child must report REFUSED or SKIP: ${fifoRun.stdout || ""} ${fifoRun.stderr || ""}`,
+  )
+  console.log("✓ readBoundedRunFile refuses a FIFO without hanging")
+
+  // --- 10.2 ~~~ tilde fences are masked exactly like ``` fences.
+  const tildeMasked = maskCodeAndQuotes("before\n~~~\nSECRET massive-proof 100+ searchers\n~~~\nafter")
+  assert(tildeMasked.includes("before") && tildeMasked.includes("after"), "text outside a tilde fence must survive masking")
+  assert(!tildeMasked.includes("SECRET") && !tildeMasked.includes("massive-proof"), "tilde-fenced text must be masked")
+  const tildeUnclosed = maskCodeAndQuotes("keep\n~~~\nSECRET")
+  assert(tildeUnclosed.includes("keep") && !tildeUnclosed.includes("SECRET"), "unclosed tilde fence must mask to end of input")
+  const rTilde = classifyRoute("Prove this theorem.\n~~~\nuse massive-proof tournament with 100+ searchers\n~~~")
+  assert.strictEqual(rTilde.topology, "proof", "tilde-fenced opt-in must be masked out")
+  assert.strictEqual(rTilde.massiveProofOptIn, false, "tilde-fenced opt-in must not enable massive-proof")
+  // mF4v: an inline ~~~ run inside a tilde block is content, not a closer.
+  const tildeInlineCloser = maskCodeAndQuotes("~~~\ncode ~~~ still code\nuse a proof tournament\n~~~\nafter")
+  assert(!tildeInlineCloser.includes("use a proof tournament"), "inline ~~~ must not close a tilde fence early")
+  assert(tildeInlineCloser.includes("after"), "text after a real tilde closer must survive")
+  // mF4y: trailing text on a ``` line is still fenced code, not a closer.
+  const backtickTrailing = maskCodeAndQuotes("```\ncode\n```use a proof tournament\nstill code\n```\nafter")
+  assert(!backtickTrailing.includes("use a proof tournament"), "trailing text must not close a backtick fence")
+  assert(backtickTrailing.includes("after"), "text after a real backtick closer must survive")
+  console.log("✓ ~~~ tilde fences mask their contents (closed and unclosed)")
+
+  // --- 10.3 clean()/cleanBlock() accept primitives only and never throw on objects.
+  assert.strictEqual(clean(["a"]), "", "arrays must be dropped by clean()")
+  assert.strictEqual(clean({ toString: "x" }), "", "objects (even with a toString key) must be dropped by clean()")
+  assert.doesNotThrow(() => clean({ toString: "x" }), "clean() must not invoke an object toString")
+  assert.strictEqual(cleanBlock(["a"]), "", "arrays must be dropped by cleanBlock()")
+  assert.strictEqual(cleanBlock({ toString: "x" }), "", "objects must be dropped by cleanBlock()")
+  assert.doesNotThrow(() => cleanBlock({ toString: "x" }), "cleanBlock() must not invoke an object toString")
+  assert.strictEqual(clean(42), "42", "numbers must still stringify")
+  assert.strictEqual(clean("a\x00b\u0085c\u2028d"), "a b c d", "control chars and line separators must become spaces")
+  assert.strictEqual(cleanBlock("a\nb\tc\r\nd"), "a\nb c \nd", "cleanBlock() must preserve only newline")
+  assert.strictEqual(cleanBlock("a\u0085b"), "a b", "cleanBlock() must strip U+0085 like the rest of C1")
+  console.log("✓ clean()/cleanBlock() drop objects/arrays and keep primitive/control-char behaviour")
+
+  // --- 10.4 Routing regex edges.
+  const rThisPr = classifyRoute({ request: "review thisPR", inputs: ["notes.md"] })
+  assert.strictEqual(rThisPr.topology, "document-review", "review thisPR must not be treated as a PR review")
+  const rMyCode = classifyRoute({ request: "review mycode", inputs: ["notes.md"] })
+  assert.strictEqual(rMyCode.topology, "document-review", "review mycode must not be treated as a code review")
+  const rRealPr = classifyRoute({ request: "review this PR", inputs: ["notes.md"] })
+  assert.strictEqual(rRealPr.topology, "distributed-coding", "review this PR must still be treated as a PR review")
+
+  const rCjkDoc = classifyRoute("review 论文.md and summarize it")
+  assert.strictEqual(rCjkDoc.topology, "document-review", "non-ASCII filename must still count as a supplied document")
+
+  const rLeanBackup = classifyRoute("open foo.lean-backup")
+  assert.strictEqual(rLeanBackup.signals.leanBareMention, false, "foo.lean-backup must not be treated as a bare .lean file")
+
+  const rLeanCross = classifyRoute("Formalize the theorem in Lean\nand then prove it")
+  assert.strictEqual(rLeanCross.topology, "proof", "Lean explicit intent must survive a real cross-line gap")
+  assert.strictEqual(rLeanCross.lemmaMode, true)
+
+  const rLeanFalsePositive = classifyRoute("We run a lean manufacturing line and need to prove ROI")
+  assert.strictEqual(rLeanFalsePositive.lemmaMode, false, "lowercase 'lean manufacturing' must not set lemmaMode")
+
+  const rLeanLower = classifyRoute("Prove this theorem in lean")
+  assert.strictEqual(rLeanLower.lemmaMode, true, "explicit 'in lean' must still set lemmaMode")
+  console.log("✓ routing regex edges (PR/code review, non-ASCII docs, lean-backup, Lean proximity) hold")
+
+  // --- 10.5 Atomic writes must not follow a planted temp-file symlink/hard link.
+  {
+    const run = mkdtempSync(join(tmpdir(), "teamwork-atomic-tr-"))
+    try {
+      const victim = join(run, "victim.txt")
+      writeFileSync(victim, "ORIGINAL")
+      const target = join(run, "manifest.json")
+      symlinkSync(victim, `${target}.tmp`)
+      writeSafeRunFile(run, target, "SAFE")
+      assert.strictEqual(readFileSync(victim, "utf8"), "ORIGINAL", "tournament temp symlink must not overwrite the victim")
+      assert.strictEqual(readFileSync(target, "utf8"), "SAFE", "tournament write must still land at the target")
+
+      const victim2 = join(run, "victim2.txt")
+      writeFileSync(victim2, "ORIGINAL2")
+      const target2 = join(run, "verdict.json")
+      linkSync(victim2, `${target2}.tmp`)
+      writeSafeRunFile(run, target2, "SAFE2")
+      assert.strictEqual(readFileSync(victim2, "utf8"), "ORIGINAL2", "tournament temp hard link must not overwrite the victim")
+      assert.strictEqual(readFileSync(target2, "utf8"), "SAFE2", "tournament write must still land at the second target")
+    } finally {
+      rmSync(run, { recursive: true, force: true })
+    }
+
+    const root = mkdtempSync(join(tmpdir(), "teamwork-atomic-tools-"))
+    try {
+      const tools = {}
+      const ctx = {
+        tool: {
+          transform: async (cb) =>
+            cb({
+              namespace: () => {},
+              add: (tool) => {
+                tools[tool.name] = tool
+              },
+            }),
+        },
+        session: { get: async () => undefined, hook: async () => {} },
+      }
+      await registerTeamworkTools(ctx, root)
+      const sid = "20261018-200000-atom"
+      const run = join(root, ".opencode", "teamwork", sid)
+      mkdirSync(run, { recursive: true })
+      const victim = join(root, "victim.txt")
+      writeFileSync(victim, "ORIGINAL")
+      for (const name of ["state.json", "costs.json", "plan.dag.json"]) symlinkSync(victim, join(run, `${name}.tmp`))
+      const res = await tools.plan.execute({ sessionId: sid, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "T1" }] })
+      assert(res.content.startsWith("Planned"), `atomic-write plan must succeed: ${res.content}`)
+      assert.strictEqual(readFileSync(victim, "utf8"), "ORIGINAL", "tools temp symlinks must not overwrite the victim")
+      assert(existsSync(join(run, "state.json")), "tools write must still land at state.json")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+    console.log("✓ atomic writes ignore planted temp symlinks/hard links and keep the victim intact")
+  }
+
+  // --- 10.6 describeRun must not read through symlinks or block on FIFOs.
+  {
+    const root = mkdtempSync(join(tmpdir(), "teamwork-desc-"))
+    try {
+      const sid = "20261018-200001-desc"
+      const run = join(root, ".opencode", "teamwork", sid)
+      mkdirSync(run, { recursive: true })
+      const secretState = join(root, "secret-state.json")
+      writeFileSync(secretState, JSON.stringify({ sessionId: sid, phase: "DONE", tasks: { leak: { status: "verified_pass" } } }))
+      symlinkSync(secretState, join(run, "state.json"))
+      assert.strictEqual(describeRun(root), undefined, "symlinked state.json must not populate run context")
+
+      rmSync(join(run, "state.json"))
+      writeFileSync(join(run, "state.json"), JSON.stringify({ sessionId: sid, phase: "DONE", tasks: {} }))
+      const secretPitfalls = join(root, "secret-pitfalls.md")
+      writeFileSync(secretPitfalls, "- LEAKED_PITFALL_FROM_OUTSIDE\n")
+      symlinkSync(secretPitfalls, join(run, "pitfalls.md"))
+      const desc = describeRun(root)
+      assert(desc, "a valid state.json must still describe the run")
+      assert(!desc.includes("LEAKED_PITFALL_FROM_OUTSIDE"), "symlinked pitfalls.md must not leak outside content")
+      assert(desc.includes("Open pitfalls: 0"), "a refused pitfalls.md read counts as zero")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+
+    const toolsUrl = new URL("../plugins/opencode-teamwork/tools.ts", import.meta.url).href
+    const describeFifoCode = [
+      `import { describeRun } from ${JSON.stringify(toolsUrl)}`,
+      `import { execFileSync } from "node:child_process"`,
+      `import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"`,
+      `import { tmpdir } from "node:os"`,
+      `import { join } from "node:path"`,
+      `const root = mkdtempSync(join(tmpdir(), "teamwork-descfifo-"))`,
+      `const run = join(root, ".opencode", "teamwork", "20261018-200002-fifo")`,
+      `mkdirSync(run, { recursive: true })`,
+      `let made = true`,
+      `try {`,
+      `  execFileSync("mkfifo", [join(run, "state.json")], { stdio: "ignore" })`,
+      `} catch (err) {`,
+      `  if (err && err.code === "ENOENT") made = false; else throw err`,
+      `}`,
+      `try {`,
+      `  if (!made) {`,
+      `    console.log("SKIP: mkfifo unavailable")`,
+      `  } else {`,
+      `    if (describeRun(root) !== undefined) throw new Error("FIFO state.json must not be read")`,
+      `    rmSync(join(run, "state.json"))`,
+      `    writeFileSync(join(run, "state.json"), JSON.stringify({ sessionId: "20261018-200002-fifo", phase: "DONE", tasks: {} }))`,
+      `    execFileSync("mkfifo", [join(run, "pitfalls.md")], { stdio: "ignore" })`,
+      `    const desc = describeRun(root)`,
+      `    if (!desc || !desc.includes("Open pitfalls: 0")) throw new Error("FIFO pitfalls must count as zero: " + desc)`,
+      `    console.log("REFUSED")`,
+      `  }`,
+      `} finally {`,
+      `  rmSync(root, { recursive: true, force: true })`,
+      `}`,
+    ].join("\n")
+    const describeFifoRun = spawnSync(process.execPath, [...process.execArgv, "--input-type=module", "-e", describeFifoCode], {
+      encoding: "utf8",
+      timeout: 15000,
+    })
+    if (describeFifoRun.error && describeFifoRun.error.code === "ETIMEDOUT") {
+      assert.fail("describeRun hung on a FIFO (timeout guard fired)")
+    }
+    assert.strictEqual(
+      describeFifoRun.status,
+      0,
+      `describeRun FIFO child failed (status ${describeFifoRun.status}, signal ${describeFifoRun.signal}): ${describeFifoRun.stderr || ""}`,
+    )
+    assert(/REFUSED|SKIP/.test(describeFifoRun.stdout || ""), `describeRun FIFO child must report REFUSED or SKIP: ${describeFifoRun.stdout || ""}`)
+    console.log("✓ describeRun refuses symlinked state/pitfalls and does not hang on FIFOs")
   }
 }
