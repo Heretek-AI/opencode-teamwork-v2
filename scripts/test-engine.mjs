@@ -33,6 +33,18 @@ const testDir = mkdtempSync(join(tmpdir(), "teamwork-engine-test-"))
 // Sonar S6324: build ESC without embedding a control character in a regex literal.
 const ESC_CHAR = String.fromCharCode(27)
 
+// Compare URLs by parsed origin/path instead of substring containment
+// (CodeQL js/incomplete-url-substring-sanitization).
+function mentionsExactUrl(text, expected) {
+  const want = new URL(expected).href
+  for (const m of String(text).matchAll(/https?:\/\/[^\s)>"']+/g)) {
+    try {
+      if (new URL(m[0]).href === want) return true
+    } catch {}
+  }
+  return false
+}
+
 try {
   let registeredTools = {}
   const mockCtx = {
@@ -4221,8 +4233,11 @@ process.exit(0);
       assert(refusalMsg.includes("elan") && refusalMsg.includes("leanprover/lean4:stable"), "must include Lean 4 install instructions")
       assert(refusalMsg.includes("$HOME/.elan/bin") && refusalMsg.includes("lean --version && lake --version"), "must include PATH and verify command")
       assert(refusalMsg.includes(LEAP_REQUIREMENT), "refusal must name the real LEAP CLI requirement")
-      assert(refusalMsg.includes("git+https://github.com/billkunghappy/LEAP-CLI@afc016d23579d8236050a157fe6cac8f17b13096"), "must include the pinned LEAP CLI git install")
-      assert(refusalMsg.includes("https://github.com/billkunghappy/LEAP-CLI"), "must include the LEAP-CLI repo URL")
+      assert(
+        refusalMsg.split("\n").map((line) => line.trim()).includes("pipx install git+https://github.com/billkunghappy/LEAP-CLI@afc016d23579d8236050a157fe6cac8f17b13096"),
+        "must include the pinned LEAP CLI git install as an exact instruction line",
+      )
+      assert(mentionsExactUrl(refusalMsg, "https://github.com/billkunghappy/LEAP-CLI"), "must include the LEAP-CLI repo URL")
       assert(refusalMsg.includes("leap --help"), "must verify the leap console script via --help")
       assert(!refusalMsg.includes("pipx install leap-tools"), "must not suggest the non-existent leap-tools PyPI package")
       assert(refusalMsg.includes("leap lean") && refusalMsg.includes("11 GB") && refusalMsg.includes("Mathlib"), "must describe optional `leap lean` Mathlib cost")
@@ -4242,7 +4257,8 @@ process.exit(0);
         tasks: [{ id: "L1" }],
       })
       assert(refusedPlan.content.startsWith("refused:"), `missing toolchain must refuse plan: ${refusedPlan.content}`)
-      assert(refusedPlan.content.includes(LEAP_REQUIREMENT) && refusedPlan.content.includes("billkunghappy/LEAP-CLI"), "plan refusal must print install instructions for Lean 4 and the LEAP CLI")
+      assert(refusedPlan.content.includes(LEAP_REQUIREMENT), "plan refusal must name the real LEAP CLI requirement")
+      assert(mentionsExactUrl(refusedPlan.content, "https://github.com/billkunghappy/LEAP-CLI"), "plan refusal must print install instructions for Lean 4 and the LEAP CLI")
       assert(!existsSync(join(rootNoTool, ".opencode", "teamwork", "20261018-000000-lemma-refuse")), "refused LEMMA plan must create zero dirs/files")
 
       const badTopo = await tools.plan.execute({

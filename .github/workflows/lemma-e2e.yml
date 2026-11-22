@@ -41,26 +41,44 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.elan
-          key: ${{ runner.os }}-elan-lean4-stable-v1
+          key: ${{ runner.os }}-elan-lean4-stable-v2
           restore-keys: |
             ${{ runner.os }}-elan-lean4-stable-
 
-      - name: Install elan + Lean 4 stable (core only, no Mathlib)
+      # lean-action installs elan and reads the toolchain from
+      # lean-toolchain. This repo is not a Lake package, so point it at a
+      # throwaway core-only package and disable every build/test feature.
+      - name: Prepare core-only Lean package
         run: |
-          if [ ! -x "$HOME/.elan/bin/lean" ]; then
-            curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y --default-toolchain leanprover/lean4:stable
-          fi
-          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.elan/bin:$PATH"
-          lean --version
+          mkdir -p "$RUNNER_TEMP/lean-core"
+          printf 'leanprover/lean4:stable\n' > "$RUNNER_TEMP/lean-core/lean-toolchain"
+          printf '{}\n' > "$RUNNER_TEMP/lean-core/lake-manifest.json"
 
-      # The `leap-tools` PyPI package does not exist. Install the pinned git
-      # revision; `leap` is the console script (legacy alias `leap-tools`).
+      - name: Install elan + Lean 4 stable (core only, no Mathlib)
+        uses: leanprover/lean-action@ba3fdfe5c4476c925da13bf11a005ddb47e47aee # v1.7.1
+        with:
+          auto-config: "false"
+          build: "false"
+          test: "false"
+          lint: "false"
+          mk_all-check: "false"
+          use-mathlib-cache: "false"
+          use-github-cache: "false"
+          lake-package-directory: ${{ runner.temp }}/lean-core
+
+      # The `leap-tools` PyPI package does not exist. Build the pinned git
+      # revision (and its wheels) first, then install binary-only so no
+      # source build or index resolution happens at install time.
       # `leap lean` (Lean 4.34 + Mathlib, ~11 GB) is deliberately NOT run:
       # LEMMA verification needs only core Lean.
-      - name: Install LEAP CLI (pinned git revision, no Mathlib)
+      - name: Build LEAP CLI wheel (pinned git revision, no Mathlib)
         run: |
-          python3 -m pip install --user "git+https://github.com/billkunghappy/LEAP-CLI@afc016d23579d8236050a157fe6cac8f17b13096"
+          mkdir -p "$RUNNER_TEMP/wheels"
+          python3 -m pip wheel "git+https://github.com/billkunghappy/LEAP-CLI@afc016d23579d8236050a157fe6cac8f17b13096" -w "$RUNNER_TEMP/wheels"
+
+      - name: Install LEAP CLI wheel (binary only, no Mathlib)
+        run: |
+          python3 -m pip install --user --only-binary :all: --no-index --find-links "$RUNNER_TEMP/wheels" leap-cli
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.elan/bin:$HOME/.local/bin:$PATH"
           lean --version
