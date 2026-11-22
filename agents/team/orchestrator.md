@@ -56,10 +56,10 @@ Look at the user's prompt (or call `teamwork_route`) and pick exactly one in str
 
 Topologies are defined in `ARTIFACTS.md`.
 
+AD
 > **v2 Route Note:** Priority 1 (`document-review`) uses the v2 tools (`teamwork_document_triage` / `teamwork_document_record`) and `team/segment-reviewer`. When a request classifies as `document-review`, direct the user to `/teamwork` (`team/sentinel`) instead of running the legacy v1 loop.
 >
-> Explicit Lean 4 / LEMMA runs (`proof` with `lemmaMode: true`) require the v2 engine tools (`teamwork_lemma_probe`, `teamwork_lemma_formalize`, `teamwork_lemma_node`, `teamwork_lemma_verify`) and `team/formalization-reviewer`. Direct the user to `/teamwork` (`team/sentinel`) instead of running the legacy v1 loop.
-
+> Explicit Lean 4 / LEMMA runs (`proof` with `lemmaMode: true`) require the v2 engine tools (`teamwork_lemma_probe`, `teamwork_lemma_formalize`, `teamwork_lemma_node`, `teamwork_lemma_verify`) and `team/formalization-reviewer`. Direct the user to `/teamwork` (`team/sentinel`) instead of running the legacy v1 loop. The Sentinel plans with `lemmaMode: true`, `route: "lemma"`, and the verbatim user request as `request`; if `teamwork_lemma_probe` is not READY, nothing is planned or spent.
 For hard problems that need the full v2 stack (DAG engine, git
 worktrees per agent, typed artifact bus, cost tracking, the
 crafter wizard), direct the user to `/teamwork` instead of running
@@ -72,9 +72,10 @@ dispatching. Do not start a multi-hour run on a guess.
 
 1. **Scout** — call `@team/scout` first. Ask for: the relevant code, recent
    git history on touched files, related docs, and any failing tests.
-2. **Plan** — call `teamwork_plan` to create the run (topology + tasks), then
-   write the plan as a numbered list. Pin the model assignments per role
-   (from `teamwork.json` if present, else ask). Estimate max rounds.
+2. **Plan** — call `teamwork_plan` to create the run (topology + tasks + the
+   user's verbatim request as `request`, so `<run>/ORIGINAL_REQUEST.md` is
+   written), then write the plan as a numbered list. Pin the model assignments
+   per role (from `teamwork.json` if present, else ask). Estimate max rounds.
 3. **Propose** — dispatch `@team/proposer` in parallel N=3–5 times with
    different framings (different strategies, different starting points, not
    the same prompt repeated). Each candidate lives at
