@@ -1,4 +1,4 @@
-import { registerTeamworkTools, registerTeamworkHooks, describeRun } from "../plugins/opencode-teamwork/tools.ts"
+import { registerTeamworkTools, registerTeamworkHooks, describeRun, touch, nextEventSeq } from "../plugins/opencode-teamwork/tools.ts"
 import {
   analyzeLeanDeclarations,
   bindVerifiedDeclaration,
@@ -18,12 +18,12 @@ import {
 import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import { currentModels, readRawModelMap, writeModelMap, installAgents, DEFAULT_MODELS } from "../lib/team.mjs"
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync, chmodSync, symlinkSync, linkSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync, chmodSync, symlinkSync, linkSync, lstatSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { createServer } from "node:http"
 import { execFileSync, spawnSync } from "node:child_process"
-import { fileURLToPath } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { deflateSync } from "node:zlib"
 import { randomBytes } from "node:crypto"
 import assert from "node:assert"
@@ -1716,6 +1716,208 @@ try {
   }
 } finally {
   rmSync(testDir, { recursive: true, force: true })
+}
+
+// ==========================================
+// Part 1d2: security regressions (CodeQL #20, #21, #11–#14)
+// ==========================================
+{
+  console.log("Testing security regressions (atomic touch, single-fd event seq, validated session ids)...")
+  const secDir = mkdtempSync(join(tmpdir(), "teamwork-security-test-"))
+  const TOOLS_URL = new URL("../plugins/opencode-teamwork/tools.ts", import.meta.url).href
+  const runFileSec = (root, runId, name) => join(root, ".opencode", "teamwork", runId, name)
+  try {
+    // --- CodeQL #20: touch() is ONE O_EXCL create; no check-then-use window.
+    {
+      const nested = join(secDir, "touch", "nested", "pitfalls.md")
+      touch(nested, "# Pitfalls\n")
+      assert.strictEqual(readFileSync(nested, "utf8"), "# Pitfalls\n", "touch must create a missing file (and its dirs)")
+      touch(nested, "# REPLACED\n")
+      assert.strictEqual(readFileSync(nested, "utf8"), "# Pitfalls\n", "touch must never overwrite an existing file")
+      console.log("✓ touch creates a missing file and never overwrites an existing one")
+    }
+    {
+      const target = join(secDir, "touch-symlink", "target.md")
+      const link = join(secDir, "touch-symlink", "pitfalls.md")
+      mkdirSync(dirname(target), { recursive: true })
+      writeFileSync(target, "TARGET\n")
+      symlinkSync(target, link)
+      assert.doesNotThrow(() => touch(link, "ATTACK\n"), "touch must not throw on a pre-planted symlink")
+      assert.strictEqual(readFileSync(target, "utf8"), "TARGET\n", "touch must never write through a symlink")
+      assert(lstatSync(link).isSymbolicLink(), "the pre-planted symlink must be left in place")
+      const danglingLink = join(secDir, "touch-symlink", "dangling.md")
+      const danglingTarget = join(secDir, "touch-symlink", "never-created.md")
+      symlinkSync(danglingTarget, danglingLink)
+      touch(danglingLink, "ATTACK\n")
+      assert(!existsSync(danglingTarget), "touch must not create the target of a dangling symlink")
+      console.log("✓ touch ignores a pre-planted symlink and leaves the target untouched")
+    }
+
+    // --- CodeQL #21: nextEventSeq uses ONE fd for tail + fallback count.
+    {
+      const missing = join(secDir, "seq-missing", "events.jsonl")
+      assert.strictEqual(nextEventSeq(missing), 1, "a missing events.jsonl is the first event")
+      const target = join(secDir, "seq-symlink", "target.jsonl")
+      const link = join(secDir, "seq-symlink", "events.jsonl")
+      mkdirSync(dirname(target), { recursive: true })
+      writeFileSync(target, '{"seq":41}\n')
+      symlinkSync(target, link)
+      assert.strictEqual(nextEventSeq(link), 1, "a symlinked events.jsonl must not be followed (first event)")
+      console.log("✓ nextEventSeq returns 1 for a missing file or symlink")
+    }
+    {
+      const file = join(secDir, "seq-tail", "events.jsonl")
+      mkdirSync(dirname(file), { recursive: true })
+      const lines = []
+      for (let i = 1; i <= 40; i++) lines.push(JSON.stringify({ seq: i, event: "task_transition" }))
+      writeFileSync(file, lines.join("\n") + "\n")
+      assert.strictEqual(nextEventSeq(file), 41, "the 8 KiB tail fast path must read the last seq")
+      console.log("✓ nextEventSeq keeps the 8 KiB tail fast path (last line seq)")
+    }
+    {
+      const file = join(secDir, "seq-legacy", "events.jsonl")
+      mkdirSync(dirname(file), { recursive: true })
+      writeFileSync(file, '{"event":"run_created"}\n{"event":"task_transition"}\n\n')
+      assert.strictEqual(nextEventSeq(file), 3, "a legacy tail must count non-empty lines through the same fd")
+      console.log("✓ nextEventSeq counts a legacy tail through the same fd")
+    }
+    {
+      const file = join(secDir, "seq-corrupt", "events.jsonl")
+      mkdirSync(dirname(file), { recursive: true })
+      writeFileSync(file, '{"seq":10}\nnot json\n')
+      assert.strictEqual(nextEventSeq(file), 3, "a corrupt tail must fall back to counting non-empty lines")
+
+      const big = join(secDir, "seq-large", "events.jsonl")
+      mkdirSync(dirname(big), { recursive: true })
+      const pad = "x".repeat(48)
+      const bigLines = []
+      for (let i = 1; i <= 20000; i++) bigLines.push(JSON.stringify({ event: "task_transition", i, pad }))
+      bigLines.push(JSON.stringify({ seq: 7777, event: "task_transition" }))
+      writeFileSync(big, bigLines.join("\n") + "\n")
+      assert(statSync(big).size > 8192, "the large fixture must exceed the 8 KiB tail")
+      assert.strictEqual(nextEventSeq(big), 7778, "a large file with a seq last line must continue from it")
+
+      const bigLegacy = join(secDir, "seq-large-legacy", "events.jsonl")
+      mkdirSync(dirname(bigLegacy), { recursive: true })
+      writeFileSync(bigLegacy, bigLines.slice(0, 20000).join("\n") + "\n")
+      assert.strictEqual(nextEventSeq(bigLegacy), 20001, "a large legacy file must be counted in chunks, not from the tail")
+      console.log("✓ nextEventSeq counts a corrupt tail and a large file chunked")
+    }
+    {
+      const fifo = join(secDir, "seq-fifo", "events.jsonl")
+      mkdirSync(dirname(fifo), { recursive: true })
+      const made = spawnSync("mkfifo", [fifo], { stdio: "ignore" })
+      if (made.status !== 0) {
+        console.log("⊘ skipped FIFO regression: mkfifo is unavailable")
+      } else {
+        const script = `import { nextEventSeq } from ${JSON.stringify(TOOLS_URL)}; process.stdout.write(String(nextEventSeq(process.argv[1])))`
+        const child = spawnSync(process.execPath, ["--input-type=module", "-e", script, fifo], {
+          encoding: "utf8",
+          timeout: 5000,
+        })
+        assert.strictEqual(child.signal, null, `nextEventSeq must not hang on a FIFO (signal: ${child.signal})`)
+        assert.strictEqual(child.stdout, "1", `a FIFO is not a log and must be treated as the first event: ${child.stdout}`)
+        console.log("✓ nextEventSeq returns 1 for a FIFO without hanging")
+      }
+    }
+
+    // --- CodeQL #11–#14: ids read from snapshots.json must pass SESSION_ID
+    // before any fetch URL is built; invalid ids are skipped, not encoded.
+    {
+      const root = mkdtempSync(join(secDir, "sid-"))
+      const home = join(secDir, "sid-home")
+      const requests = []
+      const server = createServer((req, res) => {
+        requests.push(req.url)
+        res.setHeader("content-type", "application/json")
+        if (req.url === "/api/session/ses_root_ok") {
+          res.end(
+            JSON.stringify({
+              data: { id: "ses_root_ok", parentID: null, agent: "sentinel", cost: 1.25, tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } },
+            }),
+          )
+        } else if (req.url === "/api/session?parentID=ses_root_ok") {
+          res.end(
+            JSON.stringify({
+              data: [
+                { id: "ses_child_ok", parentID: "ses_root_ok", agent: "team/worker", cost: 0.5, tokens: { input: 20, output: 10, reasoning: 0, cache: { read: 0, write: 0 } } },
+                { id: "../../etc/passwd", parentID: "ses_root_ok", cost: 99, tokens: {} },
+                { id: "bad id", parentID: "ses_root_ok", cost: 99, tokens: {} },
+              ],
+            }),
+          )
+        } else if (req.url === "/api/session?parentID=ses_child_ok") {
+          res.end(JSON.stringify({ data: [] }))
+        } else {
+          res.writeHead(404)
+          res.end("{}")
+        }
+      })
+      await new Promise((r) => server.listen(0, "127.0.0.1", r))
+      const savedEnv = {}
+      for (const k of ["HOME", "USERPROFILE", "XDG_DATA_HOME", "XDG_STATE_HOME", "LOCALAPPDATA"]) {
+        savedEnv[k] = process.env[k]
+      }
+      try {
+        const base = `http://127.0.0.1:${server.address().port}`
+        process.env.HOME = home
+        process.env.USERPROFILE = home
+        process.env.XDG_DATA_HOME = join(home, "data")
+        process.env.XDG_STATE_HOME = join(home, "state")
+        process.env.LOCALAPPDATA = join(home, "localappdata")
+        mkdirSync(join(home, "state", "opencode"), { recursive: true })
+        writeFileSync(join(home, "state", "opencode", "service.json"), JSON.stringify({ url: base, password: "test" }))
+
+        const tools = {}
+        await registerTeamworkTools(
+          {
+            tool: { transform: async (cb) => cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = tool) }) },
+            session: { get: async () => undefined },
+          },
+          root,
+        )
+        const RUN = "20261018-000000-sidval"
+        await tools.plan.execute(
+          { sessionId: RUN, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "alpha" }] },
+          { sessionID: "ses_root_ok" },
+        )
+        const snapsFile = runFileSec(root, RUN, "snapshots.json")
+        const snaps = JSON.parse(readFileSync(snapsFile, "utf8"))
+        snaps.rootSessionIds = ["ses_root_ok", "../../etc/passwd", "bad id", "a/b", "-leading", "x".repeat(80)]
+        writeFileSync(snapsFile, JSON.stringify(snaps, null, 2))
+        const costsFile = runFileSec(root, RUN, "costs.json")
+        const costsBefore = JSON.parse(readFileSync(costsFile, "utf8"))
+        costsBefore.rootSessionIds = []
+        writeFileSync(costsFile, JSON.stringify(costsBefore, null, 2))
+
+        const res = await tools.cost.execute({ sessionId: RUN, taskId: "alpha" }, { sessionID: "ses_root_ok" })
+        assert(res.content.includes("opencode service API"), `cost must still aggregate via the service tree: ${res.content}`)
+        assert.deepStrictEqual(
+          requests,
+          ["/api/session/ses_root_ok", "/api/session?parentID=ses_root_ok", "/api/session?parentID=ses_child_ok"],
+          `only SESSION_ID-valid ids may reach the API: ${JSON.stringify(requests)}`,
+        )
+        for (const url of requests) {
+          assert(!/passwd|etc|%2F|%2E%2E|bad%20id/i.test(url), `invalid id leaked into a request URL: ${url}`)
+        }
+        const costs = JSON.parse(readFileSync(costsFile, "utf8"))
+        assert.strictEqual(costs.byTask.alpha, 1.75, "valid root + child spend must still bucket to the task")
+        assert.strictEqual(costs.spentUsd, 1.75, "aggregation must not be dropped")
+        console.log("✓ cost request URLs only ever contain SESSION_ID-valid ids")
+      } finally {
+        for (const k of Object.keys(savedEnv)) {
+          if (savedEnv[k] === undefined) delete process.env[k]
+          else process.env[k] = savedEnv[k]
+        }
+        await new Promise((resolve) => {
+          server.close(resolve)
+          if (typeof server.closeAllConnections === "function") server.closeAllConnections()
+        })
+      }
+    }
+  } finally {
+    rmSync(secDir, { recursive: true, force: true })
+  }
 }
 
 // ==========================================
