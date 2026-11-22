@@ -13,7 +13,8 @@ an effect or setup function. (cause: SchemaError(Expected object at ["default"])
 ```
 
 This repo is the ported, V2-native version: the original 10 agents plus a
-security auditor and document segment reviewer (12 total) and 7 slash commands,
+security auditor, document segment reviewer, and formalization reviewer
+(13 total) and 7 slash commands,
 rewritten for the V2 plugin + agent APIs. Verified against **OpenCode `v2.0.26`**.
 
 ## What changed (V1 → V2)
@@ -33,6 +34,7 @@ package.json                      # npm manifest (name: @heretek-ai/opencode-tea
 index → plugins/opencode-teamwork/index.ts   # V2 plugin, registers the 7 commands
 plugins/opencode-teamwork/tools.ts           # engine tools + hooks (V2 API)
 plugins/opencode-teamwork/document-review.ts # Document Review route classifier, PDF/MD ingestion, RSA bounds
+plugins/opencode-teamwork/lemma.ts           # LEMMA (Lean 4) probe, classifier, verifier
 agents/team/*.md                  # 12 team agents (markdown, V2 frontmatter)
 docs/ARTIFACTS.md                 # canonical artifact layout, topologies, schemas
 lib/team.mjs                      # installer core (config dir, model map, agent files)
@@ -70,18 +72,25 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 | `teamwork_next` | evaluates DAG dependencies, lifecycle states, and ready tasks |
 | `teamwork_task_update` | deterministic task state machine transitions (`pending` → `worker_active` → `worker_done` → `verifier_active` → `verified_pass` / `verified_fail` / `blocked`) |
 | `teamwork_security_audit` | mandatory pre-merge security gate (`verify/security-audit.json`) |
-| `teamwork_final_verify` | compute the final verdict from the task reports + security audit, stamp it, write `verify/final.json` |
+| `teamwork_final_verify` | compute the final verdict from the task reports + security audit (plus `lemma/` artifacts when in LEMMA mode), stamp it, write `verify/final.json` |
+| `teamwork_route` | read-only priority-ordered route classifier (`document-review` > explicit LEMMA > non-opt-in `.lean` → `distributed-coding` > `massive-proof` > `proof` > coding) |
+| `teamwork_lemma_probe` | read-only probe for `lean`, `lake`, and `leap-tools` on `PATH` |
+| `teamwork_lemma_formalize` | LEMMA Phase 0 `problem_draft.lean` / `review_pre` → `problem.lean` and `review_final` faithfulness gate |
+| `teamwork_lemma_node` | bounded lemma decomposition tree (`create`, `update`, `blueprint`, `attempt`) |
+| `teamwork_lemma_verify` | execute real `lean`/`lake` verification with `sorry`/admit/axiom rejection, stamping `verify-<r>.json` |
 | `teamwork_worktree` | out-of-repo git worktree provisioning, diff, merge, resolve & cleanup |
 
 Hooks: `permission.evaluate` enforces the per-agent read-only policy **in code**
 (not just in their prompts). The read-only agents (`team/verifier`,
 `team/falsifier`, `team/scout`, `team/security-auditor`,
-`team/segment-reviewer`) all deny the `edit` tool, so none of them can write
-through it. `shell` is still available to the verifier, scout and security
-auditor, and it can modify files; the falsifier also has `shell` denied, and
-`team/segment-reviewer` denies `edit`, `shell`, `webfetch`, and `subagent`.
-In short: no writes through `edit` for all five, and no `shell` writes for the
-falsifier or segment reviewer. The hook also enforces network constraints
+`team/segment-reviewer`, `team/formalization-reviewer`) all deny the `edit`
+tool, so none of them can write through it. `shell` is still available to the
+verifier, scout and security auditor, and it can modify files; the falsifier,
+segment reviewer, and formalization reviewer also have `shell` denied, and the
+segment and formalization reviewers deny `webfetch` and `subagent` as well.
+In short: no writes through `edit` for all six, and no `shell` writes for the
+falsifier, segment reviewer, or formalization reviewer. The hook also enforces
+network constraints
 (`constraints.network: denied`), and `session.context` injects the active run's
 state + recent pitfalls into every team agent's system prompt.
 
@@ -291,7 +300,7 @@ format details.
 Each agent's model lives in the `model:` frontmatter of its markdown file. The
 shipped defaults are:
 
-- `deepseek/deepseek-v4-pro`: sentinel, orchestrator, synthesizer, verifier, falsifier, proof-worker, security-auditor
+- `deepseek/deepseek-v4-pro`: sentinel, orchestrator, synthesizer, verifier, falsifier, proof-worker, formalization-reviewer, security-auditor
 - `deepseek/deepseek-flash`: crafter, worker, proposer, scout, segment-reviewer
 
 Change them with `opencode-teamwork init` (interactive), the flags above
@@ -360,13 +369,21 @@ built-ins.
 
 ## Agents
 
-The 12 shipped agents are: `team/crafter`, `team/sentinel`, `team/worker`,
+The 13 shipped agents are: `team/crafter`, `team/sentinel`, `team/worker`,
 `team/proof-worker`, `team/verifier`, `team/security-auditor`,
-`team/segment-reviewer`, `team/orchestrator`, `team/proposer`,
-`team/falsifier`, `team/synthesizer`, `team/scout`.
+`team/segment-reviewer`, `team/formalization-reviewer`, `team/orchestrator`,
+`team/proposer`, `team/falsifier`, `team/synthesizer`, `team/scout`.
 
 Model assignments live in each agent's frontmatter (`model:`); see
 [Model assignment](#model-assignment) for how to set them.
+
+### LEMMA (Lean 4 formal-proof route)
+
+LEMMA is an explicit opt-in capability-gated route (`topology: "proof"`, `lemmaMode: true`) for Lean 4 proving and verification:
+
+- **Explicit opt-in only:** `teamwork_route` checks `document-review` first, requires an explicit Lean 4 prove/formalize/verify/check request in prose, ignores instructions inside fenced code blocks, and routes unrequested `.lean` or Lean-syntax tasks to `distributed-coding` (never `proof`).
+- **Pre-spending toolchain gate:** Requires user-installed **Lean 4** (`lean` and `lake` via `elan`) and **`leap-tools`** on `PATH`. If either is missing, `teamwork_plan` refuses **before `mkdir`** (zero run files created, zero budget spent) and prints install instructions for both.
+- **Bounded verification:** Phase 0 formalization (`problem_draft.lean` → `team/formalization-reviewer` `APPROVE` → `problem.lean`), bounded lemma tree (`maxDepth <= 3`, `maxWidth <= 4`, `maxNodes <= 24`, `maxRetries <= 4`), real `lean`/`lake` execution via `teamwork_lemma_verify` rejecting `sorry`/`admit`/unauthorized `axiom` even on exit `0`, and final `FAITHFUL` check before `teamwork_final_verify`.
 
 ## Notes
 

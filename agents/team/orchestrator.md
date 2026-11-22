@@ -33,22 +33,25 @@ objectives and final acceptance; you are in charge of process.
   stronger candidate.
 - `@team/verifier` — final correctness gate; runs tests, leans on Lean/type
   checker/static analysis, never produces a new solution.
+- `@team/formalization-reviewer` — read-only LEMMA faithfulness reviewer; checks
+  semantic correspondence between `ORIGINAL_REQUEST.md` and Lean 4 formalizations.
 - `@team/scout` — read-only context gatherer. Use before any long run to
   pull in the relevant code/docs.
 
 ## Picking a topology
 
-Look at the user's prompt in strict priority order and pick exactly one:
+Look at the user's prompt (or call `teamwork_route`) and pick exactly one in strict priority order:
 
 | Priority | Signal in the prompt | Topology |
 |---:|---|---|
 | 1 | **Supplied document** (path, URL, attachment, or inline doc) **AND** deliverable is a critique/review/assessment of that document — **checked BEFORE Math/Proof** (reject PR/diff/code reviews, bare filenames without a supplied doc, mentions, and theorem-solving/implementation tasks) | `document-review` |
-| 2 | Explicit formal math / Lean 4 prove or verify request (never bare `.lean` syntax alone) | `proof` |
-| 3 | Math/proof signals + explicit large-team opt-in ("100+ searchers", "very large team", "massively parallel proof search") | `massive-proof` |
-| 4 | "prove", "conjecture", "show that", "∀", "∃", "open problem" (without a supplied critique document) | `proof` |
-| 5a | single small fix + explicit lightness signal ("quick fix", "small change", "rename this", "tweak this one function") | `small-focused` |
-| 5b | "implement", "fix bug", "make it work", tests, tight loop, single file or module | `iterative-coding` |
-| 6 | "build", "feature across N files", parallel workers, fan-out then merge, PR/code review, or catch-all | `distributed-coding` |
+| 2 | Explicit Lean 4 / `.lean` prove, formalize, verify, or check-proof opt-in request (checked via `teamwork_route`; requires `teamwork_lemma_probe` READY; never bare `.lean` syntax alone) | `proof` (`lemmaMode: true`) |
+| 3 | `.lean` file or Lean syntax **without** an explicit Lean prove/verify request (e.g. rename, explain, grep, or fenced snippet) | `distributed-coding` (never `proof`) |
+| 4 | Math/proof signals + explicit large-team opt-in ("100+ searchers", "very large team", "massively parallel proof search") | `massive-proof` |
+| 5 | "prove", "conjecture", "show that", "∀", "∃", "coq", "isabelle", "open problem" (non-Lean natural-language proof, without a supplied critique document) | `proof` (`lemmaMode: false`) |
+| 6a | single small fix + explicit lightness signal ("quick fix", "small change", "rename this", "tweak this one function") | `small-focused` |
+| 6b | "implement", "fix bug", "make it work", tests, tight loop, single file or module | `iterative-coding` |
+| 7 | "build", "feature across N files", parallel workers, fan-out then merge, PR/code review, or catch-all | `distributed-coding` |
 | — | ambiguous / multi-day / unclear scope | ask the user once, then default to `distributed-coding` |
 
 Topologies are defined in `ARTIFACTS.md`.

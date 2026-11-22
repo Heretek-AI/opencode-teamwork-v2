@@ -87,6 +87,7 @@ const FORBIDDEN = [
 const PARALLEL_AGENTS = new Set([
   "proposer.md", "synthesizer.md", "worker.md", "proof-worker.md",
   "falsifier.md", "scout.md", "verifier.md", "segment-reviewer.md",
+  "formalization-reviewer.md",
 ])
 
 for (const file of agents) {

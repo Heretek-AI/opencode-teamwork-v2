@@ -34,6 +34,13 @@ Every run writes under one root:
 ├── verify/report-<task>.json
 ├── verify/summary.json
 ├── verify/security-audit.json # pre-merge security gate report
+├── verify/final.json          # stamped final verification verdict
+├── lemma/                     # optional: LEMMA (Lean 4) formal-proof state when lemmaMode=true
+│   ├── manifest.json          # bounds, toolchain snapshot, phase, node index
+│   ├── problem_draft.lean     # Phase 0 formalization draft
+│   ├── problem.lean           # approved Phase 0 formalization
+│   ├── formalization-review.json # preSearch (APPROVE/REQUEST_CHANGES) + final (FAITHFUL/...)
+│   └── nodes/<lemmaId>/       # state.json, blueprint.md, attempt-<r>.lean, verify-<r>.json
 ├── final.md                 # presented result
 ├── report.html / report.md  # optional export output (`opencode-teamwork export`)
 └── interrupted.md           # present when the user stops a run
@@ -52,7 +59,7 @@ the repo are a footgun). Default root: `$TEAMWORK_WORKTREES_DIR` or
 | `small-focused` | 1 worker + 1 verifier loop |
 | `iterative-coding` | 1 worker, test-driven tight loop on one module |
 | `distributed-coding` | N workers fan-out + merge |
-| `proof` | 1 strategist + 3-5 searchers + 1 formal checker |
+| `proof` | 1 strategist + 3-5 searchers + 1 formal checker (plus explicit opt-in LEMMA / Lean 4 mode via `lemmaMode: true`) |
 | `massive-proof` | 1 meta-coordinator + 100+ searchers (opt-in) |
 | `document-review` | segment triage (1–8 segments, default 6) → bounded per-segment RSA tree `[4,2,1]` → cross-segment synthesis `[4,1]` |
 
@@ -753,6 +760,18 @@ One line per entry:
 ```
 - [round 2] assumes the input is already sorted — seen in R1-impl
 ```
+
+### LEMMA (`lemma/` — explicit opt-in Lean 4 mode under `proof` + `lemmaMode: true`)
+
+When `teamwork_plan` is invoked with `lemmaMode: true` (or `route: "lemma"`, requiring `topology: "proof"`), the engine first probes `lean`, `lake`, and `leap-tools` on `PATH` **before `mkdir`**. If any tool is missing or unusable (even when `allowMissingInputs: true`), planning is refused immediately with exact install instructions for both Lean 4 (`elan`) and `leap-tools`, writing zero files and spending zero budget.
+
+When the toolchain is ready, the run initializes `.opencode/teamwork/<session-id>/lemma/`:
+
+- `manifest.json`: `phase` (`FORMALIZE | SOLVING | VERIFIED | BLOCKED`), `bounds` (`maxDepth <= 3`, `maxWidth <= 4`, `maxNodes <= 24`, `maxRetries <= 4`, `maxFormalizationRounds <= 3`), `toolchain` snapshot, and `nodes` map keyed by safe `LEMMA_ID` (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, not `.`/`..`).
+- `problem_draft.lean` & `problem.lean`: Phase 0 formalization written via `teamwork_lemma_formalize({ action: "draft" })`; promoted to `problem.lean` only after compilation (`exitCode === 0`) and `team/formalization-reviewer` `preSearch.verdict === "APPROVE"`.
+- `formalization-review.json`: records `draftVerification`, `preSearch` (`APPROVE | REQUEST_CHANGES`), and `final` (`FAITHFUL | UNFAITHFUL | MISFORMALIZED`).
+- `nodes/<lemmaId>/`: `state.json`, `blueprint.md`, `attempt-<r>.lean`, and stamped `verify-<r>.json` written by `teamwork_lemma_verify` (real `lean`/`lake` execution via `execFileSync` + comment-stripped `sorry`/`admit`/unauthorized `axiom` check even when `lean` exits `0`).
+- `teamwork_final_verify` validates all `lemma/` artifacts with `O_NOFOLLOW` + `realpathSync` containment and stamps `evidence.lemma` into `verify/final.json`.
 
 ### `scout-report.md`, `candidates/*.md`, `critiques/*.md`, `synthesis/*.md`
 

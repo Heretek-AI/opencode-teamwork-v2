@@ -1095,6 +1095,52 @@ await check("document-review: buildTimeline and renderTimeline handle seg-01/seg
   assert(rendered.includes("doc-synthesis"))
 })
 
+await check("LEMMA: buildTimeline & renderTimeline surface lemma/manifest.json and formalization-review.json without altering non-LEMMA shape", () => {
+  // Non-LEMMA run shape remains exact
+  assertShape(eventsTimeline)
+  assertShape(derivedTimeline)
+
+  const root = makeRun({
+    plan: { ...PLAN, topology: "proof", lemmaMode: true, route: "lemma" },
+    state: { ...STATE, lemmaMode: true, route: "lemma" },
+  })
+  const dir = runDirOf(root, SESSION)
+  writeJson(join(dir, "lemma", "manifest.json"), {
+    version: 1,
+    sessionId: SESSION,
+    phase: "VERIFIED",
+    nodes: {
+      root: { id: "root", parentId: null, depth: 0, status: "proved", attempts: 1 },
+      helper: { id: "helper", parentId: "root", depth: 1, status: "proved", attempts: 1 },
+    },
+  })
+  writeJson(join(dir, "lemma", "formalization-review.json"), {
+    preSearch: { verdict: "APPROVE", notes: "ok\x1b[31m" },
+    final: { verdict: "FAITHFUL", notes: "ok" },
+  })
+  const tl = buildTimeline(root, SESSION)
+  assert.deepStrictEqual(tl.lemma, {
+    phase: "VERIFIED",
+    nodes: 2,
+    proved: 2,
+    preSearchVerdict: "APPROVE",
+    finalVerdict: "FAITHFUL",
+  })
+  const rendered = renderTimeline(tl, { color: false }).join("\n")
+  assert(rendered.includes("lemma: phase=VERIFIED  nodes=2/2 proved  preSearch=APPROVE  final=FAITHFUL"), `expected lemma line, got:\n${rendered}`)
+  assert(!rendered.includes(ESC), "rendered timeline must not leak ESC")
+
+  // Symlinked lemma/ dir is refused with a warning
+  const symRoot = makeRun({ plan: { ...PLAN, topology: "proof", lemmaMode: true } })
+  const outside = uniq("lemma-outside")
+  mkdirSync(outside, { recursive: true })
+  writeJson(join(outside, "manifest.json"), { phase: "VERIFIED", nodes: {} })
+  symlinkSync(outside, join(runDirOf(symRoot, SESSION), "lemma"))
+  const symTl = buildTimeline(symRoot, SESSION)
+  assert.strictEqual(symTl.lemma, undefined, "symlinked lemma/ must not be read")
+  assert(timelineWarnings(symTl).some((w) => w.includes("lemma/")), "symlinked lemma/ must emit warning")
+})
+
 // ---------------------------------------------------------------- cleanup
 
 rmSync(testDir, { recursive: true, force: true })

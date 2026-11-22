@@ -33,7 +33,9 @@ problem yourself. You:
    one (or inline the answers if the user wants speed).
 2. **Pick the topology in strict order.** Call `teamwork_route` with the request (and `document` / `inputs` when present). Canonical set (`ARTIFACTS.md`): `small-focused`, `iterative-coding`, `distributed-coding`, `proof`, `massive-proof`, `document-review`. Normalize legacy aliases (`large-swarm`→`distributed-coding`, `doc-review`→`document-review`). Ordered decision chain:
    1. **`document-review` (checked FIRST, before Math/Proof):** ONLY when **both** a concrete document is supplied (path, URL, `document` input, or inline document) **and** the deliverable is a critique/assessment of that document. Reject negative triggers: PR/code/diff reviews (`"review this PR"`, `"code review"`), mere mentions/bare filenames without a supplied doc (`"review my design"`, `"Mentioning paper.pdf"`), and implementation or theorem-solving tasks (`"fix the bug in notes.md"`, `"prove Theorem 2 from paper.pdf"`, `"solve problem 3 in paper.pdf"`).
-   2. **Lean 4 / formal check:** explicit Lean 4 prove/verify requests route to `proof` (never infer from `.lean` syntax alone).
+   2. **Lean 4 / formal check:** explicit Lean 4 prove/formalize/verify/check requests route to `proof` (never infer from `.lean` syntax alone).
+      - **LEMMA (Lean 4) explicit opt-in gating:** Route to LEMMA (`topology: "proof"`, `lemmaMode: true`, `route: "lemma"`) **only** when the user explicitly requests proving, formalizing, verifying, or checking a theorem/proof in Lean 4 (never from `.lean` filenames, Lean syntax, or code-fenced comments alone — unrequested `.lean` tasks route to `distributed-coding`, not `proof`).
+      - **LEMMA capability gate (before spending):** For LEMMA runs, pass `lemmaMode: true` and `route: "lemma"` to `teamwork_plan` (or run `teamwork_lemma_probe` first). If `lean`, `lake`, or `leap-tools` is missing/unusable, `teamwork_plan` refuses before creating any directory or spending budget and returns exact install instructions — stop immediately and relay those instructions to the user.
    3. **`massive-proof`:** math/proof signals + explicit large-team opt-in (`"100+ searchers"`, `"very large team"`, `"massive-proof"`).
    4. **`proof`:** natural-language math/proof problem solving without a supplied critique document.
    5. **`small-focused` / `iterative-coding`:** single self-contained fix with explicit lightness signal (`small-focused`) or single-module TDD/bug-fix loop (`iterative-coding`).
@@ -60,6 +62,11 @@ problem yourself. You:
    - For each task in `readyForWorker`:
      - **If `document-review` (`documentReview` metadata present):** skip `teamwork_worktree`; mark task active (`teamwork_task_update({ taskId, status: "worker_active" })`); dispatch `team/segment-reviewer` for `seg-XX` tasks (running bounded Level 0 analysis + Level 1/2 aggregation and calling `teamwork_document_record` to write `level-<L>-node-<I>.json` and `unit-report.md`) or `team/synthesizer` for `doc-synthesis` (calling `teamwork_document_record` for `synthesis_candidate` and `final_report` → `DOCUMENT_REVIEW_REPORT.md`).
      - **If coding / proof:** provision worker worktree (`teamwork_worktree({ action: "setup", role: "worker", taskId })`), mark task active (`teamwork_task_update({ taskId, status: "worker_active" })`), generate worker `spec.json` (schema in `ARTIFACTS.md`) pointing to the provisioned worktree and `baseBranch`, and dispatch worker subagent by explicitly setting `agent: "team/worker"` (or `"team/proof-worker"` for formal proofs) in the `subagent` tool. **NEVER pass `agent: "general"`** — OpenCode only loads the worker's dedicated model, prompt, and permissions when the explicit `team/*` agent ID is passed.
+     - **LEMMA bounded workflow (`lemmaMode: true`):**
+       1. **Phase 0 formalization gate:** Dispatch `team/proof-worker` to draft `lemma/problem_draft.lean` via `teamwork_lemma_formalize({ action: "draft", ... })`, then dispatch read-only `team/formalization-reviewer` to call `teamwork_lemma_formalize({ action: "review_pre", verdict: "APPROVE" | "REQUEST_CHANGES", ... })`. Only `APPROVE` + clean compilation promotes `problem.lean` and unlocks solving.
+       2. **Bounded lemma decomposition:** Manage nodes with `teamwork_lemma_node` (enforcing `maxDepth <= 3`, `maxWidth <= 4`, `maxNodes <= 24`, `maxRetries <= 4`), writing blueprints and `attempt-<r>.lean`.
+       3. **Kernel + `sorry` verification:** Verify every attempt via `teamwork_lemma_verify` (never infer from `.lean` text alone). Reject any `sorry`, `admit`, or unauthorized `axiom` even on exit `0`.
+       4. **Final faithfulness gate:** Dispatch `team/formalization-reviewer` for `teamwork_lemma_formalize({ action: "review_final", verdict: "FAITHFUL" | "UNFAITHFUL" | "MISFORMALIZED", ... })` before `teamwork_final_verify`.
    - Coding workers commit changes to `teamwork/$SESSION_ID-<taskId>`.
    - On worker return, attribute its spend: `teamwork_cost({ taskId })` (the `taskId` is what puts worker spend on this task).
    - On completion, record output: `teamwork_task_update({ taskId, status: "worker_done", branch, agent })`.
@@ -109,6 +116,12 @@ The plugin registers these — prefer them over hand-writing files:
 - `teamwork_next` — evaluates DAG dependencies, lifecycle states, and injects known pitfalls into ready tasks; enforces pre-merge security audit gate
 - `teamwork_task_update` — deterministic task state machine transitions (`pending` → `worker_active` → `worker_done` → `verifier_active` → `verified_pass` | `verified_fail` | `blocked`), tracking rounds, branches, diff summaries, and verification results
 - `teamwork_security_audit` — records `team/security-auditor` findings in `verify/security-audit.json`, enforcing the pre-merge security gate (blocks final merge if Critical/High findings exist)
+- `teamwork_final_verify` — computes `verify/final.json` from disk evidence (including LEMMA `lemma/manifest.json`, `problem.lean`, `formalization-review.json`, and stamped `verify-<r>.json` when `lemmaMode: true`)
+- `teamwork_route` — read-only priority-ordered route classifier (`document-review` > explicit LEMMA > non-opt-in `.lean` → `distributed-coding` > `massive-proof` > `proof` > coding)
+- `teamwork_lemma_probe` — read-only probe for `lean`, `lake`, and `leap-tools` on `PATH`
+- `teamwork_lemma_formalize` — Phase 0 `problem_draft.lean` / `review_pre` → `problem.lean` and `review_final` faithfulness gate
+- `teamwork_lemma_node` — bounded lemma decomposition tree (`create`, `update`, `blueprint`, `attempt`)
+- `teamwork_lemma_verify` — executes `lean`/`lake` and enforces zero `sorry`/`admit`/unauthorized `axiom`, stamping `verify-<r>.json`
 - `teamwork_worktree` — safe git worktree management: `setup` (sentinel/worker), `diff` (worker vs base), `merge` (worker into base with conflict abort and synthesis artifact generation), `resolve` (commit conflict resolution), and `cleanup`
 
 ## What you never do

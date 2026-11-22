@@ -10,7 +10,7 @@
 // make the process exit non-zero.
 
 import { buildExportData, renderExport } from "../lib/export.mjs"
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync, utimesSync } from "node:fs"
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync, utimesSync, symlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -599,6 +599,51 @@ await check("document-review: buildExportData and renderExport render document-r
   assert(md.includes("document-review"))
   assert(md.includes("seg-01"))
   assert(md.includes("doc-synthesis"))
+})
+
+await check("LEMMA: buildExportData & renderExport render lemma/ artifacts safely (defang, escape, symlink guard)", () => {
+  const root = makeRun({
+    plan: { ...PLAN, topology: "proof", lemmaMode: true, route: "lemma" },
+    state: { ...STATE, lemmaMode: true, route: "lemma" },
+  })
+  const dir = runDirOf(root, SESSION)
+  writeJson(join(dir, "lemma", "manifest.json"), {
+    version: 1,
+    sessionId: SESSION,
+    phase: "VERIFIED",
+    formalizationRounds: 1,
+    nodes: {
+      root: { id: "root", parentId: null, depth: 0, status: "proved", attempts: 2, verifiedRound: 2 },
+      sub1: { id: "sub1", parentId: "root", depth: 1, status: "proved", attempts: 1, verifiedRound: 1 },
+    },
+  })
+  writeJson(join(dir, "lemma", "formalization-review.json"), {
+    preSearch: { verdict: "APPROVE", notes: `Matches https://example.com/spec ${XSS}` },
+    final: { verdict: "FAITHFUL", notes: "Verified end-to-end" },
+  })
+
+  const data = buildExportData(root, SESSION)
+  assert(data.lemma, "LEMMA export data must include lemma summary")
+  assert.strictEqual(data.lemma.phase, "VERIFIED")
+  assert.strictEqual(data.lemma.nodes.length, 2)
+
+  const html = renderExport(data, { format: "html" })
+  assert(html.includes("<h2>LEMMA formal proof</h2>"), "HTML must render LEMMA section")
+  assert(!/https?:\/\//i.test(html), "HTML must defang URLs in lemma notes")
+  assert(!html.includes(XSS), "HTML must escape XSS in lemma notes")
+
+  const mdOut = renderExport(data, { format: "markdown" })
+  assert(mdOut.includes("## LEMMA formal proof"), "Markdown must render LEMMA section")
+  assert(mdOut.includes("FAITHFUL"), "Markdown must render final verdict")
+
+  // Symlinked lemma/ dir is refused and produces a warning
+  const symRoot = makeRun({ plan: { ...PLAN, topology: "proof", lemmaMode: true } })
+  const outside = mkdtempSync(join(testDir, "lemma-sym-out-"))
+  writeJson(join(outside, "manifest.json"), { phase: "VERIFIED", nodes: {} })
+  symlinkSync(outside, join(runDirOf(symRoot, SESSION), "lemma"))
+  const symData = buildExportData(symRoot, SESSION)
+  assert.strictEqual(symData.lemma, undefined, "symlinked lemma/ must not be read")
+  assert(symData.warnings.some((w) => w.includes("lemma/")), "symlinked lemma/ must emit warning")
 })
 
 // ---------------------------------------------------------------- cleanup

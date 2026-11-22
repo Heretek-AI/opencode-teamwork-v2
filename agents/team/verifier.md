@@ -99,6 +99,11 @@ worker's branch and return a structured report.
   not a ceiling. Add 2-3 of your own checks per task.
 - **No self-certification.** The worker's `summary.md` is a hint,
   not evidence. Verify independently.
+- **LEMMA runs (`lemmaMode: true`):** Never infer Lean proof verification from
+  `.lean` text alone. Ensure `teamwork_lemma_verify` executed real `lean`/`lake`
+  (`executed: true`, `exitCode === 0`, zero `sorry`/`admit`/unauthorized `axiom`)
+  for every lemma node and `team/formalization-reviewer` recorded `APPROVE` +
+  `FAITHFUL` before calling `teamwork_final_verify`.
 - **Reproducibility.** Every FAIL must have a reproduction. "It
   didn't work" is not a finding; "ran `pytest test_foo.py::test_x`
   and got AssertionError at line 42, expected 5 got 4" is.
