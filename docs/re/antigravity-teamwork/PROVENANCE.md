@@ -3,7 +3,7 @@
 ## What This Corpus Is [OBSERVED]
 
 - This corpus is reverse-engineering notes plus recovered material about a third-party proprietary product (the Google Antigravity Linux CLI, focused on the `/teamwork` command). [OBSERVED]
-- It is static analysis only: every fact was measured by static inspection of the archive and extracted binary. [OBSERVED]
+- The core is static analysis of the archive and extracted binary. Two later evidence classes are labelled separately: shipped builtin source read directly (`09`) and runtime observation of the installed, byte-identical CLI (`07`, `11`, `12`). [OBSERVED]
 
 ## Source Identity [OBSERVED]
 
@@ -23,7 +23,7 @@ Artifact facts in this section are [OBSERVED]; the licensing paragraph below is 
 
 ## Method Disclosure [OBSERVED]
 
-- Static extraction only [OBSERVED]: `readelf`, `strings`, `grep -aob`, `xxd`, `go1.27.4-X:nodwarf5`, `objdump`, `radare2`, and Ghidra were used; no execution, no network, and no auth were used at any point.
+- Static extraction [OBSERVED]: `readelf`, `strings`, `grep -aob`, `xxd`, `go1.27.4-X:nodwarf5`, `objdump`, `radare2`, and Ghidra were used for the artifact. Runtime evidence (`07`, `11`, `12`) was produced by executing the installed CLI in print mode; shipped-source evidence (`09`) was read from the materialised builtin tree (`assets/builtin/`). The evidence class is stated per claim. [OBSERVED]
 - What `strings` can prove [OBSERVED]: it can prove that a byte sequence is present in the binary at a given file offset.
 - What `strings` cannot prove [INFERRED]: merged string literals mean recovered prompt boundaries can be imprecise — adjacent literals may be concatenated or truncated, so the exact original source text cannot be reconstructed from the dump alone.
 - Every recovered prompt must therefore carry a fidelity note stating how precisely its boundaries are known. [POLICY — project policy statement]
