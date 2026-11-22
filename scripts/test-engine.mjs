@@ -4927,7 +4927,7 @@ process.exit(0);
       process.env.PATH = `${stubBin}:${savedPath}`
       const rootB = mkdtempSync(join(lemmaTestDir, "root-binding-"))
       const tools = await makeToolsFor(rootB)
-      const setupRun = async (RUN, maxRetries = 4, lemmaPolicy) => {
+      const setupRun = async (RUN, { lemmaPolicy, maxRetries = 4 } = {}) => {
         await tools.plan.execute({
           sessionId: RUN,
           topology: "proof",
@@ -5039,7 +5039,7 @@ process.exit(0);
       assert(vTransitiveSorry.report.unauthorizedAxioms.includes("sorryAx"), "transitive sorryAx must be reported")
 
       const RUN_AX = "20261018-000000-lemma-axioms"
-      await setupRun(RUN_AX, 2, { allowedAxioms: ["my_custom_ax"] })
+      await setupRun(RUN_AX, { lemmaPolicy: { allowedAxioms: ["my_custom_ax"] }, maxRetries: 2 })
       await tools.lemma_node.execute({ sessionId: RUN_AX, action: "attempt", lemmaId: "root", round: 1, leanCode: "-- AXIOM_BAD_DEP\ntheorem t : 1 = 1 := by rfl" })
       const vBadAx = await tools.lemma_verify.execute({ sessionId: RUN_AX, lemmaId: "root", round: 1 })
       assert.strictEqual(vBadAx.report.status, "FAIL", "unauthorized transitive axiom must FAIL")
@@ -5059,7 +5059,7 @@ process.exit(0);
 
       // S2 E2E: a printing command in the attempt must stop the probe.
       const RUN_HIJACK = "20261018-000000-lemma-hijack"
-      await setupRun(RUN_HIJACK, 1)
+      await setupRun(RUN_HIJACK, { maxRetries: 1 })
       await tools.lemma_node.execute({
         sessionId: RUN_HIJACK,
         action: "attempt",
@@ -5092,7 +5092,7 @@ process.exit(0);
       ]
       for (const [label, policy, pattern] of badPolicies) {
         const rejected = validateLemmaPolicy(policy)
-        assert(rejected.error && pattern.test(rejected.error), `${label} policy must be rejected: ${rejected.error}`)
+        assert(rejected.error && pattern.test(rejected.error), `${String(label)} policy must be rejected: ${rejected.error}`)
       }
 
       const stubBin = makeFullStubEnv("policy")
@@ -5168,9 +5168,12 @@ process.exit(0);
       const policyPass = await tools.lemma_verify.execute({ sessionId: RUN_FINAL, lemmaId: "root", round: 1 })
       assert.strictEqual(policyPass.report.status, "PASS", `approved custom axiom must PASS: ${JSON.stringify(policyPass.report)}`)
 
-      for (const st of ["worker_active", "worker_done", "verifier_active"]) {
-        await tools.task_update.execute({ sessionId: RUN_FINAL, taskId: "L1", status: st })
-      }
+      // Task transitions are a serial state machine, so await each one in order.
+      const advanceTask = (status) =>
+        tools.task_update.execute({ sessionId: RUN_FINAL, taskId: "L1", status })
+      await advanceTask("worker_active")
+      await advanceTask("worker_done")
+      await advanceTask("verifier_active")
       await tools.task_update.execute({ sessionId: RUN_FINAL, taskId: "L1", status: "verified_pass", verification: { status: "PASS" } })
       const finalRepFile = join(rootP, ".opencode", "teamwork", RUN_FINAL, "verify", "report-L1.json")
       mkdirSync(dirname(finalRepFile), { recursive: true })

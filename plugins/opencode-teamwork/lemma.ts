@@ -1804,13 +1804,76 @@ export function canonicalAxiomSet(values: unknown): string[] {
         .map((value) => stripGuillemets(String(value ?? "").trim()))
         .filter(Boolean),
     ),
-  ].sort()
+  ].sort((a, b) => a.localeCompare(b))
 }
 
 export function sameAxiomSet(a: unknown, b: unknown): boolean {
   const left = canonicalAxiomSet(a)
   const right = canonicalAxiomSet(b)
   return left.length === right.length && left.every((name, i) => name === right[i])
+}
+
+/** Reject an unsupported policy schema version; absent/null means current. */
+function validatePolicyVersion(raw: any): string | undefined {
+  if (
+    raw.version === undefined ||
+    raw.version === null ||
+    raw.version === LEMMA_POLICY_VERSION
+  ) {
+    return undefined
+  }
+  return `refused: unsupported lemmaPolicy.version "${clean(raw.version, 16)}" (expected ${LEMMA_POLICY_VERSION})`
+}
+
+function validatePolicyAxiomEntry(entry: unknown): { name?: string; error?: string } {
+  if (typeof entry !== "string") {
+    return { error: `refused: lemmaPolicy.allowedAxioms entry "${clean(entry, 80)}" must be a string` }
+  }
+  const trimmed = entry.trim()
+  if (!trimmed) {
+    return { error: "refused: lemmaPolicy.allowedAxioms entries must be non-empty" }
+  }
+  // `clean` both strips control characters and caps length; a mismatch means
+  // the entry would have been silently rewritten, so refuse instead.
+  if (clean(trimmed, 128) !== trimmed) {
+    return { error: `refused: unsafe lemmaPolicy.allowedAxioms entry "${clean(entry, 80)}"` }
+  }
+  const name = stripGuillemets(trimmed)
+  if (!name || !isSafeLeanDeclarationName(name)) {
+    return {
+      error: `refused: invalid lemmaPolicy.allowedAxioms entry "${clean(entry, 80)}" (must be a safe Lean axiom name)`,
+    }
+  }
+  if (name === "sorryAx") {
+    return { error: "refused: sorryAx can never be allowlisted as a transitive axiom" }
+  }
+  return { name }
+}
+
+function validatePolicyAxioms(rawAxioms: unknown): { allowedAxioms?: string[]; error?: string } {
+  if (rawAxioms === undefined || rawAxioms === null) {
+    return { allowedAxioms: [] }
+  }
+  if (!Array.isArray(rawAxioms)) {
+    return { error: "refused: lemmaPolicy.allowedAxioms must be an array of Lean axiom names" }
+  }
+  if (rawAxioms.length > MAX_LEMMA_ALLOWED_AXIOMS) {
+    return {
+      error: `refused: lemmaPolicy.allowedAxioms has ${rawAxioms.length} entries (max ${MAX_LEMMA_ALLOWED_AXIOMS})`,
+    }
+  }
+
+  const allowedAxioms: string[] = []
+  const seen = new Set<string>()
+  for (const entry of rawAxioms) {
+    const checked = validatePolicyAxiomEntry(entry)
+    if (checked.error) return { error: checked.error }
+    const name = checked.name
+    if (!name || seen.has(name)) continue
+    seen.add(name)
+    allowedAxioms.push(name)
+  }
+  return { allowedAxioms }
 }
 
 /**
@@ -1826,58 +1889,15 @@ export function validateLemmaPolicy(raw?: any): { policy?: LemmaPolicy; error?: 
   if (typeof raw !== "object" || Array.isArray(raw)) {
     return { error: "refused: lemmaPolicy must be an object" }
   }
-  if (
-    raw.version !== undefined &&
-    raw.version !== null &&
-    raw.version !== LEMMA_POLICY_VERSION
-  ) {
-    return {
-      error: `refused: unsupported lemmaPolicy.version "${clean(raw.version, 16)}" (expected ${LEMMA_POLICY_VERSION})`,
-    }
+  const versionError = validatePolicyVersion(raw)
+  if (versionError) {
+    return { error: versionError }
   }
-
-  const rawAxioms = raw.allowedAxioms
-  if (rawAxioms === undefined || rawAxioms === null) {
-    return { policy: { version: LEMMA_POLICY_VERSION, allowedAxioms: [] } }
+  const checked = validatePolicyAxioms(raw.allowedAxioms)
+  if (checked.error || !checked.allowedAxioms) {
+    return { error: checked.error ?? "refused: invalid lemmaPolicy.allowedAxioms" }
   }
-  if (!Array.isArray(rawAxioms)) {
-    return { error: "refused: lemmaPolicy.allowedAxioms must be an array of Lean axiom names" }
-  }
-  if (rawAxioms.length > MAX_LEMMA_ALLOWED_AXIOMS) {
-    return {
-      error: `refused: lemmaPolicy.allowedAxioms has ${rawAxioms.length} entries (max ${MAX_LEMMA_ALLOWED_AXIOMS})`,
-    }
-  }
-
-  const allowedAxioms: string[] = []
-  const seen = new Set<string>()
-  for (const entry of rawAxioms) {
-    if (typeof entry !== "string") {
-      return { error: `refused: lemmaPolicy.allowedAxioms entry "${clean(entry, 80)}" must be a string` }
-    }
-    const trimmed = entry.trim()
-    if (!trimmed) {
-      return { error: "refused: lemmaPolicy.allowedAxioms entries must be non-empty" }
-    }
-    // `clean` both strips control characters and caps length; a mismatch means
-    // the entry would have been silently rewritten, so refuse instead.
-    if (clean(trimmed, 128) !== trimmed) {
-      return { error: `refused: unsafe lemmaPolicy.allowedAxioms entry "${clean(entry, 80)}"` }
-    }
-    const name = stripGuillemets(trimmed)
-    if (!name || !isSafeLeanDeclarationName(name)) {
-      return {
-        error: `refused: invalid lemmaPolicy.allowedAxioms entry "${clean(entry, 80)}" (must be a safe Lean axiom name)`,
-      }
-    }
-    if (name === "sorryAx") {
-      return { error: "refused: sorryAx can never be allowlisted as a transitive axiom" }
-    }
-    if (seen.has(name)) continue
-    seen.add(name)
-    allowedAxioms.push(name)
-  }
-  return { policy: { version: LEMMA_POLICY_VERSION, allowedAxioms } }
+  return { policy: { version: LEMMA_POLICY_VERSION, allowedAxioms: checked.allowedAxioms } }
 }
 
 /**
@@ -1991,42 +2011,46 @@ function emptyManifest(
   }
 }
 
-/**
- * `policy` is the plan-time decision: `null` means the caller omitted it (a
- * re-plan keeps the persisted policy untouched), while an object is compared
- * with any existing manifest and refused on mismatch.
- */
-export function initLemmaArtifacts(
+function ensureManifestPolicyConsistency(runDir: string, policy: LemmaPolicy): { error?: string } {
+  const mRead = readJsonSafe<LemmaManifest>(runDir, "lemma/manifest.json")
+  if (mRead.error || !mRead.value) return { error: mRead.error ?? "refused: lemma/manifest.json unreadable" }
+  const persisted = resolveManifestAxiomAllowlist(mRead.value)
+  if (persisted.error) return { error: persisted.error }
+  if (mRead.value.policy === undefined || mRead.value.policy === null) {
+    if (policy.allowedAxioms.length > 0) {
+      return {
+        error:
+          "refused: existing lemma/manifest.json has no approved axiom policy (legacy run); start a new run instead of widening it",
+      }
+    }
+    return {}
+  }
+  if (!sameAxiomSet(persisted.allowedAxioms, policy.allowedAxioms)) {
+    return {
+      error: "refused: lemmaPolicy conflicts with the approved policy in lemma/manifest.json; nothing was written.",
+    }
+  }
+  return {}
+}
+
+function initManifestFile(
   runDir: string,
   sessionId: string,
   bounds: LemmaBounds,
   probe: LemmaProbeResult,
-  policy: LemmaPolicy | null = null,
+  policy: LemmaPolicy | null,
 ): { error?: string } {
   const existing = ensureSafeSubpath(runDir, "lemma/manifest.json")
   if (existing.error) return { error: existing.error }
   if (!existsSync(existing.path!)) {
     const initialPolicy = policy ?? { version: LEMMA_POLICY_VERSION, allowedAxioms: [] }
     const w1 = writeJsonAtomicSafe(runDir, "lemma/manifest.json", emptyManifest(sessionId, bounds, probe, initialPolicy))
-    if (w1.error) return { error: w1.error }
-  } else if (policy) {
-    const mRead = readJsonSafe<LemmaManifest>(runDir, "lemma/manifest.json")
-    if (mRead.error || !mRead.value) return { error: mRead.error ?? "refused: lemma/manifest.json unreadable" }
-    const persisted = resolveManifestAxiomAllowlist(mRead.value)
-    if (persisted.error) return { error: persisted.error }
-    if (mRead.value.policy === undefined || mRead.value.policy === null) {
-      if (policy.allowedAxioms.length > 0) {
-        return {
-          error:
-            "refused: existing lemma/manifest.json has no approved axiom policy (legacy run); start a new run instead of widening it",
-        }
-      }
-    } else if (!sameAxiomSet(persisted.allowedAxioms, policy.allowedAxioms)) {
-      return {
-        error: "refused: lemmaPolicy conflicts with the approved policy in lemma/manifest.json; nothing was written.",
-      }
-    }
+    return w1.error ? { error: w1.error } : {}
   }
+  return policy ? ensureManifestPolicyConsistency(runDir, policy) : {}
+}
+
+function initFormalizationReviewFile(runDir: string): { error?: string } {
   const rev = ensureSafeSubpath(runDir, "lemma/formalization-review.json")
   if (rev.error) return { error: rev.error }
   if (!existsSync(rev.path!)) {
@@ -2039,6 +2063,25 @@ export function initLemmaArtifacts(
     const w2 = writeJsonAtomicSafe(runDir, "lemma/formalization-review.json", initRev)
     if (w2.error) return { error: w2.error }
   }
+  return {}
+}
+
+/**
+ * `policy` is the plan-time decision: `null` means the caller omitted it (a
+ * re-plan keeps the persisted policy untouched), while an object is compared
+ * with any existing manifest and refused on mismatch.
+ */
+export function initLemmaArtifacts(
+  runDir: string,
+  sessionId: string,
+  bounds: LemmaBounds,
+  probe: LemmaProbeResult,
+  policy: LemmaPolicy | null = null,
+): { error?: string } {
+  const manifestInit = initManifestFile(runDir, sessionId, bounds, probe, policy)
+  if (manifestInit.error) return manifestInit
+  const reviewInit = initFormalizationReviewFile(runDir)
+  if (reviewInit.error) return reviewInit
   return {}
 }
 
