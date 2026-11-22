@@ -54,6 +54,28 @@ safe, executing — the actual code in a scratch directory under `/tmp`.
 6. **Secret leakage**: artifacts, logs, injected context, error messages.
 7. **DoS / resource abuse**: unbounded reads, huge inputs, loops, per-call work.
 
+## Strict verification wave
+
+A run planned with `verification: "strict"` also asks you, after a task's
+verifier report is `PASS`, for an independent per-task audit. You may inspect
+the diff, read the artifacts, and run tests or reproductions in a scratch
+directory (or a read-only checkout); `edit` and `webfetch` remain denied.
+
+If the task has no Critical/High finding and no integrity violation forbidden at
+the run's mode, call:
+
+`teamwork_wave_record({ sessionId, taskId, kind: "audit", verdict: "CLEAN", notes, evidence })`
+
+`notes` (≤1,000 chars) and `evidence` (≤2,000 chars) are sanitized. The tool
+derives your identity from the trusted session; there is no `agent` override,
+and only `team/security-auditor` may record an audit. The file
+`verify/audit-<taskId>.json` is write-once, and it cannot be recorded before the
+verifier report is PASS. A finding means you do **not** record `CLEAN`; report
+it and let the task fail.
+
+This per-task audit is in addition to the run-level pre-merge
+`teamwork_security_audit`; do not conflate the two files.
+
 ## Output
 
 - A findings table: ID, severity (Critical/High/Medium/Low), `file:line`, one line.

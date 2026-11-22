@@ -71,11 +71,12 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 | `teamwork_resume` | tasks still open, for a restart |
 | `teamwork_cost` | read real budget spend across OpenCode session tree (sentinel + workers + verifiers) |
 | `teamwork_pitfall` | append to the pitfall registry (dynamically injected into workers) |
-| `teamwork_next` | evaluates DAG dependencies, lifecycle states, and ready tasks |
+| `teamwork_next` | evaluates DAG dependencies, lifecycle states, and ready tasks; strict runs stop at `NEEDS_STRICT_WAVE` until both wave verdicts exist |
 | `teamwork_task_update` | deterministic task state machine transitions (`pending` → `worker_active` → `worker_done` → `verifier_active` → `verified_pass` / `verified_fail` / `blocked`) |
 | `teamwork_security_audit` | mandatory pre-merge security gate (`verify/security-audit.json`) |
 | `teamwork_victory_audit` | record the independent `team/victory-auditor` acceptance verdict, bound to the current `ORIGINAL_REQUEST.md` hash (`verify/victory.json`) |
-| `teamwork_final_verify` | compute the final verdict from the task reports + security audit + victory audit (plus `lemma/` artifacts when in LEMMA mode), stamp it, write `verify/final.json` |
+| `teamwork_wave_record` | strict mode only: record one `team/falsifier` challenge (`PASS`) or `team/security-auditor` audit (`CLEAN`) per task (`verify/challenge-<task>.json` / `verify/audit-<task>.json`); trusted caller identity and write-once |
+| `teamwork_final_verify` | compute the final verdict from the task reports + security audit + victory audit (plus the strict wave when enabled, and `lemma/` artifacts when in LEMMA mode), stamp it, write `verify/final.json` |
 | `teamwork_lemma_probe` | read-only probe for `lean`, `lake`, and the LEAP CLI (`leap`; legacy `leap-tools` accepted) on `PATH` |
 | `teamwork_lemma_formalize` | LEMMA Phase 0 `problem_draft.lean` / `review_pre` → `problem.lean` and `review_final` faithfulness gate |
 | `teamwork_lemma_node` | bounded lemma decomposition tree (`create`, `update`, `blueprint`, `attempt`) |
@@ -110,6 +111,7 @@ topologies, and the JSON schemas (`spec.json`, `plan.dag.json`, `state.json`,
 - A run completes only with a `PASS` `verify/final.json` stamped by `teamwork_final_verify`; an unstamped report needs the recorded `allowUnstamped` bypass.
 - That PASS also needs a `verify/victory.json` from the independent `team/victory-auditor` reporting `VICTORY CONFIRMED` for every requirement and the current `ORIGINAL_REQUEST.md` hash, unless the plan explicitly recorded `victoryAudit: "skip"` (then `final_verify` records `victory: "SKIPPED (explicit)"`).
 - The security audit fails on integrity-rule violations for the run's mode, and that blocks the merge.
+- Opt-in `verification: "strict"` adds exactly one `team/falsifier` challenge (`PASS`) and one `team/security-auditor` audit (`CLEAN`) per task after its verifier report. Missing or non-PASS/CLEAN verdicts block `teamwork_next` (`NEEDS_STRICT_WAVE`) and `teamwork_final_verify`; a strict PASS writes `GATE_STATUS.md` with worker/verifier/challenger/auditor rows. The default `standard` mode is unchanged, and the wave reuses the existing agents rather than adding roles.
 - Planning refuses to start when blocking inputs are missing or unreachable unless `allowMissingInputs` is recorded.
 - Legacy topology aliases are normalised on write; an unknown topology is refused before anything is written.
 

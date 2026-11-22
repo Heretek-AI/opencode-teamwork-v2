@@ -89,6 +89,16 @@ worker's branch and return a structured report.
 }
 ```
 
+## Strict verification mode
+
+When `plan.dag.json` records `verification: "strict"`, your PASS report is the
+**review** row of the gate, not the whole gate. After you write
+`verify/report-<taskId>.json` with `status: "PASS"`, the Sentinel dispatches a
+`team/falsifier` challenge and a `team/security-auditor` audit for the task.
+They record `verify/challenge-<taskId>.json` (`PASS`) and
+`verify/audit-<taskId>.json` (`CLEAN`) through `teamwork_wave_record`; you never
+write those files and must not call that tool. Standard runs are unchanged.
+
 ## Hard rules
 
 - **Run the actual command, don't read code and judge.** The whole

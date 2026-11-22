@@ -13,7 +13,7 @@ Every run writes under one root:
 ├── prompt_draft.md          # spec (from the crafter, or inlined by the sentinel); required by teamwork_plan unless bypassed
 ├── ORIGINAL_REQUEST.md      # verbatim routed request + integrity mode (write-once; absent on legacy runs)
 ├── requirements.json        # plan-time requirements baseline (caller or request-derived; absent when neither exists)
-├── plan.dag.json            # task DAG (+ preflight gate result + victoryAudit mode)
+├── plan.dag.json            # task DAG (+ preflight gate result + verification/victoryAudit modes)
 ├── preflight.json           # input-checks report (written by teamwork_preflight)
 ├── state.json               # resumable coordinator state
 ├── costs.json               # coordinator-maintained budget tracker
@@ -33,10 +33,13 @@ Every run writes under one root:
 ├── synthesis/syn-<n>.md     # one per synthesizer run
 ├── synthesis/conflict-<task>.json # git 3-way merge conflict artifact
 ├── verify/report-<task>.json
+├── verify/challenge-<task>.json # strict mode: team/falsifier PASS challenge
+├── verify/audit-<task>.json     # strict mode: team/security-auditor CLEAN audit
 ├── verify/summary.json
 ├── verify/security-audit.json # pre-merge security gate report
 ├── verify/victory.json        # independent final acceptance verdict (team/victory-auditor)
 ├── verify/final.json          # stamped final verification verdict
+├── GATE_STATUS.md             # strict mode: final verification gate table
 ├── lemma/                     # optional: LEMMA (Lean 4) formal-proof state when lemmaMode=true
 │   ├── manifest.json          # bounds, toolchain snapshot, phase, node index
 │   ├── problem_draft.lean     # Phase 0 formalization draft
@@ -204,6 +207,7 @@ plan records `victoryAudit: "skip"` explicitly.
   "sessionId": "20260112-101500-a1b2",
   "topology": "distributed-coding",
   "integrityMode": "development",
+  "verification": "standard|strict",
   "victoryAudit": "required",
   "victoryAuditSource": "default",
   "requirementsSource": "request",
@@ -230,6 +234,7 @@ plan records `victoryAudit: "skip"` explicitly.
   "version": 1,
   "sessionId": "20260112-101500-a1b2",
   "integrityMode": "development",
+  "verification": "standard|strict",
   "victoryAudit": "required|skip",
   "phase": "LOAD_SPEC|WORKTREE_INIT|DAG_BUILD|DISPATCH|SECURITY_AUDIT|FINAL_VERIFICATION|MERGE|PRESENT_PARTIAL|DONE",
   "tasks": {
@@ -307,14 +312,15 @@ field, exactly as before.
 ### Engine Tools
 
 The plugin provides deterministic orchestration tools for the Sentinel coordinator:
-- `teamwork_plan`: Creates the run directory and writes `plan.dag.json`, `state.json` and `costs.json`. It is gated on a spec by default (`requireSpec`, see below). `skipInterview` is the explicit, recorded bypass.
+- `teamwork_plan`: Creates the run directory and writes `plan.dag.json`, `state.json` and `costs.json`. It is gated on a spec by default (`requireSpec`, see below). `skipInterview` is the explicit, recorded bypass. `verification` selects `standard` (default, unchanged) or `strict` (per-task falsifier challenge + security-auditor audit); it is persisted in both artifacts and a re-plan cannot change it.
 - `teamwork_route`: Deterministic read-only route classifier checking `document-review` FIRST (before Math/Proof) when a supplied document has critique intent while rejecting PR/code reviews, bare filenames without supplied docs, and problem-solving/coding tasks.
 - `teamwork_document_triage`: Validates bounds (`maxSegments <= 8`, `reviewTreeShape <= [4,2,1]`, `synthTreeShape <= [4,1]`), path containment (`realpathSync` + `O_NOFOLLOW`), URL/inline limits, and PDF headers **before** creating any directory, ingests and partitions the document into `seg-01`..`seg-0K` + `doc-synthesis`, and writes `document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}`.
 - `teamwork_document_record`: Persists bounded RSA node outputs (`level-<L>-node-<I>.json`), `unit-report.md`, `synthesis/candidate-<I>.md`, and `DOCUMENT_REVIEW_REPORT.md` with `SEGMENT_ID` allowlist, manifest bounds, symlink refusal, and `clean()`/`cleanBlock()` sanitisation.
-- `teamwork_next`: Evaluates the DAG dependencies against current task lifecycle statuses. Categorizes tasks into `readyForWorker`, `readyForVerifier`, `inProgress`, or terminal conditions (`ALL_TASKS_PASSED` / `DEADLOCK`). Completion additionally requires a stamped `verify/final.json` from `teamwork_final_verify` (unless the caller passes the recorded `allowUnstamped: true` legacy bypass) **and** a `CONFIRMED` `verify/victory.json` bound to the current `ORIGINAL_REQUEST.md`, unless the plan explicitly recorded `victoryAudit: "skip"`. Before a confirmed verdict it returns `READY_FOR_VICTORY_AUDIT` (or `BLOCKED_BY_VICTORY_AUDIT` for a rejection).
+- `teamwork_next`: Evaluates the DAG dependencies against current task lifecycle statuses. Categorizes tasks into `readyForWorker`, `readyForVerifier`, `inProgress`, or terminal conditions (`ALL_TASKS_PASSED` / `DEADLOCK`). Completion additionally requires a stamped `verify/final.json` from `teamwork_final_verify` (unless the caller passes the recorded `allowUnstamped: true` legacy bypass) **and** a `CONFIRMED` `verify/victory.json` bound to the current `ORIGINAL_REQUEST.md`, unless the plan explicitly recorded `victoryAudit: "skip"`. Before a confirmed verdict it returns `READY_FOR_VICTORY_AUDIT` (or `BLOCKED_BY_VICTORY_AUDIT` for a rejection). In strict mode it returns `NEEDS_STRICT_WAVE` / `BLOCKED_BY_STRICT_WAVE` first, listing the missing `taskId:kind` pairs, and never returns `ALL_PASSED` without both per-task verdicts.
 - `teamwork_task_update`: Enforces deterministic state transitions, tracks worker branch names and diff summaries, updates verifier metrics, and advances run `phase` to `MERGE` or `PRESENT_PARTIAL`.
 - `teamwork_victory_audit`: Records the independent final acceptance verdict from `team/victory-auditor`. Only a trusted session whose agent resolves to `team/victory-auditor` may call it; there is no caller-supplied `agent` label. Every `requirements.json` id must appear exactly once, `met: true` needs non-empty evidence, and `VICTORY CONFIRMED` needs a current `ORIGINAL_REQUEST.md` (the verdict stores its sha256). Writes `verify/victory.json`; a confirmed verdict is write-once.
-- `teamwork_final_verify`: Computes the run's final verdict from the artifacts on disk — every task must be `verified_pass`, every `verify/report-<taskId>.json` must be `PASS`, `verify/security-audit.json` must be `PASS`, the victory audit must be `CONFIRMED` (unless explicitly skipped), and when `document-review/manifest.json` exists, every segment's `unit-report.md` and `DOCUMENT_REVIEW_REPORT.md` must exist as non-empty regular files — then writes `verify/final.json` atomically and appends a `final_verification` event. The verdict is computed from evidence; no input can turn a failing run into `PASS` (a caller-supplied `failReason` can only force `FAIL`). See [`verify/final.json`](#verifyfinaljson-final-verification-verdict).
+- `teamwork_wave_record`: Strict mode only. Records one wave verdict: `kind: "challenge"` / `verdict: "PASS"` may only be written by a trusted session whose agent resolves to `team/falsifier`; `kind: "audit"` / `verdict: "CLEAN"` only by `team/security-auditor`. There is no caller-supplied `agent` label. It refuses a task absent from `plan.dag.json`, a missing/non-PASS `verify/report-<taskId>.json`, any other verdict, and any overwrite (write-once). It writes `verify/challenge-<taskId>.json` or `verify/audit-<taskId>.json` atomically and appends a `verification_wave` event.
+- `teamwork_final_verify`: Computes the run's final verdict from the artifacts on disk — every task must be `verified_pass`, every `verify/report-<taskId>.json` must be `PASS`, `verify/security-audit.json` must be `PASS`, the victory audit must be `CONFIRMED` (unless explicitly skipped), and when `document-review/manifest.json` exists, every segment's `unit-report.md` and `DOCUMENT_REVIEW_REPORT.md` must exist as non-empty regular files. In strict mode it also requires `verify/challenge-<taskId>.json` (`team/falsifier`, `PASS`) and `verify/audit-<taskId>.json` (`team/security-auditor`, `CLEAN`) for every task, then writes `GATE_STATUS.md`. It writes `verify/final.json` atomically and appends a `final_verification` event. The verdict is computed from evidence; no input can turn a failing run into `PASS` (a caller-supplied `failReason` can only force `FAIL`). See [`verify/final.json`](#verifyfinaljson-final-verification-verdict).
 - `teamwork_worktree`: Isolates git worktrees outside the project repo (`setup` for sentinel and worker), inspects branch diffs (`diff`), performs clean merges into `teamwork/base-$SESSION_ID` with automatic conflict abort (`merge`), and prunes worktrees (`cleanup`).
 - `teamwork_preflight`: Re-checks the inputs named by an existing run's `ORIGINAL_REQUEST.md` (plus optional `inputs`), writes `<run>/preflight.json`, and appends a `preflight` event. It never throws and never blocks; it reports.
 
@@ -333,6 +339,7 @@ With no spec and neither override, the call is refused with an actionable messag
 | --- | --- | --- | --- |
 | `request` | string | omitted | The verbatim text the run was routed on (≤20,000 chars). Recorded once in `ORIGINAL_REQUEST.md` before any plan file; omitting it creates no artifact. |
 | `integrityMode` | `development \| demo \| benchmark` | `development` | Recorded in `ORIGINAL_REQUEST.md`, `state.json` and `plan.dag.json`. Any other value refuses the plan before anything is written. |
+| `verification` | `standard \| strict` | `standard` | Recorded in `plan.dag.json` and `state.json`. `strict` adds exactly one `team/falsifier` challenge (`PASS`) and one `team/security-auditor` audit (`CLEAN`) per task. Any other value refuses the plan before anything is written; a re-plan may omit or repeat the persisted mode but not change it. |
 | `requirements` | `Array<{id, text}>` | omitted | Up to 50 plan-time requirements. `id` matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$` and must be unique; `text` is non-empty and ≤2,000 chars. Persisted to `requirements.json` (source `caller`). Invalid/duplicate items refuse the plan before anything is written. |
 | `victoryAudit` | `required \| skip` | `required` when a request/requirements baseline exists | Recorded in `plan.dag.json` and `state.json`. A run with no request and no requirements records `skip`; `required` without a baseline is refused. An explicit `skip` makes `final_verify` record `victory: "SKIPPED (explicit)"`. |
 
@@ -536,7 +543,7 @@ plus `agentSource` when an actor exists:
   **Optional on legacy lines**: logs written before `seq` existed have no
   `seq`, and they remain valid.
 - `event` (string): `run_created`, `task_transition`, `security_audit`,
-  `victory_audit`, `final_verification`, `final_verification_bypass`, or `preflight`
+  `victory_audit`, `verification_wave`, `final_verification`, `final_verification_bypass`, or `preflight`
 - `sessionId` (string): Run session id (≤64 chars)
 - `taskId` (string or null): Task id (≤64 chars); `null` for run-level events
 - `from` (string or null): Previous task status (≤32 chars)
@@ -553,13 +560,13 @@ plus `agentSource` when an actor exists:
 - `branch` (string or null): Task branch (≤120 chars)
 - `worktree` (string or null): Task worktree path (≤200 chars)
 - `phase` (string or null): Run phase after the event (≤32 chars)
-- `note` (string, optional): Why a bypass was taken or what input preflight
-  found (≤200 chars). Emitted on `final_verification_bypass`, on
-  `teamwork_preflight`'s `preflight` event, and on `run_created` when the
-  input-preflight gate was bypassed. Every other event omits it. Sanitised with
-  `clean()`.
+- `note` (string, optional): Why a bypass was taken, what input preflight
+  found, or which strict-wave verdict was recorded (≤200 chars). Emitted on
+  `final_verification_bypass`, on `teamwork_preflight`'s `preflight` event, on
+  `verification_wave`, and on `run_created` when the input-preflight gate was
+  bypassed. Every other event omits it. Sanitised with `clean()`.
 
-The seven event kinds:
+The eight event kinds:
 
 - `run_created`: written by `teamwork_plan` once the run is created. `taskId` and
   `from` are `null`, `to` is `"pending"`, `round` is `0`, `phase` is `"DAG_BUILD"`.
@@ -583,6 +590,12 @@ The seven event kinds:
   `verify/victory.json` is saved. `to` is `"VICTORY CONFIRMED"` or
   `"VICTORY REJECTED"`, `taskId` and `from` are `null`, `round` is `0`, and
   `agent` is always `"team/victory-auditor"` with `agentSource: "session"`.
+- `verification_wave`: written by `teamwork_wave_record` after
+  `verify/challenge-<taskId>.json` or `verify/audit-<taskId>.json` is saved.
+  `taskId` is the task, `to` is `"PASS"` or `"CLEAN"`, `round` is `0`, and
+  `agent` is the trusted agent for the kind (`team/falsifier` or
+  `team/security-auditor`) with `agentSource: "session"`. `note` is
+  `challenge: PASS` or `audit: CLEAN`. A refused call appends nothing.
 - `preflight`: written by `teamwork_preflight` after `preflight.json` is
   saved. `to` is the overall preflight status (`READY`, `MISSING`, or
   `OUTAGE`); `taskId` and `from` are `null`, `round` is `0`, and `phase` is the
@@ -662,6 +675,50 @@ to derived mode, with start and duration unknown.
   ]
 }
 ```
+
+### `verify/challenge-<taskId>.json` (strict challenge verdict)
+
+```json
+{
+  "version": 1,
+  "sessionId": "20260112-101500-a1b2",
+  "taskId": "R1-impl",
+  "kind": "challenge",
+  "verdict": "PASS",
+  "agent": "team/falsifier",
+  "agentSessionId": "ses_abc123",
+  "notes": "Tried empty input, overflow, TOCTOU; no fatal or serious flaw.",
+  "evidence": "verify/report-R1-impl.json + src/api.ts:42",
+  "generatedAt": "ISO8601"
+}
+```
+
+### `verify/audit-<taskId>.json` (strict audit verdict)
+
+```json
+{
+  "version": 1,
+  "sessionId": "20260112-101500-a1b2",
+  "taskId": "R1-impl",
+  "kind": "audit",
+  "verdict": "CLEAN",
+  "agent": "team/security-auditor",
+  "agentSessionId": "ses_def456",
+  "notes": "No Critical/High findings; no forbidden integrity rule.",
+  "evidence": "npm test tail + git diff base..task",
+  "generatedAt": "ISO8601"
+}
+```
+
+Both are written only by `teamwork_wave_record`. There is no caller-supplied
+agent label: the tool derives the caller from the trusted session identity and
+accepts `challenge` only from `team/falsifier` and `audit` only from
+`team/security-auditor`. The task must exist in `plan.dag.json` and its
+`verify/report-<taskId>.json` must already be `PASS`. The allowed verdicts are
+exactly `PASS` (challenge) and `CLEAN` (audit); `notes` and `evidence` are
+sanitised and bounded. Each file is **write-once**, refused if a symlink or
+existing entry is present, and written atomically. A missing/non-PASS report
+refuses the call, so the wave supplements the review and never replaces it.
 
 ### `verify/security-audit.json` (pre-merge security gate output)
 
@@ -762,7 +819,22 @@ request hash, which catches stale, mislabelled, or partially edited verdicts.
     ],
     "securityAudit": { "path": "verify/security-audit.json", "status": "PASS" },
     "allTasksVerifiedPass": true,
-    "victory": { "mode": "required", "status": "CONFIRMED", "auditor": "team/victory-auditor", "requestHash": "..." }
+    "victory": { "mode": "required", "status": "CONFIRMED", "auditor": "team/victory-auditor", "requestHash": "..." },
+    "strict": {
+      "mode": "strict",
+      "status": "PASS",
+      "missing": [],
+      "reasons": [],
+      "tasks": [
+        {
+          "id": "R1-impl",
+          "report": "verify/report-R1-impl.json",
+          "reportStatus": "PASS",
+          "challenge": { "path": "verify/challenge-R1-impl.json", "status": "PASS", "agent": "team/falsifier", "ok": true },
+          "audit": { "path": "verify/audit-R1-impl.json", "status": "CLEAN", "agent": "team/security-auditor", "ok": true }
+        }
+      ]
+    }
   },
   "reasons": [],
   "summary": "Independent final check passed.",
@@ -779,6 +851,14 @@ allowlist) reports `PASS`, `verify/security-audit.json` reports `PASS`, and the
 independent victory audit is `CONFIRMED` with every requirement met and a
 `requestHash` matching the current `ORIGINAL_REQUEST.md`. A plan that explicitly
 recorded `victoryAudit: "skip"` records `victory: "SKIPPED (explicit)"` instead.
+A plan that recorded `verification: "strict"` must additionally have, for every
+task, `verify/challenge-<taskId>.json` with `kind: "challenge"`,
+`verdict: "PASS"`, `agent: "team/falsifier"` and the run's `sessionId`, plus
+`verify/audit-<taskId>.json` with `kind: "audit"`, `verdict: "CLEAN"`,
+`agent: "team/security-auditor"` and the run's `sessionId`; a missing, malformed,
+mismatched, or non-PASS/CLEAN verdict adds a named `strict <kind> <taskId>`
+reason. Standard mode never reads those files, so stray wave artifacts cannot
+affect it.
 Any unmet condition yields `FAIL` with one entry per condition in `reasons`
 (capped at 100), including named victory reasons (`missing`, `VICTORY REJECTED`,
 unmet requirement, stale hash, forged auditor). The verdict is computed from
@@ -802,6 +882,12 @@ unstamped/legacy and cannot complete a run by default. Recompute it with
 **Completion gate.** With every task `verified_pass` and the security audit
 `PASS`, `teamwork_next` evaluates `verify/final.json`:
 
+In strict mode the wave gate runs first: if any task is missing its challenge
+or audit, `teamwork_next` returns `NEEDS_STRICT_WAVE` (or
+`BLOCKED_BY_STRICT_WAVE` when both exist but a verdict is wrong) and lists the
+`taskId:kind` pairs. It does not evaluate `verify/final.json` or report
+`ALL_PASSED` until the wave is complete.
+
 | Report state | Result | Phase |
 | --- | --- | --- |
 | missing/unreadable/malformed | `READY_FOR_FINAL_VERIFICATION` | `FINAL_VERIFICATION` |
@@ -819,6 +905,34 @@ predate `teamwork_final_verify`; every new run should complete through a stamped
 verdict. `FINAL_VERIFICATION_UNVERIFIED` results carry `finalReport`,
 `passedCount` and `integrityMode`, and the message names both remedies (run the
 tool, or re-call with the bypass).
+
+### `GATE_STATUS.md` (strict verification gate table)
+
+Written by `teamwork_final_verify` only in strict mode (on PASS and FAIL). It is
+sanitised and written atomically, and cites the artifact behind every row:
+
+```md
+# Verification Gate
+
+- Session: `20260112-101500-a1b2`
+- Mode: strict
+- Generated: 2026-01-12T10:30:00.000Z
+
+| Agent | Role | Verdict | Source |
+| --- | --- | --- | --- |
+| team/worker | worker | verified_pass | state.json#tasks.R1-impl |
+| team/verifier | verifier | PASS | verify/report-R1-impl.json |
+| team/falsifier | challenger | PASS | verify/challenge-R1-impl.json |
+| team/security-auditor | auditor | CLEAN | verify/audit-R1-impl.json |
+
+Gate Result: **PASS**
+```
+
+On FAIL it adds a `## Reasons` list and ends with `Gate Result: **FAIL**`. A task
+adds one worker/verifier/challenger/auditor group; the wave scales by tasks and
+rounds, not by a fixed row count. If `GATE_STATUS.md` cannot be written (for
+example a symlink is planted at the path), final verification records a named
+strict reason and cannot PASS.
 
 ### `synthesis/conflict-<task>.json` (git 3-way merge conflict artifact)
 
