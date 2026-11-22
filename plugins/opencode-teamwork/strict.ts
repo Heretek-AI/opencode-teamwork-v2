@@ -15,14 +15,18 @@
 //     `tools.ts`; no caller-supplied agent label can self-authorize.
 //   * Files are bounded and symlink-safe reads, and atomically written through
 //     the tournament containment helpers (`O_NOFOLLOW`, realpath containment).
-//   * A recorded verdict is write-once.
+//   * A verdict binds to the verifier report it approved (sha256). Recording
+//     again for the same report hash is write-once; a changed report makes the
+//     old verdict stale and is the only overwrite path.
 //   * The gate is recomputed from artifacts on every read; it never trusts the
 //     caller or a cached summary.
 
+import { createHash } from "node:crypto"
 import { basename, join } from "node:path"
 import {
   clean,
   cleanBlock,
+  readBoundedRunFile,
   readBoundedRunJson,
   writeSafeRunJson,
 } from "./tournament.ts"
@@ -53,6 +57,11 @@ const MAX_REPORT_BYTES = 1024 * 1024
 const MAX_WAVE_BYTES = 256 * 1024
 const NOTES_MAX = 1000
 const EVIDENCE_MAX = 2000
+const REPORT_HASH = /^[0-9a-f]{64}$/
+
+function sha256Hex(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex")
+}
 
 /** True when `value` is a recognised verification mode. */
 export function normalizeVerificationMode(value: unknown): VerificationMode | undefined {
@@ -92,6 +101,8 @@ export interface WaveVerdictFile {
   verdict: string
   agent: string
   agentSessionId: string
+  /** sha256 of the exact verify/report-<taskId>.json bytes this verdict saw. */
+  reportHash: string
   notes: string
   evidence: string
   generatedAt: string
@@ -167,7 +178,7 @@ export function recordVerificationWave(
     }
   }
   const reportPath = `verify/report-${taskId}.json`
-  const reportRes = readBoundedRunJson<any>(run, join(run, reportPath), MAX_REPORT_BYTES)
+  const reportRes = readBoundedRunFile(run, join(run, reportPath), MAX_REPORT_BYTES)
   if (reportRes.status === "absent") {
     return {
       ok: false,
@@ -177,28 +188,39 @@ export function recordVerificationWave(
   if (reportRes.status === "error") {
     return { ok: false, error: `${reportRes.error}; nothing was written` }
   }
-  if (reportRes.value?.status !== "PASS") {
+  let report: any
+  try {
+    report = JSON.parse(reportRes.text)
+  } catch {
+    return { ok: false, error: `refused: ${reportPath} is malformed JSON; nothing was written` }
+  }
+  if (report?.status !== "PASS") {
     return {
       ok: false,
-      error: `refused: ${reportPath} reports ${clean(reportRes.value?.status, 32) || "no status"} (expected PASS); nothing was written`,
+      error: `refused: ${reportPath} reports ${clean(report?.status, 32) || "no status"} (expected PASS); nothing was written`,
     }
   }
+  const reportHash = sha256Hex(reportRes.text)
 
   const relativePath = `verify/${kind}-${taskId}.json`
   const target = join(run, relativePath)
-  // Write-once: any existing entry (valid, malformed, or a symlink) refuses the
-  // overwrite. A fresh run/iteration is the only way to record a new verdict.
+  // Report-bound write-once: the same verifier report may not be re-approved,
+  // but a changed report (a reworked task) makes the old verdict stale, and
+  // replacing that stale verdict is the only overwrite path.
   const existing = readBoundedRunJson<any>(run, target, MAX_WAVE_BYTES)
   if (existing.status === "ok") {
-    return {
-      ok: false,
-      error: `refused: ${relativePath} already records this task's ${kind} verdict and is write-once; start a new run for a different verdict`,
+    const previousHash = typeof existing.value?.reportHash === "string" ? existing.value.reportHash : null
+    if (previousHash === reportHash) {
+      return {
+        ok: false,
+        error: `refused: ${relativePath} already records this task's ${kind} verdict for the current verifier report and is write-once; rework the task and re-verify to record a new verdict`,
+      }
     }
   }
   if (existing.status === "error") {
     return {
       ok: false,
-      error: `refused: ${relativePath} already exists but is unreadable or unsafe (${clean(existing.error, 120)}); it is write-once and will not be overwritten`,
+      error: `refused: ${relativePath} already exists but is unreadable or unsafe (${clean(existing.error, 120)}); it will not be overwritten`,
     }
   }
 
@@ -210,6 +232,7 @@ export function recordVerificationWave(
     verdict: expectedVerdict,
     agent: expectedAgent,
     agentSessionId: input.agentSessionId,
+    reportHash,
     notes: typeof input.notes === "string" ? cleanBlock(input.notes, NOTES_MAX).trim() : "",
     evidence: typeof input.evidence === "string" ? cleanBlock(input.evidence, EVIDENCE_MAX).trim() : "",
     generatedAt: new Date().toISOString(),
@@ -231,6 +254,7 @@ export interface WaveEvidence {
   /** The recorded verdict, or MISSING / INVALID / the bad value found. */
   verdict: string
   agent: string | null
+  reportHash: string | null
   ok: boolean
   reasons: string[]
 }
@@ -254,11 +278,17 @@ export interface StrictGate {
 }
 
 function emptyWave(path: string, verdict: string): WaveEvidence {
-  return { path, present: false, verdict, agent: null, ok: false, reasons: [] }
+  return { path, present: false, verdict, agent: null, reportHash: null, ok: false, reasons: [] }
 }
 
 /** Read and validate one wave artifact. Reasons name the task and the file. */
-function readWaveEvidence(run: string, taskId: string, kind: WaveKind, sessionId: string): WaveEvidence {
+function readWaveEvidence(
+  run: string,
+  taskId: string,
+  kind: WaveKind,
+  sessionId: string,
+  currentReportHash: string | null,
+): WaveEvidence {
   const relativePath = `verify/${kind}-${taskId}.json`
   const path = join(run, relativePath)
   const expectedAgent = WAVE_AGENTS[kind]
@@ -282,11 +312,13 @@ function readWaveEvidence(run: string, taskId: string, kind: WaveKind, sessionId
   const rawVerdict = typeof value?.verdict === "string" ? clean(value.verdict, 48) : ""
   const verdict = rawVerdict || "INVALID"
   const agent = typeof value?.agent === "string" ? clean(value.agent, 64) : null
+  const reportHash = typeof value?.reportHash === "string" ? value.reportHash : null
   const evidence: WaveEvidence = {
     path: relativePath,
     present: true,
     verdict,
     agent,
+    reportHash,
     ok: false,
     reasons,
   }
@@ -306,6 +338,11 @@ function readWaveEvidence(run: string, taskId: string, kind: WaveKind, sessionId
   if (agent !== expectedAgent) {
     reasons.push(`${label}: agent ${agent || "missing"} (expected ${expectedAgent})`)
   }
+  if (!reportHash || !REPORT_HASH.test(reportHash)) {
+    reasons.push(`${label}: reportHash missing or invalid`)
+  } else if (currentReportHash && reportHash !== currentReportHash) {
+    reasons.push(`strict ${kind} for ${taskId} is stale (report changed since it was recorded)`)
+  }
   if (typeof value?.agentSessionId !== "string" || value.agentSessionId.trim() === "") {
     reasons.push(`${label}: agentSessionId is missing`)
   }
@@ -319,7 +356,8 @@ function readWaveEvidence(run: string, taskId: string, kind: WaveKind, sessionId
 /**
  * Recompute the strict gate from disk. Standard mode is a no-op. Strict mode
  * requires, per task: the verifier report PASS, the challenge PASS from
- * team/falsifier, and the audit CLEAN from team/security-auditor.
+ * team/falsifier, and the audit CLEAN from team/security-auditor. Both wave
+ * verdicts must also bind (reportHash) to the current verifier report bytes.
  */
 export function evaluateStrictGate(
   run: string,
@@ -342,22 +380,27 @@ export function evaluateStrictGate(
   const missing: Array<{ taskId: string; kind: WaveKind }> = []
   const evidence: StrictTaskEvidence[] = []
   for (const task of tasks) {
-    const reportRes = readBoundedRunJson<any>(run, join(run, `verify/report-${task.id}.json`), MAX_REPORT_BYTES)
-    const reportStatus: StrictTaskEvidence["reportStatus"] =
-      reportRes.status === "ok" && reportRes.value?.status === "PASS"
-        ? "PASS"
-        : reportRes.status === "ok" && reportRes.value?.status === "FAIL"
-          ? "FAIL"
-          : "MISSING"
+    const reportRes = readBoundedRunFile(run, join(run, `verify/report-${task.id}.json`), MAX_REPORT_BYTES)
+    let reportStatus: StrictTaskEvidence["reportStatus"] = "MISSING"
+    let currentReportHash: string | null = null
+    if (reportRes.status === "ok") {
+      currentReportHash = sha256Hex(reportRes.text)
+      try {
+        const parsed = JSON.parse(reportRes.text)
+        reportStatus = parsed?.status === "PASS" ? "PASS" : parsed?.status === "FAIL" ? "FAIL" : "MISSING"
+      } catch {
+        reportStatus = "MISSING"
+      }
+    }
     if (reportStatus !== "PASS") {
       reasons.push(`strict verifier report ${task.id}: ${reportStatus}`)
     }
-    const challenge = readWaveEvidence(run, task.id, "challenge", sessionId)
+    const challenge = readWaveEvidence(run, task.id, "challenge", sessionId, currentReportHash)
     if (!challenge.ok) {
       reasons.push(...challenge.reasons)
       missing.push({ taskId: task.id, kind: "challenge" })
     }
-    const audit = readWaveEvidence(run, task.id, "audit", sessionId)
+    const audit = readWaveEvidence(run, task.id, "audit", sessionId, currentReportHash)
     if (!audit.ok) {
       reasons.push(...audit.reasons)
       missing.push({ taskId: task.id, kind: "audit" })
@@ -390,6 +433,12 @@ function cell(value: unknown): string {
   return clean(value, 200).replace(/\|/g, "\\|")
 }
 
+/** Verdict cell: a stale/invalid present artifact is a FAIL, not its old label. */
+function gateVerdict(wave: WaveEvidence): string {
+  if (wave.ok) return wave.verdict
+  return wave.present ? "FAIL" : "MISSING"
+}
+
 /**
  * Render the sanitized, human-readable `GATE_STATUS.md` table. One four-row
  * group per task; Source cites the artifact the verdict came from.
@@ -419,10 +468,10 @@ export function renderGateStatus(input: {
       `| ${cell("team/verifier")} | verifier | ${cell(task.reportStatus)} | ${cell(`verify/report-${task.id}.json`)} |`,
     )
     lines.push(
-      `| ${cell(WAVE_AGENTS.challenge)} | challenger | ${cell(task.challenge.verdict)} | ${cell(task.challenge.path)} |`,
+      `| ${cell(WAVE_AGENTS.challenge)} | challenger | ${cell(gateVerdict(task.challenge))} | ${cell(task.challenge.path)} |`,
     )
     lines.push(
-      `| ${cell(WAVE_AGENTS.audit)} | auditor | ${cell(task.audit.verdict)} | ${cell(task.audit.path)} |`,
+      `| ${cell(WAVE_AGENTS.audit)} | auditor | ${cell(gateVerdict(task.audit))} | ${cell(task.audit.path)} |`,
     )
   }
   lines.push("", `Gate Result: **${input.finalStatus}**`)

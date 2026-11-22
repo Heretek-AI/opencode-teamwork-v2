@@ -89,8 +89,10 @@ again. If you find no FATAL or SERIOUS flaw, call:
 `notes` (≤1,000 chars) and `evidence` (≤2,000 chars) are sanitized. The tool
 derives your identity from the trusted session; there is no `agent` override,
 and only `team/falsifier` may record a challenge. The file
-`verify/challenge-<taskId>.json` is write-once, and it cannot be recorded before
-the verifier report is PASS.
+`verify/challenge-<taskId>.json` is write-once for the same verifier report and
+is bound to that report's sha256; if the task is reworked and re-verified, the
+new report makes the old verdict stale and a new challenge may be recorded. The
+call cannot be made before the verifier report is PASS.
 
 If you do find a FATAL or SERIOUS flaw, do **not** record a PASS. Report the
 finding to the Sentinel so the task fails verification and the worker gets
