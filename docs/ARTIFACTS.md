@@ -771,7 +771,7 @@ One line per entry:
 
 ### LEMMA (`lemma/` — explicit opt-in Lean 4 mode under `proof` + `lemmaMode: true`)
 
-When `teamwork_plan` is invoked with `lemmaMode: true` (or `route: "lemma"`, requiring `topology: "proof"`), the engine first probes `lean`, `lake`, and `leap-tools` on `PATH` **before `mkdir`**. If any tool is missing or unusable (even when `allowMissingInputs: true`), planning is refused immediately with exact install instructions for both Lean 4 (`elan`) and `leap-tools`, writing zero files and spending zero budget.
+When `teamwork_plan` is invoked with `lemmaMode: true` (or `route: "lemma"`, requiring `topology: "proof"`), the engine first probes `lean`, `lake`, and the LEAP CLI (`leap`; legacy `leap-tools` accepted) on `PATH` **before `mkdir`**. If any tool is missing or unusable (even when `allowMissingInputs: true`), planning is refused immediately with exact install instructions for both Lean 4 (`elan`) and the pinned LEAP CLI (`pipx install git+https://github.com/billkunghappy/LEAP-CLI@afc016d23579d8236050a157fe6cac8f17b13096`), writing zero files and spending zero budget.
 
 When the toolchain is ready, the run initializes `.opencode/teamwork/<session-id>/lemma/`:
 

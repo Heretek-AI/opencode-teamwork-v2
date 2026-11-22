@@ -8,6 +8,7 @@ import {
   detectLeanProofHoles,
   formatMissingToolchainRefusal,
   leanStatementMatches,
+  LEAP_REQUIREMENT,
   parseLeanAxiomOutput,
   parseLeanDeclarations,
   probeLemmaToolchain,
@@ -4153,11 +4154,17 @@ process.exit(0);
     )
     writeStubBin(
       binDir,
-      "leap-tools",
+      "leap",
       `
 const args = process.argv.slice(2);
+// The real leap CLI is an argparse CLI with a required subcommand and no
+// --version flag, so --version exits non-zero and --help succeeds.
 if (args.includes("--version")) {
-  console.log("leap-tools 0.1.0-stub");
+  console.error("usage: leap [-h] {lean,doctor,config} ...");
+  process.exit(2);
+}
+if (args.includes("--help")) {
+  console.log("usage: leap [-h] {lean,doctor,config} ...");
   process.exit(0);
 }
 process.exit(0);
@@ -4172,19 +4179,39 @@ process.exit(0);
       const probeEmpty = probeLemmaToolchain({ env: { PATH: "" } })
       assert.strictEqual(probeEmpty.ready, false, "empty PATH must not be ready")
       assert.strictEqual(probeEmpty.status, "MISSING")
-      assert.deepStrictEqual(probeEmpty.missing, ["lean", "lake", "leap-tools"])
+      assert.deepStrictEqual(probeEmpty.missing, ["lean", "lake", LEAP_REQUIREMENT])
 
       const onlyLeanDir = mkdtempSync(join(lemmaTestDir, "only-lean-"))
       writeStubBin(onlyLeanDir, "lean", `console.log("Lean 4.14.0")`)
       writeStubBin(onlyLeanDir, "lake", `console.log("Lake 5.0")`)
       const probeNoLeap = probeLemmaToolchain({ env: { PATH: onlyLeanDir } })
-      assert.strictEqual(probeNoLeap.ready, false, "missing leap-tools must fail probe")
-      assert.deepStrictEqual(probeNoLeap.missing, ["leap-tools"])
+      assert.strictEqual(probeNoLeap.ready, false, "missing LEAP CLI must fail probe")
+      assert.deepStrictEqual(probeNoLeap.missing, [LEAP_REQUIREMENT])
+
+      // `leap` is preferred; the legacy `leap-tools` name is still accepted.
+      const legacyDir = mkdtempSync(join(lemmaTestDir, "legacy-leap-"))
+      writeStubBin(legacyDir, "lean", `console.log("Lean 4.14.0")`)
+      writeStubBin(legacyDir, "lake", `console.log("Lake 5.0")`)
+      writeStubBin(legacyDir, "leap-tools", `console.log("leap-tools 0.1.0-stub")`)
+      const probeLegacy = probeLemmaToolchain({ env: { PATH: legacyDir } })
+      assert.strictEqual(probeLegacy.ready, true, "legacy leap-tools must satisfy the LEAP CLI requirement")
+      assert.strictEqual(probeLegacy.leap.name, "leap-tools", "legacy binary must be reported as leap-tools")
+      assert.strictEqual(probeLegacy.leap.path, join(legacyDir, "leap-tools"))
+
+      const bothDir = mkdtempSync(join(lemmaTestDir, "both-leap-"))
+      writeStubBin(bothDir, "lean", `console.log("Lean 4.14.0")`)
+      writeStubBin(bothDir, "lake", `console.log("Lake 5.0")`)
+      writeStubBin(bothDir, "leap", `if (process.argv.includes("--version")) process.exit(2); console.log("usage: leap ...")`)
+      writeStubBin(bothDir, "leap-tools", `console.log("leap-tools 0.1.0-stub")`)
+      const probeBoth = probeLemmaToolchain({ env: { PATH: bothDir } })
+      assert.strictEqual(probeBoth.ready, true)
+      assert.strictEqual(probeBoth.leap.name, "leap", "`leap` must be probed before legacy leap-tools")
+      assert.strictEqual(probeBoth.leap.path, join(bothDir, "leap"))
 
       const outageDir = mkdtempSync(join(lemmaTestDir, "outage-"))
       writeStubBin(outageDir, "lean", `console.error("broken binary"); process.exit(2)`)
       writeStubBin(outageDir, "lake", `console.log("Lake 5.0")`)
-      writeStubBin(outageDir, "leap-tools", `console.log("leap-tools 0.1.0")`)
+      writeStubBin(outageDir, "leap", `console.error("broken binary"); process.exit(2)`)
       const probeOutage = probeLemmaToolchain({ env: { PATH: outageDir } })
       assert.strictEqual(probeOutage.ready, false)
       assert.strictEqual(probeOutage.status, "OUTAGE", "non-zero probe on existing binary must report OUTAGE")
@@ -4193,7 +4220,13 @@ process.exit(0);
       assert(refusalMsg.startsWith("refused:"), "refusal must start with refused:")
       assert(refusalMsg.includes("elan") && refusalMsg.includes("leanprover/lean4:stable"), "must include Lean 4 install instructions")
       assert(refusalMsg.includes("$HOME/.elan/bin") && refusalMsg.includes("lean --version && lake --version"), "must include PATH and verify command")
-      assert(refusalMsg.includes("leap-tools") && refusalMsg.includes("leap-tools --version"), "must include leap-tools install instructions")
+      assert(refusalMsg.includes(LEAP_REQUIREMENT), "refusal must name the real LEAP CLI requirement")
+      assert(refusalMsg.includes("git+https://github.com/billkunghappy/LEAP-CLI@afc016d23579d8236050a157fe6cac8f17b13096"), "must include the pinned LEAP CLI git install")
+      assert(refusalMsg.includes("https://github.com/billkunghappy/LEAP-CLI"), "must include the LEAP-CLI repo URL")
+      assert(refusalMsg.includes("leap --help"), "must verify the leap console script via --help")
+      assert(!refusalMsg.includes("pipx install leap-tools"), "must not suggest the non-existent leap-tools PyPI package")
+      assert(refusalMsg.includes("leap lean") && refusalMsg.includes("11 GB") && refusalMsg.includes("Mathlib"), "must describe optional `leap lean` Mathlib cost")
+      assert(/no Mathlib|only core Lean/i.test(refusalMsg), "must state the E2E needs only core Lean")
 
       // teamwork_plan pre-mkdir refusal even with allowMissingInputs: true & skipInterview: true
       const rootNoTool = mkdtempSync(join(lemmaTestDir, "root-notool-"))
@@ -4209,7 +4242,7 @@ process.exit(0);
         tasks: [{ id: "L1" }],
       })
       assert(refusedPlan.content.startsWith("refused:"), `missing toolchain must refuse plan: ${refusedPlan.content}`)
-      assert(refusedPlan.content.includes("elan") && refusedPlan.content.includes("leap-tools"), "plan refusal must print install instructions for both tools")
+      assert(refusedPlan.content.includes(LEAP_REQUIREMENT) && refusedPlan.content.includes("billkunghappy/LEAP-CLI"), "plan refusal must print install instructions for Lean 4 and the LEAP CLI")
       assert(!existsSync(join(rootNoTool, ".opencode", "teamwork", "20261018-000000-lemma-refuse")), "refused LEMMA plan must create zero dirs/files")
 
       const badTopo = await tools.plan.execute({

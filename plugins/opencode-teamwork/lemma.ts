@@ -45,7 +45,10 @@ export interface LemmaBounds {
 }
 
 export type ProbeStatus = "READY" | "MISSING" | "OUTAGE"
-export type LemmaBinaryName = "lean" | "lake" | "leap-tools"
+export type LemmaBinaryName = "lean" | "lake" | "leap" | "leap-tools"
+/** The real LEAP requirement: the `leap` console script, with the legacy `leap-tools` alias. */
+export const LEAP_REQUIREMENT = "leap (LEAP CLI) or legacy leap-tools"
+export type LemmaRequirement = "lean" | "lake" | typeof LEAP_REQUIREMENT
 
 export interface BinaryProbeResult {
   name: LemmaBinaryName
@@ -61,8 +64,9 @@ export interface LemmaProbeResult {
   ready: boolean
   lean: BinaryProbeResult
   lake: BinaryProbeResult
-  leapTools: BinaryProbeResult
-  missing: LemmaBinaryName[]
+  /** Resolved LEAP CLI: `leap` when present, otherwise the legacy `leap-tools`. */
+  leap: BinaryProbeResult
+  missing: LemmaRequirement[]
   installInstructions: string
 }
 
@@ -254,7 +258,7 @@ function readJsonSafe<T>(runDir: string, relPath: string): { value?: T; error?: 
 }
 
 // ---------------------------------------------------------------------------
-// Toolchain Probe (Lean 4: lean + lake, and leap-tools)
+// Toolchain Probe (Lean 4: lean + lake, and the LEAP CLI: leap or legacy leap-tools)
 // ---------------------------------------------------------------------------
 
 function resolveExecutableOnPath(binName: string, pathEnv: string | undefined): string | null {
@@ -291,7 +295,7 @@ function firstNonEmptyLine(text: unknown): string {
 }
 
 function probeBinary(
-  name: "lean" | "lake" | "leap-tools",
+  name: LemmaBinaryName,
   env: NodeJS.ProcessEnv,
   timeoutMs: number,
   allowHelpFallback: boolean,
@@ -393,11 +397,25 @@ export function buildInstallInstructions(): string {
     "     export PATH=\"$HOME/.elan/bin:$PATH\"",
     "     elan default leanprover/lean4:stable",
     "   - Verify: lean --version && lake --version",
-    "2. `leap-tools`:",
-    "   - Install leap-tools (via pipx/pip or your LEAP distribution) so `leap-tools` is executable on PATH:",
-    "     pipx install leap-tools   # or: pip install leap-tools",
-    "   - Verify: leap-tools --version",
+    "2. LEAP CLI (`leap`; the legacy `leap-tools` name is also accepted):",
+    "   - The `leap-tools` PyPI package does not exist; install the pinned CLI from git:",
+    "     pipx install git+https://github.com/billkunghappy/LEAP-CLI@afc016d23579d8236050a157fe6cac8f17b13096",
+    "   - Source: https://github.com/billkunghappy/LEAP-CLI",
+    "   - Verify: leap --help   # `leap` has no --version flag; --help proves it runs",
+    "   - Optional full Mathlib setup: `leap lean` downloads Lean 4.34 + Mathlib",
+    "     (~11 GB, 10-20 minutes). LEMMA's E2E needs only core Lean and never runs `leap lean`.",
   ].join("\n")
+}
+
+function probeLeapCli(env: NodeJS.ProcessEnv, timeoutMs: number): BinaryProbeResult {
+  // `leap` is the current console script; fall back to the legacy `leap-tools`
+  // name only when `leap` is absent. A present-but-broken `leap` is an OUTAGE,
+  // not a reason to silently use another binary.
+  const leap = probeBinary("leap", env, timeoutMs, true)
+  if (leap.available || leap.path !== null) return leap
+  const legacy = probeBinary("leap-tools", env, timeoutMs, true)
+  if (legacy.available || legacy.path !== null) return legacy
+  return { ...leap, error: "neither `leap` nor legacy `leap-tools` found on PATH" }
 }
 
 export function probeLemmaToolchain(options?: { env?: NodeJS.ProcessEnv; timeoutMs?: number }): LemmaProbeResult {
@@ -406,14 +424,14 @@ export function probeLemmaToolchain(options?: { env?: NodeJS.ProcessEnv; timeout
 
   const lean = probeBinary("lean", env, timeoutMs, false)
   const lake = probeBinary("lake", env, timeoutMs, false)
-  const leapTools = probeBinary("leap-tools", env, timeoutMs, true)
+  const leap = probeLeapCli(env, timeoutMs)
 
-  const missing: Array<"lean" | "lake" | "leap-tools"> = []
+  const missing: LemmaRequirement[] = []
   if (!lean.available) missing.push("lean")
   if (!lake.available) missing.push("lake")
-  if (!leapTools.available) missing.push("leap-tools")
+  if (!leap.available) missing.push(LEAP_REQUIREMENT)
 
-  const failedResults = [lean, lake, leapTools].filter((r) => !r.available)
+  const failedResults = [lean, lake, leap].filter((r) => !r.available)
   let status: ProbeStatus = "READY"
   if (failedResults.length > 0) {
     status = failedResults.some((r) => r.status === "MISSING") ? "MISSING" : "OUTAGE"
@@ -424,25 +442,30 @@ export function probeLemmaToolchain(options?: { env?: NodeJS.ProcessEnv; timeout
     ready: missing.length === 0,
     lean,
     lake,
-    leapTools,
+    leap,
     missing,
     installInstructions: buildInstallInstructions(),
   }
 }
 
 export function formatMissingToolchainRefusal(probe: LemmaProbeResult): string {
-  const tools = [probe.lean, probe.lake, probe.leapTools]
-  const details = tools.map((t) => {
-    if (t.available) return `  - ${t.name}: READY (${t.version ?? t.path})`
-    return `  - ${t.name}: ${t.status}${t.path ? ` at ${t.path}` : ""} (${t.error ?? "unavailable"})`
-  })
+  const details = [
+    `  - lean: ${describeProbe(probe.lean)}`,
+    `  - lake: ${describeProbe(probe.lake)}`,
+    `  - ${LEAP_REQUIREMENT}: ${describeProbe(probe.leap)}`,
+  ]
   return [
-    `refused: LEMMA route requires Lean 4 (lean, lake) and leap-tools, which are not ready (status: ${probe.status}; missing/unusable: ${probe.missing.join(", ")}). Nothing was written; zero budget spent.`,
+    `refused: LEMMA route requires Lean 4 (lean, lake) and a LEAP CLI binary (${LEAP_REQUIREMENT}), which are not ready (status: ${probe.status}; missing/unusable: ${probe.missing.join(", ")}). Nothing was written; zero budget spent.`,
     "Toolchain probe:",
     ...details,
     "",
     probe.installInstructions,
   ].join("\n")
+}
+
+function describeProbe(t: BinaryProbeResult): string {
+  if (t.available) return `READY (${t.version ?? t.path})`
+  return `${t.status}${t.path ? ` at ${t.path}` : ""} (${t.error ?? "unavailable"})`
 }
 
 // ---------------------------------------------------------------------------
@@ -1777,6 +1800,7 @@ export interface LemmaManifest {
     status: ProbeStatus
     lean: string | null
     lake: string | null
+    /** LEAP CLI version (resolved from `leap`, or legacy `leap-tools`). */
     leapTools: string | null
   }
   formalizationRounds: number
@@ -1828,7 +1852,7 @@ function emptyManifest(sessionId: string, bounds: LemmaBounds, probe: LemmaProbe
       status: probe.status,
       lean: probe.lean.version,
       lake: probe.lake.version,
-      leapTools: probe.leapTools.version,
+      leapTools: probe.leap.version,
     },
     formalizationRounds: 0,
     nodes: {},
