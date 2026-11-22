@@ -5084,15 +5084,15 @@ process.exit(0);
       assert.strictEqual(goodPolicy.error, undefined, `valid policy must pass: ${goodPolicy.error}`)
       assert.deepStrictEqual(goodPolicy.policy.allowedAxioms, ["my_custom_ax", "other_ax"], "policy must dedupe and strip guillemets")
       const badPolicies = [
-        ["sorryAx", { allowedAxioms: ["sorryAx"] }, /sorryAx/],
-        ["unsafe name", { allowedAxioms: ["bad name"] }, /safe Lean axiom name/],
-        ["unsafe guillemet payload", { allowedAxioms: ["«bad name»"] }, /safe Lean axiom name/],
-        ["empty entry", { allowedAxioms: [""] }, /non-empty/],
-        ["over cap", { allowedAxioms: Array.from({ length: 33 }, (_, i) => `ax_${i}`) }, /max 32/],
+        { label: "sorryAx", policy: { allowedAxioms: ["sorryAx"] }, pattern: /sorryAx/ },
+        { label: "unsafe name", policy: { allowedAxioms: ["bad name"] }, pattern: /safe Lean axiom name/ },
+        { label: "unsafe guillemet payload", policy: { allowedAxioms: ["«bad name»"] }, pattern: /safe Lean axiom name/ },
+        { label: "empty entry", policy: { allowedAxioms: [""] }, pattern: /non-empty/ },
+        { label: "over cap", policy: { allowedAxioms: Array.from({ length: 33 }, (_, i) => `ax_${i}`) }, pattern: /max 32/ },
       ]
-      for (const [label, policy, pattern] of badPolicies) {
+      for (const { label, policy, pattern } of badPolicies) {
         const rejected = validateLemmaPolicy(policy)
-        assert(rejected.error && pattern.test(rejected.error), `${String(label)} policy must be rejected: ${rejected.error}`)
+        assert(rejected.error && pattern.test(rejected.error), `${label} policy must be rejected: ${rejected.error}`)
       }
 
       const stubBin = makeFullStubEnv("policy")
