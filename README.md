@@ -36,7 +36,7 @@ plugins/opencode-teamwork/tools.ts           # engine tools + hooks (V2 API)
 plugins/opencode-teamwork/document-review.ts # Document Review route classifier, PDF/MD ingestion, RSA bounds
 plugins/opencode-teamwork/lemma.ts           # LEMMA (Lean 4) probe, classifier, verifier
 plugins/opencode-teamwork/tournament.ts      # bounded massive-proof tournament & opt-in router
-agents/team/*.md                  # 12 team agents (markdown, V2 frontmatter)
+agents/team/*.md                  # 14 team agents (markdown, V2 frontmatter)
 docs/ARTIFACTS.md                 # canonical artifact layout, topologies, schemas
 lib/team.mjs                      # installer core (config dir, model map, agent files)
 lib/picker.mjs                    # interactive model picker (`opencode models`)
@@ -220,7 +220,7 @@ defaults without touching files that already exist.
 1. Install the plugin: `opencode plugin add @heretek-ai/opencode-teamwork-v2`.
 
 2. Assign models and install the agents. `init` writes
-   `~/.config/opencode/teamwork.json`, installs all 12 agents and registers the
+   `~/.config/opencode/teamwork.json`, installs all 14 agents and registers the
    plugin; `models` rewrites only the model map and the agents' `model:` lines.
    Both are safe to re-run.
 
@@ -371,11 +371,24 @@ built-ins.
 
 ## Agents
 
-The 14 shipped agents are: `team/crafter`, `team/sentinel`, `team/worker`,
-`team/proof-worker`, `team/verifier`, `team/security-auditor`,
-`team/segment-reviewer`, `team/formalization-reviewer`, `team/orchestrator`,
-`team/proposer`, `team/falsifier`, `team/synthesizer`, `team/scout`,
-`team/referee`.
+The 14 shipped agents are installed as markdown files under `~/.config/opencode/agents/team/`. Specialised roles are added strictly alongside the route that exercises them (never a 49-file flat roster or unused roles):
+
+| Agent | File | Default Model | Consuming Route / Topology | Code-Enforced Deny Set (`READ_ONLY_ACTIONS`) | Purpose |
+| --- | --- | --- | --- | --- | --- |
+| `team/crafter` | `crafter.md` | `deepseek/deepseek-flash` | `/teamwork-craft` (all routes) | — (interactive `ask` on `edit`/`shell`) | 9-step elicitation wizard producing `prompt_draft.md` |
+| `team/sentinel` | `sentinel.md` | `deepseek/deepseek-v4-pro` | `/teamwork` (all routes) | — | Main DAG coordinator, route dispatcher, worktree manager |
+| `team/orchestrator` | `orchestrator.md` | `deepseek/deepseek-v4-pro` | `/team-orchestrate` (legacy v1 loop) | — | Legacy propose → falsify → synthesize → verify loop coordinator |
+| `team/scout` | `scout.md` | `deepseek/deepseek-flash` | All routes (pre-plan context gathering) | `edit`, `subagent` (`shell` available, can modify files) | Read-only repository and documentation context gatherer |
+| `team/worker` | `worker.md` | `deepseek/deepseek-flash` | `small-focused`, `iterative-coding`, `distributed-coding` | — (`webfetch` denied when `network: denied`) | Implementation worker operating in an isolated git worktree |
+| `team/proof-worker` | `proof-worker.md` | `deepseek/deepseek-v4-pro` | `proof` (including LEMMA `lemmaMode: true`) & `massive-proof` | — | Formal and mathematical proof searcher / Lean 4 prover |
+| `team/proposer` | `proposer.md` | `deepseek/deepseek-flash` | `proof`, `massive-proof`, `/team-propose` | — | Parallel candidate generator with distinct proof/coding strategies |
+| `team/falsifier` | `falsifier.md` | `deepseek/deepseek-v4-pro` | `proof`, `massive-proof` (`FALSIFY_PRUNE`), `/team-falsify` | `edit`, `shell`, `subagent` | Read-only adversarial critic and tournament falser |
+| `team/synthesizer` | `synthesizer.md` | `deepseek/deepseek-v4-pro` | `distributed-coding` (merge conflict), `document-review` (`doc-synthesis`), `massive-proof` (`MERGE`), `/team-synthesize` | — | Candidate merger, tournament level aggregator, and cross-segment document synthesizer |
+| `team/verifier` | `verifier.md` | `deepseek/deepseek-v4-pro` | All routes (`readyForVerifier`, `teamwork_final_verify`, `/team-review`) | `edit`, `webfetch`, `subagent` (`shell` available, can modify files) | Independent verification forcing function |
+| `team/security-auditor` | `security-auditor.md` | `deepseek/deepseek-v4-pro` | All routes (`READY_FOR_SECURITY_AUDIT`, `teamwork_security_audit`) | `edit`, `webfetch`, `subagent` (`shell` available, can modify files) | Mandatory pre-merge security and integrity-mode auditor |
+| `team/segment-reviewer` | `segment-reviewer.md` | `deepseek/deepseek-flash` | `document-review` (`teamwork_document_triage` / `teamwork_document_record`) | `edit`, `shell`, `webfetch`, `subagent` | Strictly read-only RSA tree (`[4,2,1]`) analyst/aggregator/adjudicator for one document segment |
+| `team/formalization-reviewer` | `formalization-reviewer.md` | `deepseek/deepseek-v4-pro` | `proof` with `lemmaMode: true` (`teamwork_lemma_formalize`) | `edit`, `shell`, `webfetch`, `subagent` | Strictly read-only Lean 4 formalization faithfulness reviewer (`APPROVE` / `FAITHFUL`) |
+| `team/referee` | `referee.md` | `deepseek/deepseek-v4-pro` | `massive-proof` (`teamwork_tournament` `score` & `audit`) | `edit`, `shell`, `webfetch`, `subagent` | Strictly read-only tournament referee, deterministic candidate scorer, and victory auditor |
 
 Model assignments live in each agent's frontmatter (`model:`); see
 [Model assignment](#model-assignment) for how to set them.
