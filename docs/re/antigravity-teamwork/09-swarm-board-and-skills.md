@@ -10,7 +10,7 @@ as captured into [`assets/builtin/`](assets/builtin/) (see [`assets/PROVENANCE-A
 
 **What this changes in the set.** `05-coordination-and-artifacts.md` recovered `board.Message` and `swarm.Member` from Go generic instantiations and had to leave the board's persistence location, ordering scope and channel semantics `UNKNOWN`. The materialised sidecar settles those: the persisted board is `board.jsonl`, one record per line, under a **per-conversation** swarm directory; `seq` is one number space per board; the channel model is `main` plus named channels with log-derived subscriptions. [OBSERVED]
 
-**What this document does not prove.** The sidecar is a *reader*. It writes no file and messages no agent (`plugins/swarm/sidecars/swarm_board/main.mjs:12`, `plugins/swarm/sidecars/swarm_board/README.md:368-369`), and its HTTP surface is `GET` only (`main.mjs:1307-1421`). Everything below about the **writer** — who allocates `seq`, what lock serialises appends — is therefore out of reach of this source and is marked as such.
+**What this document does not prove.** The sidecar is a *reader*. It writes no file and messages no agent (`plugins/swarm/sidecars/swarm_board/main.mjs:12`, `plugins/swarm/sidecars/swarm_board/README.md:368-369`), and its HTTP surface is `GET` only (`main.mjs:1307-1421`). Everything below about the **writer** — who allocates `seq`, what lock serialises appends — is therefore out of reach of *this source* and is marked as such. One live swarm directory is now available as a second evidence class (§2.4): it shows the records one writer actually emitted, but not the code that emitted them, so it narrows the `UNKNOWN`s without closing them. Throughout, `[OBSERVED — disk]` marks a value read from that live directory and `[OBSERVED — source]` (or plain `[OBSERVED]` where the citation is a `file:line`) marks a value read from the shipped tree.
 
 ## Confidence Legend
 
@@ -78,22 +78,50 @@ There is **one board per swarm**, and a swarm is identified by the **coordinator
 | File | Shape | Written by |
 |---|---|---|
 | `board.jsonl` | append-only JSONL, one message object per line | the Go board writer (`05` §4); sidecar reads only |
-| `members.json` | `{"title","members":{name:{conversation_id,model,role,wake_mode,wait_since,last_read_seq,last_nudged_seq,last_park_blocked_seq,killed}}}` | the Go board writer |
+| `members.json` | `{"title","members":{name:{conversation_id,role,desired_state,desired_model,applied_model,workspace_mode,phase,wake_mode,wait_since,last_read_seq,last_nudged_seq,last_park_blocked_seq,killed,model}}}` — the README documents only the nine-key subset | the Go board writer |
 | `view.json` | narrator Overview data (schema in §8) | the narrator worker |
 | `view.html` | narrator Overview template, sandboxed | the narrator worker |
 | `plan.json` | `{goal,tasks,threads}` for the built-in Overview | the coordinator (`S/swarm_pane/SKILL.md:19-37`) |
 | `transcript.jsonl` (per member) | one step per line; `PLANNER_RESPONSE` steps carry `thinking`, `tool_calls` | the Language Server |
-| `swarm.json` (remote only) | `{"backend","swarm_id","db"}` anchor, no board | the remote board backend |
+| `swarm.json` | versioned backend anchor. Remote: `{"backend","swarm_id","db"}`, no board. Local (live): `{"version":1,"backend":"local","swarm_id","created_at"}` | the board backend (remote *or* local) |
 
-[OBSERVED — `SB/README.md:22-28`; `main.mjs:720-731`, `main.mjs:297-298`, `main.mjs:921-931`; `S/swarm_pane/SKILL.md:22-29`]
+[OBSERVED — `SB/README.md:22-28`; `main.mjs:720-731`, `main.mjs:297-298`, `main.mjs:921-931`; `S/swarm_pane/SKILL.md:22-29`; the `members.json` and `swarm.json` rows additionally OBSERVED — disk at §2.4]
 
 The **writers are not in this tree**. The "Written by" column is INFERRED from the consuming code and from the skills' statements of ownership; only the narrator's and coordinator's files are described as written by a member (`S/swarm_narrator/SKILL.md:24-44`, `S/swarm_pane/SKILL.md:19-37`). Who writes `board.jsonl` and `members.json`, and with what locking, is outside the materialised source (§3.3, §7.4).
 
-`members.json` fields beyond the documented nine — `channels`, `workspace`, `workspace_mode` — are read when present (`main.mjs:744`, `main.mjs:839-840`). The roster's stored channel set is explicitly **a cache**: the authoritative subscriptions are rebuilt from control messages in the log (`channels.mjs:222-229`, "members.json is only a cache of the log, as in board.RebuildChannels").
+One correction to the file contract above, forced by the live directory: `swarm.json` is **not** remote-only. §2.3 describes the remote anchor as `{"backend","swarm_id","db"}`; the live local swarm wrote `swarm.json` too, with `backend:"local"` and a `created_at` instead of a `db` (§2.4). So the file is present on both backends; its keys differ by backend.
+
+`members.json` fields beyond the nine documented ones — `channels`, `workspace`, `workspace_mode` — are read when present (`main.mjs:744`, `main.mjs:839-840`). The live file adds four more that the sidecar never reads: `desired_state`, `desired_model`, `applied_model`, `phase` (§4). The roster's stored channel set is explicitly **a cache**: the authoritative subscriptions are rebuilt from control messages in the log (`channels.mjs:222-229`, "members.json is only a cache of the log, as in board.RebuildChannels").
 
 ### 2.3 Remote boards
 
 A build may read swarms whose members span machines by placing `remote_board.json` next to `main.mjs` (`main.mjs:81-96`). Such a swarm's directory holds only `swarm.json`; roster and messages come from NDJSON on the board CLI's stdout (`main.mjs:887-904`, `main.mjs:1069-1121`). The JSON member/message shapes are the same (`main.mjs:976-992`: "Members carry the members.json keys … plus the owner LS"). **Two backends, one schema** — which is itself evidence that the file schema is the canonical one. [OBSERVED]
+
+### 2.4 One live swarm directory (2026-11-22)
+
+A live run on this machine left a complete local swarm directory, read here as `[OBSERVED — disk]`. It is **one** swarm: every concrete value below is a sample, not a default, and composition, member names, model ids and the presence of any given file must be treated as `UNKNOWN` for other swarms.
+
+Path (the coordinator conversation is the swarm id):
+
+```text
+~/.gemini/antigravity-cli/brain/0e3db35c-47d2-4faf-98e6-a2a842cd4fc2/.system_generated/swarm/
+```
+
+| File | Size | Content observed |
+|---|---:|---|
+| `swarm.json` | 117 B | `{"version":1,"backend":"local","swarm_id":"0e3db35c-47d2-4faf-98e6-a2a842cd4fc2","created_at":"2026-11-22T00:30:52Z"}` |
+| `plan.json` | 389 B | `{"goal":{"title":"Create and test FizzBuzz in JavaScript","line":"Implement fizzbuzz.js and test.js, then run the test suite."},"tasks":{"coder":"Implement fizzbuzz.js, write test.js, and run tests"},"threads":[{"id":"t-fizzbuzz","title":"FizzBuzz implementation and test","goal":"Create fizzbuzz.js and test.js and verify tests pass.","tasks":["coder"]}]}` |
+| `members.json` | 1,593 B | `title:"FizzBuzz module and test suite"`; three members — `coordinator`, `coder`, `monitor` — each with fourteen keys (§4) |
+| `board.jsonl` | 2,194 B | four lines, `seq` 1–4 (§3.5) |
+
+Values are quoted exactly; `plan.json`'s whitespace is normalised to one line here (on disk it is pretty-printed across four).
+
+Facts this directory settles, and their limits:
+
+- **`swarm.json` is versioned and backend-tagged, and `swarm_id` equals the coordinator conversation id.** `version:1`, `backend:"local"`, `created_at` an ISO-8601 UTC instant. That is the concrete form of "a swarm is identified by the coordinator's conversation id" (§2.1). [OBSERVED — disk for this swarm; whether `swarm_id` is *always* the coordinator conversation id is INFERRED from §2.1's resolution rule]
+- **`plan.json` carries `goal`, `tasks` and `threads` in the shape the pane skill specifies** (`S/swarm_pane/SKILL.md:19-37`), written at swarm creation time (its mtime precedes the board's last line by ~2 minutes). [OBSERVED — disk]
+- **No `view.json` and no `view.html`.** This swarm had no narrator, so the built-in Overview files were absent. Absence here is a composition fact (no narrator member), not evidence that narrator files are optional for every swarm. [OBSERVED — disk; generality UNKNOWN]
+- **No `channels`, `control` or `channel` key appears anywhere**, so this sample exercises only the `main` channel. [OBSERVED — disk; absence]
 
 ---
 
@@ -122,9 +150,26 @@ const control = controlOf(m);              // :377  -> m.control object, else nu
 
 [OBSERVED — `board_cache.mjs:367-382`; field accessors at `channels.mjs:67`, `channels.mjs:70`]
 
-Nothing in the sidecar reads `kind` or `request_id` (a full-text search for both returns only unrelated `failure.kind` uses at `main.mjs:571-575`, `main.mjs:795`, `main.mjs:866`). [OBSERVED — negative result]
+Nothing in the sidecar **reads** `kind` or `request_id` (a full-text search for both returns only unrelated `failure.kind` uses at `main.mjs:571-575`, `main.mjs:795`, `main.mjs:866`). [OBSERVED — negative result, read path only]
 
-**Reconciliation with `05` §2.** `05` recovered an 8-field `board.Message` from a Go instantiation: `seq`, `agent`, `text`, `time` without `omitempty`; `kind`, `request_id`, `channel`, `control` with `omitempty`. That is exactly compatible with what the sidecar sees: the four always present, `channel`/`control` present only when set, and `kind`/`request_id` never observed on disk because nothing in this feature emits or consumes them. The struct is the **in-memory superset**; the persisted line is the subset that survives `omitempty`. [OBSERVED for the tags (`05` §2) and for the reader's field set; INFERRED that `kind`/`request_id` are unused by native swarm]
+**That negative result does not mean the writer omits them — the live board writes both.** All four lines of the live `board.jsonl` (§3.5) end with a `request_id`, and the two coordinator briefs (seq 1–2) additionally carry `kind:"brief"`. First line, with only its long `text` elided:
+
+```json
+{"seq":1,"agent":"coordinator","text":"@coder You own …","time":"2026-11-21 19:30:54","kind":"brief","request_id":"e20dee73-85ca-4027-8fdc-2ab40cd1c9ba"}
+```
+
+[OBSERVED — disk, §2.4] So the precise statement, which replaces an earlier inference in this document, is:
+
+| Key | Read by the sidecar? | Written by the live board? |
+|---|---|---|
+| `seq`, `agent`, `text`, `time` | yes (`board_cache.mjs:371-374`) | yes, all four lines |
+| `channel`, `control` | yes (`channels.mjs:67`, `channels.mjs:70`) | not exercised in this swarm (no channels) |
+| `kind` | no | yes — `"brief"` on the two coordinator briefs (seq 1–2) |
+| `request_id` | no | yes — on every line |
+
+A reader that inspected only `board_cache.mjs` would conclude `kind`/`request_id` are dead fields. They are not dead; they are *written but unread by this sidecar*. Who consumes them, and what `kind` values exist besides `brief`, is `UNKNOWN` — the live file shows one value only.
+
+**Reconciliation with `05` §2.** `05` recovered an 8-field `board.Message` from a Go instantiation: `seq`, `agent`, `text`, `time` without `omitempty`; `kind`, `request_id`, `channel`, `control` with `omitempty`. That is exactly what the live file shows: the four core keys on every line, `kind` and `request_id` on the lines that set them, and no `channel`/`control` in a channel-free swarm. The struct is the **in-memory superset**; the persisted line is its `omitempty` projection, and the writer *does* populate two of the four optional fields. [OBSERVED — tags (`05` §2), reader field set, and the live lines; INFERRED that `channel`/`control` serialise the same way when a writer sets them, since this sample had neither]
 
 ### 3.2 The append path, as far as a reader can see it
 
@@ -161,13 +206,34 @@ Two further observations:
 
 ### 3.4 What the record does not carry
 
-The reader has no edit or delete path, no thread/reply parent, no acknowledgement field, and no per-message recipient list: recipients are *derived* from the text at read time (`mentionsOf`, `channels.mjs:48-54`; the feed prints `→ @a @b` from that derivation, `SB/README.md:253-256`). `request_id` exists in the Go struct but has no consumer in this feature, so request/response pairing is not part of the swarm board's protocol as shipped. [OBSERVED — absence of consumers; INFERRED that pairing belongs to another consumer of `board.Message`, if any]
+The reader has no edit or delete path, no thread/reply parent, no acknowledgement field, and no per-message recipient list: recipients are *derived* from the text at read time (`mentionsOf`, `channels.mjs:48-54`; the feed prints `→ @a @b` from that derivation, `SB/README.md:253-256`). `request_id` **is** persisted on every live line (§3.5) but has no reader anywhere in this tree, so its pairing role is `UNKNOWN`: the writer distinguishes posts by request id, yet nothing here pairs a reply to a request by it. Request/response pairing is therefore **not part of the board protocol as this source shows it**, even though the field is present on disk. [OBSERVED — writer emits it, no consumer; the "no pairing" reading is INFERRED from the absence of a consumer, not from absence of the field]
 
 The board is documented as permanent: "The board outlives the turn. Everything said is on it, in order, forever" (`S/native_swarm/SKILL.md:351-352`). No compaction, rotation or trimming exists in the sidecar. [OBSERVED for the sidecar; `UNKNOWN` for the writer — see `05` §8]
+
+### 3.5 The live board: four lines, one space
+
+The live swarm's `board.jsonl` (§2.4) has four lines, `seq` 1–4, written across two agents in one sequence space — the first direct confirmation of §3.3's scope claim from a file rather than from a consumer.
+
+| `seq` | `agent` | Role of the line | Keys beyond `seq`/`agent`/`text`/`time` |
+|---:|---|---|---|
+| 1 | `coordinator` | assigns file ownership: `@coder You own \`/tmp/opencode/agy-run2/fizzbuzz.js\` and \`/tmp/opencode/agy-run2/test.js\`. Do not touch any other files.` then five numbered instructions | `kind:"brief"`, `request_id` |
+| 2 | `coordinator` | briefs the monitor: `@monitor You are this swarm's stall monitor. Load the swarm_monitor skill and follow it. Post only to break a stall.` | `kind:"brief"`, `request_id` |
+| 3 | `coder` | reports: `@coordinator [done] Created … Verified with \`node /tmp/opencode/agy-run2/test.js\`: exited 0 with \`All fizzbuzz tests passed!\`.` | `request_id` only |
+| 4 | `coordinator` | closes: `[done] Created fizzbuzz.js and test.js and verified all tests pass.` | `request_id` only |
+
+[OBSERVED — disk] Observations that follow, each scoped to this sample:
+
+- **`kind` is set on briefs, not on reports.** The only value seen is `"brief"`, on the two lines that assign work. Whether `kind` has other values (a report kind, a control kind) is `UNKNOWN`; line 3, a `[done]` report, carries no `kind` at all.
+- **`request_id` is on every line**, including the coordinator's summary, and the four values differ. It looks like a per-post correlation id, not a thread key. Meaning and consumer `UNKNOWN`.
+- **`time` is local time with no offset**, `2026-11-21 19:30:54` … `19:32:51`, matching the `YYYY-MM-DD HH:MM:SS` parser contract (§12) and *not* the UTC `created_at` in `swarm.json` (`2026-11-22T00:30:52Z`). The machine's offset is UTC−05:00, so line 1 is `00:30:54Z` — two seconds after `created_at`. The two clocks in one directory are in different zones; do not compare them naively.
+- **The monitor never posted.** `seq` 2 briefs it and the coder finished before a stall, so a three-member swarm produced two speakers. Board traffic is not proportional to membership.
+- **Ownership is stated in text, not in a field.** Line 1's `You own … Do not touch any other files.` is prose; there is no `owner` or `paths` key. Enforcement, if any, is elsewhere. [OBSERVED — absence]
 
 ---
 
 ## 4. `members.json` — the roster and its cursors
+
+The sidecar README documents nine keys per member:
 
 ```text
 {"title",
@@ -177,24 +243,31 @@ The board is documented as permanent: "The board outlives the turn. Everything s
 
 [OBSERVED — `SB/README.md:25`; parsed at `main.mjs:171-179`; projected at `main.mjs:817-845`]
 
+The live file carries **fourteen**, in this file order: `conversation_id`, `role`, `desired_state`, `desired_model`, `applied_model`, `workspace_mode`, `phase`, `wake_mode`, `wait_since`, `last_read_seq`, `last_nudged_seq`, `last_park_blocked_seq`, `killed`, `model`. [OBSERVED — disk, §2.4] **The README example is a subset, not the schema.** The sidecar reads the nine documented keys plus `channels`, `workspace` and `workspace_mode`; `desired_state`, `desired_model`, `applied_model` and `phase` are written and never read here. Do not model `members.json` from the README alone — a round-trip through the README's nine keys would drop five persisted fields.
+
 | Field | What the source establishes | Confidence |
 |---|---|---|
 | `title` | Swarm title; may also arrive later from `agentapi` conversation metadata, which is why it is part of the ETag (`main.mjs:190-212`, `main.mjs:763-764`) | OBSERVED |
 | `conversation_id` | The member's own conversation; used to locate its transcript (`main.mjs:297-298`, `main.mjs:768`), and validated against `ID_RE = /^[0-9a-f-]{8,}$/i` before being joined into a path (`main.mjs:33`, `main.mjs:640`, `main.mjs:1214-1216`) | OBSERVED |
-| `model` | Model id shown per member (`main.mjs:820`); switching is a `swarm{action:"model"}` operation (`S/native_swarm/SKILL.md:355-370`) | OBSERVED |
-| `role` | `coordinator` / `worker` / `narrator` / `monitor` are the roles the code discriminates on (`main.mjs:42-52`, `main.mjs:77`) | OBSERVED |
-| `wake_mode` | Parking intent plus a `working` value — see §6.2 | OBSERVED literals; semantics in §6 |
+| `model` | Model id shown per member (`main.mjs:820`); switching is a `swarm{action:"model"}` operation (`S/native_swarm/SKILL.md:355-370`). In the live file it is byte-identical to `applied_model` on all three members — a persisted duplication, not a separate value | OBSERVED |
+| `role` | `coordinator` / `worker` / `narrator` / `monitor` are the roles the code discriminates on (`main.mjs:42-52`, `main.mjs:77`). Live: coordinator role `coordinator`; coder and monitor both role `worker` — the monitor is a *worker* that was briefed as a monitor, not a distinct role | OBSERVED — source + disk |
+| `wake_mode` | Parking intent plus a `working` value — see §6.2. Live: coordinator `mentions`, monitor `mentions`, coder `working` (with `desired_state:"KILLED"`) | OBSERVED literals; semantics in §6 |
 | `wait_since` | The `seq` the member parked after — see §6.3 | OBSERVED (exposed) + INFERRED (meaning, from monitor skill) |
 | `last_read_seq` | The member's read cursor; `unread = head − last_read_seq` | OBSERVED |
-| `last_nudged_seq` | Persisted and exposed (`main.mjs:827`); **no consumer** in the sidecar | Field OBSERVED, meaning `UNKNOWN` |
-| `last_park_blocked_seq` | Persisted and exposed (`main.mjs:828`); **no consumer** | Field OBSERVED, meaning `UNKNOWN` |
-| `killed` | Terminal; overrides every other status (`main.mjs:502-503`) | OBSERVED |
+| `last_nudged_seq` | Persisted and exposed (`main.mjs:827`); **no consumer** in the sidecar. Live: equals `last_read_seq` on all three members | Field OBSERVED, meaning `UNKNOWN` |
+| `last_park_blocked_seq` | Persisted and exposed (`main.mjs:828`); **no consumer**. Live: `0` on all three members | Field OBSERVED, meaning `UNKNOWN` |
+| `killed` | Terminal; overrides every other status (`main.mjs:502-503`). Live: `true` for the coder after its completion, `false` for coordinator and monitor | OBSERVED — source + disk |
+| `desired_state` | Declarative member state. Live values `RUNNING` (coordinator, monitor) and `KILLED` (coder); not read anywhere in the sidecar | Field OBSERVED — disk; meaning INFERRED from the name; reader `UNKNOWN` |
+| `desired_model` | Requested model. Live: `gemini-4-argon-medium` on all three; not read by the sidecar | Field OBSERVED — disk; divergence between desired and applied never exercised in this sample |
+| `applied_model` | Model actually in force. Live: same string as `desired_model` and `model` on all three; not read by the sidecar | Field OBSERVED — disk; semantics `UNKNOWN` |
+| `workspace_mode` | Live `inherit` on all three; surfaced to the UI when a string (`main.mjs:839-840`) | OBSERVED — disk for the value; other values `UNKNOWN` |
+| `phase` | Live `RUNNING` / `KILLED`, tracking `desired_state` in this sample; not read by the sidecar | Field OBSERVED — disk; semantics and state machine `UNKNOWN` |
 | `channels` | Optional stored subscription set; `null`/absent means the role default | OBSERVED (`main.mjs:744`, `channels.mjs:79-84`) |
-| `workspace`, `workspace_mode` | Optional; surfaced to the UI when strings (`main.mjs:839-840`) | OBSERVED |
+| `workspace` | Optional; surfaced to the UI when a string (`main.mjs:839-840`) | OBSERVED |
 
 The roster is **not** the same type as `swarm.Member` in `05` §3. `swarm.Member` is the CLI/UI model with `Name`, `ModelLabel`, `State`, `Failure`, `Openable`; `members.json` is the persisted board roster with cursors. The two agree on `conversation_id`, `model`, `role` and workspace naming, but they are distinct shapes and neither is proved to be the other's serialisation. [OBSERVED — both shapes; INFERRED that they are separate models]
 
-Presentation order is derived, not stored: coordinator first, then alphabetical (`main.mjs:846-847`).
+Presentation order is derived, not stored: coordinator first, then alphabetical (`main.mjs:846-847`). The live file's member order is `coder`, `coordinator`, `monitor` — alphabetical, with the coordinator **not** first — which is consistent with storage order being irrelevant to presentation. [OBSERVED — disk + source]
 
 ---
 
@@ -527,7 +600,7 @@ The HTTP surface is `GET`-only: the page `/`, the static assets in `STATIC`, `/a
 
 ## 11. Relationship to `/teamwork-preview`
 
-This section exists because the two multi-agent features share one binary and are easy to conflate. The materialised source separates them cleanly **at the tool surface**, and leaves the runtime relationship `UNKNOWN`.
+This section exists because the two multi-agent features share one binary and are easy to conflate. The materialised source separates them cleanly **at the tool surface**; the runtime relationship is no longer wholly unobserved — a `/teamwork-preview` invocation produced a *native swarm* on one occasion (`11` §1.6) — but the rule that selects one path over the other is still `UNKNOWN` (`11` §1.7).
 
 ### 11.1 What belongs to which feature
 
@@ -554,16 +627,17 @@ Because (2) is independently attested, **absence from the allowlist proves nothi
 
 ### 11.3 The persistence question, corrected
 
-`05` §1 and §6 previously called `board.jsonl` a *probable* `/teamwork` artifact, on the strength of a bare literal at binary offset 105,759,229 and no directory binding. The materialised source now binds `board.jsonl` to the **native swarm** swarm directory (`main.mjs:134`, `main.mjs:724`). It does not bind it to `/teamwork-preview`. The earlier inference should therefore be withdrawn as unsupported — while noting that coexistence in one binary keeps a runtime relationship possible. [OBSERVED for the binding to native swarm; the `/teamwork-preview` binding is `UNKNOWN`]
+`05` §1 and §6 previously called `board.jsonl` a *probable* `/teamwork` artifact, on the strength of a bare literal at binary offset 105,759,229 and no directory binding. The materialised source binds `board.jsonl` to the **native swarm** swarm directory (`main.mjs:134`, `main.mjs:724`). The earlier inference should therefore be withdrawn as unsupported. What changes that picture is runtime, not source: one `/teamwork-preview` invocation produced exactly this directory (`11` §1.6). That is an observed *outcome* of the command, not a binding of the teamwork orchestrator to the board — the `teamwork` path of run 1 never ran. The source binding remains native swarm; whether the command deliberately selects it is `UNKNOWN` (`11` §1.7). [OBSERVED for the source binding and for the one invocation; the selection mechanism is `UNKNOWN`]
 
 ### 11.4 Explicitly not claimed
 
-- **Not claimed:** that `/teamwork-preview` runs on this board.
-- **Not claimed:** that `/teamwork-preview` subagents are swarm members with `members.json` rows.
-- **Not claimed:** that `board.Message.Kind` or `RequestID` are used by `/teamwork-preview`. No consumer of either field exists in this tree, and no `/teamwork-preview` prompt, source path or symbol binding the two was recovered.
-- **UNKNOWN:** whether the two features can be active in one conversation; whether a `/teamwork-preview` run creates a swarm directory; whether any third consumer writes `board.jsonl`.
+- **Not claimed:** that `/teamwork-preview`'s orchestrator *uses* this board. The `teamwork` conversation observed in `11` §1 never produced a turn (`11` §1.3).
+- **Not claimed:** that teamwork registry subagents (`teamwork_worker`, `teamwork_reviewer`, …) are swarm members. The one live swarm's members are `coordinator`, `coder`, `monitor` — native-swarm roles, not `AllAgents` registry types (`11` §1.6; `02`).
+- **Not claimed:** that anything *reads* `board.Message.Kind` or `RequestID`. The live writer emits both (§3.1, §3.5); no consumer exists in this tree. An earlier edition of this document said "no consumer exists", which remains true, but was read as "not written" — that part was wrong.
+- **OBSERVED once:** a `/teamwork-preview` invocation **did** create a swarm directory. The live run in `11` §1.6 entered through `/teamwork-preview` and left `.system_generated/swarm/` with no `.agents/teamwork/` anywhere. Whether the entry command itself starts the swarm, or the top-level agent chooses the native-swarm path while handling it, is `UNKNOWN`.
+- **UNKNOWN:** whether the two features can be active in one conversation or turn; what makes one `/teamwork-preview` invocation dispatch a `teamwork` conversation and another produce a native swarm (`11` §1.7); whether any third consumer writes `board.jsonl`. Composition, member names and values observed in the one live swarm are also `UNKNOWN` as universals.
 
-What *is* established is narrower and useful: the board, its file format, its channels and its wake protocol belong to the **native swarm** feature (`/swarm`), and `/teamwork-preview` coordinates through parent/child subagent dispatch plus the `.agents/teamwork/` file tree. The two should not be cited for each other.
+What *is* established is narrower and useful: the board, its file format, its channels and its wake protocol belong to the **native swarm** feature (`/swarm`), and the `teamwork` path of `/teamwork-preview` coordinates through parent/child subagent dispatch plus the `.agents/teamwork/` file tree (`11` §2–§5). One invocation of the same command took the native-swarm path instead; that divergence is a runtime selection this document does not explain and `11` §1.7 records without resolving. The two should still not be cited for each other.
 
 ---
 
@@ -573,7 +647,12 @@ What *is* established is narrower and useful: the board, its file format, its ch
 |---|---|---|
 | The board persists as `board.jsonl`, one JSON object per line | OBSERVED | `SB/README.md:24`, `main.mjs:724` |
 | Its directory is `<appData>/brain/<coordinatorConv>/.system_generated/swarm/` | OBSERVED | `main.mjs:134`, `SB/README.md:19-20` |
-| The roster persists as `members.json` with the nine documented keys plus optional `channels`/`workspace*` | OBSERVED | `SB/README.md:25`, `main.mjs:744`, `main.mjs:839-840` |
+| The roster persists as `members.json`; the README documents nine keys, the live file carries fourteen (adds `desired_state`, `desired_model`, `applied_model`, `workspace_mode`, `phase`; the sidecar reads the nine plus optional `channels`/`workspace*`) | OBSERVED — source + disk | `SB/README.md:25`, `main.mjs:744`, `main.mjs:839-840`, §2.4, §4 |
+| `swarm.json` is versioned and backend-tagged on **both** backends; local form `{"version":1,"backend":"local","swarm_id","created_at"}`, with `swarm_id` = coordinator conversation id | OBSERVED — disk (one swarm); INFERRED as universal from the resolution rule (§2.1) | §2.2, §2.4 |
+| `plan.json` carries `{goal{title,line},tasks,threads}` and is written at swarm creation | OBSERVED — disk + source | §2.2, §2.4; `S/swarm_pane/SKILL.md:19-37` |
+| The writer **persists** `kind` and `request_id`; the sidecar does not read them | OBSERVED — disk + source (negative read path) | §3.1, §3.5 |
+| One `seq` space covers coordinator and worker posts in a live file, 1–4 | OBSERVED — disk | §3.5 |
+| The coordinator can kill a completed worker (`killed:true`, `desired_state`/`phase` `KILLED`, `wake_mode` still `working`) | OBSERVED — disk | §2.4; `11` §1.6 |
 | `seq` is one number space per board, shared by all channels and control lines | OBSERVED (consumers) / INFERRED (scope) | §3.3 |
 | Message order is file order; `seq` is a cursor, not a sort key | OBSERVED | §3.3 |
 | The `seq` allocator and writer locking are outside this source | UNKNOWN | §3.3, §7.4 |
@@ -586,7 +665,7 @@ What *is* established is narrower and useful: the board, its file format, its ch
 | `swarm_wait` parks only on `DONE`; `RUNNING` siblings do not hold the turn | OBSERVED | `main.mjs:428-460` |
 | Reads are append-verified (inode + head/tail anchors + remainder) and fall back to a full read | OBSERVED | `board_cache.mjs:78-117`, `:147-162` |
 | Malformed lines are skipped; a torn tail is retried | OBSERVED | `board_cache.mjs:33-46`, `:205-208` |
-| `/teamwork-preview` uses this board | **NOT ESTABLISHED** — `UNKNOWN`, and no file in this tree binds them | §11 |
+| `/teamwork-preview` uses this board | **PARTIAL** — one invocation produced a swarm directory (`11` §1.6); whether the command selects this path, and why, is `UNKNOWN` | §11, `11` §1.7 |
 
 ### Remaining UNKNOWN (this subject)
 
@@ -595,10 +674,12 @@ What *is* established is narrower and useful: the board, its file format, its ch
 3. **`last_nudged_seq` / `last_park_blocked_seq`** — write-time meaning and readers, if any.
 4. **`stopped` vs `waiting`** — how the coordinator tool's fourth status maps onto `board.StateOf`'s three.
 5. **Retention** — whether `board.jsonl` is ever trimmed or compacted (the sidecar has no code for it).
-6. **`kind` / `request_id`** — whether native swarm emits them, and whether another consumer reads them.
+6. **`kind` / `request_id`** — the writer emits both (`kind:"brief"` observed; `request_id` on every line), but nothing in this tree reads them. The full `kind` value set, the rule that decides when `kind` is set, and any external consumer are `UNKNOWN`.
 7. **Channel-post delivery** — whether a channel post is pushed to subscribers or discovered on wake, and whether the writer rejects a post to an unknown or archived channel.
 8. **`board.Control`'s Go declaration** — the key names are known from the mirror; the field types and tags are not.
-9. **Any runtime relationship between native swarm and `/teamwork-preview`.**
+9. **The live roster's state machine** — `desired_state`, `applied_model` and `phase` are persisted and unread; how they relate to `killed`, `wake_mode` and `board.StateOf` is `UNKNOWN`.
+10. **Swarm composition and values as universals** — one swarm (`coordinator` + `coder` + `monitor`, model `gemini-4-argon-medium`, `workspace_mode:"inherit"`) is a sample, not a default.
+11. **Any runtime relationship between native swarm and the `/teamwork-preview` teamwork path** — including why one invocation chose each (`11` §1.7).
 
 ---
 
@@ -641,3 +722,6 @@ What *is* established is narrower and useful: the board, its file format, its ch
 | Narrator file ownership | `S/swarm_narrator/SKILL.md:24-44` |
 | Built-in Overview / `plan.json` | `S/swarm_pane/SKILL.md:11-52`, `main.mjs:778-787` |
 | Teamwork dispatch pair in allowlists | `02-agent-registry.md` Appendix B (rows 14, 21, 22, 23, 24, 31, 42, 43, 46, 48) |
+| Live swarm directory (sample) | §2.4 — `~/.gemini/antigravity-cli/brain/0e3db35c-47d2-4faf-98e6-a2a842cd4fc2/.system_generated/swarm/` |
+| Live board lines, `kind`/`request_id` | §3.5 |
+| Live member fields | §4 |

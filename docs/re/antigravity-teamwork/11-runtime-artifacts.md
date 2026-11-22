@@ -1,13 +1,14 @@
 # Runtime Artifacts — Live Dispatch and the On-Disk Teamwork Contract
 
-**Status: OBSERVED — live dispatch, quota-partial; second evidence class: the state tree of the user's own prior runs.** Recorded on **2026-11-21** against `agy --version` **1.5.14**, the same binary analysed throughout this corpus (`00-artifact-identity.md`; `07` §1 re-proves byte identity). This document does two things the rest of the set could not:
+**Status: OBSERVED — two live invocations with divergent paths, one quota-partial; second evidence class: the state tree of the user's own prior runs.** Recorded on **2026-11-21** and **2026-11-22** against `agy --version` **1.5.14**, the same binary analysed throughout this corpus (`00-artifact-identity.md`; `07` §1 re-proves byte identity). This document does three things the rest of the set could not:
 
-1. It records a **live `/teamwork-preview` print-mode run** that the client recognised, dispatched to a subagent, lost twice to HTTP 429 quota, and then completed **inline** — §1.
-2. It records the **artifact contract as it exists on disk**, recovered from state trees that already existed under the CLI's app-data directory — §2–§6. Those trees are the user's own prior teamwork runs, not a controlled experiment.
+1. It records a **live `/teamwork-preview` print-mode run** that the client recognised, dispatched to a subagent, lost twice to HTTP 429 quota, and then completed **inline** — §1.1–§1.5.
+2. It records a **second invocation of the same command** that started a lean **native swarm** instead — a `coordinator` + `coder` + `monitor` with a `board.jsonl`, no `.agents/teamwork/` anywhere — and it states the divergence between the two runs with the cause `UNKNOWN` — §1.6–§1.7.
+3. It records the **artifact contract as it exists on disk**, recovered from state trees that already existed under the CLI's app-data directory — §2–§6. Those trees are the user's own prior teamwork runs, not a controlled experiment.
 
 Confidence labels follow [`PROVENANCE.md`](PROVENANCE.md), with one addition used only here: **OBSERVED — disk** means a file whose path, name and structure were read on this machine; **OBSERVED — client** means a string the CLI printed; **OBSERVED — source** means the shipped prompt text quoted at `file:line`. Nothing about the user's project content is reproduced: names, slugs, percentages, commit ids and conversation ids of prior runs are replaced with `<placeholders>`, and no conversation transcript is quoted. See §7.
 
-The short version: **the artifacts are real, but they are not written into the user's workspace.** They live under `<appDataDir>/brain/<conversation-id>/scratch/.agents/teamwork/`, one state root per agent conversation, and the dispatch text explicitly forbids creating `.agents/teamwork/` in the project directory (§2, §6).
+The short version: **the teamwork artifacts are real, but they are not written into the user's workspace.** They live under `<appDataDir>/brain/<conversation-id>/scratch/.agents/teamwork/`, one state root per agent conversation, and the dispatch text explicitly forbids creating `.agents/teamwork/` in the project directory (§2, §6). **But the command does not always produce them:** a second invocation on the next day produced a native-swarm board instead (§1.6), so this contract describes one of at least two outcomes of `/teamwork-preview`, not the only one.
 
 ---
 
@@ -71,6 +72,70 @@ Read from the parent conversation's message store (structure only; prompt text i
 - **No routing, no per-role dispatch, no gate.** The child never ran, so `01`'s decision table, `04`'s DAGs, the worker/reviewer/challenger/auditor composition, `GATE_STATUS.md` evaluation and completion verification were not exercised.
 - **No artifact write by a live orchestrator.** The workspace is empty of teamwork state, and both dispatcher scratch directories are empty. The artifact contract in §2–§6 comes from completed **prior** runs, not from this one.
 - **No claim that the inline fallback is prompt-sanctioned.** The recovered prompt tells the sentinel to manage failures and, on a terminal non-victory stop, to relay the status plainly and **never report project completion** (`prompts/sentinel-routing.md:670-676`); it contains no instruction to do the work itself. The observed inline completion is therefore a **behaviour outside the recovered prompt text** — possibly deliberate client-side fallback, possibly the sentinel model's own choice. [OBSERVED behaviour; cause UNKNOWN]
+
+### 1.6 Second live run (2026-11-22): a lean native swarm
+
+Same binary, same `--print` channel (`-p=`), same `[skip-interview]` token, new empty workspace.
+
+| Item | Value | Label |
+|---|---|---|
+| Command | `agy -p='/teamwork-preview [skip-interview] Create fizzbuzz.js … Keep it small and cheap: a quick single self-contained change.' --dangerously-skip-permissions --print-timeout 1450s` (task text elided at `…`) | OBSERVED — client |
+| Workspace | `/tmp/opencode/agy-run2`, empty at start | OBSERVED — disk |
+| Exit code | `0` | OBSERVED — client |
+| Wall-clock | ~4 minutes | OBSERVED — disk mtimes |
+| Product | `fizzbuzz.js` (210 B) and `test.js` (713 B); `node test.js` exited `0` | OBSERVED — disk |
+| Teamwork artifacts in the workspace | **none** — no `.agents/`, no `ORIGINAL_REQUEST.md`, no `plan.md`, no `progress.md` | OBSERVED — disk |
+| Teamwork state in app data | **none** — no `brain/<any-conversation>/scratch/.agents/teamwork/` created by this run | OBSERVED — disk |
+| Native-swarm state | `~/.gemini/antigravity-cli/brain/0e3db35c-47d2-4faf-98e6-a2a842cd4fc2/.system_generated/swarm/` with `swarm.json`, `plan.json`, `members.json`, `board.jsonl` | OBSERVED — disk |
+
+Output text, verbatim (paragraph 2 is elided at `…`; every quoted word is the model's, including the `fuzzbuzz` spelling):
+
+```text
+I have started a lean swarm (`coder` + `monitor`) to create [fizzbuzz.js](file:///tmp/opencode/agy-run2/fizzbuzz.js) and [test.js](file:///tmp/opencode/agy-run2/test.js) and run the test suite. I will report back as soon as `coder` posts the result.
+
+[fizzbuzz.js] and [test.js] have been created and verified: … `node test.js` exited `0` with `All fuzzbuzz tests passed!`
+```
+
+[OBSERVED — client] What the state directory shows:
+
+| Fact | Value | Label |
+|---|---|---|
+| `swarm.json` | `{"version":1,"backend":"local","swarm_id":"0e3db35c-47d2-4faf-98e6-a2a842cd4fc2","created_at":"2026-11-22T00:30:52Z"}` | OBSERVED — disk |
+| `plan.json` | `goal.title` "Create and test FizzBuzz in JavaScript"; one task, `coder`; one thread `t-fizzbuzz` whose `tasks` is `["coder"]` | OBSERVED — disk |
+| `members.json` title | `FizzBuzz module and test suite` | OBSERVED — disk |
+| Members | `coordinator` (role `coordinator`, `wake_mode:"mentions"`), `coder` (role `worker`, `wake_mode:"working"`), `monitor` (role `worker`, `wake_mode:"mentions"`) | OBSERVED — disk |
+| Model, all three | `desired_model` / `applied_model` / `model` all `gemini-4-argon-medium` | OBSERVED — disk |
+| Coder on completion | `desired_state:"KILLED"`, `phase:"KILLED"`, `killed:true`, while `wake_mode` stays `working` | OBSERVED — disk |
+| Board | four lines, `seq` 1–4: coordinator assigns file ownership (`kind:"brief"`), coordinator briefs the monitor (`kind:"brief"`), coder posts `@coordinator [done] …`, coordinator posts `[done] …`; every line carries a distinct `request_id` | OBSERVED — disk |
+| Monitor activity | briefed but never posted — no stall occurred | OBSERVED — disk |
+
+The shape of the swarm is `coordinator` + `coder` + `monitor`; the coordinator's **own conversation is the swarm id**. It delegated one self-contained change to one worker, and the monitor existed only as a watchdog. The board, member schema and swarm-directory contract are documented from the source and this capture in [`09-swarm-board-and-skills.md`](09-swarm-board-and-skills.md) §2.4, §3.5 and §4.
+
+**The coordinator killed the coder on completion.** After the coder's `[done]` post (`board.jsonl` seq 3), `members.json` records the coder with `desired_state:"KILLED"`, `phase:"KILLED"`, `killed:true`. The call that produced that transition was not captured in this document; whether it was an explicit `swarm{action:"kill"}`, an automatic cleanup, or part of turn teardown is `UNKNOWN`. The final answer is the coordinator's summary (seq 4), not the coder's.
+
+### 1.7 Two runs, one command: the divergence
+
+The two live runs are the most important pair in this set because they share the entry conditions — same binary, same print-mode channel, same bracket token, both on an empty workspace — and produced different subsystems.
+
+| Dimension | Run 1 (2026-11-21) | Run 2 (2026-11-22) |
+|---|---|---|
+| Entry channel | `-p=` print mode | `-p=` print mode |
+| Bracket token | `[skip-interview]` | `[skip-interview]` |
+| What the command dispatched | a `teamwork`-typed conversation labelled **"Teamwork Orchestrator"** (`invoke_subagent`) | a **native swarm**: coordinator + coder + monitor, which the client calls a "lean swarm" |
+| Where state landed | empty `brain/<conv>/scratch/` for two orchestrator conversations; no `.agents/` tree | `brain/<coordinatorConv>/.system_generated/swarm/{swarm.json,plan.json,members.json,board.jsonl}` |
+| `.agents/teamwork/` artifacts | none (orchestrator never ran) | **none** (the swarm does not use them) |
+| Coordination medium | parent → child dispatch (never exercised) | `board.jsonl` posts and `@`-mentions; `members.json` carries park cursors (`wake_mode`, `wait_since`) |
+| Terminal state | two orchestrators quota-blocked; sentinel completed inline | coder completed; coordinator killed it and summarised |
+| Workspace result | `hello.txt`, 5 B | `fizzbuzz.js` 210 B, `test.js` 713 B; tests exit `0` |
+
+**The divergence is real and the cause is `UNKNOWN`.** Both runs used `--print` and `[skip-interview]`; both targeted an empty workspace; both exited `0`. The token therefore does **not** select the teamwork path, and the entry point does **not** imply it. The remaining differences between the invocations are the task text, the timeout (`880s` vs `1450s`), the date, and the workspace path — none of which is a demonstrated cause. Whether the CLI picks teamwork vs native swarm by task shape, by an enabled plugin/skill (`enable-native-swarm`), by model output, by quota/availability at dispatch time, or nondeterministically, this record cannot say. [OBSERVED — both runs; cause UNKNOWN]
+
+Two things must not be inferred from this pair:
+
+- **Not** that `/teamwork-preview` *is* native swarm. One invocation of the command left a swarm directory; another dispatched a teamwork orchestrator. Both are outcomes of the same command on the same binary.
+- **Not** that native swarm is now the default or the fallback. Two observations cannot establish a default; `07` §3.5 and this section record an existence proof for each path, nothing about their frequencies.
+
+The `/teamwork-preview` ↔ native-swarm question in [`09`](09-swarm-board-and-skills.md) §11 therefore moves from "no runtime evidence" to "one observed instance, mechanism unexplained". The artifact contract in §2–§6 is untouched: it describes the teamwork path, which run 2 did not take.
 
 ---
 
@@ -144,6 +209,8 @@ Metadata & State Folder Rule:
 ```
 
 [OBSERVED — disk; project path redacted] The prompt's own `File Workspace Convention` says the same thing in general terms: keep code and work products in the working directory and **Teamwork state** in the per-run state folder, "never in the working directory" (`prompts/sentinel-routing.md:181-202`). So the absence of artifacts in `/tmp/opencode/agy-lab` is the **specified** behaviour, not evidence that artifacts are not written at all.
+
+Run 2 (§1.6) is an independent second instance, and a stronger one because it did **not** fail on quota: an empty workspace, a completed task, exit `0`, and still **no** `.agents/teamwork/` in the workspace and **no** `.agents/teamwork/` tree in app data. The only coordination state it left was a native-swarm directory. So the negative workspace result is a property of the teamwork path, not an artefact of the quota failure — and the swarm path produces a different root entirely, which §2.1's pattern does not cover.
 
 ---
 
@@ -268,6 +335,7 @@ For anyone reconciling this corpus: cite the **structure and vocabulary** from t
 - **No conversation transcript content is copied.** The dispatch and briefing evidence in §2.3 is quoted only for the **state-folder rule** (a template instruction), with the project path removed. The live-run paragraphs in §1.2 are this session's own CLI output, quoted because they are the observation.
 - **Counts are of a sample, not of all runs.** 39 roots is what exists on this machine at this time; the CLI may create roots elsewhere on other installs or on other platforms. The pattern in §2.1 is corroborated by the recovered prompt text, which is what makes it generalisable beyond this machine.
 - **No project artifact is redistributed.** The two non-markdown files found inside a state root are project products and were neither copied nor named here.
+- **Run 2's swarm state is quoted because it is the observation.** `swarm.json`, `plan.json`, the member fields and the four board lines in §1.6 come from this corpus' own invocation of the CLI, not from a prior user run, and the task text in them is the small self-contained task that invocation was given. No unrelated project content, credentials or personal data appears in them.
 
 ---
 
@@ -282,6 +350,10 @@ For anyone reconciling this corpus: cite the **structure and vocabulary** from t
 | When are `DEAD_ENDS.md`, `TEST_INFRA.md`, `TEST_READY.md`, `plan.md`, `context.md` written? | Zero instances in 39 roots (§3) |
 | What does `_gen<N>` mark? | No successor-generation folder occurred in the sample (§4) |
 | Does the state root ever use the `<appDataDir>/scratch/teamwork/<run_id>/` form rather than the `brain/<conv>/scratch/` fallback? | Only the fallback form was found (§2.1) |
-| Does a completed run write anything at all into the workspace? | All observed product files are project code/outputs; no teamwork state document appeared in a workspace in this sample (§2.3) |
+| Does a completed run write anything at all into the workspace? | All observed product files are project code/outputs; no teamwork state document appeared in a workspace in either run (§2.3, §1.6) |
+| What selects native swarm over the teamwork path for one `/teamwork-preview` invocation? | Both runs used `--print` and `[skip-interview]` and diverged; no flag, task feature or log line is attributed (§1.7) |
+| Is a worker killed on completion by an explicit call or by turn teardown? | `killed:true`, `phase:"KILLED"` observed after the coder's `[done]`; the call is not captured (§1.6) |
+| Is `coordinator` + `coder` + `monitor` a standard lean composition? | One swarm only; no second composition or size observed (§1.6) |
 
-A controlled run that completes one milestoned task on the cheapest route — long enough for a worker, two reviewers, two challengers and an auditor to hand off — would settle the first, third, fourth and last rows at once. That is the next live step, and it should be attempted only after quota is confirmed, as `07` §5 sequences it.
+A controlled run that completes one milestoned task on the cheapest route — long enough for a worker, two reviewers, two challengers and an auditor to hand off — would settle the gate-composition, fallback, override and workspace rows at once. Run 2 (§1.6) shows a cheap completed run can bypass the teamwork path altogether, so such a run must first select that path; how to force the choice is itself `UNKNOWN` (§1.7). It should be attempted only after quota is confirmed, as `07` §5 sequences it.
+

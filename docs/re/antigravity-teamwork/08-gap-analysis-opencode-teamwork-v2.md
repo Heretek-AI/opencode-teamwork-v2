@@ -2,25 +2,40 @@
 
 A capability-by-capability comparison between the Antigravity `/teamwork`
 subsystem and this repository. The Antigravity column is the reference
-implementation, recovered by static analysis. The local column is measured from
-this repository's source only.
+implementation, recovered by static analysis and, where noted, by runtime
+observation. The local column is measured from this repository's source only.
+
+> **Revision 2.** The first revision predated `07`, `09`, `10` and `11` and the
+> engine changes that implemented its own §3.1–§3.6. §2.6 lists the findings
+> that changed the table, each with its source document; §3.0 records where the
+> first revision's proposals now live.
 
 ## 0. Method and evidence rules
 
-- **Antigravity side.** Facts are read from the corpus in this directory:
-  `prompts/sentinel-routing.md` (697-line verbatim sentinel slice),
-  `02-agent-registry.md` (the 49-entry `AllAgents` roster and per-agent dispatch
-  text), and `00-artifact-identity.md` (package location and command
-  description). The roster count used here is **49** — the membership of
-  `teamwork.AllAgents`; the earlier "60+" figure counted identifier-like strings
-  (runtime type names, prompt archetypes, source-file stems) and is superseded.
-  Facts that are not in those slices — route-pipeline internals, the board's
-  coordination mechanics and the five gating flags — are marked `(brief)` and
-  are not re-derived here. The five flags' enforcement path is `UNKNOWN` on the
-  Antigravity side.
-- **Local side.** Every claim cites a file path and line range. Behaviour the
-  source does not determine is written `UNKNOWN`; nothing is inferred from
-  prompts about what the engine enforces.
+- **Antigravity side.** Three evidence classes are used, and they are not
+  interchangeable:
+  - **binary / prompt text** — `prompts/sentinel-routing.md` (697-line verbatim
+    sentinel slice), `02-agent-registry.md` (the 49-entry `AllAgents` roster,
+    per-agent dispatch text and decoded tool allowlists), `10-official-docs-cross-check.md`
+    (docs vs. binary byte offsets);
+  - **materialised source** — `09-swarm-board-and-skills.md` reads the shipped
+    sidecar and skills directly, so its mechanical claims are `file:line` facts
+    rather than inference;
+  - **runtime** — `07-runtime-observed.md` (one live, quota-partial dispatch) and
+    `11-runtime-artifacts.md` (the on-disk state tree of 39 prior runs plus one
+    observed gate).
+  The roster count used here is **49** — the membership of `teamwork.AllAgents`
+  (`02-agent-registry.md:129-146`). The earlier "60+"/"70+" figures counted
+  identifier-like strings (runtime type names, prompt archetypes, source-file
+  stems) and are superseded.
+  Where the sample is one milestone or one route family, this document says
+  `UNKNOWN` rather than generalising. In particular, the gate composition in
+  §2.4 is observed, not established as universal (`11` §5.1).
+- **Local side.** Every claim cites a file path and line range, measured against
+  the tree containing this revision. `plugins/opencode-teamwork/tools.ts` was
+  re-read after the engine changes that closed the first revision's §3; the line
+  numbers below are current, not inherited. Behaviour the source does not
+  determine is written `UNKNOWN`.
 - **Classes.** Exactly one per capability:
   - `PRESENT-EQUIVALENT` — same shape, comparable guarantees.
   - `WEAKER` — implemented, but with a named guarantee absent.
@@ -28,7 +43,9 @@ this repository's source only.
   - `MISSING` — no equivalent.
 - **Enforcement vs. prose.** The decisive axis is whether a guarantee is
   enforced by code or merely stated in a prompt. §1.6 separates the two
-  locally; §2 notes it per capability.
+  locally; §2 notes it per capability. The Antigravity evidence now supplies a
+  worked example of the distinction: the explorer's role text says read-only
+  and its allowlist contains all three write tools (`10` §3.5).
 
 ## 1. Local capability inventory (as built)
 
@@ -52,7 +69,7 @@ switching the session agent with `ctx.session.switchAgent({ sessionID, agent })`
 No command is gated. There is no enable/disable flag, environment switch, or
 admin control in `plugins/`, `lib/`, or `bin/` (searched for `disabled`,
 `feature flag`, and `admin`). The worktree root is overridable via
-`TEAMWORK_WORKTREES_DIR` (`plugins/opencode-teamwork/tools.ts:1659-1661`), but
+`TEAMWORK_WORKTREES_DIR` (`plugins/opencode-teamwork/tools.ts:1838-1840`), but
 that relocates state rather than gating the subsystem.
 
 The `/teamwork` description is a multi-line operating instruction for the
@@ -81,59 +98,62 @@ file per agent. One-line purposes (paraphrased from each file's frontmatter
 
 All 11 are installed as markdown files because the V2 `AgentEditor` has no
 `add` (`README.md:24`, `index.ts:8-11`). The installer writes them and the
-plugin recreates only missing files on load
-(`index.ts:198-211`).
+plugin recreates only missing files on load (`index.ts:198-211`).
 
 ### 1.3 Engine tools — 10, one namespace
 
-`plugins/opencode-teamwork/tools.ts:795-1869` registers them under the
-`teamwork` namespace (`:798-801`).
+`plugins/opencode-teamwork/tools.ts:838-2048` registers them under the
+`teamwork` namespace (`:840-845`).
 
 | Tool | Lines | What the code does |
 | --- | --- | --- |
-| `teamwork_plan` | `803-933` | Creates the run dir, validates task/dependency ids against `TASK_ID`, writes `plan.dag.json` / `state.json` / `costs.json` / `snapshots.json`, mints the session id |
-| `teamwork_status` | `935-949` | Reads `state.json`, prints per-task status |
-| `teamwork_resume` | `951-966` | Lists tasks whose status is not `pass` |
-| `teamwork_cost` | `968-1121` | Reads real cost/tokens for the whole OpenCode session tree, tracks deltas in `snapshots.json`, warns at 80% |
-| `teamwork_budget` | `1123-1149` | Detects `opencode/` models + connected `opencode_console`; returns instructions, applies nothing |
-| `teamwork_pitfall` | `1151-1170` | Appends one line to `pitfalls.md` |
-| `teamwork_next` | `1172-1361` | Dependency resolution, ready sets, deadlock, security gate, `ALL_TASKS_PASSED` |
-| `teamwork_task_update` | `1363-1510` | Status whitelist, alias normalisation, `maxRounds` → `blocked`, phase advance, event append |
-| `teamwork_security_audit` | `1512-1614` | Writes `verify/security-audit.json`; forces `FAIL` on any Critical/High finding |
-| `teamwork_worktree` | `1616-1867` | `setup` / `diff` / `merge` / `resolve` / `cleanup`, worktrees outside the repo |
+| `teamwork_plan` | `847-1012` | Creates the run dir; validates topology, task/dependency ids and the spec gate; writes `plan.dag.json` / `state.json` / `costs.json` / `snapshots.json`; mints the session id |
+| `teamwork_status` | `1014-1028` | Reads `state.json`, prints per-task status (counts both `pass` and `verified_pass`) |
+| `teamwork_resume` | `1030-1045` | Lists tasks whose status is not a passing state |
+| `teamwork_cost` | `1047-1200` | Reads real cost/tokens for the whole OpenCode session tree, tracks deltas in `snapshots.json`, warns at 80% |
+| `teamwork_budget` | `1202-1228` | Detects `opencode/` models + connected `opencode_console`; returns instructions, applies nothing |
+| `teamwork_pitfall` | `1230-1249` | Appends one line to `pitfalls.md` |
+| `teamwork_next` | `1251-1475` | Dependency resolution, ready sets, deadlock, security gate, final-verification gate, `ALL_TASKS_PASSED` |
+| `teamwork_task_update` | `1477-1690` | Status whitelist, alias normalisation, transition graph, PASS evidence, `maxRounds` → `blocked`, cumulative feedback ledger, phase advance, event append |
+| `teamwork_security_audit` | `1692-1794` | Writes `verify/security-audit.json`; forces `FAIL` on any Critical/High finding |
+| `teamwork_worktree` | `1796-2048` | `setup` / `diff` / `merge` / `resolve` / `cleanup`, worktrees outside the repo |
 
 ### 1.4 Hooks — 2
 
-`registerTeamworkHooks` (`tools.ts:1871-1912`):
+`registerTeamworkHooks` (`tools.ts:2050-2091`):
 
-- `permission.hook("evaluate")` (`:1879-1903`) — per-agent deny list for
+- `permission.hook("evaluate")` (`:2058-2082`) — per-agent deny list for
   `team/verifier`, `team/falsifier`, `team/scout`, `team/security-auditor`
-  (`:508-515`), plus a narrow `webfetch` deny for `team/worker` and
+  (`:531-538`), plus a narrow `webfetch` deny for `team/worker` and
   `team/verifier` when `prompt_draft.md` matches `network: denied`
-  (`:1888-1902`).
-- `session.hook("context")` (`:1906-1911`) — injects a sanitised run summary
-  (`describeRun`, `:764-793`) into the system prompt of any `team/*` agent.
+  (`:2067-2081`).
+- `session.hook("context")` (`:2085-2090`) — injects a sanitised run summary
+  (`describeRun`, `:807-836`) into the system prompt of any `team/*` agent.
 
-If the permission API is absent the plugin refuses to load (`:1874-1876`), so
-the read-only guardrail cannot be silently dropped.
+If the permission API is absent the plugin refuses to load (`:2051-2055`), so
+the deny list cannot be silently dropped. The deny list covers `edit`; three of
+the four "read-only" agents still have `shell` (§1.8 #1).
 
 ### 1.5 Artifact layout
 
-One root per run, `.opencode/teamwork/<session-id>/` (`docs/ARTIFACTS.md:11-30`),
-where the session id is `YYYYMMDD-HHMMSS-<4 hex>` (`:32`) and is minted by
-`teamwork_plan` (`tools.ts:519-524`, `:834`). Files include `prompt_draft.md`,
-`plan.dag.json`, `state.json`, `costs.json`, `snapshots.json`, `events.jsonl`,
-`pitfalls.md`, `candidates/`, `critiques/`, `synthesis/`, `verify/`, `final.md`,
-and optional `report.html` / `report.md` (`ARTIFACTS.md:12-30`).
+One root per run, `.opencode/teamwork/<session-id>/` (`RUN_ROOT`,
+`tools.ts:475`; `runsDir`, `:587-589`; `docs/ARTIFACTS.md:11-30`), where the
+session id is `YYYYMMDD-HHMMSS-<4 hex>` (`:32`) and is minted by
+`teamwork_plan` (`tools.ts:542-547`, `:847-1012`). Files include
+`prompt_draft.md`, `plan.dag.json`, `state.json`, `costs.json`,
+`snapshots.json`, `events.jsonl`, `pitfalls.md`, `candidates/`, `critiques/`,
+`synthesis/`, `verify/`, `final.md`, and optional `report.html` / `report.md`
+(`ARTIFACTS.md:12-30`). `verify/final.json` is read by the completion gate but
+is not listed in that layout block (§1.8 #5).
 
-Worktrees are created **outside** the repository (`tools.ts:1659-1662`,
-`ARTIFACTS.md:34-36`), with per-task branches
-`teamwork/<session-id>-<taskId>` (`tools.ts:1725`) and a sentinel base branch
-`teamwork/base-<session-id>` (`:1663`).
+Worktrees are created **outside** the repository (`tools.ts:1838-1841`,
+`ARTIFACTS.md:34-36`), with per-task branches `teamwork/<session-id>-<taskId>`
+(`tools.ts:1904`) and a sentinel base branch `teamwork/base-<session-id>`
+(`:1842`).
 
 "Active run" means *most recently modified run directory*: `resolveRun(root)`
-with no id returns `listRuns(root)[0]` (`tools.ts:669-670`), and `listRuns`
-sorts by mtime (`:617-641`). There is no active-run pointer, so two concurrent
+with no id returns `listRuns(root)[0]` (`tools.ts:682-704`), and `listRuns`
+sorts by mtime (`:651-680`). There is no active-run pointer, so two concurrent
 runs are indistinguishable to a tool call that omits `sessionId`.
 
 ### 1.6 Code-enforced vs. prompt prose
@@ -141,48 +161,57 @@ runs are indistinguishable to a tool call that omits `sessionId`.
 **Enforced in code:**
 
 - Session-id allowlist + lexical and realpath containment + symlink refusal
-  (`tools.ts:581-600`, `:607-615`, `:648-671`).
+  (`tools.ts:615-634`, `:641-649`, `:682-704`).
 - Task-id allowlist `TASK_ID` before any path, branch, or map key is built
-  (`tools.ts:486-489`, `:840-846`, `:976-978`, `:1653-1657`;
-  `ARTIFACTS.md:187-192`).
-- Status set whitelist, legacy alias normalisation, and automatic
+  (`tools.ts:486-489`, `:894-899`, `:1830-1835`; `ARTIFACTS.md:235-240`).
+- Topology enum and legacy-alias normalisation on write
+  (`tools.ts:498-512`, `:886-892`, `:929-935`).
+- Status set whitelist, legacy alias normalisation, an allowed-predecessor
+  graph, PASS evidence for `verified_pass`, and automatic
   `verified_fail → blocked` when `round >= maxRounds`
-  (`tools.ts:1423-1452`).
+  (`tools.ts:1536-1605`).
 - Dependency gating, deadlock detection, `READY_FOR_SECURITY_AUDIT`,
-  `BLOCKED_BY_SECURITY`, `ALL_TASKS_PASSED` (`tools.ts:1200-1324`).
+  `BLOCKED_BY_SECURITY`, `READY_FOR_FINAL_VERIFICATION`,
+  `BLOCKED_BY_FINAL_VERIFICATION`, `ALL_TASKS_PASSED`
+  (`tools.ts:1278-1437`).
 - Security gate: any Critical/High finding forces `FAIL`
-  (`tools.ts:1555-1558`); `PASS` sets the phase to `MERGE` (`:1578-1579`).
-- Read-only guarantee for four agents, fail-closed on a missing permission API
-  (`tools.ts:508-515`, `:1874-1886`).
+  (`tools.ts:1734-1737`); `PASS` sets the phase to `MERGE` (`:1757-1758`).
+- Completion gate: all tasks passed + security PASS + a usable
+  `verify/final.json` with `status: "PASS"` (`tools.ts:1359-1428`).
+- Spec gate: a non-empty `prompt_draft.md` is required before the run dir is
+  created, unless the caller passes the recorded bypass
+  (`tools.ts:901-920`).
+- Cumulative feedback ledger: append-only per task, capped at 20 entries,
+  resolved on `verified_pass`, surfaced to the next worker
+  (`tools.ts:1337-1354`, `:1607-1628`; `ARTIFACTS.md:148-167`).
+- Deny list for four agents, fail-closed on a missing permission API
+  (`tools.ts:531-538`, `:2051-2064`).
 - Cost/token accounting read from OpenCode's database, service API, or client,
-  with delta tracking (`tools.ts:211-324`, `:1019-1066`;
-  `ARTIFACTS.md:224-254`).
-- Serialised read-modify-write within the process (`tools.ts:746-758`) and
-  best-effort, fail-open `events.jsonl` (`:696-740`, `ARTIFACTS.md:316-325`).
+  with delta tracking (`tools.ts:211-324`, `:1047-1200`;
+  `ARTIFACTS.md:272-302`).
+- Serialised read-modify-write within the process (`tools.ts:790-805`) and
+  best-effort, fail-open `events.jsonl` (`:736-788`, `ARTIFACTS.md:371-380`).
 
 **Prompt prose only (not enforced):**
 
 - The sentinel does not edit code (`agents/team/sentinel.md:118-121`).
-- Topology selection and alias normalisation (`sentinel.md:34-37`,
-  `orchestrator.md:39-61`). `teamwork_plan` writes `topology` as a free string
-  after `clean()` and never validates it (`tools.ts:811`, `:857`); no tool
-  branches on it.
-- Existence of `prompt_draft.md` before `teamwork_plan`
-  (`sentinel.md:30-33`). `teamwork_plan` never checks for it
-  (`tools.ts:833-933`); the only reader anywhere is the network-deny hook
-  (`:1892`).
-- Production and consumption of `verify/report-<task>.json` and
-  `verify/final.json` (`sentinel.md:73`, `:97-101`, `index.ts:53`). No engine
-  tool reads either file; only the export report parses `final.json`
-  (`lib/export.mjs:370`).
+- Topology *selection* and its rationale (`sentinel.md:34-37`,
+  `orchestrator.md:39-61`). The enum is validated, but nothing checks that the
+  chosen shape fits the request; `routingReason` is optional and unread
+  (`tools.ts:929-935`).
+- Production and content of `verify/report-<task>.json` and
+  `verify/final.json` (`sentinel.md:73`, `:97-101`, `index.ts:53`). The engine
+  now reads `final.json`'s `status` string (`tools.ts:1389-1414`); it does not
+  check the evidence behind it, and the verifier that writes it is the one the
+  coordinator dispatched.
 - `interrupted.md` when the user stops a run (`orchestrator.md:106`;
   `ARTIFACTS.md:29`) — legacy agent only; no tool writes it.
 - Worker `handoff.md` when stuck (`agents/team/worker.md:71-73`).
 - "Halt non-essential workers" at 80% budget — `teamwork_cost` returns
-  `shouldHalt` (`tools.ts:1110-1118`) but nothing enforces a halt.
+  `shouldHalt` (`tools.ts:1194`) but nothing enforces a halt.
 - Worktree/cwd confinement for writers (`docs/GUARDRAILS.md:27-31`).
 - `constraints.network` / `constraints.sandbox` beyond the narrow `webfetch`
-  slice above (`GUARDRAILS.md:32-33` vs `tools.ts:1888-1902`).
+  slice above (`GUARDRAILS.md:32-33` vs `tools.ts:2067-2081`).
 
 ### 1.7 Support surface
 
@@ -199,175 +228,222 @@ runs are indistinguishable to a tool call that omits `sessionId`.
 
 These bound what the local engine can honestly claim:
 
-1. **`verified_pass` is invisible to two tools.** `teamwork_status` counts
-   `status === "pass"` (`tools.ts:946`) and `teamwork_resume` filters
-   `status !== "pass"` (`:960`), while the lifecycle and `describeRun` use
-   `verified_pass` (`ARTIFACTS.md:128-135`, `tools.ts:770-771`). After a normal
-   run, `status` reports `0/N pass` and `resume` reports a finished run as open.
-2. **The state machine's ordering is not enforced.** `teamwork_task_update`
-   whitelists the seven statuses (`tools.ts:1428-1439`) but never checks the
-   previous status, so `pending → verified_pass` is accepted (`:1441-1464`).
-   `README.md:66` calls these "deterministic task state machine transitions";
-   only the status *set* and the `maxRounds` coercion are deterministic.
-3. **`verified_pass` needs no evidence.** The `verification` payload is optional
-   (`tools.ts:1386-1394`) and no tool reads `verify/report-<task>.json`.
-4. **Network enforcement is narrower than the README says.** `README.md:70-74`
-   says the hook "enforces network constraints (`constraints.network: denied`)".
-   The code denies `webfetch` only, only for `team/worker` and `team/verifier`,
-   and only via a regex over `prompt_draft.md` (`tools.ts:1888-1902`).
-   `GUARDRAILS.md:32-33` calls this honor-system, which is closer but not exact.
-5. **Plugin tools are not agent-scoped** (`GUARDRAILS.md:34-36`): any agent in a
+1. **"Read-only" covers the edit tool, not the filesystem.** `team/scout`,
+   `team/verifier` and `team/security-auditor` deny `edit` in both frontmatter
+   and code (`tools.ts:531-538`; `agents/team/scout.md:7-12`,
+   `agents/team/verifier.md:7-15`, `agents/team/security-auditor.md:7-18`) but
+   allow `shell`, which can write files. Only `team/falsifier` denies `shell`
+   as well. The code-enforced guarantee is therefore "no in-place edits through
+   the edit tool", not "cannot modify the workspace".
+2. **The final-verification gate trusts a self-produced status.** `teamwork_next`
+   requires `verify/final.json` with `status: "PASS"` (`tools.ts:1389-1414`),
+   but the file is written by a verifier the sentinel itself dispatches
+   (`index.ts:53`), and the engine checks nothing behind the status string. A
+   fabricated PASS satisfies the gate.
+3. **Plugin tools are not agent-scoped** (`GUARDRAILS.md:34-36`): any agent in a
    run can call `teamwork_task_update` or `teamwork_security_audit`.
+4. **`events.jsonl` attribution is best-effort.** The actor is resolved from an
+   explicit input, then the calling session, then the plan — and is never
+   verified (`tools.ts:360-380`, `ARTIFACTS.md:351-359`). The log has no
+   sequence number, so a consumer cannot distinguish order from file order.
+5. **Two completion rules disagree.** `teamwork_next` requires every task to be
+   `verified_pass` before it looks at `verify/final.json`
+   (`tools.ts:1359-1392`), while the export report returns `PASS` when
+   `final.json` says PASS even if some tasks are not yet `verified_pass`
+   (`ARTIFACTS.md:490-500`). A run can be "PASS" in an exported report and
+   "not done" to the engine.
+6. **The spec gate checks presence, not approval.** Any caller can pass
+   `requireSpec: false` (recorded as `not_required`) or `skipInterview: true`
+   (recorded as `bypassed`); the file's provenance is never checked
+   (`tools.ts:901-920`).
 
 ## 2. Per-capability classification
 
-Class counts over 18 capabilities: 1 `PRESENT-EQUIVALENT`, 2 `DIVERGENT`,
-8 `WEAKER`, 7 `MISSING`.
+Class counts over 22 capabilities: 1 `PRESENT-EQUIVALENT`, 4 `DIVERGENT`,
+8 `WEAKER`, 9 `MISSING`.
 
 ### 2.1 Entry and routing
 
 | Capability | Antigravity behaviour | Local behaviour | Class | Impact | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| A1 Slash-command entry | `/teamwork`, described "Preview the multi-agent teamwork workflow." (`00-artifact-identity.md:88-91`); dispatches the sentinel | `/teamwork` switches the session to `team/sentinel` and injects a multi-step operating template with `$ARGUMENTS` substituted (`index.ts:31-65`, `:215-230`). Six further commands expose the legacy loop's stages and the crafter (`index.ts:66-188`) | **PRESENT-EQUIVALENT** | Same entry shape: one command hands the request to a coordinator agent. Local additionally exposes stage commands | `plugins/opencode-teamwork/index.ts:30-230`; `00-artifact-identity.md:88-91` |
-| A2 Interview gate before routing | `teamwork_interviewer` runs before routing; the run starts only after the user approves a task prompt; `[skip-interview]` bypasses (`sentinel-routing.md:426-522`, `:690`; sentinel dispatch row `02-agent-registry.md:101`, prompt-level-actor note `:144`). `teamwork_interviewer` is a prompt-level dispatch target, not an `AllAgents` registry entry (`02:144`) | Elicitation exists as an optional upstream command: `/teamwork-craft` runs a 9-step wizard producing `prompt_draft.md` (`index.ts:66-92`, `crafter.md:27-77`). When no spec is found, the sentinel's template says to "ask 1-2 short questions to pick the topology" and then run the crafter or inline the answers (`index.ts:38`); the sentinel prompt itself says to ask and use the crafter (`sentinel.md:30-33`). Nothing blocks `teamwork_plan` on a missing spec (`tools.ts:833-933`) | **WEAKER** | The absent guarantee is the barrier: no approved prompt is required, there is no skip token because there is no gate, and a request can be dispatched with no falsifiable spec. The spec wizard is otherwise a stronger, more explicit form of the interview | `index.ts:38`, `:66-92`; `docs/ARTIFACTS.md:13`; `agents/team/crafter.md:27-77`; `agents/team/sentinel.md:30-33`; `tools.ts:833-933`; `sentinel-routing.md:426-522` |
-| A3 Router: 6-route taxonomy, ordered procedure, anti-patterns, default General | Six named routes — Document Review, Formal Math / Lean 4 (LEMMA), Math / Proof (Large Team), Math / Proof, SWE Light, General — a five-step ordered procedure, a nine-item anti-pattern list ("do not deliberate endlessly", "do not split a request across paths", "do not route to SWE Light just because it sounds small", "do not re-route mid-execution"), and default General (`sentinel-routing.md:523-640`, `:642-672`) | A **topology** enum exists: six values recorded in `plan.dag.json` (`ARTIFACTS.md:40-51`, `tools.ts:811`), chosen by prompt prose (`sentinel.md:34-37`). A signal→topology table with a default lives in the **legacy** orchestrator (`orchestrator.md:39-61`: "ambiguous … ask the user once, then default to `distributed-coding`"). The sentinel has no decision procedure, no anti-pattern list, no default. `teamwork_plan` does not validate the value (`tools.ts:857`) and no tool behaviour depends on it | **WEAKER** | Topology is a DAG-shape label, not a request-class router: it selects nothing, accepts any string, and records no rationale. A typo becomes a run's permanent label; a wrong route is invisible afterwards | `agents/team/sentinel.md:34-37`; `agents/team/orchestrator.md:39-61`; `docs/ARTIFACTS.md:40-51`; `tools.ts:811`, `:857`; `sentinel-routing.md:523-672` |
+| A1 Slash-command entry | `/teamwork`, described "Preview the multi-agent teamwork workflow." (`00-artifact-identity.md:88-91`); dispatches the sentinel. Runtime now confirms the entry **spawns a separate `teamwork`-typed conversation** and links it as `conversation://<id>` (`07` §3.5, `11` §1.3-§1.4) | `/teamwork` switches the *current* session to `team/sentinel` and injects a multi-step operating template with `$ARGUMENTS` substituted (`index.ts:31-65`, `:215-230`). Six further commands expose the legacy loop's stages and the crafter (`index.ts:66-188`) | **PRESENT-EQUIVALENT** | Same entry shape: one command hands the request to a coordinator. The local command mutates the caller's session instead of opening a child conversation; that isolation difference is counted once, under A21, so it is not double-charged here | `plugins/opencode-teamwork/index.ts:30-230`; `00-artifact-identity.md:88-91`; `07` §3.5; `11` §1.3 |
+| A2 Interview gate before routing | `teamwork_interviewer` runs before routing; the run starts only after the user approves a task prompt; `[skip-interview]` bypasses (`sentinel-routing.md:426-522`, `:690`; sentinel dispatch row `02-agent-registry.md:101`, prompt-level-actor note `:144`). `teamwork_interviewer` is a prompt-level dispatch target, not an `AllAgents` registry entry (`02:144`) | A **spec gate** now exists: `teamwork_plan` refuses when `<run>/prompt_draft.md` is missing or empty, before creating anything, and records the decision (`specGate: satisfied \| bypassed \| not_required`) (`tools.ts:901-920`). The bypass is explicit and recorded (`skipInterview`, `requireSpec:false`). The crafter wizard can produce the spec (`/teamwork-craft`, `index.ts:66-92`). Nothing verifies that the user approved it | **WEAKER** | The barrier is now enforced; the absent guarantee is **approval**, not existence. A non-empty file and a caller-chosen bypass both satisfy the tool, so the gate proves a spec was present, not that anyone signed off. Antigravity's gate is an interviewer turn the user answers | `tools.ts:901-920`; `docs/ARTIFACTS.md:186-196`; `agents/team/crafter.md:27-77`; `index.ts:66-92`; `sentinel-routing.md:426-522` |
+| A3 Router: 6-route taxonomy, ordered procedure, anti-patterns, default General | Six named routes — Document Review, Formal Math / Lean 4 (LEMMA), Math / Proof (Large Team), Math / Proof, SWE Light, General — a five-step ordered procedure, a nine-item anti-pattern list ("do not deliberate endlessly", "do not split a request across paths", "do not route to SWE Light just because it sounds small", "do not re-route mid-execution"), and default General (`sentinel-routing.md:523-640`, `:642-672`) | A validated **topology** enum: six canonical values plus four legacy aliases, normalised on write and refused otherwise (`tools.ts:498-512`, `:886-892`); an optional `routingReason` is persisted (`:929-935`). The choice itself is prompt prose (`sentinel.md:34-37`); a signal→topology table with a default exists only in the **legacy** orchestrator (`orchestrator.md:39-61`). No tool branches on topology | **WEAKER** | The typo hole is closed: a bad label can no longer become a run's permanent name. Topology is still a DAG-shape label, not a request classifier — it selects nothing, has no anti-patterns and no default, and `routingReason` is unread and optional | `agents/team/sentinel.md:34-37`; `agents/team/orchestrator.md:39-61`; `docs/ARTIFACTS.md:38-51`; `tools.ts:498-512`, `:886-892`, `:929-935`; `sentinel-routing.md:523-672` |
 
 ### 2.2 Recording and continuity
 
 | Capability | Antigravity behaviour | Local behaviour | Class | Impact | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| A4 Record the routed request once, before the chosen agent starts | The routed text is recorded once in `.agents/teamwork/ORIGINAL_REQUEST.md` before dispatch; later messages are appended; it is the baseline an auditor checks the work against (`sentinel-routing.md:263-288`, `:691`) | `prompt_draft.md` is a **drafted spec** produced by the crafter/wizard, not a verbatim record of the text routed on (`ARTIFACTS.md:13`, `crafter.md:79-90`). No tool writes or requires it (`tools.ts:833-933`); the sentinel only looks for one (`index.ts:38`). No append-only request log exists | **MISSING** | The original wording is lost: a spec is a transformation of the request, so a later "does the work match what was asked" check has no verbatim baseline, and nothing guarantees the file exists or predates dispatch | `docs/ARTIFACTS.md:13`; `plugins/opencode-teamwork/index.ts:38`; `tools.ts:1892`; `agents/team/crafter.md:79-90`; `sentinel-routing.md:263-288` |
-| A5 `## Parameters` block for bracket-led requests | When a request began with a recognised bracket, the bracket is preserved verbatim in its own section with the line "How this run was launched; not part of the task." (`sentinel-routing.md:426-445`, `:691`) | No equivalent. The whole argument text is passed through `$ARGUMENTS` substitution (`index.ts:224-226`); there is no parameter grammar or recording convention | **MISSING** | Launch modifiers are indistinguishable from task text. Low impact today because the plugin defines no launch modifiers, and it is the prerequisite for A2's skip token | `plugins/opencode-teamwork/index.ts:224-226`; `sentinel-routing.md:426-445` |
-| A6 `BRIEFING.md` mission/identity, re-read when out of context | Mission, identity, key constraints, active orchestrator, progress, victory-audit status, artifact index; re-read whenever it falls out of recent context (`sentinel-routing.md:105-179`, `:692`) | No briefing file. The substitute is the `session.context` hook, which injects a sanitised summary — run id, phase, pass/fail counts, cost, state path — into every `team/*` agent's prompt (`tools.ts:764-793`, `:1906-1911`) | **WEAKER** | Continuity is automatic rather than a re-read convention, which is stronger for *state*, but carries none of mission, identity, decisions, or acceptance criteria. After compaction an agent knows the run exists, not what it is for | `tools.ts:764-793`, `:1906-1911`; `sentinel-routing.md:105-179` |
-| A7 `handoff.md` five-part protocol | Fixed structure: Observation, Logic Chain, Caveats, Conclusion, Verification Method; the sentinel rewrites its own handoff each cycle (`sentinel-routing.md:697`) | `handoff.md` appears once, as an instruction to a **stuck** worker: write what is left and stop (`worker.md:71-73`). No structure is mandated; no other agent writes one | **WEAKER** | A handoff artifact exists but not a protocol: reasoning, caveats, and verification instructions are not required, so a successor starts from a status note, and only after a worker declares itself stuck | `agents/team/worker.md:71-73`; `sentinel-routing.md:697` |
+| A4 Record the routed request once, before the chosen agent starts | The routed text is recorded once in `.agents/teamwork/ORIGINAL_REQUEST.md` before dispatch; later messages are appended; it is the baseline an auditor checks the work against (`sentinel-routing.md:263-288`, `:691`; on disk: `11` §3 row 1, with requirements R1…Rn and acceptance criteria) | `prompt_draft.md` is a **drafted spec** produced by the crafter/wizard, not a verbatim record of the text routed on (`ARTIFACTS.md:13`, `crafter.md:79-90`). It is now load-bearing — the plan refuses without it (`tools.ts:901-920`) — but its content is a transformation of the request and nothing appends later messages. No append-only request log exists | **MISSING** | The original wording is still lost: a later "does the work match what was asked" check has no verbatim baseline. The spec gate makes the *substitute* mandatory without making it a record, and it cannot serve as the baseline the integrity auditor reads (A19) | `docs/ARTIFACTS.md:13`, `:186-196`; `plugins/opencode-teamwork/index.ts:38`; `tools.ts:901-920`; `agents/team/crafter.md:79-90`; `sentinel-routing.md:263-288`; `11` §3 |
+| A5 `## Parameters` block for bracket-led requests | When a request began with a recognised bracket, the bracket is preserved verbatim in its own section with the line "How this run was launched; not part of the task." (`sentinel-routing.md:426-445`, `:691`) | No equivalent. The whole argument text is passed through `$ARGUMENTS` substitution (`index.ts:224-226`); there is no parameter grammar or recording convention. Neither sampled Antigravity run contains a `## Parameters` block (`11` §3 row 1, `UNKNOWN` whether because neither was bracket-launched) | **MISSING** | Launch modifiers are indistinguishable from task text. Low impact today because the plugin defines no launch modifiers, and it is the prerequisite for A2's skip token | `plugins/opencode-teamwork/index.ts:224-226`; `sentinel-routing.md:426-445`; `11` §3 |
+| A6 `BRIEFING.md` mission/identity, re-read when out of context | Mission, identity, key constraints, active orchestrator, progress, victory-audit status, artifact index; re-read whenever it falls out of recent context (`sentinel-routing.md:105-179`, `:692`). On disk it is one brief per agent folder, 1.6–7.1 KB, with a locked append-only identity block (`11` §3 row 6) | No briefing file. The substitute is the `session.context` hook, which injects a sanitised summary — run id, phase, pass/fail counts, cost, state path — into every `team/*` agent's prompt (`tools.ts:807-836`, `:2085-2090`) | **WEAKER** | Continuity is automatic rather than a re-read convention, which is stronger for *state*, but carries none of mission, identity, decisions, or acceptance criteria. After compaction an agent knows the run exists, not what it is for. The observed Antigravity briefing is per-agent, so it also preserves identity uniqueness the local shared summary cannot | `tools.ts:807-836`, `:2085-2090`; `sentinel-routing.md:105-179`; `11` §3 |
+| A7 `handoff.md` five-part protocol | Fixed structure: Observation, Logic Chain, Caveats, Conclusion, Verification Method; the sentinel rewrites its own handoff each cycle (`sentinel-routing.md:697`). On disk it is the largest artifact kind (4.8–36.5 KB), read by the parent and cited as the `Source` of every gate verdict (`11` §3 row 8, §5.2) | `handoff.md` appears once, as an instruction to a **stuck** worker: write what is left and stop (`worker.md:71-73`). No structure is mandated; no other agent writes one | **WEAKER** | A handoff artifact exists but not a protocol: reasoning, caveats, and verification instructions are not required, so a successor starts from a status note, and only after a worker declares itself stuck. The observed gate is built entirely out of these handoffs, which is why their absence local is a gate gap as well as a continuity gap | `agents/team/worker.md:71-73`; `sentinel-routing.md:697`; `11` §3, §5.2 |
 
 ### 2.3 Monitoring and completion
 
 | Capability | Antigravity behaviour | Local behaviour | Class | Impact | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| A8 Progress monitoring with `Sentinel Monitoring` → `Cleanup` | Two crons: `*/8` progress reporting (reads `progress.md` / `BRIEFING.md`, scans the top recently modified workspace files) and `*/20` liveness (kill and re-spawn a dead orchestrator); cleanup cancels timers and subagents (`sentinel-routing.md:324-376`) | No scheduler of any kind: no `setInterval` or cron in `plugins/`, `lib/`, or `bin/`; `setTimeout` appears only in the request-timeout helper (`tools.ts:346-352`). Progress is pull-only: `teamwork_status` reads `state.json` on request (`:935-949`) and `describeRun` re-injects state each turn (`:764-793`) | **MISSING** | No proactive progress reports and no liveness recovery: a stalled worker is noticed only when the sentinel's next turn runs or the user asks. Separately, `teamwork_status` mis-reports `verified_pass` runs as incomplete (§1.8 #1) | `tools.ts:346-352`, `:935-949`, `:764-793`; `sentinel-routing.md:324-376` |
-| A9 Victory audit: a claim is never accepted at face value | Route-dependent verification (`sentinel-routing.md:673-683`). SWE runs its own blocking auditor (at most two) and must cite `VICTORY CONFIRMED`; Document Review spawns `teamwork_document_victory_auditor`; Math / Proof (Large Team) reports its pipeline's own verified result; LEMMA accepts a kernel-checked proof without a second auditor; every unlisted route spawns `teamwork_victory_auditor`. `VICTORY REJECTED` → forward the audit report and resume the team; the audit is given `ORIGINAL_REQUEST.md` as its baseline | A real code gate exists but answers a different question: the mandatory pre-merge **security** audit (`tools.ts:1274-1302`, `:1512-1614`, `sentinel.md:87-92`). Completion is decided by task statuses plus that audit (`tools.ts:1274-1315`). An independent final verifier is prompt prose writing `verify/final.json` (`sentinel.md:97-101`, `index.ts:53`), read by no engine tool and only by the export report (`lib/export.mjs:370`; `ARTIFACTS.md:435-445`). No auditor measures fidelity to the request | **WEAKER** | The strongest local gate asks "is this safe to merge", not "is this what was asked". `teamwork_next` returns `ALL_TASKS_PASSED` on statuses + security alone, so a run can be reported complete with an unread final verdict — and, because `verified_pass` needs no evidence or legal predecessor (§1.8 #2-3), with no verified work at all | `tools.ts:1274-1315`, `:1512-1614`, `:1428-1464`; `agents/team/sentinel.md:87-101`; `agents/team/security-auditor.md:2`; `lib/export.mjs:370`; `sentinel-routing.md:673-683` |
-| A10 Terminal-state discipline: pause vs. terminal non-victory vs. confirmed completion | Three explicit branches with what *not* to do: pause → no auditor, no cleanup, never report completion; terminal non-victory → no auditor, run cleanup, never report completion; confirmed → cleanup, report (`sentinel-routing.md:673-683`, `:359-375`) | Terminal *states* exist in code: `PRESENT_PARTIAL` when nothing is active and something is blocked (`tools.ts:1473-1475`), `DEADLOCK` (`:1317-1324`), `BLOCKED_BY_SECURITY` (`:1285-1294`). The sentinel is told to present the partial result and open reports (`sentinel.md:93-96`). No pause state (`PHASES`, `:503`), no cleanup rule, no prohibition on announcing completion; `interrupted.md` is prose in the legacy agent only (`orchestrator.md:106`) | **WEAKER** | Partial outcomes are represented, which is the important half. But there is no defined behaviour for "the user answered a question mid-run", and nothing stops a completion claim after a DEADLOCK or with a missing final report | `tools.ts:503`, `:1473-1475`, `:1317-1324`, `:1285-1294`; `agents/team/sentinel.md:93-96`; `agents/team/orchestrator.md:106`; `sentinel-routing.md:673-683` |
+| A8 Progress monitoring with `Sentinel Monitoring` → `Cleanup` | Two crons: `*/8` progress reporting (reads `progress.md` / `BRIEFING.md`, scans the top recently modified workspace files) and `*/20` liveness (kill and re-spawn a dead orchestrator); cleanup cancels timers and subagents (`sentinel-routing.md:324-376`). Firing is still unobserved: the live run never produced an orchestrator turn (`07` §1.5, `11` §1.5) | No scheduler of any kind: no `setInterval` or cron in `plugins/`, `lib/`, or `bin/`; `setTimeout` appears only in the request-timeout helper (`tools.ts:346-352`). Progress is pull-only: `teamwork_status` reads `state.json` on request (`:1014-1028`) and `describeRun` re-injects state each turn (`:807-836`) | **MISSING** | No proactive reports and no liveness recovery: a stalled worker is noticed only when the sentinel's next turn runs or the user asks. The `verified_pass` counting defect in the first revision is fixed (`isPassStatus`, `tools.ts:496`, `:813`, `:1024`, `:1038`), so the tools no longer misreport a finished run | `tools.ts:346-352`, `:496`, `:1014-1028`, `:807-836`; `sentinel-routing.md:324-376`; `07` §1.5 |
+| A9 Victory audit: a claim is never accepted at face value | Route-dependent verification (`sentinel-routing.md:673-683`). SWE runs its own blocking auditor (at most two) and must cite `VICTORY CONFIRMED`; Document Review spawns `teamwork_document_victory_auditor`; Math / Proof (Large Team) reports its pipeline's own verified result; LEMMA accepts a kernel-checked proof without a second auditor; every unlisted route spawns `teamwork_victory_auditor`. `VICTORY REJECTED` → forward the audit report and resume the team; the audit is given `ORIGINAL_REQUEST.md` as its baseline. The observed milestone gate is an explicit AND over six verdicts plus an independent test result (`11` §5.1-§5.2) | A real completion gate now exists: all tasks `verified_pass` → security audit PASS → a usable `verify/final.json` with `status: "PASS"` (`tools.ts:1359-1428`). The final report is produced by a verifier the sentinel dispatches (`index.ts:53`), and only its status string is checked (`tools.ts:1389-1414`). No auditor measures fidelity to the request | **WEAKER** | The gate now asks "did the run's own verifier say PASS" in addition to "is it safe to merge". It still does not ask "is this what was asked": there is no request baseline (A4), and the verdict is not independent of the coordinator. Antigravity's observed gate is redundant (2 reviewers + 2 challengers) and cites each agent's handoff; local is single-verifier | `tools.ts:1359-1428`, `:1692-1794`, `:1389-1414`; `agents/team/sentinel.md:87-101`; `index.ts:53`; `docs/ARTIFACTS.md:490-500`; `sentinel-routing.md:673-683`; `11` §5 |
+| A10 Terminal-state discipline: pause vs. terminal non-victory vs. confirmed completion | Three explicit branches with what *not* to do: pause → no auditor, no cleanup, never report completion; terminal non-victory → no auditor, run cleanup, never report completion; confirmed → cleanup, report (`sentinel-routing.md:673-683`, `:359-375`). Runtime shows the rule is prose: when the orchestrator was quota-blocked, the sentinel **did the work inline** instead of relaying a non-victory (`07` §3.5.3, `11` §1.5) | Terminal *states* exist in code: `PRESENT_PARTIAL` when nothing is active and something is blocked (`tools.ts:1652-1654`), `DEADLOCK` (`:1430-1437`), `BLOCKED_BY_SECURITY` (`:1370-1379`), `BLOCKED_BY_FINAL_VERIFICATION` (`:1407-1414`). The sentinel is told to present the partial result (`sentinel.md:93-96`). No pause state (`PHASES`, `:526`), no cleanup rule, no prohibition on announcing completion | **WEAKER** | Partial outcomes are represented, which is the important half. There is still no defined behaviour for "the user answered a question mid-run", and nothing stops a completion claim after a DEADLOCK or with a missing final report. The Antigravity branch rules are also only prose — the observed inline fallback is the proof — so the comparison is between two prose disciplines plus local terminal states, not between a guarantee and a gap | `tools.ts:526`, `:1652-1654`, `:1430-1437`, `:1370-1379`, `:1407-1414`; `agents/team/sentinel.md:93-96`; `sentinel-routing.md:673-683`; `07` §3.5.3; `11` §1.5 |
 
-### 2.4 Route-specific pipelines
+### 2.4 Route-specific pipelines and the gate
 
 | Capability | Antigravity behaviour | Local behaviour | Class | Impact | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| A11 SWE Light: one implementer, repeated reviewer rounds over a **cumulative open-issues ledger**, correctness by running tests, orchestrator writes no code | One `teamwork_implementer`; reviewer rounds carry a cumulative open-issues ledger; the gate is tests; the orchestrator does not write code (`02-agent-registry.md:102-104`; ledger rule `04-pipeline-topologies.md:522`) | Generic DAG loop: worker → verifier → `verified_fail` → re-dispatch with feedback until `maxRounds` (`tools.ts:1258-1270`, `:1450-1452`; `ARTIFACTS.md:128-138`). Feedback is a **single string overwritten each round** (`tools.ts:1461`, capped at 500 chars); the verifier's report is written but never read by the engine (`ARTIFACTS.md:327-344`). "Sentinel does not edit code" is prose (`sentinel.md:118-121`). Tests-as-gate is the verifier's rubric, not an engine check | **WEAKER** | Convergence quality is the gap: a round-2 worker sees only the previous round's last feedback, not the ledger of every open issue, so fixed-then-regressed problems can reappear. `small-focused` (1 worker + 1 verifier; `ARTIFACTS.md:42`) is the closest existing shape | `tools.ts:1258-1270`, `:1461`; `docs/ARTIFACTS.md:42`, `:128-138`, `:327-344`; `agents/team/sentinel.md:118-121`; `02-agent-registry.md:102-104` |
-| A12 Document Review: segment triage → `teamwork_group` per segment (RSA review tree) → cross-segment synthesis → `teamwork_synthesizer` | Multi-stage pipeline with per-segment group agents and a synthesis stage (`02-agent-registry.md:97-99`; `sentinel-routing.md:530-539`) | `document-review` is a label only: "1 chair + 3 critics + 1 aggregator" (`ARTIFACTS.md:47`). No segment triage, no per-segment agent, no review tree, no segment handoff or candidate artifacts (`synthesis/` holds only `syn-<n>.md` and conflict JSON, `ARTIFACTS.md:22-23`, `:368-383`). No tool reads topology (`tools.ts:857`) | **MISSING** | A document review must be hand-composed by the sentinel in its prompt loop, with no segmentation discipline and no per-segment isolation. A long document is reviewed as one blob | `docs/ARTIFACTS.md:22-23`, `:47`; `tools.ts:857`; `02-agent-registry.md:97-99` |
-| A13 LEMMA pipeline + capability gate | `teamwork_worker` / `planner` / `reviewer` / `verifier` / `formalizer` / `formalization_reviewer`; gated on user-installed `leap-tools` + Lean; **stops before work** when absent (`02-agent-registry.md:70-76`, `:224-235`; `sentinel-routing.md:572-573`) | One `team/proof-worker` whose diff is a Lean/Coq/Isabelle proof and whose verifier is the formal checker (`proof-worker.md:1-2`, `:29-46`); `proof` topology is "1 strategist + 3-5 searchers + 1 formal checker" (`ARTIFACTS.md:45`). No toolchain probe, no gate, no stop-before-work, and no planner/formalizer/formalization-reviewer split | **WEAKER** | A Lean request is attempted and fails at compile time instead of being refused before budget is spent. No separation between informal reasoning and formalization review, where Lean proofs usually break | `agents/team/proof-worker.md:1-2`, `:29-46`; `docs/ARTIFACTS.md:45`; `02-agent-registry.md:70-76` |
-| A14 Theorem proving: 5-phase outer loop delegating tournament-tree levels to `teamwork_layer` | Phase loop plus a layer agent owning tournament-tree levels (`02-agent-registry.md:69`, `:86`; `sentinel-routing.md:536`) | `massive-proof` is a string in the topology list ("1 meta-coordinator + 100+ searchers (opt-in)", `ARTIFACTS.md:46`) plus a 24 h cap in the command template (`index.ts:56`). No layer agent, no tournament bracket, no phase object: `teamwork_next` runs the same generic task/round loop (`tools.ts:1183-1360`), and "100+" is prose | **MISSING** | The declared shape is not implemented: wide search is just many independent tasks whose results the root model must reconcile itself, with no elimination or per-level aggregation | `docs/ARTIFACTS.md:46`; `plugins/opencode-teamwork/index.ts:56`; `tools.ts:1183-1360`; `02-agent-registry.md:69`, `:86` |
-| A15 Dependency pre-flight: BLOCKING audit naming every file, folder and URL | `teamwork_dependency` is dispatched before routes whose Route Summary marks a pre-flight audit required (Document Review, LEMMA); it must name every file, folder and URL the request names; verdicts READY / MISSING / OUTAGE are blocking, and the sentinel never installs anything (`sentinel-routing.md:61-72`, `:530-539`). It is a dispatch target, not a route; `teamwork_dependency` is a prompt-level actor and is not an `AllAgents` registry entry (`02-agent-registry.md:144`) | No equivalent. `dependsOn` in `plan.dag.json` is task ordering (`ARTIFACTS.md:81-97`, `tools.ts:1223-1241`), not an input inventory. Missing inputs surface as worker failures mid-DAG | **MISSING** | Budget is spent before missing prerequisites are discovered, and there is no place where the request's named files and URLs are enumerated and checked | `tools.ts:1223-1241`; `docs/ARTIFACTS.md:81-97`; `sentinel-routing.md:61-72`, `:530-539`; `02-agent-registry.md:144` |
+| A11 Iterative coding / SWE Light: implementer + repeated reviewer rounds over a **cumulative open-issues ledger**; observed milestone gate is 1 worker + 2 reviewers + 2 challengers + 1 auditor | SWE Light: one `teamwork_implementer`, then repeated `teamwork_reviewer` rounds carrying a cumulative open-issues ledger; the gate is tests; the orchestrator writes no code (`02-agent-registry.md:102-104`; ledger rule `04-pipeline-topologies.md:522`). Separately, the observed milestone gate has six rows — worker, two reviewers, two challengers, auditor — each verdict citing a `handoff.md` in a **different** conversation directory, with `PASS = Auditor CLEAN + both Reviewers APPROVE + both Challengers CONFIRMED + independent test/audit result` (`11` §5.1-§5.2). Whether that composition is fixed is `UNKNOWN`; all three samples are one route family | Generic DAG loop with a now-real **cumulative ledger**: every non-empty feedback appends `{round, at, text, resolved}` to `state.tasks[id].feedbackLog` (cap 20, resolved on `verified_pass`), and `teamwork_next` injects every unresolved entry to the next worker (`tools.ts:1337-1354`, `:1607-1628`; `ARTIFACTS.md:148-167`). Redundancy is 1 worker + 1 verifier; there is no reviewer/challenger/auditor role. Tests-as-gate remains the verifier's rubric, not an engine check. "Sentinel does not edit code" is prose (`sentinel.md:118-121`) | **WEAKER** | Convergence is now at parity on the ledger: a round-2 worker sees every open issue, not just the last. What remains absent is the gate's redundancy and independence — one verifier's PASS closes a task, and no separate auditor re-derives the result. The 2+2+1 composition is observed, not proven universal | `tools.ts:1337-1354`, `:1607-1628`; `docs/ARTIFACTS.md:42`, `:148-167`; `agents/team/sentinel.md:118-121`; `02-agent-registry.md:102-104`; `04-pipeline-topologies.md:522`; `11` §5 |
+| A12 Document Review: segment triage → `teamwork_group` per segment (RSA review tree) → cross-segment synthesis → `teamwork_synthesizer` | Multi-stage pipeline with per-segment group agents and a synthesis stage (`02-agent-registry.md:97-99`; `sentinel-routing.md:530-539`). The route was **not** exercised by any of the 39 sampled runs: no segment or synthesis artifacts appear in the state trees (`11` §3, §6.3) | `document-review` is a label only: "1 chair + 3 critics + 1 aggregator" (`ARTIFACTS.md:47`). No segment triage, no per-segment agent, no review tree, no segment handoff or candidate artifacts (`synthesis/` holds only `syn-<n>.md` and conflict JSON, `ARTIFACTS.md:22-23`, `:382-399`). No tool reads topology (`tools.ts:886-892`) | **MISSING** | A document review must be hand-composed by the sentinel in its prompt loop, with no segmentation discipline and no per-segment isolation. A long document is reviewed as one blob. Antigravity's side is also only statically known, so this row compares an unimplemented local pipeline with an unobserved reference | `docs/ARTIFACTS.md:22-23`, `:47`; `tools.ts:886-892`; `02-agent-registry.md:97-99`; `11` §3 |
+| A13 LEMMA pipeline + capability gate | `teamwork_worker` / `planner` / `reviewer` / `verifier` / `formalizer` / `formalization_reviewer`; gated on user-installed `leap-tools` + Lean; **stops before work** when absent (`02-agent-registry.md:70-76`, `:224-235`; `sentinel-routing.md:572-573`) | One `team/proof-worker` whose diff is a Lean/Coq/Isabelle proof and whose verifier is the formal checker (`proof-worker.md:1-2`, `:29-46`); `proof` topology is "1 strategist + 3-5 searchers + 1 formal checker" (`ARTIFACTS.md:45`). No toolchain probe, no gate, no stop-before-work, and no planner/formalizer/formalization-reviewer split | **WEAKER** | A Lean request is attempted and fails at compile time instead of being refused before budget is spent. No separation between informal reasoning and formalization review, where Lean proofs usually break. The one registry entry whose allowlist omits all three write tools (`lemma_formalization_reviewer`, 10 tools) has no local counterpart (`02` §*Tool allowlist observations*) | `agents/team/proof-worker.md:1-2`, `:29-46`; `docs/ARTIFACTS.md:45`; `02-agent-registry.md:70-76` |
+| A14 Theorem proving: 5-phase outer loop delegating tournament-tree levels to `teamwork_layer` | Phase loop plus a layer agent owning tournament-tree levels (`02-agent-registry.md:69`, `:86`; `sentinel-routing.md:536`) | `massive-proof` is a string in the topology list ("1 meta-coordinator + 100+ searchers (opt-in)", `ARTIFACTS.md:46`) plus a 24 h cap in the command template (`index.ts:56`). No layer agent, no tournament bracket, no phase object: `teamwork_next` runs the same generic task/round loop (`tools.ts:1261-1473`), and "100+" is prose | **MISSING** | The declared shape is not implemented: wide search is just many independent tasks whose results the root model must reconcile itself, with no elimination or per-level aggregation | `docs/ARTIFACTS.md:46`; `plugins/opencode-teamwork/index.ts:56`; `tools.ts:1261-1473`; `02-agent-registry.md:69`, `:86` |
+| A15 Dependency pre-flight: BLOCKING audit naming every file, folder and URL | `teamwork_dependency` is dispatched before routes whose Route Summary marks a pre-flight audit required (Document Review, LEMMA); it must name every file, folder and URL the request names; verdicts READY / MISSING / OUTAGE are blocking, and the sentinel never installs anything (`sentinel-routing.md:61-72`, `:530-539`). It is a dispatch target, not a route; `teamwork_dependency` is a prompt-level actor and is not an `AllAgents` registry entry (`02-agent-registry.md:144`) | No equivalent. `dependsOn` in `plan.dag.json` is task ordering (`ARTIFACTS.md:81-97`, `tools.ts:1301-1319`), not an input inventory. Missing inputs surface as worker failures mid-DAG | **MISSING** | Budget is spent before missing prerequisites are discovered, and there is no place where the request's named files and URLs are enumerated and checked | `tools.ts:1301-1319`; `docs/ARTIFACTS.md:81-97`; `sentinel-routing.md:61-72`, `:530-539`; `02-agent-registry.md:144` |
 
 ### 2.5 Coordination, roster, gating
 
 | Capability | Antigravity behaviour | Local behaviour | Class | Impact | Evidence |
 | --- | --- | --- | --- | --- | --- |
-| A16 Coordination surface: shared swarm board with sequenced posts, inbox, per-segment handoffs, `candidate_*.md`, `teamwork_tmp` | A mutable shared board with sequenced posts and an inbox, including the post format `Post %d/%d (seq #%d by %s)` `(brief)`; per-agent state folders under `.agents/teamwork/<type>_<milestone>/` and scratch space at `teamwork_tmp` (`sentinel-routing.md:306-323`, `:257-258`) | Deliberately the opposite: **one file per artifact**, no shared mutable state — `candidates/cand-<n>.md`, `critiques/crit-<n>.md`, `synthesis/syn-<n>.md`, `verify/report-<task>.json`, plus an append-only `events.jsonl` (`ARTIFACTS.md:11-30`, `:256-325`). No board, inbox, segment folders, or `teamwork_tmp` anywhere in `plugins/`, `lib/`, or `agents/` (searched) | **DIVERGENT** | Trade-off, not a shortfall: no cross-writer ordering or contention, and every artifact is sanitised and path-contained (`GUARDRAILS.md:18-25`). The loss is inter-agent messaging and post attribution: `events.jsonl.agent` is caller-reported and unverified (`ARTIFACTS.md:296-304`), and concurrent runs share no coordination channel at all | `docs/ARTIFACTS.md:11-30`, `:256-325`, `:296-304`; `sentinel-routing.md:306-323` |
-| A17 Roster breadth — 49 `AllAgents` registry entries | 49 decoded registry entries: 39 core (sentinel, orchestrators, critics, workers, LEMMA, math/proof, audit, curation, pipeline, entry) plus 5 `@document_review`, 3 `@swe_light`, 1 `@colosseum` and 1 `@external` (`02-agent-registry.md:44-104`). `swarm_*` names are source files, not registry entries; `teamwork_dependency` and `teamwork_interviewer` are prompt-level actors (`02:144`) | 11 agents, each installed as a file in the user's config dir (`lib/team.mjs:35-47`), with one worker/verifier pair parameterised by `spec.json` and `plan.dag.json` (`ARTIFACTS.md:55-77`, `tools.ts:848-856`) | **DIVERGENT** | 11 is a deliberate fit for a plugin that installs agents into the user's own config and makes them visible in the UI (`CHANGELOG.md:48-50`, `README.md:307-314`). The loss is role specialisation: no dependency auditor, document segment reviewer, formalization reviewer, or curator exists, which is why A12/A14/A15 are missing and A13 is weak rather than merely smaller | `lib/team.mjs:35-47`; `docs/ARTIFACTS.md:55-77`; `CHANGELOG.md:48-50`; `README.md:307-314`; `02-agent-registry.md:44-104` |
-| A18 Gating: `TeamworkPreviewCommandDisabled`, `enable-teamwork-subagent`, `disable-teamwork-forced-flash-model`, `TeamworkDefaultsToFlash`, `teamworkDisabled` | Admin/feature flags around the subsystem; enforcement path `UNKNOWN` (`brief`) | No flags. All 7 commands register unconditionally (`index.ts:215-230`); models are per-agent frontmatter (`README.md:235-245`, `lib/team.mjs:35-47`). The installer exposes `--dry-run`, `--no-register`, and `--refresh` (`bin/opencode-teamwork.mjs:57-75`, `:100-110`); none of them disables the subsystem | **MISSING** | There is no way to disable `/teamwork` short of removing the plugin or its config entry. Whether that is a gap depends on the host: this material documents no OpenCode V2 admin surface, so an equivalent control may not exist to implement. Antigravity enforcement: `UNKNOWN` | `plugins/opencode-teamwork/index.ts:215-230`; `lib/team.mjs:35-47`; `bin/opencode-teamwork.mjs:57-75`; `(brief)` |
+| A16 Coordination surface: per-agent artifact folders + `send_message`; a shared swarm board exists but belongs to `/swarm` | `/teamwork` coordinates through parent/child dispatch and per-agent state folders — one `DISPATCH.md`, `BRIEFING.md`, `progress.md` and `handoff.md` per agent, in `teamwork_<role>_m<M>_r<R>[_<N>]/` (`11` §3-§4); `send_message` is in every registry item (`02` Appendix B, `09` §11.1). A separate feature, `/swarm`, has a shared board with source-established mechanics: one `seq` space per board, channels rebuilt from log control lines, `wake_mode ∈ mentions \| anything \| working`, and append-verified reads using head/tail anchors (`09` §3.3, §5, §6.2, §7.1). `09` §11 does **not** bind that board to `/teamwork`, but it records one `/teamwork-preview` invocation that created a swarm directory and no `.agents/teamwork/` tree; whether the command or the top-level agent chose that path is `UNKNOWN` (`09` §11.4) | Deliberately the opposite: **one file per artifact**, no shared mutable state — `candidates/cand-<n>.md`, `critiques/crit-<n>.md`, `synthesis/syn-<n>.md`, `verify/report-<task>.json`, plus an append-only `events.jsonl` (`ARTIFACTS.md:11-30`, `:371-380`). No per-agent state folder, board, inbox, or `teamwork_tmp` in `plugins/`, `lib/`, or `agents/` (searched). Concurrency needs are avoided by worktree isolation (`tools.ts:1838-1841`) | **DIVERGENT** | Trade-off, not a shortfall: no cross-writer ordering or contention, and every artifact is sanitised and path-contained (`GUARDRAILS.md:18-25`). The loss is per-agent state uniqueness and inter-agent messaging: the local run has one shared directory and a shared context injection, `events.jsonl.agent` is best-effort and unverified (`ARTIFACTS.md:351-359`), and there is no sequence number or read cursor. The earlier framing of this row as "teamwork uses a shared board" was wrong: the board is `/swarm`'s. One `/teamwork-preview` invocation still took the native-swarm path and wrote a swarm directory instead of teamwork artifacts (`09` §11.4), so the runtime selection is `UNKNOWN` — but the coordination *vocabulary* the local design would have to match is not the board's | `docs/ARTIFACTS.md:11-30`, `:351-359`, `:371-380`; `tools.ts:475`, `:587-589`, `:736-788`, `:807-836`; `09` §3.3, §5, §7.1, §11.4; `11` §3-§4; `02` Appendix B |
+| A17 Roster breadth — 49 `AllAgents` registry entries | 49 decoded registry entries: 39 core (sentinel, orchestrators, critics, workers, LEMMA, math/proof, audit, curation, pipeline, entry) plus 5 `@document_review`, 3 `@swe_light`, 1 `@colosseum` and 1 `@external` (`02-agent-registry.md:44-104`, correction at `:129-146`). The 49 collapse to **43 distinct runtime types**, because four items share `teamwork_worker`, three share `teamwork_reviewer` and two share `teamwork_explorer` (`02:143`). `swarm_*` names are source files, not registry entries; `teamwork_dependency` and `teamwork_interviewer` are prompt-level actors (`02:144`) | 11 agents, each installed as a file in the user's config dir (`lib/team.mjs:35-47`), with one worker/verifier pair parameterised by `spec.json` and `plan.dag.json` (`ARTIFACTS.md:55-77`, `tools.ts:920-928`) | **DIVERGENT** | 11 is a deliberate fit for a plugin that installs agents into the user's own config and makes them visible in the UI (`CHANGELOG.md:48-50`, `README.md:307-314`). The loss is role specialisation: no dependency auditor, document segment reviewer, formalization reviewer, or curator exists, which is why A12/A14/A15 are missing and A13 is weak rather than merely smaller. Counting 49 as "dispatchable types" would overstate it — the type count is 43 | `lib/team.mjs:35-47`; `docs/ARTIFACTS.md:55-77`; `tools.ts:920-928`; `CHANGELOG.md:48-50`; `README.md:307-314`; `02-agent-registry.md:44-104`, `:129-146` |
+| A18 Gating: `TeamworkPreviewCommandDisabled`, `enable-teamwork-subagent`, `disable-teamwork-forced-flash-model`, `TeamworkDefaultsToFlash`, `teamworkDisabled` | Admin/feature flags around the subsystem (`06-config-gates-and-model-tiers.md:34-42`); enforcement path `UNKNOWN`. The flash policy now has a **runtime counterpart**: on HTTP 429 the client re-launched the orchestrator with `"Model":"flash"` in the dispatch call (`11` §1.3-§1.4, `07` §3.5). Whether that override is the sentinel's judgement, a client retry policy, or a default is `UNKNOWN`; the mechanism is exercised | No flags. All 7 commands register unconditionally (`index.ts:215-230`); models are per-agent frontmatter (`README.md:235-245`, `lib/team.mjs:35-47`), with no per-dispatch override. The installer exposes `--dry-run`, `--no-register`, and `--refresh` (`bin/opencode-teamwork.mjs:57-75`, `:100-110`); none of them disables the subsystem | **MISSING** | There is no way to disable `/teamwork` short of removing the plugin or its config entry, and no way to constrain or override a model for one dispatch. Whether an equivalent admin control exists in the V2 host is `UNKNOWN`; the runtime evidence confirms the Antigravity *model-override* mechanism but not the *gate* | `plugins/opencode-teamwork/index.ts:215-230`; `lib/team.mjs:35-47`; `bin/opencode-teamwork.mjs:57-75`; `11` §1.4; `07` §3.5; `06-config-gates-and-model-tiers.md:34-42` |
+| A19 Integrity modes: `development \| demo \| benchmark`, authored into the prompt and read by the auditor | Three modes with different rule sets, chosen by a behavioural questionnaire and recorded in the prompt artifact (`Integrity mode: …`, `10` §2.1 at `112,230,526`/`112,235,817`). Enforcement is the auditor prompt's `### Integrity Enforcement Levels` (`112,966,504`), and the auditor is told to read the mode **from `ORIGINAL_REQUEST.md` directly**, not from the orchestrator (`112,968,482`). A floor rule raises `from scratch` to at least `demo`. No code path enforces any of it (`10` §2.1, §4) | No mode concept anywhere. `teamwork_security_audit` accepts `status`, `findings` (severity/location/description) and `summary` only (`tools.ts:1695-1717`); no artifact records how the work was allowed to be produced. The run has no verbatim request to read a mode from (A4) | **MISSING** | A "from scratch" or "do not delegate" constraint has nowhere to live, so the final gate and the security audit cannot distinguish an independent implementation from a copied one. This is the one Antigravity mechanism whose *purpose* is a completion check rather than orchestration, which makes its absence here a gap in A9 as well. Porting it depends on A4: there is nothing to read the mode from until the request is recorded | `tools.ts:1695-1717`, `:901-920`; `10` §2.1 at `112,230,526`, `112,966,504`, `112,968,482`; `11` §3 row 1 |
+| A20 Successor handoff at a spawn-count threshold | A named `successor` orchestrator role writes state, spawns a replacement and exits; the `## Succession Status` template compares `Spawn count` against `succession_threshold` (`10` §2.3; threshold at `113,710,972`; role text at `114,727,128`). State transfer covers milestone state, active subagents, pending decisions, remaining work and key artifacts. The docs' "between milestones" cadence differs from the binary's trigger | No successor. The sentinel is one session for the run (`ctx.session.switchAgent`, `index.ts:223`); no tool spawns a replacement conversation, and no spawn count is tracked. Continuity is the shared `session.context` summary (`tools.ts:807-836`, `:2085-2090`), not a state-transfer document | **MISSING** | A long run relies on the host's context handling with no defined handoff, so a compacted sentinel keeps the run summary but not the decisions that led to it. The *trigger* is not portable (§4.6); the *artifact* is, and is the same protocol as A7 — which is why A7 is the cheaper half to close | `index.ts:223`; `tools.ts:807-836`, `:2085-2090`; `10` §2.3; `11` §3 row 8 |
+| A21 Per-agent conversation isolation of state | Each dispatched agent runs in its **own conversation**; its `BRIEFING.md`, `progress.md`, `DISPATCH.md` and `handoff.md` live under that conversation's scratch root, and the observed gate's `Source` paths resolve into different `brain/<conversation-id>/` directories (`11` §2.1, §4, §5.2). The dispatch text forbids writing the state tree into the project (`11` §2.3) | One shared run root for every agent (`RUN_ROOT`, `tools.ts:475`; `runsDir`, `:587-589`), one shared context injection (`:807-836`, `:2085-2090`), and no per-agent scratch folder. Agents are separated by worktree (code) but not by state: every agent can read the run directory and the agents holding `edit` can modify any artifact in it, while `task_update`/`security_audit` are not agent-scoped (§1.8 #3) | **DIVERGENT** | Deliberate and mostly beneficial: one directory is inspectable, exportable and prunable as a unit, and there is no per-conversation tree to reconcile. The loss is isolation and identity — no per-agent state root means no place where a worker's notes are private to that worker, and attribution depends on a self-reported label rather than a directory that names the agent. It also means a single poisoned artifact is visible to every reader | `tools.ts:475`, `:587-589`, `:807-836`, `:2058-2064`; `docs/ARTIFACTS.md:11-30`, `:351-359`; `11` §2.1, §4, §5.2 |
+| A22 Read-only agents: documented property vs. capability | Explorers are "read-only research agents … without modifying any source files" and the registry description says "Read-only exploration agent.", but the decoded 13-tool allowlist includes `write_to_file`, `replace_file_content` and `multi_replace_file_content` (`02-agent-registry.md:64`, Appendix B row 9; `10` §3.5). The sentinel has the same mismatch. Read-onlyness is prompt-enforced; the allowlist does not restrict it | Code-enforced for the edit tool: `READ_ONLY_ACTIONS` denies `edit` for `team/verifier`, `team/falsifier`, `team/scout` and `team/security-auditor`, fail-closed on a missing permission API (`tools.ts:531-538`, `:2051-2064`). But `shell` is allowed for scout, verifier and security-auditor (frontmatter, `agents/team/scout.md:7-12`, `verifier.md:7-15`, `security-auditor.md:7-18`), and shell can write. Only `falsifier` denies both | **DIVERGENT** | Local is strictly stronger than the reference on the `edit` capability and strictly weaker as a *claim*: "read-only" in the docs still overstates what the capability set prevents. This is the same failure the reference exhibits, one layer down — the fix is to narrow the claim or restrict shell, not to add another prompt rule. §3.1 | `tools.ts:531-538`, `:2051-2064`; `agents/team/scout.md:7-12`, `agents/team/verifier.md:7-15`, `agents/team/security-auditor.md:7-18`; `README.md:70-74`; `02-agent-registry.md:64`, Appendix B row 9; `10` §3.5 |
+
+### 2.6 Post-hoc findings (revision 2)
+
+The first revision was written before the runtime and cross-check documents
+landed, and before the engine changes that implemented its own §3. These nine
+findings are what changed the table; each points at the document that
+establishes it.
+
+1. **The roster is 49**, not 60+/70+; the larger figures counted strings, not
+   registry entries. `02-agent-registry.md:129-146`.
+2. **Explorers are documented read-only but their decoded allowlist includes
+   `write_to_file`, `replace_file_content` and `multi_replace_file_content`.**
+   Read-onlyness is a prompt rule, not a capability restriction; the sentinel's
+   allowlist has the same property. `02-agent-registry.md:64`, Appendix B row 9;
+   `10` §3.5.
+3. **The observed gate is 1 worker + 2 reviewers + 2 challengers + 1 auditor**,
+   each verdict citing a `handoff.md`; in the two samples with absolute paths
+   every `Source` resolves into a *different* `brain/<conversation-id>/`. The
+   PASS rule is Auditor CLEAN + both Reviewers APPROVE + both Challengers
+   CONFIRMED + an independent test/audit result. Whether the composition is
+   universal is `UNKNOWN` (one route family, three files). `11` §5.1-§5.2,
+   §8.
+4. **The artifact root is per-conversation scratch**, not the workspace:
+   `~/.gemini/antigravity-cli/brain/<conv>/scratch/.agents/teamwork/`, with nine
+   observed artifact kinds and per-agent folders
+   `teamwork_<role>_m<M>_r<R>[_<N>]` (`_r` is conditional; `_gen<N>` unobserved).
+   No teamwork *state* document is written into the project by design; work
+   products still are. `11` §2-§4, §6.3.
+5. **Dispatch is real, and so is the fallback.** The slash command spawns a
+   separate orchestrator conversation; on HTTP 429 the client re-launched it
+   with `"Model":"flash"`; when that also failed, the sentinel completed the
+   task inline. The cause of the override and the fallback is `UNKNOWN`.
+   `07` §3.5; `11` §1.
+6. **Integrity modes exist in the binary**: `development | demo | benchmark`,
+   authored at `112,230,526` and enforced through the auditor prompt at
+   `112,966,504`/`112,968,482`, which tells the auditor to read the mode from
+   `ORIGINAL_REQUEST.md` directly. Enforcement is prompt-level; no code path was
+   found. `10` §2.1.
+7. **Successor handoff is triggered by a spawn count**, not a milestone
+   boundary: `succession_threshold` at `113,710,972`, with a named `successor`
+   role that writes state, spawns a replacement and exits. `10` §2.3.
+8. **The coordination layer is source-established, but it belongs to
+   `/swarm`**: one `seq` space per board, channels rebuilt from log controls,
+   `wake_mode ∈ mentions | anything | working`, append-verified reads. A single
+   `/teamwork-preview` invocation took the native-swarm path — a swarm directory
+   and no `.agents/teamwork/` — and why is `UNKNOWN`. `09` §3.3, §5, §6.2,
+   §7.1, §11.4.
+9. **The local side moved too.** The engine now implements the first revision's
+   §3.1-§3.6 (completion accounting, final-verification gate, transition graph
+   plus evidence, spec gate, topology validation, cumulative ledger). §3.0
+   records where each lives; the rows above were rewritten against that code.
 
 ## 3. Highest-value upgrades
 
-Ranked by (user-visible quality gain) ÷ (implementation effort). Six items; no
-padding. Item 3.1 is first on ratio; 3.2 is the largest absolute gain.
+Ranked by (user-visible quality gain) ÷ (implementation effort). Three items;
+no padding. 3.1 is first on ratio; 3.2 is the largest absolute gain.
 
-### 3.1 Fix completion accounting in `teamwork_status` / `teamwork_resume`
+### 3.0 What the first revision proposed, and where it shipped
 
-**Gap.** §1.8 #1. Both tools recognise only the legacy `pass` (`tools.ts:946`,
-`:960`), while the canonical terminal state is `verified_pass`
-(`ARTIFACTS.md:128-135`).
+All six were implemented in the tree this revision measures; they are listed so
+a reader does not treat them as open work, and so the new list is not padded
+with them.
 
-**Change.** Accept both spellings, as `describeRun` already does
-(`tools.ts:770-771`). Two predicates, two lines.
+| First-revision item | Now |
+| --- | --- |
+| 3.1 Fix completion counting | `isPassStatus` used by `status`, `resume` and `describeRun` (`tools.ts:496`, `:813`, `:1024`, `:1038`) |
+| 3.2 Gate completion on evidence | `verify/final.json` gate, with `READY_FOR_FINAL_VERIFICATION` and `BLOCKED_BY_FINAL_VERIFICATION` (`tools.ts:1389-1414`) |
+| 3.3 Make `verified_pass` unforgeable | transition graph (`:1552-1560`) and PASS-evidence refusal (`:1594-1605`) |
+| 3.4 Gate dispatch on a spec | `requireSpec` / `skipInterview` before the run dir is created (`:901-920`) |
+| 3.5 Validate topology and persist the reason | enum + aliases (`:498-512`) and `routingReason` (`:929-935`) |
+| 3.6 Cumulative open-issue ledger | `feedbackLog` (`:1607-1628`) and unresolved-set injection (`:1337-1354`) |
 
-**Why.** Near-zero effort against a defect that makes the two tools users reach
-for first actively mislead: a finished run reads "0/N pass" and as having open
-tasks. It also repairs the human-facing half of the monitoring gap that a
-scheduler cannot close locally (§4.1).
+### 3.1 Make "read-only" mean one thing
 
-### 3.2 Make completion a gate that reads evidence — `teamwork_next`
+**Gap.** A22 and §1.8 #1. The explorer fact (finding 2) is the general form: a
+role can be documented read-only while its capabilities allow writing. Locally
+the deny list removes `edit` for four agents, but `team/scout`,
+`team/verifier` and `team/security-auditor` keep `shell`
+(`tools.ts:531-538`), which can write.
 
-**Gap.** A9. `ALL_TASKS_PASSED` is decided from task statuses plus the security
-audit (`tools.ts:1274-1315`); the independent final verdict that
-`sentinel.md:97-101` tells the model to produce is never read by any tool.
+**Change.** Pick one and state it everywhere:
 
-**Change.** In the `passedTasks.length === taskDefs.size` branch
-(`tools.ts:1274`), after the security check, read `verify/final.json`. Treat a
-missing file as not done: return `READY_FOR_FINAL_VERIFICATION` instead of
-`ALL_PASSED`; return a partial status when it reports `FAIL`. Mirror the audit
-branch's phase handling (`tools.ts:1304-1307`). Export already parses the file
-(`lib/export.mjs:370`, `ARTIFACTS.md:435-445`), so the schema and tolerance
-rules exist.
+- *Narrow the claim (recommended, ~1 hour).* Change the three affected agent descriptions,
+  `README.md:70-74`, and `GUARDRAILS.md:32-33` to say "no write through the edit
+  tool; shell remains available and can modify files", and add a test that
+  asserts the exact deny sets in `READ_ONLY_ACTIONS` so the claim cannot drift.
+- *Enforce it (only if the host supports command-level shell restrictions).*
+  Deny the specific shell commands that write for those agents. Whether V2
+  permission resources can express that is `UNKNOWN`; if they cannot, the first
+  option is the only honest one.
 
-**Why.** It converts the most consequential claim in the system — "done" — from
-prose into a precondition, and reuses an artifact the pipeline already produces.
-One function, no new agent, no new format.
+**Why.** This is the cheapest change in the list and removes a guarantee the
+code does not provide. Antigravity's explorer shows the failure mode directly:
+the docs, the description and the allowlist disagree, and only the allowlist
+decides. Here the disagreement is smaller but real, and it is in the security
+docs.
 
-### 3.3 Make `verified_pass` unforgeable — `teamwork_task_update`
+### 3.2 Record the routed request once, with an integrity mode
 
-**Gap.** A9 plus §1.8 #2-3. The status set is whitelisted, but the transition
-graph is not (`tools.ts:1428-1464`); `verification` is optional
-(`:1386-1394`); no tool reads `verify/report-<task>.json`.
+**Gap.** A4 and A19. The spec gate now requires `prompt_draft.md`
+(`tools.ts:901-920`), but that is a drafted transformation, not the request;
+and there is no integrity mode anywhere in the local tree.
 
-**Change.** Add an allowed-predecessor map and refuse anything else, e.g.
-`verified_pass` only from `verifier_active`, and only when
-`verification.status === "PASS"` or a `verify/report-<task>.json` exists on
-disk. Keep `blocked` reachable from every state so escalation never deadlocks.
-Return the refusal as a tool error the sentinel must handle.
+**Change.** Add two `teamwork_plan` inputs: `request` (the verbatim text routed
+on) and `integrityMode` (`development | demo | benchmark`, default
+`development`). Write `<run>/ORIGINAL_REQUEST.md` exactly once, refuse to
+overwrite it, and record the mode in `state.json` and `plan.dag.json`. Have the
+final verification (`verify/final.json`, `tools.ts:1389-1414`) and
+`teamwork_security_audit` read the mode from that file rather than from the
+caller. Keep the spec gate: a request record and an approved spec are different
+artifacts.
 
-**Why.** Every downstream guarantee (security gate, completion, export status)
-inherits its truth from this field. Without this, 3.2 can be satisfied by a
-fabricated record.
+**Why.** This closes two rows at once. It gives A9's gate a baseline — today
+"does the work match the ask" has no verbatim ask to compare against — and it
+creates the only place an integrity mode can be read from, which is the part of
+Antigravity's design that makes the mode check independent of the orchestrator
+(`10` §2.1). It is medium effort because it adds one artifact and one enum, not
+a new agent.
 
-### 3.4 Gate dispatch on a spec — `teamwork_plan`
+### 3.3 Give `events.jsonl` a sequence and actor provenance
 
-**Gap.** A2. The sentinel *may* ask questions and *may* use the crafter
-(`sentinel.md:30-33`, `index.ts:38`); `teamwork_plan` accepts a task list
-unconditionally (`tools.ts:833-933`).
+**Gap.** A16 and §1.8 #4. The local event log is append-only but has no `seq`
+and its `agent` field is best-effort and self-reported
+(`tools.ts:360-380`, `ARTIFACTS.md:351-359`).
 
-**Change.** Add `requireSpec` (default true) and `skipInterview` (boolean) to
-`teamwork_plan`'s input. When `requireSpec` is true and
-`<run>/prompt_draft.md` is absent, refuse and tell the caller to run
-`/teamwork-craft` or re-call with `skipInterview: true`. Record the bypass in
-the new run's `events.jsonl` (`run_created`, `tools.ts:696-740`, `:922`) so it
-is visible in `timeline` and `export`.
+**Change.** Add a monotonically increasing `seq` (one number space per file, as
+`/swarm` does per board — `09` §3.3) and an `agentSource` field with the value
+`explicit | session | plan`, set where `deriveCallerAgent` resolves the actor
+(`tools.ts:360-380`). Surface both in `timeline` and the export summary.
 
-**Why.** This is the Antigravity gate reduced to one boolean and one file check,
-and it makes the escape explicit rather than implicit — the property worth
-copying, not the interviewer agent.
-
-### 3.5 Validate the topology enum and persist the routing decision
-
-**Gap.** A3. `topology` is written after `clean()` with no enum check
-(`tools.ts:857`); no rationale is recorded anywhere.
-
-**Change.** Validate against the six canonical values plus the four legacy
-aliases, normalised on write (`ARTIFACTS.md:49-51`), and refuse otherwise — the
-pattern already used for task ids (`tools.ts:840-846`). Add an optional
-`routingReason` string (capped by `clean()`) to `teamwork_plan`, persist it in
-`plan.dag.json`, and surface it in `inspect` (`lib/runs.mjs`) and the export
-summary.
-
-**Why.** Cheap, and it closes a real hole: a typo'd topology silently becomes a
-run's permanent label. It also creates the record any future triage logic
-(A12/A15) would need.
-
-### 3.6 Cumulative open-issue ledger per task
-
-**Gap.** A11. Round feedback overwrites a single 500-char field
-(`tools.ts:1461`); `teamwork_next` injects only that field plus pitfalls
-(`:1258-1270`).
-
-**Change.** Append each round's feedback to `verify/issues-<task>.md` (or a
-`feedbackLog` array in `state.tasks[<id>]`), and have `teamwork_next` include
-the whole unresolved set in `readyForWorker[].feedback`, condensed to entries
-not yet marked fixed. Marking fixed can piggyback on the existing verifier
-payload (`verification`, `tools.ts:1386-1394`), so no new agent contract.
-
-**Why.** This is what makes repeated review rounds converge rather than repeat,
-and it is contained to two tools plus one artifact. It is ranked last because it
-needs a small schema decision, unlike 3.1-3.5.
+**Why.** The source-established board shows what ordering and attribution cost
+when they are explicit: a reader can resume from a cursor and tell which agent
+posted. Locally the log is already the only cross-agent record, so a sequence
+number and a provenance label are small additions that turn a display field into
+evidence. Keep it best-effort: the engine must still run without the log
+(`ARTIFACTS.md:376-380`).
 
 ## 4. Do not port
 
@@ -375,13 +451,14 @@ needs a small schema decision, unlike 3.1-3.5.
 
 The plugin has no scheduler (§2.3), and its tools are request/response:
 `ctx.tool.transform`, `ctx.permission.hook`, `ctx.session.hook`,
-`ctx.command.transform` (`index.ts:213-230`, `tools.ts:795-801`, `:1879-1911`).
+`ctx.command.transform` (`index.ts:213-230`, `tools.ts:838-845`, `:2058-2090`).
 The Antigravity mechanism also depends on `progress.md` / `BRIEFING.md`
 conventions and a scan of recently modified project files
 (`sentinel-routing.md:324-376`) that has no local counterpart and would emit
-guesses about work the plugin cannot observe. Improve `teamwork_status`,
-`timeline`, and the export report instead — they report from recorded state,
-which the local design can do honestly.
+guesses about work the plugin cannot observe. The crons' firing is unobserved
+even on the Antigravity side (`11` §1.5). Improve `teamwork_status`, `timeline`,
+and the export report instead — they report from recorded state, which the local
+design can do honestly.
 
 ### 4.2 Cleanup that kills subagents
 
@@ -391,8 +468,10 @@ subagent-facing call is `ctx.session.switchAgent` (`index.ts:223`), and no kill
 primitive appears in `plugins/`, `lib/`, or `bin/`. Whether the V2 host exposes
 one is `UNKNOWN`. `GUARDRAILS.md:27-40` deliberately declines destructive powers
 it cannot confine. `teamwork_worktree({ action: "cleanup" })`
-(`tools.ts:1847-1863`), which prunes worktrees, already covers the reversible
-half.
+(`tools.ts:2026-2042`), which prunes worktrees, already covers the reversible
+half. The live run also shows why "kill" is not the only outcome: when the
+dispatched agent was quota-blocked, the Antigravity sentinel completed the task
+itself instead (`07` §3.5.3).
 
 ### 4.3 Shared swarm board, inbox, and `teamwork_tmp`
 
@@ -401,7 +480,11 @@ competing with the run directory, and it widens the injection surface:
 `GUARDRAILS.md:37-39` already treats run artifacts as untrusted control data,
 and every board post would be a new untrusted-input path into prompts. The
 one-file-per-artifact layout (`ARTIFACTS.md:11-30`) plus sanitised injection in
-`describeRun` (`tools.ts:764-793`) is the safer shape. Port the *handoff* idea
+`describeRun` (`tools.ts:807-836`) is the safer shape. The board is
+`/swarm`'s (`09` §11); one `/teamwork-preview` invocation took that path
+instead of the teamwork one, and the selection is `UNKNOWN` (`09` §11.4), so
+porting the board would import a feature the reference keeps separate for every
+other observed run. Port the *handoff* idea
 (A7), not the board.
 
 ### 4.4 A 49-entry agent roster
@@ -409,21 +492,90 @@ one-file-per-artifact layout (`ARTIFACTS.md:11-30`) plus sanitised injection in
 Local agents are markdown files installed into
 `~/.config/opencode/agents/team/` and deliberately visible in the UI
 (`lib/team.mjs:35-47`, `CHANGELOG.md:48-50`, `README.md:307-314`). The Antigravity
-roster's 49 `AllAgents` entries would flood the picker, multiply the per-agent model assignment the
-installer performs (`lib/team.mjs:35-49`), and duplicate capability the engine
-expresses through `spec.json` and DAG tasks. Add roles only where a *contract*
-differs (a dependency auditor, a formalization reviewer), never for breadth.
+roster's 49 `AllAgents` entries would flood the picker, multiply the per-agent model
+assignment the installer performs (`lib/team.mjs:35-49`), and duplicate
+capability the engine expresses through `spec.json` and DAG tasks. Add roles
+only where a *contract* differs (a dependency auditor, a formalization reviewer),
+never for breadth.
+
+### 4.5 Per-conversation artifact roots
+
+Antigravity writes teamwork state under
+`~/.gemini/antigravity-cli/brain/<conv>/scratch/.agents/teamwork/` and forbids
+creating it in the project (`11` §2.1-§2.3). This looks like a hardening
+opportunity — state outside the user's repository — but it does not transfer:
+
+- every local tool builds its paths from the workspace `root` (`runsDir`,
+  `tools.ts:587-589`) and the containment and symlink checks are written against
+  that root (`:615-649`);
+- the CLI verbs `inspect`, `timeline`, `export`, `prune` and the single-root
+  contract in `docs/ARTIFACTS.md:7-30` and `scripts/lint-prompts.mjs:100-110`
+  assume the workspace path;
+- the plugin API surface this repo uses (`ctx.tool.transform`,
+  `ctx.permission.hook`, `ctx.session.hook`, `ctx.command.transform`) exposes no
+  per-conversation data directory; whether V2 has one is `UNKNOWN`.
+
+What is portable is the *sub-shape*, if isolation is wanted later: per-agent
+subfolders under the existing run root, not relocation. The current design also
+buys something Antigravity's does not — one directory a human can inspect and
+delete.
+
+### 4.6 Successor handoff at a spawn threshold
+
+The mechanism is real (`10` §2.3) and the problem it solves — context
+degradation in a long run — is real. It is not portable as shipped:
+
+- there is no spawn primitive in the plugin; `ctx.session.switchAgent` switches
+  the current session and no call anywhere in `plugins/`, `lib/` or `bin/`
+  creates a replacement conversation;
+- `succession_threshold` is compared against a spawn count the local engine does
+  not track;
+- the observed gate shows the *state transfer* first: a `handoff.md` with
+  milestone state, active subagents, pending decisions, remaining work and key
+  artifacts (`10` §2.3, `11` §3 row 8).
+
+Port the handoff protocol (A7), which is a markdown contract and needs no host
+support. Do not invent a successor role until the host exposes a way to start
+one.
+
+### 4.7 The six-agent gate as a fixed template
+
+The observed 1+2+2+1 composition and its explicit AND rule are the strongest
+gate evidence in the corpus (`11` §5). Copying the *template* would add three
+roles the local roster deliberately lacks (§4.4), and the composition's
+universality is `UNKNOWN` — all three samples are one route family
+(`11` §5.1, §8). The portable part is the rule shape, and the local engine
+already uses it: independent gates are explicit ANDs with named refusals
+(`READY_FOR_SECURITY_AUDIT`, `READY_FOR_FINAL_VERIFICATION`,
+`BLOCKED_BY_*`, `tools.ts:1359-1428`). If redundancy is added later, it should
+be as a second verifier contract on the same task, not as a copied roster.
 
 ## 5. What this comparison does not establish
 
+- Whether the observed six-agent gate composition is fixed across routes:
+  `UNKNOWN`; three samples, one route family (`11` §5.1, §8).
+- What makes one `/teamwork-preview` invocation dispatch a `teamwork`
+  conversation and another produce a native swarm: `UNKNOWN`; each is observed
+  once (`09` §11.4).
+- Whether Antigravity's explorers ever use their write tools at runtime:
+  `UNKNOWN`; the allowlist permits it and the prompt forbids it, and no tool
+  trace was captured (`10` §3.5, §4).
+- Whether integrity modes are enforced by anything other than the auditor's
+  prompt: `UNKNOWN`; the mode text exists on both the authoring and enforcement
+  sides, and no code path was found (`10` §2.1, §4).
+- What runtime value `succession_threshold` takes, and whether succession fires
+  in practice: `UNKNOWN`; only the literal and the template were recovered
+  (`10` §2.3).
 - Whether the local `session.context` injection reaches every subagent session
   on every OpenCode V2 build: `UNKNOWN` (it depends on host hook delivery; the
-  code registers it at `tools.ts:1906-1911`).
+  code registers it at `tools.ts:2085-2090`).
 - Whether `ctx.command.transform` failures are fail-open or fail-closed in the
   host: `UNKNOWN` (no local code handles a registration failure, `index.ts:215`).
-- Antigravity's enforcement path for its five gating flags: `UNKNOWN` (brief).
+- Antigravity's enforcement path for its five gating flags: `UNKNOWN` (`06-config-gates-and-model-tiers.md:34-42`);
+  the flash *override* is observed, its decision path is not (`11` §1.4).
 - Whether Antigravity's route agents beyond the sentinel can be reused across
   runs: `UNKNOWN`; the recovered sentinel text states a no-reuse-after-handoff
   rule (`sentinel-routing.md:289-297`).
-- Whether the V2 host exposes a subagent-kill or scheduler API: `UNKNOWN`; no
-  such call appears in the local source (§4.1-4.2).
+- Whether the V2 host exposes a subagent-kill, scheduler, or per-conversation
+  data directory: `UNKNOWN`; no such call appears in the local source
+  (§4.1-§4.2, §4.5).
