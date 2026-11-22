@@ -1,12 +1,13 @@
-import { registerTeamworkTools } from "../plugins/opencode-teamwork/tools.ts"
+import { registerTeamworkTools, registerTeamworkHooks } from "../plugins/opencode-teamwork/tools.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import { currentModels, readRawModelMap, writeModelMap, installAgents, DEFAULT_MODELS } from "../lib/team.mjs"
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync, symlinkSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { createServer } from "node:http"
 import { execFileSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
+import { deflateSync } from "node:zlib"
 import assert from "node:assert"
 
 const testDir = mkdtempSync(join(tmpdir(), "teamwork-engine-test-"))
@@ -1971,6 +1972,7 @@ try {
     { id: "team/falsifier", deny: ["edit", "shell", "subagent"] },
     { id: "team/scout", deny: ["edit", "subagent"] },
     { id: "team/security-auditor", deny: ["edit", "subagent", "webfetch"] },
+    { id: "team/segment-reviewer", deny: ["edit", "shell", "subagent", "webfetch"] },
   ].map((p) => ({ ...p, deny: [...p.deny].sort() }))
 
   // --- 8a: READ_ONLY_ACTIONS holds exactly the documented deny sets.
@@ -2038,4 +2040,557 @@ try {
   assert(row, "GUARDRAILS must keep the read-only enforcement row")
   assert(/shell/i.test(row) && /can modify files/i.test(row), "GUARDRAILS read-only row must state the shell caveat")
   console.log("✓ GUARDRAILS read-only row states the edit-only guarantee and the shell caveat")
+}
+
+// ==========================================
+// Part 9: Document Review route (Issue #1)
+// ==========================================
+{
+  console.log("Testing Document Review route...")
+  const docRoot = mkdtempSync(join(tmpdir(), "teamwork-docrev-test-"))
+  const outsideDir = mkdtempSync(join(tmpdir(), "teamwork-docrev-outside-"))
+  const tools = {}
+  let evaluateHook
+
+  try {
+    const ctx = {
+      tool: {
+        transform: async (cb) => {
+          await cb({
+            namespace: () => {},
+            add: (t) => {
+              tools[t.name] = t
+            },
+          })
+        },
+      },
+      permission: {
+        hook: async (name, fn) => {
+          if (name === "evaluate") evaluateHook = fn
+        },
+      },
+      session: {
+        get: async () => ({ agent: "team/verifier" }),
+        hook: async () => {},
+      },
+    }
+
+    await registerTeamworkTools(ctx, docRoot)
+    await registerTeamworkHooks(ctx, docRoot)
+
+    assert(tools.route, "teamwork_route must be registered")
+    assert(tools.document_triage, "teamwork_document_triage must be registered")
+    assert(tools.document_record, "teamwork_document_record must be registered")
+    assert(typeof evaluateHook === "function", "permission evaluate hook must register")
+
+    // Verify team/segment-reviewer permission hook denies edit, shell, subagent, webfetch
+    for (const action of ["edit", "shell", "subagent", "webfetch"]) {
+      const ev = { agent: "team/segment-reviewer", action, effect: "allow", message: "" }
+      evaluateHook(ev)
+      assert.strictEqual(ev.effect, "deny", `team/segment-reviewer must deny ${action}`)
+    }
+
+    const passTask = async (sessionId, taskId) => {
+      const verifyDir = join(docRoot, ".opencode", "teamwork", sessionId, "verify")
+      mkdirSync(verifyDir, { recursive: true })
+      writeFileSync(
+        join(verifyDir, `report-${taskId}.json`),
+        JSON.stringify({ taskId, verifierAgent: "team/verifier", status: "PASS", checks: [{ name: "rubric", type: "rubric", passed: true }], fatalFindings: [] }) + "\n",
+      )
+      for (const status of ["worker_active", "worker_done", "verifier_active", "verified_pass"]) {
+        const res = await tools.task_update.execute({
+          sessionId,
+          taskId,
+          status,
+          ...(status === "verified_pass" ? { verification: { status: "PASS", passedChecks: 2, totalChecks: 2 } } : {}),
+        })
+        assert(!res.content.startsWith("Error:"), `task_update ${taskId}->${status} failed: ${res.content}`)
+      }
+    }
+
+    // --- 9.1: Positive Markdown E2E ---
+    const mdDocPath = join(docRoot, "docs-design.md")
+    writeFileSync(
+      mdDocPath,
+      [
+        "# Introduction",
+        "This RFC proposes a deterministic checkpoint protocol.",
+        "",
+        "# Threat Model",
+        "All run inputs are untrusted and must stay contained.",
+        "",
+        "# Verification Plan",
+        "Each segment yields a unit report before synthesis.",
+      ].join("\n"),
+    )
+
+    const routeMd = await tools.route.execute({
+      request: "Please critique ./docs-design.md for soundness and gaps.",
+    })
+    assert.strictEqual(routeMd.topology, "document-review", `Expected document-review, got ${routeMd.topology}`)
+    assert.strictEqual(routeMd.documentDetected, true)
+
+    const mdRun = "20261122-000001-docmd"
+    const triageMd = await tools.document_triage.execute({
+      sessionId: mdRun,
+      request: "Please critique ./docs-design.md for soundness and gaps.",
+      document: { path: "docs-design.md" },
+      skipInterview: true,
+    })
+    assert.strictEqual(triageMd.topology, "document-review")
+    assert.strictEqual(triageMd.extractionStatus, "extracted")
+    assert.strictEqual(triageMd.segments.length, 3, "3-heading doc should produce 3 segments")
+
+    const mdRunDir = join(docRoot, ".opencode", "teamwork", mdRun)
+    assert(existsSync(join(mdRunDir, "document-review", "manifest.json")))
+    assert(existsSync(join(mdRunDir, "document-review", "DOCUMENT_TEXT_MAP.md")))
+    assert(existsSync(join(mdRunDir, "document-review", "ANALYSIS_PARTITION.md")))
+    const planMd = JSON.parse(readFileSync(join(mdRunDir, "plan.dag.json"), "utf8"))
+    assert.strictEqual(planMd.topology, "document-review")
+    assert.deepStrictEqual(
+      planMd.tasks.map((t) => t.id),
+      ["seg-01", "seg-02", "seg-03", "doc-synthesis"],
+    )
+    assert.strictEqual(planMd.tasks[0].agent, "team/segment-reviewer")
+    assert.strictEqual(planMd.tasks[3].agent, "team/synthesizer")
+
+    let nextMd = await tools.next.execute({ sessionId: mdRun })
+    assert.strictEqual(nextMd.readyForWorker.length, 3)
+    assert.strictEqual(nextMd.readyForWorker[0].documentReview.role, "segment-review")
+    assert.deepStrictEqual(nextMd.readyForWorker[0].documentReview.reviewTreeShape, [4, 2, 1])
+
+    for (const seg of triageMd.segments) {
+      const rec0 = await tools.document_record.execute({
+        sessionId: mdRun,
+        stage: "segment_analysis",
+        segmentId: seg.id,
+        level: 0,
+        index: 0,
+        summary: `Analyst 0 checked ${seg.id}`,
+        findings: [{ id: "F1", severity: "Minor", claim: "Needs clarity", location: seg.id }],
+        verdict: "CONCERN",
+      })
+      assert(rec0.artifactPath.endsWith(`segments/${seg.id}/level-0-node-0.json`))
+      const rec1 = await tools.document_record.execute({
+        sessionId: mdRun,
+        stage: "segment_aggregate",
+        segmentId: seg.id,
+        level: 1,
+        index: 0,
+        summary: `Aggregator 0 merged ${seg.id}`,
+      })
+      assert(rec1.artifactPath.endsWith(`segments/${seg.id}/level-1-node-0.json`))
+      const rep = await tools.document_record.execute({
+        sessionId: mdRun,
+        stage: "segment_report",
+        segmentId: seg.id,
+        summary: `Adjudicated report for ${seg.id}`,
+        content: `Detailed findings for ${seg.title}.`,
+        verdict: "PASS_WITH_NOTES",
+      })
+      assert(rep.artifactPath.endsWith(`segments/${seg.id}/unit-report.md`))
+      await passTask(mdRun, seg.id)
+    }
+
+    nextMd = await tools.next.execute({ sessionId: mdRun })
+    assert.strictEqual(nextMd.readyForWorker.length, 1)
+    assert.strictEqual(nextMd.readyForWorker[0].id, "doc-synthesis")
+    assert.strictEqual(nextMd.readyForWorker[0].documentReview.role, "cross-segment-synthesis")
+
+    const synCand = await tools.document_record.execute({
+      sessionId: mdRun,
+      stage: "synthesis_candidate",
+      level: 0,
+      index: 0,
+      summary: "Candidate synthesis 0",
+      content: "Cross-segment findings.",
+    })
+    assert(synCand.artifactPath.endsWith("synthesis/candidate-0.md"))
+
+    const finalDoc = await tools.document_record.execute({
+      sessionId: mdRun,
+      stage: "final_report",
+      summary: "Unified review complete.",
+      content: "All 3 segments reviewed with minor clarity recommendations.",
+      verdict: "PASS_WITH_NOTES",
+    })
+    assert(finalDoc.artifactPath.endsWith("DOCUMENT_REVIEW_REPORT.md"))
+
+    await passTask(mdRun, "doc-synthesis")
+    await tools.security_audit.execute({ sessionId: mdRun, status: "PASS", summary: "Clean" })
+    const fvPass = await tools.final_verify.execute({ sessionId: mdRun, summary: "Verified all segments." })
+    assert.strictEqual(fvPass.status, "PASS", `final_verify must PASS: ${fvPass.content}`)
+    const finalJson = JSON.parse(readFileSync(join(mdRunDir, "verify", "final.json"), "utf8"))
+    assert.deepStrictEqual(finalJson.evidence.documentReview, {
+      checked: true,
+      segmentReportsComplete: true,
+      finalReportPresent: true,
+    })
+    nextMd = await tools.next.execute({ sessionId: mdRun })
+    assert.strictEqual(nextMd.status, "ALL_PASSED")
+    console.log("✓ 9.1 Positive Markdown E2E passed")
+
+    // --- 9.2: Positive PDF ingestion + validation ---
+    const buildPdf = (streams) => {
+      const objs = [
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        `2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n`,
+        `3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents [${streams.map((_, idx) => `${4 + idx} 0 R`).join(" ")}] >>\nendobj\n`,
+      ]
+      for (let idx = 0; idx < streams.length; idx++) {
+        const s = streams[idx]
+        const filter = s.flate ? " /Filter /FlateDecode" : ""
+        const header = `${4 + idx} 0 obj\n<< /Length ${s.bytes.length}${filter} >>\nstream\n`
+        const footer = "\nendstream\nendobj\n"
+        objs.push(Buffer.concat([Buffer.from(header, "latin1"), s.bytes, Buffer.from(footer, "latin1")]))
+      }
+      const parts = [Buffer.from("%PDF-1.4\n", "latin1")]
+      for (const o of objs) parts.push(Buffer.isBuffer(o) ? o : Buffer.from(o, "latin1"))
+      parts.push(Buffer.from("%%EOF\n", "latin1"))
+      return Buffer.concat(parts)
+    }
+
+    const plainStream = Buffer.from("BT\n/F1 12 Tf\n72 720 Td\n(# Introduction) Tj\nT*\n(Plain stream claim one.) Tj\nET", "latin1")
+    const flateStream = deflateSync(Buffer.from("BT\n[(Flate) -200 (section) -200 (text.)] TJ\nET", "latin1"))
+    writeFileSync(join(docRoot, "sample.pdf"), buildPdf([{ bytes: plainStream, flate: false }, { bytes: flateStream, flate: true }]))
+
+    const pdfRun = "20261122-000002-pdf"
+    const pdfTriage = await tools.document_triage.execute({
+      sessionId: pdfRun,
+      document: { path: "sample.pdf" },
+      skipInterview: true,
+    })
+    assert.strictEqual(pdfTriage.extractionStatus, "extracted")
+    const textMap = readFileSync(pdfTriage.textMapPath, "utf8")
+    assert(textMap.includes("Plain stream claim one."), "Plain PDF stream text must be extracted")
+    assert(textMap.includes("Flate section text."), "FlateDecode PDF stream text must be extracted")
+
+    // Corrupt PDF refused before mkdir
+    writeFileSync(join(docRoot, "corrupt.pdf"), "NOT_A_PDF_HEADER")
+    const corruptRun = "20261122-000002-badpdf"
+    const corruptRes = await tools.document_triage.execute({
+      sessionId: corruptRun,
+      document: { path: "corrupt.pdf" },
+      skipInterview: true,
+    })
+    assert(corruptRes.content.startsWith("refused:"), `Corrupt PDF must be refused: ${corruptRes.content}`)
+    assert(!existsSync(join(docRoot, ".opencode", "teamwork", corruptRun)), "Corrupt PDF must not create run dir")
+
+    // Image-only empty PDF flags needs_ingestor
+    writeFileSync(join(docRoot, "scanned.pdf"), buildPdf([{ bytes: Buffer.from("q 100 0 0 100 0 0 cm /Im0 Do Q", "latin1"), flate: false }]))
+    const scannedRun = "20261122-000002-scanpdf"
+    const scannedRes = await tools.document_triage.execute({
+      sessionId: scannedRun,
+      document: { path: "scanned.pdf" },
+      skipInterview: true,
+    })
+    assert.strictEqual(scannedRes.extractionStatus, "needs_ingestor", `Empty PDF must report needs_ingestor: ${scannedRes.content}`)
+    console.log("✓ 9.2 Positive PDF + FlateDecode + corrupt refusal + needs_ingestor passed")
+
+    // --- 9.3: Positive inline content & localhost URL ---
+    const inlineRun = "20261122-000003-inline"
+    const inlineRes = await tools.document_triage.execute({
+      sessionId: inlineRun,
+      document: { content: "# Inline RFC\n\nSection body.\n\n# Security\n\nBounds check." },
+      skipInterview: true,
+    })
+    assert.strictEqual(inlineRes.topology, "document-review")
+    assert.strictEqual(inlineRes.segments.length, 2)
+
+    const srv = createServer((req, res) => {
+      if (req.url === "/paper.md") {
+        res.writeHead(200, { "Content-Type": "text/markdown" })
+        res.end("# Localhost Paper\n\nFetched from 127.0.0.1.\n\n# Results\n\nAll good.")
+      } else if (req.url === "/redir") {
+        res.writeHead(302, { Location: "http://127.0.0.1/other" })
+        res.end()
+      } else {
+        res.writeHead(500)
+        res.end("err")
+      }
+    })
+    await new Promise((r) => srv.listen(0, "127.0.0.1", r))
+    const port = srv.address().port
+    try {
+      // Offline default fetchUrl=false refuses without network call
+      const offlineRun = "20261122-000003-offline"
+      const offlineRes = await tools.document_triage.execute({
+        sessionId: offlineRun,
+        document: { url: `http://127.0.0.1:${port}/paper.md` },
+        skipInterview: true,
+      })
+      assert(offlineRes.content.startsWith("refused:"), "fetchUrl=false must refuse live fetch")
+      assert(!existsSync(join(docRoot, ".opencode", "teamwork", offlineRun)), "Refused URL must not mkdir")
+
+      // Live localhost fetchUrl=true succeeds
+      const urlRun = "20261122-000003-urlok"
+      const urlOk = await tools.document_triage.execute({
+        sessionId: urlRun,
+        document: { url: `http://127.0.0.1:${port}/paper.md` },
+        fetchUrl: true,
+        skipInterview: true,
+      })
+      assert.strictEqual(urlOk.topology, "document-review")
+      assert.strictEqual(urlOk.segments.length, 2)
+
+      // 302 redirect refused before mkdir
+      const redirRun = "20261122-000003-redir"
+      const redirRes = await tools.document_triage.execute({
+        sessionId: redirRun,
+        document: { url: `http://127.0.0.1:${port}/redir` },
+        fetchUrl: true,
+        skipInterview: true,
+      })
+      assert(redirRes.content.includes("redirect"), `302 must be refused: ${redirRes.content}`)
+      assert(!existsSync(join(docRoot, ".opencode", "teamwork", redirRun)))
+
+      // 500 error refused before mkdir
+      const errRun = "20261122-000003-err500"
+      const errRes = await tools.document_triage.execute({
+        sessionId: errRun,
+        document: { url: `http://127.0.0.1:${port}/boom` },
+        fetchUrl: true,
+        skipInterview: true,
+      })
+      assert(errRes.content.includes("HTTP 500"), `500 must be refused: ${errRes.content}`)
+      assert(!existsSync(join(docRoot, ".opencode", "teamwork", errRun)))
+    } finally {
+      await new Promise((r) => srv.close(r))
+    }
+
+    // Closed port refused before mkdir
+    const closedRun = "20261122-000003-closed"
+    const closedRes = await tools.document_triage.execute({
+      sessionId: closedRun,
+      document: { url: `http://127.0.0.1:${port}/paper.md` },
+      fetchUrl: true,
+      skipInterview: true,
+    })
+    assert(closedRes.content.startsWith("refused:"))
+    assert(!existsSync(join(docRoot, ".opencode", "teamwork", closedRun)))
+    console.log("✓ 9.3 Positive inline content & localhost URL checks passed")
+
+    // --- 9.4: Math-paper precedence ---
+    writeFileSync(
+      join(docRoot, "math-paper.md"),
+      "# Theorem 1\nFor all x, there exists y.\n\\begin{theorem}\n\\forall x \\exists y\n\\end{theorem}\n",
+    )
+    const mathPaperRoute = await tools.route.execute({
+      request: "Referee and critique ./math-paper.md (check its Theorem 1 proof).",
+    })
+    assert.strictEqual(mathPaperRoute.topology, "document-review", "Supplied math paper must beat proof")
+
+    const inlineMathPaperRoute = await tools.route.execute({
+      request:
+        "Review this preprint:\n<<<DOCUMENT\n\\begin{theorem}\n∀ n ∃ p > n prime.\n\\end{theorem}\n\\begin{proof}\nConsider N! + 1.\n\\end{proof}\n>>>",
+    })
+    assert.strictEqual(inlineMathPaperRoute.topology, "document-review", "Inline math paper must beat proof")
+
+    const posedProof = await tools.route.execute({
+      request: "Prove that there are infinitely many primes ∀ n ∃ p > n.",
+    })
+    assert.strictEqual(posedProof.topology, "proof")
+
+    const posedMassive = await tools.route.execute({
+      request: "Prove this open conjecture using a very large team with 100+ searchers.",
+    })
+    assert.strictEqual(posedMassive.topology, "massive-proof")
+
+    const leanSyntaxOnly = await tools.route.execute({
+      request: "Refactor the helper signatures in Parser.lean.",
+    })
+    assert.strictEqual(leanSyntaxOnly.topology, "distributed-coding", "Bare .lean syntax must not route to proof")
+    console.log("✓ 9.4 Math-paper precedence & Priorities 2-7 passed")
+
+    // --- 9.5: Negative triggers ---
+    writeFileSync(join(docRoot, "README.md"), "# Readme\n")
+    writeFileSync(join(docRoot, "notes.md"), "# Notes\n")
+    writeFileSync(join(docRoot, "paper.pdf"), "%PDF-1.4\n%%EOF\n")
+    const negCases = [
+      ["review this PR", "distributed-coding"],
+      ["review PR #42", "distributed-coding"],
+      ["code review src/auth.ts", "distributed-coding"],
+      ["review my design", "distributed-coding"],
+      ["Mentioning paper.pdf", "distributed-coding"],
+      ["check README.md and implement the missing flag", "distributed-coding"],
+      ["fix the bug in notes.md", "iterative-coding"],
+      ["see ./paper.pdf and solve problem 3", "proof"],
+      ["prove Theorem 2 from ./math-paper.md", "proof"],
+    ]
+    for (const [req, expected] of negCases) {
+      const r = await tools.route.execute({ request: req })
+      assert.strictEqual(r.topology, expected, `Negative trigger "${req}" routed to ${r.topology}, expected ${expected}`)
+      assert.notStrictEqual(r.topology, "document-review", `Negative trigger "${req}" must not trigger document-review`)
+    }
+    console.log("✓ 9.5 Negative triggers passed")
+
+    // --- 9.6: Bounded depth/width & artifact completeness ---
+    const badBoundsCases = [
+      { maxSegments: 9 },
+      { reviewTreeShape: [5, 2, 1] },
+      { reviewTreeShape: [4, 2, 2, 1] },
+      { reviewTreeShape: [2, 4, 1] },
+      { synthTreeShape: [5, 1] },
+      { synthTreeShape: [4, 2] },
+    ]
+    for (let i = 0; i < badBoundsCases.length; i++) {
+      const sid = `20261122-000006-badb${i}`
+      const res = await tools.document_triage.execute({
+        sessionId: sid,
+        document: { path: "docs-design.md" },
+        skipInterview: true,
+        ...badBoundsCases[i],
+      })
+      assert(res.content.startsWith("refused:"), `Out-of-bounds ${JSON.stringify(badBoundsCases[i])} must refuse: ${res.content}`)
+      assert(!existsSync(join(docRoot, ".opencode", "teamwork", sid)), "Refused bounds must not mkdir")
+    }
+
+    // 25-section deterministic packing <= 8 segments (default 6)
+    const bigSections = Array.from({ length: 25 }, (_, i) => `# Section ${i + 1}\n\nParagraph content for section ${i + 1}.`).join("\n\n")
+    const packRun = "20261122-000006-pack"
+    const packRes = await tools.document_triage.execute({
+      sessionId: packRun,
+      document: { content: bigSections },
+      skipInterview: true,
+    })
+    assert(packRes.segments.length >= 1 && packRes.segments.length <= 8, `25 sections packed to ${packRes.segments.length}`)
+
+    // Out-of-bounds level/index & invalid segmentId refused by document_record
+    const badLevel = await tools.document_record.execute({
+      sessionId: packRun,
+      stage: "segment_analysis",
+      segmentId: "seg-01",
+      level: 9,
+      index: 0,
+      summary: "oob",
+    })
+    assert(badLevel.content.startsWith("refused:"))
+    const badIndex = await tools.document_record.execute({
+      sessionId: packRun,
+      stage: "segment_analysis",
+      segmentId: "seg-01",
+      level: 0,
+      index: 4,
+      summary: "oob",
+    })
+    assert(badIndex.content.startsWith("refused:"))
+    const badSeg = await tools.document_record.execute({
+      sessionId: packRun,
+      stage: "segment_report",
+      segmentId: "../x",
+      summary: "bad",
+    })
+    assert(badSeg.content.startsWith("refused:"))
+    const protoSeg = await tools.document_record.execute({
+      sessionId: packRun,
+      stage: "segment_report",
+      segmentId: "__proto__",
+      summary: "bad",
+    })
+    assert(protoSeg.content.startsWith("refused:"))
+
+    // Missing unit-report.md or DOCUMENT_REVIEW_REPORT.md fails final_verify even when tasks+audit PASS
+    for (const seg of packRes.segments) {
+      await passTask(packRun, seg.id)
+    }
+    await passTask(packRun, "doc-synthesis")
+    await tools.security_audit.execute({ sessionId: packRun, status: "PASS", summary: "ok" })
+    const fvMissing = await tools.final_verify.execute({ sessionId: packRun })
+    assert.strictEqual(fvMissing.status, "FAIL", "final_verify must FAIL when unit-report.md and DOCUMENT_REVIEW_REPORT.md are missing")
+    assert(fvMissing.reasons.some((r) => r.includes("unit-report.md missing")))
+    assert(fvMissing.reasons.some((r) => r.includes("DOCUMENT_REVIEW_REPORT.md missing")))
+    console.log("✓ 9.6 Bounded depth/width, packing, and final_verify completeness passed")
+
+    // --- 9.7: Security (traversal, symlinks, sanitisation) ---
+    writeFileSync(join(outsideDir, "secret.md"), "# Secret\nDo not read")
+    for (const [label, badPath] of [
+      ["traversal", "../../etc/passwd"],
+      ["abs", "/etc/passwd"],
+    ]) {
+      const sid = `20261122-000007-${label}`
+      const res = await tools.document_triage.execute({
+        sessionId: sid,
+        document: { path: badPath },
+        skipInterview: true,
+      })
+      assert(res.content.startsWith("refused:"), `${label} must be refused: ${res.content}`)
+      assert(!existsSync(join(docRoot, ".opencode", "teamwork", sid)))
+    }
+
+    symlinkSync(join(outsideDir, "secret.md"), join(docRoot, "link-secret.md"))
+    const symDocRes = await tools.document_triage.execute({
+      sessionId: "20261122-000007-symdoc",
+      document: { path: "link-secret.md" },
+      skipInterview: true,
+    })
+    assert(symDocRes.content.startsWith("refused:"), "Symlinked doc file must be refused")
+
+    symlinkSync(outsideDir, join(docRoot, "link-dir"))
+    const symDirRes = await tools.document_triage.execute({
+      sessionId: "20261122-000007-symdir",
+      document: { path: "link-dir/secret.md" },
+      skipInterview: true,
+    })
+    assert(symDirRes.content.startsWith("refused:"), "Symlinked parent dir must be refused")
+
+    // Symlinked target unit-report.md refused by document_record
+    const secRun = "20261122-000007-sec"
+    await tools.document_triage.execute({
+      sessionId: secRun,
+      document: { content: "# Safe\n\nContent." },
+      skipInterview: true,
+    })
+    const secSegDir = join(docRoot, ".opencode", "teamwork", secRun, "document-review", "segments", "seg-01")
+    mkdirSync(secSegDir, { recursive: true })
+    const canaryOut = join(outsideDir, "canary.md")
+    writeFileSync(canaryOut, "CANARY")
+    symlinkSync(canaryOut, join(secSegDir, "unit-report.md"))
+    const symRec = await tools.document_record.execute({
+      sessionId: secRun,
+      stage: "segment_report",
+      segmentId: "seg-01",
+      summary: "Should not overwrite symlink target",
+    })
+    assert(symRec.content.startsWith("refused:"), `Symlinked unit-report.md must be refused: ${symRec.content}`)
+    assert.strictEqual(readFileSync(canaryOut, "utf8"), "CANARY")
+
+    // Symlinked document-review/ directory refused
+    const secRun2 = "20261122-000007-sec2"
+    await tools.document_triage.execute({
+      sessionId: secRun2,
+      document: { content: "# Safe\n\nContent." },
+      skipInterview: true,
+    })
+    rmSync(join(docRoot, ".opencode", "teamwork", secRun2, "document-review"), { recursive: true, force: true })
+    symlinkSync(outsideDir, join(docRoot, ".opencode", "teamwork", secRun2, "document-review"))
+    const symDocDirRec = await tools.document_record.execute({
+      sessionId: secRun2,
+      stage: "final_report",
+      summary: "Should refuse symlinked document-review dir",
+    })
+    assert(symDocDirRec.content.startsWith("refused:"))
+
+    // Control characters stripped from persisted outputs
+    const cleanRun = "20261122-000007-clean"
+    await tools.document_triage.execute({
+      sessionId: cleanRun,
+      document: { content: "# Section\n\nBody with \x1b[31mANSI\x1b[0m and\u0085C1\u2028sep." },
+      skipInterview: true,
+    })
+    const cleanMap = readFileSync(join(docRoot, ".opencode", "teamwork", cleanRun, "document-review", "DOCUMENT_TEXT_MAP.md"), "utf8")
+    assert(!/[\x1b\u0085\u2028\u2029]/.test(cleanMap), "Control chars must be stripped from DOCUMENT_TEXT_MAP.md")
+
+    await tools.document_record.execute({
+      sessionId: cleanRun,
+      stage: "final_report",
+      summary: "Summary\x1b[31mX\u0085Y\u2028Z",
+      content: "Detail\x1b[32mA\u0085B\u2028C",
+    })
+    const cleanRep = readFileSync(join(docRoot, ".opencode", "teamwork", cleanRun, "DOCUMENT_REVIEW_REPORT.md"), "utf8")
+    assert(!/[\x1b\u0085\u2028\u2029]/.test(cleanRep), "Control chars must be stripped from DOCUMENT_REVIEW_REPORT.md")
+    console.log("✓ 9.7 Security (traversal, symlinks, SEGMENT_ID, sanitisation) passed")
+  } finally {
+    rmSync(docRoot, { recursive: true, force: true })
+    rmSync(outsideDir, { recursive: true, force: true })
+  }
 }

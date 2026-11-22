@@ -39,7 +39,7 @@ that the Sentinel will reject.
    - `distributed-coding` — 2-6 workers fan-out + merge.
    - `proof` — 1 strategist + 3-5 searchers + 1 formal checker.
    - `massive-proof` — 1 meta-coordinator + 100+ searchers (opt-in only).
-   - `document-review` — 1 chair + 3 critics + 1 aggregator.
+   - `document-review` — segment triage (1–8 segments, default 6) → bounded per-segment RSA tree `[4,2,1]` (`team/segment-reviewer`) → cross-segment synthesis `[4,1]` (`team/synthesizer`) for a supplied document to critique (checked before Math/Proof; never triggered by PR reviews or bare filename mentions).
 
 3. **Determine Integrity Mode** — `development` (default),
    `demo` (no external code scraping), `benchmark` (blind, no test

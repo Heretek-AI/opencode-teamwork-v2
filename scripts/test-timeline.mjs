@@ -1033,6 +1033,68 @@ function basenameOf(p) {
   return p.slice(p.lastIndexOf("/") + 1)
 }
 
+// ==========================================
+// 14. Document Review route fixture compatibility
+// ==========================================
+
+await check("document-review: buildTimeline and renderTimeline handle seg-01/seg-02/doc-synthesis + document-review/ dir", () => {
+  const docSession = "20261122-100000-dr01"
+  const docEvents = [
+    { ts: "2026-11-22T10:00:00.000Z", seq: 1, event: "run_created", sessionId: docSession, taskId: null, from: null, to: "pending", round: 0, agent: null, branch: null, worktree: null, phase: "DAG_BUILD" },
+    { ts: "2026-11-22T10:00:10.000Z", seq: 2, event: "task_transition", sessionId: docSession, taskId: "seg-01", from: "pending", to: "worker_active", round: 1, agent: "team/segment-reviewer", agentSource: "plan", branch: null, worktree: null, phase: "DISPATCH" },
+    { ts: "2026-11-22T10:00:40.000Z", seq: 3, event: "task_transition", sessionId: docSession, taskId: "seg-01", from: "worker_active", to: "verified_pass", round: 1, agent: "team/verifier", agentSource: "explicit", branch: null, worktree: null, phase: "DISPATCH" },
+    { ts: "2026-11-22T10:00:45.000Z", seq: 4, event: "task_transition", sessionId: docSession, taskId: "doc-synthesis", from: "pending", to: "worker_active", round: 1, agent: "team/synthesizer", agentSource: "plan", branch: null, worktree: null, phase: "DISPATCH" },
+    { ts: "2026-11-22T10:01:15.000Z", seq: 5, event: "task_transition", sessionId: docSession, taskId: "doc-synthesis", from: "worker_active", to: "verified_pass", round: 1, agent: "team/verifier", agentSource: "explicit", branch: null, worktree: null, phase: "SECURITY_AUDIT" },
+    { ts: "2026-11-22T10:01:20.000Z", seq: 6, event: "security_audit", sessionId: docSession, taskId: null, from: null, to: "PASS", round: 0, agent: null, branch: null, worktree: null, phase: "MERGE" },
+  ]
+  const docState = {
+    version: 1,
+    sessionId: docSession,
+    phase: "MERGE",
+    tasks: {
+      "seg-01": { status: "verified_pass", round: 1, summary: "Segment 1 reviewed" },
+      "doc-synthesis": { status: "verified_pass", round: 1, summary: "Synthesized DOCUMENT_REVIEW_REPORT.md" },
+    },
+  }
+  const docPlan = {
+    sessionId: docSession,
+    topology: "document-review",
+    tasks: [
+      { id: "seg-01", dependsOn: [], agent: "team/segment-reviewer", maxRounds: 2 },
+      { id: "doc-synthesis", dependsOn: ["seg-01"], agent: "team/synthesizer", maxRounds: 2 },
+    ],
+  }
+  const docCosts = {
+    sessionId: docSession,
+    budgetUsd: 10,
+    spentUsd: 0.14,
+    byTask: { "seg-01": 0.06, "doc-synthesis": 0.08 },
+    byTaskTokens: {},
+  }
+  const root = makeRoot()
+  const dir = runDirOf(root, docSession)
+  mkdirSync(join(dir, "document-review", "segments", "seg-01"), { recursive: true })
+  writeFileSync(join(dir, "events.jsonl"), docEvents.map((e) => JSON.stringify(e)).join("\n") + "\n")
+  writeJson(join(dir, "state.json"), docState)
+  writeJson(join(dir, "plan.dag.json"), docPlan)
+  writeJson(join(dir, "costs.json"), docCosts)
+  writeJson(join(dir, "document-review", "manifest.json"), { version: 1, segments: [{ id: "seg-01" }] })
+  writeFileSync(join(dir, "document-review", "segments", "seg-01", "unit-report.md"), "# Segment 1\n")
+  writeFileSync(join(dir, "DOCUMENT_REVIEW_REPORT.md"), "# Final Report\n")
+
+  const tl = buildTimeline(root, docSession)
+  assertShape(tl)
+  assert.strictEqual(tl.topology, "document-review")
+  assert.strictEqual(tl.mode, "events")
+  assert.strictEqual(tl.tasks.length, 2)
+  assert.strictEqual(taskOf(tl, "seg-01").status, "verified_pass")
+  assert.strictEqual(taskOf(tl, "doc-synthesis").status, "verified_pass")
+  const rendered = renderTimeline(tl, { color: false }).join("\n")
+  assert(rendered.includes("document-review"))
+  assert(rendered.includes("seg-01"))
+  assert(rendered.includes("doc-synthesis"))
+})
+
 // ---------------------------------------------------------------- cleanup
 
 rmSync(testDir, { recursive: true, force: true })

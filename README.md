@@ -13,7 +13,7 @@ an effect or setup function. (cause: SchemaError(Expected object at ["default"])
 ```
 
 This repo is the ported, V2-native version: the original 10 agents plus a
-security auditor (11 total) and 7 slash commands,
+security auditor and document segment reviewer (12 total) and 7 slash commands,
 rewritten for the V2 plugin + agent APIs. Verified against **OpenCode `v2.0.26`**.
 
 ## What changed (V1 → V2)
@@ -32,7 +32,8 @@ rewritten for the V2 plugin + agent APIs. Verified against **OpenCode `v2.0.26`*
 package.json                      # npm manifest (name: @heretek-ai/opencode-teamwork-v2)
 index → plugins/opencode-teamwork/index.ts   # V2 plugin, registers the 7 commands
 plugins/opencode-teamwork/tools.ts           # engine tools + hooks (V2 API)
-agents/team/*.md                  # 11 team agents (markdown, V2 frontmatter)
+plugins/opencode-teamwork/document-review.ts # Document Review route classifier, PDF/MD ingestion, RSA bounds
+agents/team/*.md                  # 12 team agents (markdown, V2 frontmatter)
 docs/ARTIFACTS.md                 # canonical artifact layout, topologies, schemas
 lib/team.mjs                      # installer core (config dir, model map, agent files)
 lib/picker.mjs                    # interactive model picker (`opencode models`)
@@ -57,7 +58,10 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 | Tool | Purpose |
 | --- | --- |
 | `teamwork_budget` | budget preflight: console credit derivation |
+| `teamwork_route` | deterministic route classifier (`document-review` checked first with negative-trigger guards) |
 | `teamwork_plan` | create the run dir + `plan.dag.json` / `state.json` / `costs.json` |
+| `teamwork_document_triage` | ingest/partition a supplied document into `seg-01`..`seg-0K` + `doc-synthesis` with pre-`mkdir` bounds & path containment checks |
+| `teamwork_document_record` | persist bounded RSA tree node outputs, `unit-report.md`, `candidate-<I>.md`, and `DOCUMENT_REVIEW_REPORT.md` |
 | `teamwork_preflight` | re-check a run's named inputs, write `preflight.json` (reports, never blocks) |
 | `teamwork_status` | per-task progress for the active run |
 | `teamwork_resume` | tasks still open, for a restart |
@@ -71,11 +75,13 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 
 Hooks: `permission.evaluate` enforces the per-agent read-only policy **in code**
 (not just in their prompts). The read-only agents (`team/verifier`,
-`team/falsifier`, `team/scout`, `team/security-auditor`) all deny the `edit`
-tool, so none of them can write through it. `shell` is still available to the
-verifier, scout and security auditor, and it can modify files; the falsifier
-also has `shell` denied. In short: no writes through `edit` for all four, no
-`shell` writes for the falsifier. The hook also enforces network constraints
+`team/falsifier`, `team/scout`, `team/security-auditor`,
+`team/segment-reviewer`) all deny the `edit` tool, so none of them can write
+through it. `shell` is still available to the verifier, scout and security
+auditor, and it can modify files; the falsifier also has `shell` denied, and
+`team/segment-reviewer` denies `edit`, `shell`, `webfetch`, and `subagent`.
+In short: no writes through `edit` for all five, and no `shell` writes for the
+falsifier or segment reviewer. The hook also enforces network constraints
 (`constraints.network: denied`), and `session.context` injects the active run's
 state + recent pitfalls into every team agent's system prompt.
 
@@ -203,7 +209,7 @@ defaults without touching files that already exist.
 1. Install the plugin: `opencode plugin add @heretek-ai/opencode-teamwork-v2`.
 
 2. Assign models and install the agents. `init` writes
-   `~/.config/opencode/teamwork.json`, installs all 11 agents and registers the
+   `~/.config/opencode/teamwork.json`, installs all 12 agents and registers the
    plugin; `models` rewrites only the model map and the agents' `model:` lines.
    Both are safe to re-run.
 
@@ -286,7 +292,7 @@ Each agent's model lives in the `model:` frontmatter of its markdown file. The
 shipped defaults are:
 
 - `deepseek/deepseek-v4-pro`: sentinel, orchestrator, synthesizer, verifier, falsifier, proof-worker, security-auditor
-- `deepseek/deepseek-flash`: crafter, worker, proposer, scout
+- `deepseek/deepseek-flash`: crafter, worker, proposer, scout, segment-reviewer
 
 Change them with `opencode-teamwork init` (interactive), the flags above
 (scripted), or by editing the frontmatter / `teamwork.json` directly and running
@@ -354,10 +360,10 @@ built-ins.
 
 ## Agents
 
-The 11 shipped agents are: `team/crafter`, `team/sentinel`, `team/worker`,
+The 12 shipped agents are: `team/crafter`, `team/sentinel`, `team/worker`,
 `team/proof-worker`, `team/verifier`, `team/security-auditor`,
-`team/orchestrator`, `team/proposer`, `team/falsifier`, `team/synthesizer`,
-`team/scout`.
+`team/segment-reviewer`, `team/orchestrator`, `team/proposer`,
+`team/falsifier`, `team/synthesizer`, `team/scout`.
 
 Model assignments live in each agent's frontmatter (`model:`); see
 [Model assignment](#model-assignment) for how to set them.

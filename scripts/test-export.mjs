@@ -532,6 +532,75 @@ await check("package.json: aggregate `test` script still runs the five pre-exist
   }
 })
 
+// ==========================================
+// 7. Document Review route fixture compatibility
+// ==========================================
+
+await check("document-review: buildExportData and renderExport render document-review run without live links or XSS", () => {
+  const drSession = "20261122-100000-drx1"
+  const drRoot = makeRun({
+    id: drSession,
+    events: [
+      { ts: "2026-11-22T10:00:00.000Z", seq: 1, event: "run_created", sessionId: drSession, taskId: null, from: null, to: "pending", round: 0, phase: "DAG_BUILD" },
+      { ts: "2026-11-22T10:01:00.000Z", seq: 2, event: "task_transition", sessionId: drSession, taskId: "seg-01", from: "worker_active", to: "verified_pass", round: 1, agent: "team/segment-reviewer", phase: "DISPATCH" },
+      { ts: "2026-11-22T10:02:00.000Z", seq: 3, event: "task_transition", sessionId: drSession, taskId: "doc-synthesis", from: "worker_active", to: "verified_pass", round: 1, agent: "team/synthesizer", phase: "MERGE" },
+    ],
+    state: {
+      version: 1,
+      sessionId: drSession,
+      phase: "MERGE",
+      tasks: {
+        "seg-01": { status: "verified_pass", round: 1, summary: `Reviewed segment ${XSS}`, verification: { status: "PASS", passedChecks: 2, totalChecks: 2 } },
+        "doc-synthesis": { status: "verified_pass", round: 1, summary: "Synthesized DOCUMENT_REVIEW_REPORT.md", verification: { status: "PASS", passedChecks: 2, totalChecks: 2 } },
+      },
+    },
+    plan: {
+      sessionId: drSession,
+      topology: "document-review",
+      tasks: [
+        { id: "seg-01", dependsOn: [], agent: "team/segment-reviewer", maxRounds: 2 },
+        { id: "doc-synthesis", dependsOn: ["seg-01"], agent: "team/synthesizer", maxRounds: 2 },
+      ],
+    },
+    costs: {
+      sessionId: drSession,
+      budgetUsd: 10,
+      spentUsd: 0.15,
+      byTask: { "seg-01": 0.05, "doc-synthesis": 0.1 },
+      byTaskTokens: {},
+    },
+    finalReport: {
+      status: "PASS",
+      generatedBy: { agent: "team/verifier", session: "ses_dr" },
+      generatedAt: "2026-11-22T10:02:30.000Z",
+      integrityMode: "development",
+      evidence: { tasks: 2, securityAudit: "PASS", allTasksVerifiedPass: true, documentReview: { checked: true, segmentReportsComplete: true, finalReportPresent: true } },
+      reasons: [],
+    },
+    reports: [
+      { taskId: "seg-01", round: 1, status: "PASS", verifierAgent: "team/verifier", checks: [{ passed: true }], fatalFindings: [] },
+      { taskId: "doc-synthesis", round: 1, status: "PASS", verifierAgent: "team/verifier", checks: [{ passed: true }], fatalFindings: [] },
+    ],
+  })
+  const dir = runDirOf(drRoot, drSession)
+  mkdirSync(join(dir, "document-review", "segments", "seg-01"), { recursive: true })
+  writeFileSync(join(dir, "document-review", "manifest.json"), JSON.stringify({ version: 1, segments: [{ id: "seg-01" }] }))
+  writeFileSync(join(dir, "DOCUMENT_REVIEW_REPORT.md"), "# Final Report\n")
+
+  const data = buildExportData(drRoot, drSession)
+  assert.strictEqual(data.error, null)
+  assert.strictEqual(data.topology, "document-review")
+  assert.strictEqual(data.status, "PASS")
+  const html = renderExport(data, { format: "html" })
+  assert(html.includes("document-review"))
+  assert(!html.includes("<script>alert(1)</script>"), "XSS must be escaped in HTML export")
+  assert(!/https?:\/\//i.test(html), "HTML export must contain no live http(s):// links")
+  const md = renderExport(data, { format: "markdown" })
+  assert(md.includes("document-review"))
+  assert(md.includes("seg-01"))
+  assert(md.includes("doc-synthesis"))
+})
+
 // ---------------------------------------------------------------- cleanup
 
 rmSync(testDir, { recursive: true, force: true })

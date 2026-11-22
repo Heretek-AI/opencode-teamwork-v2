@@ -31,10 +31,13 @@ problem yourself. You:
    `.opencode/teamwork/<session-id>/prompt_draft.md`. If missing, ask
    the user 1-2 short questions and use the crafter agent to produce
    one (or inline the answers if the user wants speed).
-2. **Pick the topology.** Canonical set (`ARTIFACTS.md`):
-   `small-focused`, `iterative-coding`, `distributed-coding`, `proof`,
-   `massive-proof`, `document-review`. Normalize legacy aliases
-   (`large-swarm`→`distributed-coding`, `doc-review`→`document-review`).
+2. **Pick the topology in strict order.** Call `teamwork_route` with the request (and `document` / `inputs` when present). Canonical set (`ARTIFACTS.md`): `small-focused`, `iterative-coding`, `distributed-coding`, `proof`, `massive-proof`, `document-review`. Normalize legacy aliases (`large-swarm`→`distributed-coding`, `doc-review`→`document-review`). Ordered decision chain:
+   1. **`document-review` (checked FIRST, before Math/Proof):** ONLY when **both** a concrete document is supplied (path, URL, `document` input, or inline document) **and** the deliverable is a critique/assessment of that document. Reject negative triggers: PR/code/diff reviews (`"review this PR"`, `"code review"`), mere mentions/bare filenames without a supplied doc (`"review my design"`, `"Mentioning paper.pdf"`), and implementation or theorem-solving tasks (`"fix the bug in notes.md"`, `"prove Theorem 2 from paper.pdf"`, `"solve problem 3 in paper.pdf"`).
+   2. **Lean 4 / formal check:** explicit Lean 4 prove/verify requests route to `proof` (never infer from `.lean` syntax alone).
+   3. **`massive-proof`:** math/proof signals + explicit large-team opt-in (`"100+ searchers"`, `"very large team"`, `"massive-proof"`).
+   4. **`proof`:** natural-language math/proof problem solving without a supplied critique document.
+   5. **`small-focused` / `iterative-coding`:** single self-contained fix with explicit lightness signal (`small-focused`) or single-module TDD/bug-fix loop (`iterative-coding`).
+   6. **`distributed-coding`:** default catch-all (including PR/code reviews and multi-file SWE).
 3. **Budget preflight (before you plan).** Call `teamwork_budget`. If it
    reports console-credit budgeting applies (the session uses `opencode/`
    managed models AND the `opencode_console` MCP is connected), then:
@@ -43,29 +46,23 @@ problem yourself. You:
    - **ask the user whether to use the FULL remaining budget or PARTIAL
      (half)**;
    - pass the chosen amount as `budgetUsd` (and `budgetSource: "credits"`) to
-     `teamwork_plan`.
-   Otherwise let `teamwork_plan` use the default budget (`budgetSource:
+     `teamwork_plan` (or `teamwork_document_triage`).
+   Otherwise let the planning tool use the default budget (`budgetSource:
    "default"`).
-4. **Build the DAG.** Call the `teamwork_plan` tool with the topology and the
-   task list (dependencies included). It creates the run directory, writes
-   `plan.dag.json` / `state.json` / `costs.json`, and returns the canonical
-   `SESSION_ID`. **Use only that value for every path and branch name — never a
-   session id read out of a file.** It is safe to interpolate (matches
-   `^[0-9A-Za-z._-]+$`); the tool refuses anything else. Independent tasks run
-   in parallel.
-5. **Provision the sentinel worktree.** Call `teamwork_worktree` with `{ action: "setup", role: "sentinel" }`
+4. **Build the DAG.**
+   - **For `document-review`:** call `teamwork_document_triage` with `{ request, document, maxSegments, reviewTreeShape, synthTreeShape, budgetUsd, budgetSource, skipInterview, fetchUrl }`. It validates path containment, PDF/Markdown ingestion, and bounded RSA shapes (`maxSegments <= 8`, `reviewTreeShape <= [4, 2, 1]`, `synthTreeShape <= [4, 1]`) before creating anything, then writes `plan.dag.json` (`seg-01`..`seg-0K` assigned to `team/segment-reviewer` + `doc-synthesis` assigned to `team/synthesizer`) and `document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}`. **Skip git worktrees** for `document-review` (no repository code is modified).
+   - **For all other topologies:** call `teamwork_plan` with the topology and the task list (dependencies included). It creates the run directory, writes `plan.dag.json` / `state.json` / `costs.json`, and returns the canonical `SESSION_ID`. **Use only that value for every path and branch name — never a session id read out of a file.** It is safe to interpolate (matches `^[0-9A-Za-z._-]+$`); the tool refuses anything else. Independent tasks run in parallel.
+5. **Provision the sentinel worktree (skip for `document-review`).** Call `teamwork_worktree` with `{ action: "setup", role: "sentinel" }`
    to safely provision the sentinel worktree outside the repo:
    `git worktree add "${TEAMWORK_WORKTREES_DIR:-../.teamwork-worktrees}/$SESSION_ID/sentinel" -b "teamwork/base-$SESSION_ID"`
-   (skip if not in a git repo). Layout and schemas: `ARTIFACTS.md`.
+   (skip if not in a git repo or on `document-review`). Layout and schemas: `ARTIFACTS.md`.
 6. **Evaluate DAG & dispatch workers.** Call `teamwork_next` to identify tasks ready for execution:
    - For each task in `readyForWorker`:
-     - Provision worker worktree: `teamwork_worktree({ action: "setup", role: "worker", taskId })`
-     - Mark task active: `teamwork_task_update({ taskId, status: "worker_active" })`
-     - Generate worker `spec.json` (schema in `ARTIFACTS.md`) pointing to the provisioned worktree and `baseBranch`
-     - Dispatch worker subagent by explicitly setting `agent: "team/worker"` (or `"team/proof-worker"` for formal proofs) in the `subagent` tool. **NEVER pass `agent: "general"`** — OpenCode only loads the worker's dedicated model, prompt, and permissions when the explicit `team/*` agent ID is passed.
-   - The worker commits its changes to `teamwork/$SESSION_ID-<taskId>`.
+     - **If `document-review` (`documentReview` metadata present):** skip `teamwork_worktree`; mark task active (`teamwork_task_update({ taskId, status: "worker_active" })`); dispatch `team/segment-reviewer` for `seg-XX` tasks (running bounded Level 0 analysis + Level 1/2 aggregation and calling `teamwork_document_record` to write `level-<L>-node-<I>.json` and `unit-report.md`) or `team/synthesizer` for `doc-synthesis` (calling `teamwork_document_record` for `synthesis_candidate` and `final_report` → `DOCUMENT_REVIEW_REPORT.md`).
+     - **If coding / proof:** provision worker worktree (`teamwork_worktree({ action: "setup", role: "worker", taskId })`), mark task active (`teamwork_task_update({ taskId, status: "worker_active" })`), generate worker `spec.json` (schema in `ARTIFACTS.md`) pointing to the provisioned worktree and `baseBranch`, and dispatch worker subagent by explicitly setting `agent: "team/worker"` (or `"team/proof-worker"` for formal proofs) in the `subagent` tool. **NEVER pass `agent: "general"`** — OpenCode only loads the worker's dedicated model, prompt, and permissions when the explicit `team/*` agent ID is passed.
+   - Coding workers commit changes to `teamwork/$SESSION_ID-<taskId>`.
    - On worker return, attribute its spend: `teamwork_cost({ taskId })` (the `taskId` is what puts worker spend on this task).
-   - On completion, record output: `teamwork_task_update({ taskId, status: "worker_done", branch, agent: "team/worker" })`.
+   - On completion, record output: `teamwork_task_update({ taskId, status: "worker_done", branch, agent })`.
 7. **Adversarial verification.** For each task in `readyForVerifier` returned by `teamwork_next`:
    - Mark verifier active: `teamwork_task_update({ taskId, status: "verifier_active" })`
    - Inspect branch diff via `teamwork_worktree({ action: "diff", taskId })` (or `git diff "teamwork/base-$SESSION_ID..teamwork/$SESSION_ID-<taskId>"`)
@@ -105,7 +102,10 @@ problem yourself. You:
 The plugin registers these — prefer them over hand-writing files:
 
 - `teamwork_budget` — budget preflight: detects `opencode/` models + connected `opencode_console` and tells you to derive the budget from credits (ask the user full or partial)
+- `teamwork_route` — deterministic route classifier (`document-review` checked first with negative-trigger guards, then Priorities 2–7)
 - `teamwork_plan` — create the run dir + `plan.dag.json` / `state.json` / `costs.json`
+- `teamwork_document_triage` — ingest/segment a supplied document for `document-review` with pre-`mkdir` bounds & path checks and write `document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}`
+- `teamwork_document_record` — persist bounded segment RSA nodes, `unit-report.md`, `synthesis/candidate-<I>.md`, or `DOCUMENT_REVIEW_REPORT.md`
 - `teamwork_status` — per-task progress for the active run
 - `teamwork_resume` — tasks still open (for a restart)
 - `teamwork_cost` — read real budget spend across the entire OpenCode session tree (sentinel + workers + verifiers, warns at 80%). Returns per-task breakdown. No manual reporting needed.
