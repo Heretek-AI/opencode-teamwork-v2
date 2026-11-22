@@ -769,8 +769,8 @@ When the toolchain is ready, the run initializes `.opencode/teamwork/<session-id
 
 - `manifest.json`: `phase` (`FORMALIZE | SOLVING | VERIFIED | BLOCKED`), `bounds` (`maxDepth <= 3`, `maxWidth <= 4`, `maxNodes <= 24`, `maxRetries <= 4`, `maxFormalizationRounds <= 3`), `toolchain` snapshot, and `nodes` map keyed by safe `LEMMA_ID` (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`, not `.`/`..`).
 - `problem_draft.lean` & `problem.lean`: Phase 0 formalization written via `teamwork_lemma_formalize({ action: "draft" })`; promoted to `problem.lean` only after compilation (`exitCode === 0`) and `team/formalization-reviewer` `preSearch.verdict === "APPROVE"`.
-- `formalization-review.json`: records `draftVerification`, `preSearch` (`APPROVE | REQUEST_CHANGES`), and `final` (`FAITHFUL | UNFAITHFUL | MISFORMALIZED`).
-- `nodes/<lemmaId>/`: `state.json`, `blueprint.md`, `attempt-<r>.lean`, and stamped `verify-<r>.json` written by `teamwork_lemma_verify` (real `lean`/`lake` execution via `execFileSync` + comment-stripped `sorry`/`admit`/unauthorized `axiom` check even when `lean` exits `0`).
+- `formalization-review.json`: records `draftVerification` (including `draftHash` SHA-256), `preSearch` (`APPROVE | REQUEST_CHANGES`), and `final` (`FAITHFUL | UNFAITHFUL | MISFORMALIZED`).
+- `nodes/<lemmaId>/`: `state.json`, `blueprint.md`, `attempt-<r>.lean`, and stamped `verify-<r>.json` (including `allowedAxioms`) written by `teamwork_lemma_verify` (real `lean`/`lake` execution via `spawnSync` capturing both `stdout` and `stderr`, plus comment/string-stripped `sorry`/`admit`/unauthorized `axiom` check even when `lean` exits `0`).
 - `teamwork_final_verify` validates all `lemma/` artifacts with `O_NOFOLLOW` + `realpathSync` containment and stamps `evidence.lemma` into `verify/final.json`.
 
 ### `scout-report.md`, `candidates/*.md`, `critiques/*.md`, `synthesis/*.md`

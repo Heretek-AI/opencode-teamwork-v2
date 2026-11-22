@@ -1108,27 +1108,28 @@ await check("LEMMA: buildTimeline & renderTimeline surface lemma/manifest.json a
   writeJson(join(dir, "lemma", "manifest.json"), {
     version: 1,
     sessionId: SESSION,
-    phase: "VERIFIED",
+    phase: "VERIFIED\u2028\u2029",
     nodes: {
       root: { id: "root", parentId: null, depth: 0, status: "proved", attempts: 1 },
       helper: { id: "helper", parentId: "root", depth: 1, status: "proved", attempts: 1 },
     },
   })
   writeJson(join(dir, "lemma", "formalization-review.json"), {
-    preSearch: { verdict: "APPROVE", notes: "ok\x1b[31m" },
-    final: { verdict: "FAITHFUL", notes: "ok" },
+    preSearch: { verdict: "APPROVE\u2028", notes: "ok\x1b[31m\u2029" },
+    final: { verdict: "FAITHFUL\u2029", notes: "ok" },
   })
   const tl = buildTimeline(root, SESSION)
   assert.deepStrictEqual(tl.lemma, {
-    phase: "VERIFIED",
+    phase: "VERIFIED\u2028\u2029",
     nodes: 2,
     proved: 2,
-    preSearchVerdict: "APPROVE",
-    finalVerdict: "FAITHFUL",
+    preSearchVerdict: "APPROVE\u2028",
+    finalVerdict: "FAITHFUL\u2029",
   })
   const rendered = renderTimeline(tl, { color: false }).join("\n")
   assert(rendered.includes("lemma: phase=VERIFIED  nodes=2/2 proved  preSearch=APPROVE  final=FAITHFUL"), `expected lemma line, got:\n${rendered}`)
   assert(!rendered.includes(ESC), "rendered timeline must not leak ESC")
+  assert(!/[\u2028\u2029]/.test(rendered), "rendered timeline must strip U+2028 and U+2029 line/paragraph separators")
 
   // Symlinked lemma/ dir is refused with a warning
   const symRoot = makeRun({ plan: { ...PLAN, topology: "proof", lemmaMode: true } })

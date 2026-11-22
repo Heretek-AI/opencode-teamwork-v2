@@ -5,6 +5,8 @@ import {
   formatMissingToolchainRefusal,
   probeLemmaToolchain,
   stripLeanComments,
+  stripLeanCommentsAndStrings,
+  verifyLeanFile,
 } from "../plugins/opencode-teamwork/lemma.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import { currentModels, readRawModelMap, writeModelMap, installAgents, DEFAULT_MODELS } from "../lib/team.mjs"
@@ -1999,7 +2001,7 @@ try {
   for (const p of POLICY) {
     assert.deepStrictEqual(enforced[p.id], p.deny, `${p.id}: code deny set drifted: ${JSON.stringify(enforced[p.id])}`)
   }
-  console.log("✓ READ_ONLY_ACTIONS matches the expected deny set for all four read-only agents")
+  console.log("✓ READ_ONLY_ACTIONS matches the expected deny set for all 5 read-only agents")
 
   // --- 8b: every agent whose code policy denies `edit` is documented in the
   // README read-only paragraph (parsed, not a duplicate hard-coded list).
@@ -2880,11 +2882,16 @@ if (src.includes("SYNTAX_ERROR")) {
   process.exit(1);
 }
 if (src.includes("COMPILER_SORRY_WARN")) {
-  console.warn(target + ":1:0: warning: declaration uses 'sorry'");
+  process.stderr.write(target + ":1:0: warning: declaration uses 'sorry'\\n");
   process.exit(0);
 }
-if (/\\bsorry\\b/.test(src)) {
-  console.warn(target + ":1:0: warning: declaration uses 'sorry'");
+if (src.includes("STDERR_SORRY_AX")) {
+  process.stderr.write("uses sorryAx\\n");
+  process.exit(0);
+}
+const codeOnly = src.replace(/--.*$/gm, "").replace(/\\\/-[\\s\\S]*?-\\\//g, "").replace(/"(?:\\\\.|[^"\\\\])*"/g, '""');
+if (/\\bsorry\\b/.test(codeOnly)) {
+  process.stderr.write(target + ":1:0: warning: declaration uses 'sorry'\\n");
 }
 process.exit(0);
 `,
@@ -2971,6 +2978,17 @@ process.exit(0);
       })
       assert(badTopo.content.startsWith("refused:"), "lemmaMode: true with non-proof topology must refuse before mkdir")
       assert(!existsSync(join(rootNoTool, ".opencode")), "bad topology refusal must write nothing")
+
+      // V2.07: uppercase route: "LEMMA" must still trigger pre-mkdir probe
+      const upperRoutePlan = await tools.plan.execute({
+        sessionId: "20261018-000000-lemma-upper",
+        topology: "proof",
+        route: "LEMMA",
+        skipInterview: true,
+        tasks: [{ id: "L1" }],
+      })
+      assert(upperRoutePlan.content.startsWith("refused:"), `uppercase route LEMMA must refuse before mkdir: ${upperRoutePlan.content}`)
+      assert(!existsSync(join(rootNoTool, ".opencode", "teamwork", "20261018-000000-lemma-upper")), "uppercase route refusal must create zero dirs")
       console.log("✓ 9.1 pre-mkdir / pre-spending refusal & install instructions verified")
     }
 
@@ -2982,8 +3000,10 @@ process.exit(0);
       const positives = [
         "Prove Fermat's Little Theorem in Lean 4",
         "Verify src/Main.lean in Lean 4",
+        "Verify Main.lean",
         "Formalize and prove this theorem in Lean",
         "Fill in the sorry in Lemma1.lean",
+        "Fill in the `sorry` in Lemma1.lean",
       ]
       for (const req of positives) {
         const r = await tools.route.execute({ request: req })
@@ -2998,7 +3018,15 @@ process.exit(0);
         "Grep for sorry in src/Proof.lean",
         "Format and lint all .lean files",
         "Explain this snippet:\n```lean\n-- Prove theorem in Lean 4\ntheorem foo : 1 = 1 := by rfl\n```",
+        "Explain:\n```lean\ntheorem foo : 1 = 1 := by rfl\n```",
         "import Mathlib\ntheorem t : 1 = 1 := by rfl",
+        // V1.12–V1.17 regression cases
+        "explain Foo.lean and also check the theorem statement in my notes",
+        "check proof formatting in Foo.lean",
+        "solve the build issue for Foo.lean",
+        "prove that Foo.lean is in the repo",
+        "Explain this partial snippet:\n```lean\n-- Prove theorem in Lean 4\ntheorem foo : 1 = 1 := by rfl",
+        "Explain why the phrase `Prove this theorem in Lean 4` appears in Foo.lean",
       ]
       for (const req of nonOptInLean) {
         const r = await tools.route.execute({ request: req })
@@ -3016,6 +3044,14 @@ process.exit(0);
       assert.strictEqual(nlProof.route, "proof")
       assert.strictEqual(nlProof.topology, "proof")
       assert.strictEqual(nlProof.lemmaMode, false)
+
+      // V1.18: natural-language proof with illustrative Lean fence stays `proof` (lemmaMode: false)
+      const nlWithFence = await tools.route.execute({
+        request: "Prove that ∀ n : Nat, n + 0 = n\n```lean\ntheorem helper : 1 = 1 := by rfl\n```",
+      })
+      assert.strictEqual(nlWithFence.route, "proof", `V1.18 must route to proof, got ${nlWithFence.route}`)
+      assert.strictEqual(nlWithFence.topology, "proof")
+      assert.strictEqual(nlWithFence.lemmaMode, false)
 
       const docReview = await tools.route.execute({
         request: "Review this Lean 4 formalization paper (paper.pdf)",
@@ -3151,17 +3187,86 @@ process.exit(0);
       const overRetry = await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", leanCode: "theorem main : 1 = 1 := by rfl" })
       assert(overRetry.content.startsWith("refused:"), "exceeding maxRetries must be refused")
 
+      // V3.14: verifyDraft: false after a compiled draft must invalidate draftVerification and refuse APPROVE
+      const RUN_STALE = "20261018-000000-lemma-stale"
+      await tools.plan.execute({
+        sessionId: RUN_STALE,
+        topology: "proof",
+        lemmaMode: true,
+        skipInterview: true,
+        tasks: [{ id: "T1" }],
+      })
+      const goodFirst = await tools.lemma_formalize.execute({
+        sessionId: RUN_STALE,
+        action: "draft",
+        leanCode: "theorem p : 1 = 1 := by sorry",
+        verifyDraft: true,
+      })
+      assert.strictEqual(goodFirst.compiled, true)
+      const unverifiedOverwrite = await tools.lemma_formalize.execute({
+        sessionId: RUN_STALE,
+        action: "draft",
+        leanCode: "SYNTAX_ERROR theorem p : 1 = 1 := by sorry",
+        verifyDraft: false,
+      })
+      assert.strictEqual(unverifiedOverwrite.compiled, false)
+      const staleApproveRefused = await tools.lemma_formalize.execute({
+        sessionId: RUN_STALE,
+        action: "review_pre",
+        verdict: "APPROVE",
+        notes: "should refuse stale draft",
+      })
+      assert(staleApproveRefused.content.startsWith("refused:"), `stale draftVerification must refuse APPROVE: ${staleApproveRefused.content}`)
+
+      // Out-of-band edit to problem_draft.lean after compiled draft must also refuse APPROVE (hash mismatch)
+      await tools.lemma_formalize.execute({
+        sessionId: RUN_STALE,
+        action: "draft",
+        leanCode: "theorem p : 1 = 1 := by sorry",
+        verifyDraft: true,
+      })
+      writeFileSync(join(rootTree, ".opencode", "teamwork", RUN_STALE, "lemma", "problem_draft.lean"), "theorem tampered : False := by sorry\n", "utf8")
+      const tamperRefused = await tools.lemma_formalize.execute({
+        sessionId: RUN_STALE,
+        action: "review_pre",
+        verdict: "APPROVE",
+        notes: "should refuse out-of-band edit",
+      })
+      assert(tamperRefused.content.startsWith("refused:"), `out-of-band problem_draft edit must refuse APPROVE: ${tamperRefused.content}`)
+
       console.log("✓ 9.3 bounded lemma tree & formalization review gate verified")
     }
 
     // --- 9.4 Stub-binary sorry/admit/axiom + exit-code + final_verify ---
     {
-      // Unit check on comment stripping (nested block comments & line comments)
+      // Unit check on comment & string stripping (nested block comments, line comments, string literals, axiom variants)
       const commented = `-- sorry\n/- outer /- sorry -/ admit -/\ntheorem ok : True := trivial`
       assert(!stripLeanComments(commented).includes("sorry"), "comments must be stripped cleanly")
       const cleanCommentHoles = detectLeanProofHoles(commented, "")
       assert.strictEqual(cleanCommentHoles.hasSorry, false)
       assert.strictEqual(cleanCommentHoles.hasAdmit, false)
+
+      // V3.04: "sorry" inside string literals must NOT trigger a false positive
+      const stringSorry = `def msg : String := "sorry, not a proof hole"\ntheorem ok : "sorry" = "sorry" := rfl`
+      assert(!stripLeanCommentsAndStrings(stringSorry).includes("sorry"), "string literal contents must be stripped")
+      const stringHoles = detectLeanProofHoles(stringSorry, "")
+      assert.strictEqual(stringHoles.hasSorry, false, "string-literal 'sorry' must not trigger hasSorry")
+
+      // V3.07–V3.12 + Auditor @[simp] axiom variants
+      const axiomVariants = [
+        "noncomputable axiom my_ax : False",
+        "unsafe axiom my_ax : False",
+        '@[extern "c_fn"] axiom my_ax : False',
+        "@[simp] axiom my_ax : False",
+        "def x := 1 axiom my_ax : False",
+        "axiom «my_ax» : False",
+        "axiom α_ax : False",
+      ]
+      for (const variant of axiomVariants) {
+        const res = detectLeanProofHoles(variant, "")
+        assert.strictEqual(res.hasUnauthorizedAxiom, true, `axiom variant must be flagged: ${variant}`)
+      }
+      assert.strictEqual(detectLeanProofHoles("axiom «my_ax» : False", "", ["my_ax"]).hasUnauthorizedAxiom, false, "allowedAxioms should normalize guillemets")
 
       const stubBin = makeFullStubEnv("verify")
       process.env.PATH = `${stubBin}:${savedPath}`
@@ -3181,19 +3286,32 @@ process.exit(0);
       await tools.lemma_formalize.execute({ sessionId: RUN, action: "review_pre", verdict: "APPROVE", notes: "ok" })
       await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "root" })
 
-      // (a) sorry warning even on exit 0 -> FAIL
-      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 1, leanCode: "COMPILER_SORRY_WARN\ntheorem t : 1 = 1 := by sorry" })
+      // V3.16: direct update to status: "disproved" without verification must be refused
+      const directDisproved = await tools.lemma_node.execute({ sessionId: RUN, action: "update", lemmaId: "root", status: "disproved" })
+      assert(directDisproved.content.startsWith("refused:"), `direct status=disproved must be refused: ${directDisproved.content}`)
+
+      // (a) V3.01b / V3.02: stderr sorry/sorryAx warning on exit 0 with clean .lean text -> FAIL & stderr captured
+      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 1, leanCode: "-- COMPILER_SORRY_WARN\ntheorem t : 1 = 1 := by rfl" })
       const vSorry = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 1 })
-      assert.strictEqual(vSorry.report.status, "FAIL", "sorry warning on exit 0 must FAIL")
+      assert.strictEqual(vSorry.report.status, "FAIL", "stderr sorry warning on exit 0 must FAIL")
       assert.strictEqual(vSorry.report.exitCode, 0)
       assert.strictEqual(vSorry.report.hasSorry, true)
+      assert(vSorry.report.stderr.includes("warning: declaration uses 'sorry'"), `stderr must be captured on exit 0: ${vSorry.report.stderr}`)
+
+      const axTmpFile = join(rootV, "stderr-sorry-ax.lean")
+      writeFileSync(axTmpFile, "-- STDERR_SORRY_AX\ntheorem t : 1 = 1 := by rfl\n", "utf8")
+      const vSorryAx = verifyLeanFile({ filePath: axTmpFile, env: { ...process.env, PATH: `${stubBin}:${savedPath}` } })
+      assert.strictEqual(vSorryAx.status, "FAIL", "stderr uses sorryAx on exit 0 must FAIL")
+      assert.strictEqual(vSorryAx.hasSorry, true)
+      assert(vSorryAx.stderr.includes("sorryAx"))
 
       // (b) admit & unauthorized axiom -> FAIL
-      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 2, leanCode: "axiom bogus : False\ntheorem t : 1 = 1 := by admit" })
-      const vAx = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 2 })
+      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 2, leanCode: "@[simp] axiom bogus : False\ntheorem t : 1 = 1 := by admit" })
+      const vAx = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 2, allowedAxioms: ["other_ax"] })
       assert.strictEqual(vAx.report.status, "FAIL")
       assert.strictEqual(vAx.report.hasAdmit, true)
       assert.strictEqual(vAx.report.hasUnauthorizedAxiom, true)
+      assert.deepStrictEqual(vAx.report.allowedAxioms, ["other_ax"], "allowedAxioms must be persisted into verify report")
 
       // (c) clean .lean text but lean exits 1 -> FAIL (never infer PASS from text!)
       await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 3, leanCode: "-- SYNTAX_ERROR\ntheorem t : 1 = 1 := by rfl" })
@@ -3212,9 +3330,9 @@ process.exit(0);
       await tools.security_audit.execute({ sessionId: RUN, status: "PASS", findings: [] })
 
       // (d) clean .lean + exit 0 -> PASS, but without final FAITHFUL review final_verify must FAIL
-      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 4, leanCode: "theorem t : 1 = 1 := by rfl" })
+      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 4, leanCode: 'def msg : String := "sorry, not a hole"\ntheorem t : 1 = 1 := by rfl' })
       const vPass = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 4 })
-      assert.strictEqual(vPass.report.status, "PASS")
+      assert.strictEqual(vPass.report.status, "PASS", `string-literal sorry should PASS: ${JSON.stringify(vPass.report)}`)
       assert.strictEqual(vPass.report.executed, true)
       assert.strictEqual(vPass.report.exitCode, 0)
 
@@ -3231,7 +3349,20 @@ process.exit(0);
       const fvTampered = await tools.final_verify.execute({ sessionId: RUN })
       assert.strictEqual(fvTampered.status, "FAIL", "unstamped executed:false verify report must FAIL final_verify")
 
-      // Restore valid stamped verify-4.json -> final_verify PASS with evidence.lemma
+      // Restore valid stamped verify-4.json
+      writeFileSync(verify4File, savedVerify4)
+
+      // V3.15: manifest.phase === "BLOCKED" must FAIL final_verify even when nodes & verify reports look clean
+      const manifestFile = join(rootV, ".opencode", "teamwork", RUN, "lemma", "manifest.json")
+      const savedManifest = readFileSync(manifestFile, "utf8")
+      const blockedManifest = JSON.parse(savedManifest)
+      blockedManifest.phase = "BLOCKED"
+      writeFileSync(manifestFile, JSON.stringify(blockedManifest, null, 2) + "\n")
+      const fvBlocked = await tools.final_verify.execute({ sessionId: RUN })
+      assert.strictEqual(fvBlocked.status, "FAIL", "manifest.phase=BLOCKED must FAIL final_verify")
+
+      // Restore valid manifest -> final_verify PASS with evidence.lemma
+      writeFileSync(manifestFile, savedManifest)
       writeFileSync(verify4File, savedVerify4)
       const fvOk = await tools.final_verify.execute({ sessionId: RUN })
       assert.strictEqual(fvOk.status, "PASS", `valid LEMMA run must PASS final_verify: ${fvOk.content}`)
@@ -3275,6 +3406,18 @@ process.exit(0);
       symlinkSync(outside, join(runSymDir, "lemma"))
       const symRes = await tools.lemma_node.execute({ sessionId: RUN_SYM, action: "create", lemmaId: "root" })
       assert(symRes.content.startsWith("refused:"), `symlinked lemma/ must be refused: ${symRes.content}`)
+
+      // Reviewer Finding 4: symlinked cwd in lemma_verify must be refused via realpathSync/lstatSync containment
+      await tools.lemma_formalize.execute({ sessionId: RUN, action: "draft", leanCode: "theorem t : 1 = 1 := by sorry" })
+      await tools.lemma_formalize.execute({ sessionId: RUN, action: "review_pre", verdict: "APPROVE", notes: "ok" })
+      await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "root" })
+      await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 1, leanCode: "theorem t : 1 = 1 := by rfl" })
+      symlinkSync(outside, join(rootSec, "escape-cwd"))
+      const symCwdRes = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 1, cwd: "escape-cwd" })
+      assert(symCwdRes.content.startsWith("refused:"), `symlinked cwd must be refused: ${symCwdRes.content}`)
+      mkdirSync(join(rootSec, "lean-sub"), { recursive: true })
+      const okCwdRes = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 1, cwd: "lean-sub" })
+      assert.strictEqual(okCwdRes.report?.status, "PASS", `valid subdir cwd must succeed: ${okCwdRes.content}`)
 
       console.log("✓ 9.5 security containment (LEMMA_ID, symlink, sanitization) verified")
     }
