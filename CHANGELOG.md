@@ -12,11 +12,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Input pre-flight gate. A shared inventory helper extracts explicit `inputs`, URLs, blocking absolute/`~`/`file:` paths and advisory relative path-like tokens from the routed request (deduplicated, capped at 100). `teamwork_plan` gains `inputs`, `checkUrls` and `allowMissingInputs`; `MISSING`/`OUTAGE` refuse the plan before anything is written. A bypass persists `plan.dag.json.preflight: {status, bypassed: true}` plus a `run_created` note; `READY` records `{status: "READY", bypassed: false}`, and a run with no inventory records `{status: "SKIPPED"}`.
 - `teamwork_preflight` re-runs the input check for an existing run and writes `<run>/preflight.json` (`checkedAt`, `integrityMode`, `items`, `summary`), appending a `preflight` event. URLs are `UNCHECKED` by default; `checkUrls: true` issues one 3 s HEAD request per URL and yields `READY` or `OUTAGE`.
 - `events.jsonl` gains the `preflight` event kind.
+- Export reports (HTML and Markdown) gain a "Run terms" block showing the integrity mode, the pre-flight status with an explicit `(bypassed)` marker, and final-verdict provenance (`stamped by <agent/session>`, `UNSTAMPED (legacy)`, or `not produced`); all values are escaped, and legacy runs degrade to `not recorded`.
+- `opencode-teamwork doctor --json` gains an additive `nextSteps` array naming one command for the first non-passing check; existing `ok` and `checks` fields are unchanged.
 
 ### Changed
 
 - Planning can now be refused for missing blocking inputs, and the refusal writes no run directory. The `allowMissingInputs` bypass is explicit and recorded.
 - Integrity violations force the security audit to FAIL, which blocks merge and final verification.
+- `opencode-teamwork doctor` prints an actionable `Next steps:` line pointing at the first non-passing check; the seven-check contract is unchanged.
+- The model picker ends with an `agent → model` summary and warns, keeping the previous value, when typed input is neither a detected model nor `provider/model`; the banner count is derived from the shipped team instead of hardcoded.
+- `opencode-teamwork init` prints the two next commands: `opencode-teamwork models`, then `/teamwork-craft`.
+- The README adds a five-minute first-run walkthrough and a "Completion guarantees" section, lists `teamwork_preflight` and `teamwork_final_verify` in the engine table, and documents all 11 agents including `team/security-auditor`.
 
 ## [0.5.8] - 2026-11-22
 

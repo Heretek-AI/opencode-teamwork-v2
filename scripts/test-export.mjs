@@ -154,10 +154,27 @@ const REPORT_BETA = {
   fatalFindings: [{ where: "src/beta.mjs:3", why: "empty input crashes", fix: "guard the empty case" }],
 }
 
+// Run terms: demo mode, a recorded preflight bypass, and a stamped final verdict.
+const TERMS_PLAN = { ...PLAN, integrityMode: "demo", preflight: { status: "MISSING", bypassed: true } }
+const TERMS_STATE = { ...STATE, integrityMode: "demo" }
+const FINAL_STAMPED = {
+  status: "PASS",
+  generatedBy: { agent: "team/final-verifier", session: "ses_final_verify" },
+  generatedAt: "2026-10-18T10:04:00.000Z",
+  integrityMode: "demo",
+  evidence: { tasks: 2, securityAudit: "PASS", allTasksVerifiedPass: false },
+  reasons: [],
+}
+
+// A single passing task, so a final PASS verdict yields an overall PASS.
+const PASS_STATE = { ...STATE, tasks: { alpha: STATE.tasks.alpha } }
+const PASS_PLAN = { ...TERMS_PLAN, tasks: [TERMS_PLAN.tasks[0]] }
+const PASS_REPORTS = [REPORT_ALPHA]
+
 /**
  * Write a run directory under `root`. Pass `null` for any file to omit it.
  */
-function writeRun(root, { id = SESSION, events = EVENTS, state = STATE, plan = PLAN, costs = COSTS, security = SECURITY, reports = [REPORT_ALPHA, REPORT_BETA] } = {}) {
+function writeRun(root, { id = SESSION, events = EVENTS, state = STATE, plan = PLAN, costs = COSTS, security = SECURITY, finalReport = null, reports = [REPORT_ALPHA, REPORT_BETA] } = {}) {
   const dir = runDirOf(root, id)
   mkdirSync(dir, { recursive: true })
   if (events !== null) writeFileSync(join(dir, "events.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + "\n")
@@ -165,6 +182,7 @@ function writeRun(root, { id = SESSION, events = EVENTS, state = STATE, plan = P
   if (plan !== null) writeJson(join(dir, "plan.dag.json"), plan)
   if (costs !== null) writeJson(join(dir, "costs.json"), costs)
   if (security !== null) writeJson(join(dir, "verify", "security-audit.json"), security)
+  if (finalReport !== null) writeJson(join(dir, "verify", "final.json"), finalReport)
   for (const report of reports) writeJson(join(dir, "verify", `report-${report.taskId}.json`), report)
   return dir
 }
@@ -253,6 +271,93 @@ await check("Markdown: contains a checklist line (- [ ] or - [x])", () => {
   assert(/^- \[[ x]\] /m.test(md), "Markdown must contain a checklist item")
   assert(/^- \[x\] alpha: /m.test(md), "the passed task must be a checked item")
   assert(/^- \[ \] beta: /m.test(md), "the failed task must be an unchecked item")
+})
+
+// ==========================================
+// 2b. Run terms (integrity mode, preflight, final verdict provenance)
+// ==========================================
+
+const termsData = buildExportData(makeRun({ plan: TERMS_PLAN, state: TERMS_STATE, finalReport: FINAL_STAMPED }), SESSION)
+
+await check("Run terms: buildExportData records integrity mode, preflight bypass and a stamped verdict", () => {
+  assert.strictEqual(termsData.error, null, `buildExportData must succeed, got: ${termsData.error}`)
+  assert.deepStrictEqual(termsData.terms, {
+    integrityMode: "demo",
+    preflight: { status: "MISSING", bypassed: true },
+    finalVerdict: {
+      status: "PASS",
+      stamped: true,
+      generatedBy: { agent: "team/final-verifier", session: "ses_final_verify" },
+      generatedAt: "2026-10-18T10:04:00.000Z",
+      integrityMode: "demo",
+    },
+  })
+})
+
+await check("Run terms: HTML shows integrity mode, preflight bypass and the stamping agent/session", () => {
+  const html = renderExport(termsData, { format: "html" })
+  assert(html.includes("demo"), "the integrity mode must appear")
+  assert(html.includes("MISSING (bypassed)"), "the bypassed preflight must be marked")
+  assert(html.includes("team/final-verifier"), "the stamping agent must appear")
+  assert(html.includes("ses_final_verify"), "the stamping session must appear")
+  assert(html.includes("2026-10-18T10:04:00.000Z"), "the generatedAt timestamp must appear")
+  assert(html.includes("stamped by "), "the verdict must be labelled as stamped")
+})
+
+await check("Run terms: Markdown shows integrity mode, preflight bypass and the stamping agent/session", () => {
+  const md = renderExport(termsData, { format: "markdown" })
+  assert(md.includes("demo"), "the integrity mode must appear")
+  assert(md.includes("MISSING (bypassed)"), "the bypassed preflight must be marked")
+  assert(md.includes("team/final-verifier"), "the stamping agent must appear")
+  assert(md.includes("ses\\_final\\_verify"), "the stamping session must appear (escaped)")
+  assert(md.includes("stamped by "), "the verdict must be labelled as stamped")
+})
+
+await check("Run terms: an unstamped verdict is marked UNSTAMPED and the run status is unchanged", () => {
+  const unstamped = { status: "PASS", integrityMode: "demo" }
+  const failData = buildExportData(makeRun({ plan: TERMS_PLAN, state: TERMS_STATE, finalReport: unstamped }), SESSION)
+  assert.strictEqual(failData.terms.finalVerdict.stamped, false, "a final report without generatedBy is unstamped")
+  assert.strictEqual(failData.status, "FAIL", "a failed task still fails the run despite an unstamped PASS")
+  const failHtml = renderExport(failData, { format: "html" })
+  const failMd = renderExport(failData, { format: "markdown" })
+  assert(failHtml.includes("UNSTAMPED"), "HTML must label the legacy verdict UNSTAMPED")
+  assert(failMd.includes("UNSTAMPED"), "Markdown must label the legacy verdict UNSTAMPED")
+  assert(/class="badge b-fail">FAIL</.test(failHtml), "HTML must still render the FAIL badge")
+  assert(failMd.includes("| Status | **FAIL** |"), "Markdown must still render the FAIL status")
+
+  const passData = buildExportData(
+    makeRun({ plan: PASS_PLAN, state: PASS_STATE, finalReport: unstamped, reports: PASS_REPORTS }),
+    SESSION,
+  )
+  assert.strictEqual(passData.status, "PASS", "an unstamped PASS with all tasks passing is still an overall PASS")
+  const passHtml = renderExport(passData, { format: "html" })
+  const passMd = renderExport(passData, { format: "markdown" })
+  assert(passHtml.includes("UNSTAMPED"), "HTML must label the legacy verdict UNSTAMPED")
+  assert(/class="badge b-pass">PASS</.test(passHtml), "HTML must still render the PASS badge")
+  assert(passMd.includes("| Status | **PASS** |"), "Markdown must still render the PASS status")
+})
+
+await check("Run terms: a legacy run degrades to not recorded / not produced without throwing", () => {
+  assert.deepStrictEqual(healthyData.terms, { integrityMode: null, preflight: null, finalVerdict: null })
+  const html = renderExport(healthyData, { format: "html" })
+  const md = renderExport(healthyData, { format: "markdown" })
+  assert(html.includes("not recorded"), "HTML must show 'not recorded' for absent mode/preflight")
+  assert(html.includes("not produced"), "HTML must show 'not produced' for an absent verdict")
+  assert(md.includes("not recorded"), "Markdown must show 'not recorded' for absent mode/preflight")
+  assert(md.includes("not produced"), "Markdown must show 'not produced' for an absent verdict")
+})
+
+await check("Run terms: a <script> agent name is escaped in both outputs", () => {
+  const data = buildExportData(
+    makeRun({ plan: TERMS_PLAN, state: TERMS_STATE, finalReport: { ...FINAL_STAMPED, generatedBy: { agent: XSS, session: "ses_final_verify" } } }),
+    SESSION,
+  )
+  const html = renderExport(data, { format: "html" })
+  const md = renderExport(data, { format: "markdown" })
+  assert(!html.includes("<script>"), "raw <script> must not appear in the HTML")
+  assert(/<dt>Final verdict<\/dt><dd>stamped by &lt;script&gt;alert\(1\)&lt;\/script&gt; \/ ses_final_verify at /.test(html), "the terms verdict must be HTML-escaped")
+  assert(!md.includes("<script>"), "raw <script> must not appear in the Markdown")
+  assert(md.includes("stamped by \\<script\\>alert(1)\\</script\\> / ses\\_final\\_verify"), "the terms verdict must be Markdown-escaped")
 })
 
 // ==========================================

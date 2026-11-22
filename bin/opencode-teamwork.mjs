@@ -26,7 +26,7 @@ import {
 } from "../lib/team.mjs"
 import { detectAvailableModels, pickModels, applyOverrides } from "../lib/picker.mjs"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
-import { runDoctor } from "../lib/doctor.mjs"
+import { runDoctor, nextSteps } from "../lib/doctor.mjs"
 import { buildTimeline, renderTimeline, timelineWarnings } from "../lib/timeline.mjs"
 import { buildExportData, renderExport } from "../lib/export.mjs"
 
@@ -146,7 +146,7 @@ function isInteractive(options) {
   return !options.yes && Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY)
 }
 
-function printSummary(configDir, models, install, registration) {
+function printSummary(configDir, models, install, registration, { init = false } = {}) {
   const changed = install.created.length + install.updated.length
   console.log("")
   console.log(`Config dir : ${configDir}`)
@@ -166,9 +166,14 @@ function printSummary(configDir, models, install, registration) {
   for (const agent of TEAM_AGENTS) console.log(`  ${agent.id.padEnd(20)} ${models[agent.id]}`)
   if (changed === 0 && !registration) console.log("\nNothing changed.")
   console.log("\nRestart OpenCode (or run `opencode reload`) to pick up the changes.")
+  if (init) {
+    console.log("\nNext steps:")
+    console.log("  opencode-teamwork models")
+    console.log("  /teamwork-craft  (in OpenCode)")
+  }
 }
 
-async function run(options, { register }) {
+async function run(options, { register, init = false }) {
   const configDir = resolveConfigDir(options.configDir)
   const current = currentModels(configDir)
 
@@ -183,7 +188,7 @@ async function run(options, { register }) {
   const install = installAgents({ configDir, models, dryRun: options.dryRun, refresh: options.refresh === true })
   const registration = register ? registerPlugin({ configDir, dryRun: options.dryRun }) : undefined
 
-  printSummary(configDir, models, install, registration)
+  printSummary(configDir, models, install, registration, { init })
 }
 
 function status(options) {
@@ -443,9 +448,11 @@ const DOCTOR_INDICATORS = { pass: "[✓]", warn: "[!]", fail: "[✗]" }
 function doctorCommand(options) {
   const configDir = resolveConfigDir(options.configDir)
   const report = runDoctor({ configDir, cwd: process.cwd() })
+  const steps = nextSteps(report.checks)
 
   if (options.json) {
-    console.log(JSON.stringify(report, null, 2))
+    // Additive: existing consumers still see { ok, checks }; nextSteps is new.
+    console.log(JSON.stringify({ ...report, nextSteps: steps }, null, 2))
     process.exitCode = report.ok ? 0 : 1
     return
   }
@@ -464,6 +471,10 @@ function doctorCommand(options) {
     console.log(warned ? `Environment looks healthy (${warned} warning(s)).` : "Environment looks healthy.")
   } else {
     console.log(`Environment has ${failed} failing check(s)${warned ? ` and ${warned} warning(s)` : ""}.`)
+  }
+  if (steps.length) {
+    console.log("\nNext steps:")
+    for (const step of steps) console.log(`  → ${step}`)
   }
   process.exitCode = report.ok ? 0 : 1
 }
@@ -497,7 +508,7 @@ async function main() {
   if (command === "models") {
     return run(options, { register: false })
   }
-  return run(options, { register: options.register })
+  return run(options, { register: options.register, init: true })
 }
 
 main().catch((error) => {

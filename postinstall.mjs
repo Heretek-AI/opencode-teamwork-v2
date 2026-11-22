@@ -1,6 +1,6 @@
 // opencode-teamwork-v2 — postinstall hook
 //
-// Installs the 10 `team/*` agent markdown files into the OpenCode config
+// Installs the 11 `team/*` agent markdown files into the OpenCode config
 // directory and asks the user which model each agent should use.
 //
 // It deliberately does NOT edit opencode.json: OpenCode's own

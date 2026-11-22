@@ -58,6 +58,7 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 | --- | --- |
 | `teamwork_budget` | budget preflight: console credit derivation |
 | `teamwork_plan` | create the run dir + `plan.dag.json` / `state.json` / `costs.json` |
+| `teamwork_preflight` | re-check a run's named inputs, write `preflight.json` (reports, never blocks) |
 | `teamwork_status` | per-task progress for the active run |
 | `teamwork_resume` | tasks still open, for a restart |
 | `teamwork_cost` | read real budget spend across OpenCode session tree (sentinel + workers + verifiers) |
@@ -65,6 +66,7 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 | `teamwork_next` | evaluates DAG dependencies, lifecycle states, and ready tasks |
 | `teamwork_task_update` | deterministic task state machine transitions (`pending` → `worker_active` → `worker_done` → `verifier_active` → `verified_pass` / `verified_fail` / `blocked`) |
 | `teamwork_security_audit` | mandatory pre-merge security gate (`verify/security-audit.json`) |
+| `teamwork_final_verify` | compute the final verdict from the task reports + security audit, stamp it, write `verify/final.json` |
 | `teamwork_worktree` | out-of-repo git worktree provisioning, diff, merge, resolve & cleanup |
 
 Hooks: `permission.evaluate` enforces the per-agent read-only policy **in code**
@@ -82,6 +84,14 @@ All run artifacts live under `.opencode/teamwork/<session-id>/`; see
 topologies, and the JSON schemas (`spec.json`, `plan.dag.json`, `state.json`,
 `verification_report.json`). The installer copies that reference to
 `<config-dir>/teamwork/ARTIFACTS.md` next to your agents.
+
+### Completion guarantees
+
+- `verified_pass` requires a legal lifecycle transition and PASS evidence (an inline PASS verdict or a `PASS` per-task report).
+- A run completes only with a `PASS` `verify/final.json` stamped by `teamwork_final_verify`; an unstamped report needs the recorded `allowUnstamped` bypass.
+- The security audit fails on integrity-rule violations for the run's mode, and that blocks the merge.
+- Planning refuses to start when blocking inputs are missing or unreachable unless `allowMissingInputs` is recorded.
+- Legacy topology aliases are normalised on write; an unknown topology is refused before anything is written.
 
 ## Install
 
@@ -188,6 +198,40 @@ defaults without touching files that already exist.
 
    To activate without a restart: `opencode reload`.
 
+## First run (5 minutes)
+
+1. Install the plugin: `opencode plugin add opencode-teamwork-v2`.
+
+2. Assign models and install the agents. `init` writes
+   `~/.config/opencode/teamwork.json`, installs all 11 agents and registers the
+   plugin; `models` rewrites only the model map and the agents' `model:` lines.
+   Both are safe to re-run.
+
+   ```sh
+   npx opencode-teamwork-v2 init
+   npx opencode-teamwork-v2 models
+   ```
+
+3. In your project, run `/teamwork-craft`. The 9-step interview writes the
+   approved spec to `.opencode/teamwork/<session-id>/prompt_draft.md`.
+
+4. Review it, then run `/teamwork <session-id>`. Planning now **requires a
+   non-empty `prompt_draft.md`**; the explicit bypass is `skipInterview: true`
+   on `teamwork_plan`, recorded as `specGate: "bypassed"`.
+
+5. The run directory `.opencode/teamwork/<session-id>/` holds `plan.dag.json`
+   (the task DAG), per-task `verify/report-<task>.json` reports, and
+   `verify/final.json` — written and stamped by `teamwork_final_verify`, never
+   by hand.
+
+6. Inspect it afterwards from the project root:
+
+   ```sh
+   npx opencode-teamwork-v2 status     # install + model map
+   npx opencode-teamwork-v2 timeline   # per-task timing, rounds, spend
+   npx opencode-teamwork-v2 export     # HTML report (-m for Markdown)
+   ```
+
 ## Run reports (`export`)
 
 `opencode-teamwork export` turns one run into a report you can share or archive.
@@ -241,7 +285,7 @@ format details.
 Each agent's model lives in the `model:` frontmatter of its markdown file. The
 shipped defaults are:
 
-- `deepseek/deepseek-v4-pro`: sentinel, orchestrator, synthesizer, verifier, falsifier, proof-worker
+- `deepseek/deepseek-v4-pro`: sentinel, orchestrator, synthesizer, verifier, falsifier, proof-worker, security-auditor
 - `deepseek/deepseek-flash`: crafter, worker, proposer, scout
 
 Change them with `opencode-teamwork init` (interactive), the flags above
@@ -310,9 +354,10 @@ built-ins.
 
 ## Agents
 
-`team/crafter`, `team/sentinel`, `team/worker`, `team/proof-worker`,
-`team/verifier`, `team/orchestrator`, `team/proposer`, `team/falsifier`,
-`team/synthesizer`, `team/scout`.
+The 11 shipped agents are: `team/crafter`, `team/sentinel`, `team/worker`,
+`team/proof-worker`, `team/verifier`, `team/security-auditor`,
+`team/orchestrator`, `team/proposer`, `team/falsifier`, `team/synthesizer`,
+`team/scout`.
 
 Model assignments live in each agent's frontmatter (`model:`); see
 [Model assignment](#model-assignment) for how to set them.

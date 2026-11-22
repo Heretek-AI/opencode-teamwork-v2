@@ -7,7 +7,7 @@
 //
 // Run with plain Node (no test framework): an uncaught assertion exits non-zero.
 
-import { runDoctor, CHECK_NAMES } from "../lib/doctor.mjs"
+import { runDoctor, CHECK_NAMES, nextSteps } from "../lib/doctor.mjs"
 import { TEAM_AGENTS, PACKAGE_NAME, writeModelMap } from "../lib/team.mjs"
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -67,6 +67,7 @@ function makeGitRepo() {
 
 /** Assert the report carries exactly the seven checks in the fixed order. */
 function assertCheckOrder(checks) {
+  assert.strictEqual(CHECK_NAMES.length, 7, "the check contract must define exactly seven names")
   assert.deepStrictEqual(
     checks.map((check) => check.name),
     CHECK_NAMES,
@@ -101,6 +102,7 @@ try {
   for (const check of healthyReport.checks) {
     assert.strictEqual(check.status, "pass", `expected ${check.name} to pass, got ${check.status}: ${check.message}`)
   }
+  assert.deepStrictEqual(nextSteps(healthyReport.checks), [], "a fully passing report must yield no next steps")
 
   console.log("✓ Healthy environment passes all 7 checks in fixed order (ok: true)")
 
@@ -187,6 +189,8 @@ try {
   assert.strictEqual(parsed.ok, true, "CLI JSON must report ok: true for a healthy fixture")
   assert.strictEqual(parsed.checks.length, 7, "CLI JSON must report exactly 7 checks")
   assertCheckOrder(parsed.checks)
+  assert(Array.isArray(parsed.nextSteps), "CLI JSON must expose an additive nextSteps array")
+  assert.deepStrictEqual(parsed.nextSteps, [], "healthy CLI JSON must carry an empty nextSteps array")
   assert(
     parsed.checks.every((check) => check.status === "pass"),
     "CLI JSON checks must all be pass for a healthy fixture",
@@ -212,8 +216,71 @@ try {
     encoding: "utf8",
   })
   assert.strictEqual(brokenExit.status, 1, `doctor with a missing agent must exit 1, got ${brokenExit.status}`)
+  const brokenJson = JSON.parse(brokenExit.stdout)
+  assert.deepStrictEqual(
+    brokenJson.nextSteps,
+    ["opencode-teamwork init"],
+    "JSON nextSteps must name the init command for a missing-agent failure",
+  )
+
+  const brokenText = spawnSync(process.execPath, [cliPath, "doctor", "--config-dir", brokenFixture.configDir], {
+    cwd: gitRepo,
+    encoding: "utf8",
+  })
+  assert.strictEqual(brokenText.status, 1, `text doctor with a missing agent must exit 1, got ${brokenText.status}`)
+  assert(
+    brokenText.stdout.includes("→ opencode-teamwork init"),
+    `text doctor output must render the actionable step, got:\n${brokenText.stdout}`,
+  )
+  assert(
+    !brokenText.stdout.includes("→ opencode-teamwork models"),
+    "text doctor output must not render steps for later checks once one is matched",
+  )
 
   console.log("✓ CLI exit codes verified (0 healthy, 1 on failure)")
+
+  // ==========================================
+  // Part 7: nextSteps advice is additive and first-failure only
+  // ==========================================
+  console.log("Testing nextSteps advice...")
+
+  assert.deepStrictEqual(nextSteps(missingReport.checks), ["opencode-teamwork init"], "agents_installed must map to init")
+  assert.deepStrictEqual(nextSteps(desyncReport.checks), ["opencode-teamwork models"], "model_sync must map to models")
+
+  // A non-pass config check comes first, so later agent failures must not add a
+  // second command.
+  assert.deepStrictEqual(
+    nextSteps([
+      { name: "config_file", status: "warn", message: "" },
+      { name: "agents_installed", status: "fail", message: "" },
+    ]),
+    [`opencode plugin add ${PACKAGE_NAME}`],
+    "only the first non-pass check may produce a step",
+  )
+
+  const expectedSteps = {
+    config_file: `opencode plugin add ${PACKAGE_NAME}`,
+    plugin_registration: `opencode plugin add ${PACKAGE_NAME}`,
+    agents_installed: "opencode-teamwork init",
+    model_sync: "opencode-teamwork models",
+    git_installed: "Install git (https://git-scm.com/downloads)",
+    git_repository: "git init",
+    worktrees_dir: "Set TEAMWORK_WORKTREES_DIR to a writable directory",
+  }
+  assert.deepStrictEqual(
+    Object.keys(expectedSteps),
+    CHECK_NAMES,
+    "every check in the contract must have exactly one mapping",
+  )
+  for (const [name, command] of Object.entries(expectedSteps)) {
+    assert.deepStrictEqual(
+      nextSteps([{ name, status: name === "git_installed" ? "fail" : "warn", message: "" }]),
+      [command],
+      `${name} must map to its actionable command`,
+    )
+  }
+
+  console.log("✓ nextSteps maps the first non-pass check only; all-pass yields []")
 } finally {
   rmSync(testDir, { recursive: true, force: true })
   for (const dir of fixtureDirs) rmSync(dir, { recursive: true, force: true })
