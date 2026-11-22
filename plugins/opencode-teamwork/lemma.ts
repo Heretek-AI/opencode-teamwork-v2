@@ -12,7 +12,6 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readFileSync,
   readSync,
   realpathSync,
   renameSync,
@@ -45,9 +44,10 @@ export interface LemmaBounds {
 }
 
 export type ProbeStatus = "READY" | "MISSING" | "OUTAGE"
+export type LemmaBinaryName = "lean" | "lake" | "leap-tools"
 
 export interface BinaryProbeResult {
-  name: "lean" | "lake" | "leap-tools"
+  name: LemmaBinaryName
   available: boolean
   status: ProbeStatus
   path: string | null
@@ -61,7 +61,7 @@ export interface LemmaProbeResult {
   lean: BinaryProbeResult
   lake: BinaryProbeResult
   leapTools: BinaryProbeResult
-  missing: Array<"lean" | "lake" | "leap-tools">
+  missing: LemmaBinaryName[]
   installInstructions: string
 }
 
@@ -74,9 +74,17 @@ export type RouteName =
   | "iterative-coding"
   | "general"
 
+export type CanonicalTopology =
+  | "small-focused"
+  | "iterative-coding"
+  | "distributed-coding"
+  | "proof"
+  | "massive-proof"
+  | "document-review"
+
 export interface RouteClassification {
   route: RouteName
-  topology: "small-focused" | "iterative-coding" | "distributed-coding" | "proof" | "massive-proof" | "document-review"
+  topology: CanonicalTopology
   lemmaMode: boolean
   reason: string
   signals: {
@@ -92,14 +100,20 @@ export function isSafeLemmaId(id: unknown): id is string {
   return typeof id === "string" && LEMMA_ID.test(id) && id !== "." && id !== ".."
 }
 
+function asStr(value: unknown): string {
+  if (typeof value === "string") return value
+  if (typeof value === "number" || typeof value === "boolean") return String(value)
+  return ""
+}
+
 export function clean(value: unknown, max = 64): string {
-  return String(value ?? "")
+  return asStr(value)
     .replace(/[\r\n\t\x00-\x1f\x7f-\x9f\u0085\u2028\u2029]/g, " ")
     .slice(0, max)
 }
 
 export function cleanBlock(value: unknown, max = 2000): string {
-  const s = String(value ?? "").replace(/[\r\t\x00-\x09\x0b-\x1f\x7f-\x9f\u0085\u2028\u2029]/g, " ")
+  const s = asStr(value).replace(/[\r\x00-\x09\x0b-\x1f\x7f-\x9f\u0085\u2028\u2029]/g, " ")
   return s.length > max ? s.slice(0, Math.max(0, max - 1)) + "…" : s
 }
 
@@ -175,14 +189,14 @@ export function ensureSafeSubpath(runDir: string, relPath: string): { path?: str
 
 /**
  * Read a regular file with O_NOFOLLOW and a strict byte cap (default 1 MiB).
+ * Opens the descriptor first with O_NOFOLLOW and runs fstatSync(fd) on the open
+ * descriptor so there is no TOCTOU check-then-open race.
  */
 export function readBoundedRegular(file: string, maxBytes = MAX_LEMMA_FILE_BYTES): { text?: string; error?: string } {
   let fd: number | null = null
   try {
-    const lst = lstatSync(file)
-    if (lst.isSymbolicLink()) return { error: `refused: symlinked file "${basename(file)}"` }
-    if (!lst.isFile()) return { error: `refused: "${basename(file)}" is not a regular file` }
-    fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+    const nofollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0
+    fd = openSync(file, fsConstants.O_RDONLY | nofollow)
     const st = fstatSync(fd)
     if (!st.isFile()) return { error: `refused: "${basename(file)}" is not a regular file` }
     if (st.size > maxBytes) return { error: `refused: "${basename(file)}" exceeds ${maxBytes} byte read cap` }
@@ -198,6 +212,7 @@ export function readBoundedRegular(file: string, maxBytes = MAX_LEMMA_FILE_BYTES
     return { text: buf.subarray(0, total).toString("utf8") }
   } catch (err: any) {
     if (err?.code === "ENOENT") return { error: `missing: "${basename(file)}" does not exist` }
+    if (err?.code === "ELOOP" || err?.code === "EMLINK") return { error: `refused: symlinked file "${basename(file)}"` }
     return { error: `unreadable: "${basename(file)}" (${clean(err?.message, 80)})` }
   } finally {
     if (fd !== null) {
@@ -316,12 +331,23 @@ function probeBinary(
 
   const primary = runProbe("--version")
   if (primary.ok) {
+    const verLine = clean(firstNonEmptyLine(primary.output) || `${name} ready`, 120)
+    if (name === "lean" && /\bversion\s+[0-3]\./i.test(verLine)) {
+      return {
+        name,
+        available: false,
+        status: "OUTAGE",
+        path: resolved,
+        version: verLine,
+        error: `Lean 4 is required, but ${resolved} reported "${verLine}"`,
+      }
+    }
     return {
       name,
       available: true,
       status: "READY",
       path: resolved,
-      version: clean(firstNonEmptyLine(primary.output) || `${name} ready`, 120),
+      version: verLine,
     }
   }
 
@@ -422,17 +448,16 @@ export function formatMissingToolchainRefusal(probe: LemmaProbeResult): string {
 // Priority-ordered explicit opt-in route classifier
 // ---------------------------------------------------------------------------
 
+function stripTrailingUnclosedFence(text: string, marker: string): string {
+  const idx = text.indexOf(marker)
+  if (idx === -1) return text
+  return text.slice(0, idx) + " "
+}
+
 export function maskFencedCodeBlocks(rawText: string): string {
-  // Replace paired ```...``` / ~~~...~~~ blocks, unclosed trailing fences,
-  // multi-backtick spans, and inline backtick code spans so embedded code
-  // comments/phrases (e.g. `Prove this theorem in Lean 4`) cannot trigger opt-in
-  // prose routing. Preserve single-token `sorry` or `*.lean` inside inline
-  // backticks so prompts like "Fill in the `sorry` in Lemma1.lean" still route.
-  return rawText
-    .replace(/```[\s\S]*?```/g, " ")
-    .replace(/~~~[\s\S]*?~~~/g, " ")
-    .replace(/```[\s\S]*$/g, " ")
-    .replace(/~~~[\s\S]*$/g, " ")
+  const noPairedTicks = rawText.replace(/```[\s\S]*?```/g, " ").replace(/~~~[\s\S]*?~~~/g, " ")
+  const noUnclosedTicks = stripTrailingUnclosedFence(stripTrailingUnclosedFence(noPairedTicks, "```"), "~~~")
+  return noUnclosedTicks
     .replace(/``[\s\S]*?``/g, " ")
     .replace(/`([^`\r\n]*)`/g, (_m, inner: string) => {
       const trimmed = inner.trim()
@@ -443,26 +468,11 @@ export function maskFencedCodeBlocks(rawText: string): string {
 
 export function hasLeanSignal(rawText: string): boolean {
   if (!rawText) return false
-  // .lean file or path
-  if (/(?:^|[\s"'`(\[<\/])[^\s"'`)\]>]+\.lean\b/i.test(rawText) || /\b[A-Za-z0-9_.-]+\.lean\b/i.test(rawText)) {
-    return true
-  }
-  // Explicit "Lean 4" / "lean4"
-  if (/\blean\s*4\b/i.test(rawText)) {
-    return true
-  }
-  // leap-tools reference
-  if (/\bleap-tools\b/i.test(rawText)) {
-    return true
-  }
-  // Capitalized "Lean" (avoiding non-proof business phrases like "Lean Startup" / "Lean agile")
-  if (/\bLean\b(?!\s+(?:startup|manufacturing|agile|management|methodology|ux|product)\b)/.test(rawText)) {
-    return true
-  }
-  // Lean 4 syntax markers
+  if (/\b[A-Za-z0-9_./-]+\.lean\b/i.test(rawText)) return true
+  if (/\blean\s*4\b/i.test(rawText) || /\bleap-tools\b/i.test(rawText)) return true
+  if (/\bLean\b(?!\s+(?:startup|manufacturing|agile|management|methodology|ux|product)\b)/.test(rawText)) return true
   if (
-    /^\s*import\s+Mathlib\b/m.test(rawText) ||
-    /\bimport\s+Mathlib(?:\.[A-Za-z0-9_]+)*/.test(rawText) ||
+    /\bimport\s+Mathlib\b/.test(rawText) ||
     /:=\s*by\b/.test(rawText) ||
     /\blake\s+build\b/.test(rawText) ||
     /\blakefile\.(?:lean|toml)\b/i.test(rawText) ||
@@ -475,11 +485,39 @@ export function hasLeanSignal(rawText: string): boolean {
   return false
 }
 
+const LEAN_TARGET_STR = String.raw`(?:Lean\s*4|Lean(?!\s+(?:startup|manufacturing|agile|management|methodology|ux|product)\b)|[A-Za-z0-9_./-]+\.lean\b)`
+const PROVE_IN_LEAN_RE = new RegExp(
+  String.raw`\b(?:prove|formalize|formalise|disprove|refute)\b[\s\S]{0,80}?\b(?:in|using|with|via)\s+${LEAN_TARGET_STR}`,
+  "i",
+)
+const CHECK_PROOF_IN_LEAN_RE = new RegExp(
+  String.raw`\b(?:verify|typecheck|type-check|kernel[- ]check|check)\b[\s\S]{0,60}?\b(?:proof|theorem|lemma|formalization|formalisation)\b[\s\S]{0,60}?\b(?:in|with|using|via)\s+${LEAN_TARGET_STR}`,
+  "i",
+)
+const NON_PROVE_STYLE_CLAUSE_RE =
+  /\b(?:formatting|style|lint(?:ing)?|spelling|indentation|whitespace|syntax\s+highlighting|filename|names?|imports?\s+only)\b/i
+const FILE_EXISTS_CLAUSE_RE =
+  /\b(?:check|verify)\s+(?:if|whether)\s+[A-Za-z0-9_./-]+\.lean\s+(?:exists|is\s+(?:present|tracked|committed|in))\b/i
+const EXPLAIN_ONLY_START_RE = /^\s*(?:what\s+is|how\s+is|explain|describe|summarize|summarise)\b/i
+
+function clauseHasExplicitProofCheck(clause: string): boolean {
+  if (NON_PROVE_STYLE_CLAUSE_RE.test(clause) || FILE_EXISTS_CLAUSE_RE.test(clause)) return false
+  if (CHECK_PROOF_IN_LEAN_RE.test(clause)) return true
+  if (
+    /\b(?:verify|typecheck|type-check|kernel[- ]check)\s+(?:the\s+)?(?:(?:proof|theorem|lemma|formalization|formalisation)s?\s+(?:in|of)\s+)?[A-Za-z0-9_./-]*\.lean\b/i.test(
+      clause,
+    )
+  ) {
+    return true
+  }
+  return /\b(?:verify|typecheck|type-check|kernel[- ]check|check)\s+(?:(?:this|the|a)\s+)?[A-Za-z0-9_./-]*\.lean\s+(?:proof|theorem|lemma|formalization|formalisation)\b/i.test(
+    clause,
+  )
+}
+
 export function hasExplicitLeanRequest(proseOnly: string): boolean {
   if (!proseOnly || !proseOnly.trim()) return false
 
-  // Reject purely non-proving maintenance/inspection requests unless an explicit
-  // prove/formalize/verify/check-proof/fill-sorry intent is also present.
   const hasProseLeanTarget =
     /\blean\s*4\b/i.test(proseOnly) ||
     /\bLean\b(?!\s+(?:startup|manufacturing|agile|management|methodology|ux|product)\b)/.test(proseOnly) ||
@@ -489,43 +527,18 @@ export function hasExplicitLeanRequest(proseOnly: string): boolean {
 
   if (!hasProseLeanTarget) return false
 
-  // Explicit prove / formalize / disprove / verify / typecheck / complete-proof / fill-sorry
-  // targeted at Lean 4 / .lean / theorem / lemma / proof.
-  const leanTargetRe = "(?:Lean\\s*4|Lean(?!\\s+(?:startup|manufacturing|agile|management|methodology|ux|product)\\b)|[A-Za-z0-9_./-]+\\.lean\\b)"
   const proveOrFormalize =
-    new RegExp(
-      `\\b(?:prove|formalize|formalise|disprove|refute)\\b[\\s\\S]{0,80}?\\b(?:in|using|with|via)\\s+${leanTargetRe}`,
-      "i",
-    ).test(proseOnly) ||
-    (
-      /\b(?:Lean\s*4|Lean(?!\s+(?:startup|manufacturing|agile|management|methodology|ux|product)\b))\s+(?:formalization|formalisation|proof|verification)\b/i.test(
+    PROVE_IN_LEAN_RE.test(proseOnly) ||
+    (!EXPLAIN_ONLY_START_RE.test(proseOnly) &&
+      /\b(?:write|produce|create|give|run|build|do)\s+(?:a\s+|the\s+)?(?:Lean\s*4|Lean)\s+(?:formalization|formalisation|proof|verification)\b/i.test(
         proseOnly,
-      ) &&
-      !/^\s*(?:what\s+is|explain|describe)\b/i.test(proseOnly)
-    ) ||
+      )) ||
     /\b(?:formalize|formalise)\s+(?:the\s+(?:theorem|lemma|proof|claim|statement)s?\s+(?:in|from)\s+)?[A-Za-z0-9_./-]+\.lean\b/i.test(
       proseOnly,
     )
 
-  const checkProof =
-    (
-      new RegExp(
-        `\\b(?:verify|typecheck|type-check|kernel[- ]check|check)\\b[\\s\\S]{0,60}?\\b(?:proof|theorem|lemma|formalization|formalisation)\\b[\\s\\S]{0,60}?\\b(?:in|with|using|via)\\s+${leanTargetRe}`,
-        "i",
-      ).test(proseOnly) ||
-      /\b(?:verify|typecheck|type-check|kernel[- ]check)\s+(?:the\s+)?(?:(?:proof|theorem|lemma|formalization|formalisation)s?\s+(?:in|of)\s+)?[A-Za-z0-9_./-]+\.lean\b/i.test(
-        proseOnly,
-      ) ||
-      /\b(?:verify|typecheck|type-check|kernel[- ]check|check)\s+(?:this|the|a)?\s*[A-Za-z0-9_./-]+\.lean\s+(?:proof|theorem|lemma|formalization|formalisation)\b/i.test(
-        proseOnly,
-      )
-    ) &&
-    !/\b(?:check|verify|typecheck|type-check|kernel[- ]check)\s+(?:the\s+|this\s+|all\s+)?(?:[A-Za-z0-9_./-]+\.lean\s+)?(?:(?:proof|code|file|lean)\s+)?(?:formatting|style|lint(?:ing)?|spelling|indentation|whitespace|syntax\s+highlighting|filename|names?|imports?\s+only)\b/i.test(
-      proseOnly,
-    ) &&
-    !/\b(?:check|verify)\s+(?:if|whether)\s+[A-Za-z0-9_./-]+\.lean\s+(?:exists|is\s+(?:present|tracked|committed|in))\b/i.test(
-      proseOnly,
-    )
+  const clauses = proseOnly.split(/(?:[;\n]+|\.(?=\s|$)|,\s*(?:then|and\s+then)\s+)/)
+  const checkProof = clauses.some((c) => clauseHasExplicitProofCheck(c))
 
   const completeOrFillSorry =
     /\b(?:complete|finish)\s+(?:the\s+)?(?:proof|formalization|formalisation)\b/i.test(proseOnly) ||
@@ -538,8 +551,7 @@ export function hasExplicitLeanRequest(proseOnly: string): boolean {
 
 function isDocumentReviewRequest(rawText: string, proseOnly: string, inputs: string[], hasDocument?: boolean): boolean {
   const textForReview = proseOnly || rawText
-  // Explicitly avoid treating PR/diff code review as document review
-  if (/\b(?:review|critique)\s+(?:this|the|my)?\s*(?:pr|pull\s+request|diff|commit|patch|codebase)\b/i.test(textForReview)) {
+  if (/\b(?:review|critique)\s+(?:(?:this|the|my)\s+)?(?:pr|pull\s+request|diff|commit|patch|codebase)\b/i.test(textForReview)) {
     return false
   }
   const hasDeliverableVerb =
@@ -914,17 +926,20 @@ export function verifyLeanFile(options: LeanVerifyOptions): LeanVerifyResult {
     )
   } catch {}
 
-  const args =
-    mode === "lean"
-      ? [options.filePath]
-      : mode === "lake-env-lean"
-        ? ["env", "lean", options.filePath]
-        : options.lakeTarget
-          ? ["build", options.lakeTarget]
-          : ["build"]
+  let args: string[]
+  if (mode === "lean") {
+    args = [options.filePath]
+  } else if (mode === "lake-env-lean") {
+    args = ["env", "lean", options.filePath]
+  } else if (options.lakeTarget) {
+    args = ["build", options.lakeTarget]
+  } else {
+    args = ["build"]
+  }
 
+  const runDirCwd = options.cwd ?? dirname(options.filePath)
   const proc = spawnSync(binPath, args, {
-    cwd: options.cwd ?? dirname(options.filePath),
+    cwd: runDirCwd,
     env,
     timeout: timeoutMs,
     maxBuffer: 1024 * 1024,
@@ -933,8 +948,8 @@ export function verifyLeanFile(options: LeanVerifyOptions): LeanVerifyResult {
     shell: false,
   })
 
-  const stdout = typeof proc.stdout === "string" ? proc.stdout : String(proc.stdout ?? "")
-  const stderr = typeof proc.stderr === "string" ? proc.stderr : String(proc.stderr ?? "")
+  let stdout = typeof proc.stdout === "string" ? proc.stdout : String(proc.stdout ?? "")
+  let stderr = typeof proc.stderr === "string" ? proc.stderr : String(proc.stderr ?? "")
   let exitCode = typeof proc.status === "number" ? proc.status : -1
   let execFailed = false
   let execErrorMsg = ""
@@ -951,6 +966,38 @@ export function verifyLeanFile(options: LeanVerifyOptions): LeanVerifyResult {
     execFailed = true
     exitCode = -1
     execErrorMsg = `${binName} terminated by signal ${proc.signal ?? "unknown"}`
+  }
+
+  // In lake-build mode without an explicit target covering the file, also check the exact file via `lake env lean`
+  if (!execFailed && exitCode === 0 && mode === "lake-build" && !options.lakeTarget) {
+    const fileProc = spawnSync(binPath, ["env", "lean", options.filePath], {
+      cwd: runDirCwd,
+      env,
+      timeout: timeoutMs,
+      maxBuffer: 1024 * 1024,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: false,
+    })
+    const fStdout = typeof fileProc.stdout === "string" ? fileProc.stdout : String(fileProc.stdout ?? "")
+    const fStderr = typeof fileProc.stderr === "string" ? fileProc.stderr : String(fileProc.stderr ?? "")
+    stdout = [stdout, fStdout].filter(Boolean).join("\n")
+    stderr = [stderr, fStderr].filter(Boolean).join("\n")
+    if (fileProc.error) {
+      execFailed = true
+      exitCode = typeof fileProc.status === "number" ? fileProc.status : -1
+      const errCode = (fileProc.error as any)?.code
+      execErrorMsg =
+        errCode === "ETIMEDOUT"
+          ? `lake env lean timed out after ${timeoutMs}ms`
+          : clean(fileProc.error.message || errCode || "lake env lean execution failed", 200)
+    } else if (fileProc.status === null) {
+      execFailed = true
+      exitCode = -1
+      execErrorMsg = `lake env lean terminated by signal ${fileProc.signal ?? "unknown"}`
+    } else if (typeof fileProc.status === "number" && fileProc.status !== 0) {
+      exitCode = fileProc.status
+    }
   }
 
   if (execFailed) {
@@ -1077,12 +1124,14 @@ export interface FormalizationReviewFile {
     verdict: "APPROVE" | "REQUEST_CHANGES"
     reviewer: string
     notes: string
+    problemHash?: string
     timestamp: string
   } | null
   final: {
     verdict: "FAITHFUL" | "UNFAITHFUL" | "MISFORMALIZED"
     reviewer: string
     notes: string
+    problemHash?: string
     timestamp: string
   } | null
 }
@@ -1135,7 +1184,7 @@ export function initLemmaArtifacts(
 export function recordFormalizationDraft(
   runDir: string,
   leanCode: string,
-  options?: { env?: NodeJS.ProcessEnv; verifyDraft?: boolean },
+  options?: { env?: NodeJS.ProcessEnv; verifyDraft?: boolean; cwd?: string; mode?: "lean" | "lake-env-lean" },
 ): { compiled?: boolean; exitCode?: number; error?: string; findings?: string[] } {
   if (typeof leanCode !== "string" || !leanCode.trim()) {
     return { error: "refused: leanCode must be non-empty" }
@@ -1166,7 +1215,8 @@ export function recordFormalizationDraft(
     // it must elaborate/compile with exitCode === 0.
     const v = verifyLeanFile({
       filePath: wDraft.path,
-      cwd: dirname(wDraft.path),
+      cwd: options?.cwd ?? dirname(wDraft.path),
+      mode: options?.mode === "lake-env-lean" ? "lake-env-lean" : "lean",
       env: options?.env,
       allowSorry: true,
     })
@@ -1260,8 +1310,14 @@ export function recordFormalizationPreReview(
 
   let promoted = false
   if (norm === "APPROVE") {
+    const promotedHash = createHash("sha256").update(draftRead.text, "utf8").digest("hex")
     const wProb = writeTextAtomicSafe(runDir, "lemma/problem.lean", draftRead.text)
     if (wProb.error) return { error: wProb.error }
+    review.preSearch.problemHash = promotedHash
+    // Promoting a new formalization invalidates any previous final faithfulness review for a different problem digest.
+    if (review.final && review.final.problemHash !== promotedHash) {
+      review.final = null
+    }
     manifest.phase = "SOLVING"
     promoted = true
   } else if (nextRound >= (manifest.bounds.maxFormalizationRounds || MAX_FORMALIZATION_ROUNDS)) {
@@ -1291,6 +1347,15 @@ export function recordFormalizationFinalReview(
   if (mRead.error || !mRead.value) return { error: mRead.error ?? "refused: lemma/manifest.json missing" }
   const manifest = mRead.value
 
+  let problemHash: string | undefined
+  const probSafe = ensureSafeSubpath(runDir, "lemma/problem.lean")
+  if (!probSafe.error && probSafe.path) {
+    const probRead = readBoundedRegular(probSafe.path)
+    if (!probRead.error && probRead.text) {
+      problemHash = createHash("sha256").update(probRead.text, "utf8").digest("hex")
+    }
+  }
+
   const rRead = readJsonSafe<FormalizationReviewFile>(runDir, "lemma/formalization-review.json")
   const review: FormalizationReviewFile = rRead.value ?? { rounds: [], draftVerification: null, preSearch: null, final: null }
   const now = new Date().toISOString()
@@ -1307,6 +1372,7 @@ export function recordFormalizationFinalReview(
     verdict: norm as "FAITHFUL" | "UNFAITHFUL" | "MISFORMALIZED",
     reviewer: clean(reviewer, 64),
     notes: clean(notes, 500),
+    ...(problemHash ? { problemHash } : {}),
     timestamp: now,
   }
   if (norm === "UNFAITHFUL" || norm === "MISFORMALIZED") {
@@ -1464,7 +1530,18 @@ export function mutateLemmaNode(
       return { error: `refused: attempt round ${round} exceeds maxRetries (${bounds.maxRetries})` }
     }
     const relAttempt = `lemma/nodes/${lemmaId}/attempt-${round}.lean`
-    const wAtt = writeTextAtomicSafe(runDir, relAttempt, params.leanCode.endsWith("\n") ? params.leanCode : params.leanCode + "\n")
+    const attemptSafe = ensureSafeSubpath(runDir, relAttempt)
+    if (attemptSafe.error || !attemptSafe.path) return { error: attemptSafe.error }
+    const normalizedAttempt = params.leanCode.endsWith("\n") ? params.leanCode : params.leanCode + "\n"
+    if (existsSync(attemptSafe.path)) {
+      const existingRead = readBoundedRegular(attemptSafe.path)
+      if (!existingRead.error && existingRead.text !== undefined && existingRead.text !== normalizedAttempt) {
+        return {
+          error: `refused: attempt round ${round} (${relAttempt}) already exists and is immutable; submit the next round (${node.attempts + 1}) instead`,
+        }
+      }
+    }
+    const wAtt = writeTextAtomicSafe(runDir, relAttempt, normalizedAttempt)
     if (wAtt.error || !wAtt.path) return { error: wAtt.error ?? "failed to write attempt" }
 
     node.attempts = Math.max(node.attempts, round)
@@ -1511,6 +1588,7 @@ export interface StampedLemmaVerifyReport extends LeanVerifyResult {
   lemmaId: string
   round: number
   attemptFile: string
+  attemptHash?: string
   allowedAxioms: string[]
 }
 
@@ -1548,6 +1626,11 @@ export function verifyLemmaNodeAttempt(
   if (!existsSync(attemptSafe.path)) {
     return { error: `refused: attempt file ${attemptRel} does not exist` }
   }
+  const attemptRead = readBoundedRegular(attemptSafe.path)
+  if (attemptRead.error || attemptRead.text === undefined) {
+    return { error: attemptRead.error ?? `refused: cannot read ${attemptRel}` }
+  }
+  const attemptHash = createHash("sha256").update(attemptRead.text, "utf8").digest("hex")
 
   const normalizedAllowedAxioms = Array.isArray(params.allowedAxioms)
     ? params.allowedAxioms.map((a) => clean(a, 128).trim()).filter(Boolean)
@@ -1565,6 +1648,7 @@ export function verifyLemmaNodeAttempt(
     lemmaId: params.lemmaId,
     round,
     attemptFile: attemptRel,
+    attemptHash,
     allowedAxioms: normalizedAllowedAxioms,
     ...res,
   }
@@ -1669,6 +1753,7 @@ export function evaluateLemmaFinalEvidence(runDir: string): LemmaFinalEvidence {
   }
 
   let problemLeanPresent = false
+  let currentProblemHash: string | undefined
   const probSafe = ensureSafeSubpath(runDir, "lemma/problem.lean")
   if (probSafe.error || !probSafe.path) {
     reasons.push(`lemma/problem.lean: ${probSafe.error ?? "unsafe path"}`)
@@ -1678,6 +1763,7 @@ export function evaluateLemmaFinalEvidence(runDir: string): LemmaFinalEvidence {
       reasons.push(`lemma/problem.lean: ${probRead.error ?? "empty or missing"}`)
     } else {
       problemLeanPresent = true
+      currentProblemHash = createHash("sha256").update(probRead.text, "utf8").digest("hex")
     }
   }
 
@@ -1692,6 +1778,12 @@ export function evaluateLemmaFinalEvidence(runDir: string): LemmaFinalEvidence {
     }
     if (finalVerdict !== "FAITHFUL") {
       reasons.push(`lemma formalization final verdict is ${finalVerdict ?? "MISSING"} (must be FAITHFUL)`)
+    } else if (
+      currentProblemHash &&
+      rRead.value.final?.problemHash &&
+      rRead.value.final.problemHash !== currentProblemHash
+    ) {
+      reasons.push("lemma formalization final verdict does not match current lemma/problem.lean digest")
     }
   }
 
@@ -1741,6 +1833,21 @@ export function evaluateLemmaFinalEvidence(runDir: string): LemmaFinalEvidence {
       reasons.push(
         `lemma node ${id}: invalid/missing stamped verification (status=${verifyStatus}, executed=${executed}, exitCode=${exitCode}, sorry=${hasSorry}, admit=${hasAdmit}, axiom=${hasUnauthorizedAxiom})`,
       )
+    } else if (vReport.attemptHash && vReport.attemptFile) {
+      const attSafe = ensureSafeSubpath(runDir, vReport.attemptFile)
+      if (attSafe.error || !attSafe.path) {
+        reasons.push(`lemma node ${id}: ${attSafe.error ?? "unsafe attemptFile"}`)
+      } else {
+        const attRead = readBoundedRegular(attSafe.path)
+        if (attRead.error || attRead.text === undefined) {
+          reasons.push(`lemma node ${id}: ${attRead.error ?? "cannot read attemptFile"}`)
+        } else {
+          const curAttHash = createHash("sha256").update(attRead.text, "utf8").digest("hex")
+          if (curAttHash !== vReport.attemptHash) {
+            reasons.push(`lemma node ${id}: attempt file ${vReport.attemptFile} modified since verification`)
+          }
+        }
+      }
     }
 
     nodeSummaries.push({
