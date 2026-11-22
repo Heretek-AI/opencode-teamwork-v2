@@ -10,7 +10,20 @@
 // make the process exit non-zero.
 
 import { buildExportData, renderExport } from "../lib/export.mjs"
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, readdirSync, existsSync, utimesSync, symlinkSync } from "node:fs"
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -790,6 +803,94 @@ await check("tournament: symlinked tournament/ dir is refused with warning and N
   const dataFailFinal = buildExportData(rootFailFinal, sid)
   assert.strictEqual(dataFailFinal.status, "FAIL", "FAIL finalReport must still export FAIL even when tournament/ is symlinked")
 })
+// ==========================================
+// 8. Bounded reader: no-follow, FIFO-safe, absent/oversize classification
+// ==========================================
+
+await check("reader: an absent events.jsonl yields timing unknown with no warning", () => {
+  const data = buildExportData(makeRun({ events: null }), SESSION)
+  assert.strictEqual(data.timing, "unknown", "no events file must fall back to unknown timing")
+  assert(!data.warnings.some((w) => w.includes("events.jsonl")), `absent events must not warn: ${data.warnings}`)
+})
+
+await check("reader: a symlinked events.jsonl is never followed", () => {
+  const root = makeRoot()
+  writeRun(root, { events: null })
+  const outside = join(testDir, "outside-events.jsonl")
+  writeFileSync(outside, JSON.stringify({ ts: "2026-10-18T10:00:00.000Z", event: "run_created", sessionId: SESSION }) + "\n")
+  symlinkSync(outside, join(runDirOf(root, SESSION), "events.jsonl"))
+  const data = buildExportData(root, SESSION)
+  assert.strictEqual(data.timing, "unknown", "a symlinked events file must not produce events timing")
+  assert(data.warnings.some((w) => w.includes("events.jsonl") && w.includes("not a regular file")), `symlink must be reported: ${data.warnings}`)
+  assert(!renderExport(data, { format: "html" }).includes("outside-events.jsonl"), "the link target must not be read")
+})
+
+await check("reader: an oversize pitfalls.md is reported as oversize, never absent", () => {
+  const root = makeRun({ events: null })
+  writeFileSync(join(runDirOf(root, SESSION), "pitfalls.md"), "x".repeat(1024 * 1024 + 32))
+  const data = buildExportData(root, SESSION)
+  assert(data.warnings.some((w) => /pitfalls\.md exceeds the 1 MiB read cap/.test(w)), `oversize warning missing: ${data.warnings}`)
+  assert.deepStrictEqual(data.pitfalls, [], "an oversize pitfalls file contributes no entries")
+})
+
+await check("reader: a FIFO events.jsonl does not hang the export", () => {
+  const root = makeRun({ events: null })
+  const exportUrl = new URL("../lib/export.mjs", import.meta.url).href
+  const code = [
+    `import { buildExportData } from ${JSON.stringify(exportUrl)}`,
+    `import { execFileSync } from "node:child_process"`,
+    `import { join } from "node:path"`,
+    `const root = process.argv[1]`,
+    `const events = join(root, ".opencode", "teamwork", ${JSON.stringify(SESSION)}, "events.jsonl")`,
+    `try {`,
+    `  execFileSync("mkfifo", [events], { stdio: "ignore" })`,
+    `} catch (err) {`,
+    `  if (err && err.code === "ENOENT") { console.log("SKIP: mkfifo unavailable"); process.exit(0) }`,
+    `  throw err`,
+    `}`,
+    `const data = buildExportData(root, ${JSON.stringify(SESSION)})`,
+    `if (data.timing === "events") throw new Error("FIFO events.jsonl must not be read")`,
+    `if (!data.warnings.some((w) => w.includes("events.jsonl") && w.includes("not a regular file"))) throw new Error("FIFO events must be reported: " + JSON.stringify(data.warnings))`,
+    `console.log("REFUSED")`,
+  ].join("\n")
+  const res = spawnSync(process.execPath, [...process.execArgv, "--input-type=module", "-e", code, root], {
+    encoding: "utf8",
+    timeout: 15000,
+  })
+  if (res.error && res.error.code === "ETIMEDOUT") assert.fail("buildExportData hung on a FIFO (timeout guard fired)")
+  assert.strictEqual(res.status, 0, `FIFO export child failed (status ${res.status}): ${res.stderr || ""}`)
+  assert(/REFUSED|SKIP/.test(res.stdout || ""), `FIFO child must report REFUSED or SKIP: ${res.stdout || ""}`)
+})
+
+// ==========================================
+// 9. CLI writer: O_NOFOLLOW symlink refusal and regular-file overwrite
+// ==========================================
+
+await check("CLI writer: a symlinked -o target is refused and the link target is untouched", () => {
+  const root = makeRun()
+  const outside = join(testDir, "outside-report.html")
+  writeFileSync(outside, "ORIGINAL\n")
+  const link = join(root, "report-link.html")
+  symlinkSync(outside, link)
+  const res = runCli(["export", SESSION, "-o", "report-link.html"], root)
+  assert.strictEqual(res.status, 1, `symlink output must exit 1, got ${res.status}`)
+  assert(/symlink/i.test(res.stderr), `stderr must name the symlink refusal: ${res.stderr}`)
+  assert.strictEqual(readFileSync(outside, "utf8"), "ORIGINAL\n", "the symlink target must not be written")
+  assert(lstatSync(link).isSymbolicLink(), "the symlink must be left in place")
+  assert.strictEqual(res.stdout, "", "nothing may be printed as written")
+})
+
+await check("CLI writer: an existing regular file is overwritten and keeps its mode", () => {
+  const root = makeRun()
+  const file = join(root, "report-existing.html")
+  writeFileSync(file, "OLD CONTENT")
+  chmodSync(file, 0o640)
+  const res = runCli(["export", SESSION, "-o", "report-existing.html"], root)
+  assert.strictEqual(res.status, 0, `regular-file overwrite must exit 0, got ${res.status}: ${res.stderr}`)
+  assert.strictEqual(readFileSync(file, "utf8"), renderExport(buildExportData(root, SESSION), { format: "html" }), "the file must be replaced with the document")
+  assert.strictEqual(statSync(file).mode & 0o777, 0o640, "the existing file mode must be preserved")
+})
+
 // ---------------------------------------------------------------- cleanup
 
 rmSync(testDir, { recursive: true, force: true })
