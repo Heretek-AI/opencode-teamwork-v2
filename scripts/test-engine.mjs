@@ -3001,6 +3001,8 @@ process.exit(0);
         "Prove Fermat's Little Theorem in Lean 4",
         "Verify src/Main.lean in Lean 4",
         "Verify Main.lean",
+        "verify Foo.lean",
+        "verify the proof in Foo.lean",
         "Formalize and prove this theorem in Lean",
         "Fill in the sorry in Lemma1.lean",
         "Fill in the `sorry` in Lemma1.lean",
@@ -3027,6 +3029,12 @@ process.exit(0);
         "prove that Foo.lean is in the repo",
         "Explain this partial snippet:\n```lean\n-- Prove theorem in Lean 4\ntheorem foo : 1 = 1 := by rfl",
         "Explain why the phrase `Prove this theorem in Lean 4` appears in Foo.lean",
+        // N21 regression cases
+        "verify Foo.lean formatting",
+        "verify path/to/Bar.lean style",
+        "check Foo.lean lint",
+        "verify Foo.lean imports only",
+        "verify the formatting of Foo.lean",
       ]
       for (const req of nonOptInLean) {
         const r = await tools.route.execute({ request: req })
