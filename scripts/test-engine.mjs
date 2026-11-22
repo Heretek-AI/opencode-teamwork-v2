@@ -4,6 +4,7 @@ import { currentModels, readRawModelMap, writeModelMap, installAgents, DEFAULT_M
 import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
+import { createServer } from "node:http"
 import { execFileSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import assert from "node:assert"
@@ -503,6 +504,193 @@ try {
   console.log("✓ request recorded verbatim once, modes validated/persisted, audit & final gate read the artifact")
 
   // ==========================================
+  // Part 1c-quinquies: input preflight gate
+  // ==========================================
+  console.log("Testing the input preflight gate...")
+
+  const existingInput = join(testDir, "preflight-existing.txt")
+  writeFileSync(existingInput, "present\n")
+  const missingAbs = join(testDir, "preflight-does-not-exist.txt")
+  assert(!existsSync(missingAbs), "fixture: the missing path must not exist")
+
+  // (a) an existing absolute path named by the request -> READY, plan proceeds.
+  const pfReadyRun = "20261018-000000-preflight-ready"
+  const pfReady = await registeredTools.plan.execute({
+    sessionId: pfReadyRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: `Read ${existingInput} before planning`,
+    tasks: [{ id: "PF1" }],
+  })
+  assert(pfReady.content.startsWith("Planned"), `an existing input must not block: ${pfReady.content}`)
+  assert(/Preflight: READY/.test(pfReady.content), `the plan result must report the preflight: ${pfReady.content}`)
+  const pfReadyPlan = JSON.parse(readFileSync(planFileOf(pfReadyRun), "utf8"))
+  assert.deepStrictEqual(pfReadyPlan.preflight, { status: "READY", bypassed: false }, "a READY preflight must be recorded in plan.dag.json")
+
+  // (b) an absolute path named by the request that does not exist -> refused, no run dir.
+  const pfMissingRun = "20261018-000000-preflight-missing"
+  const pfMissing = await registeredTools.plan.execute({
+    sessionId: pfMissingRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: `Read ${missingAbs} before planning`,
+    tasks: [{ id: "PF1" }],
+  })
+  assert(pfMissing.content.startsWith("refused:"), `a missing absolute input must be refused: ${pfMissing.content}`)
+  assert(/MISSING/.test(pfMissing.content), "the refusal must name the item status")
+  assert(pfMissing.content.includes(missingAbs), "the refusal must name the missing path")
+  assert(!existsSync(join(testDir, ".opencode", "teamwork", pfMissingRun)), "a preflight refusal must create no run directory")
+
+  // (c) a missing entry in the explicit `inputs` array -> refused.
+  const pfExplicitRun = "20261018-000000-preflight-explicit"
+  const pfExplicit = await registeredTools.plan.execute({
+    sessionId: pfExplicitRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    inputs: [missingAbs],
+    tasks: [{ id: "PF1" }],
+  })
+  assert(pfExplicit.content.startsWith("refused:"), `a missing explicit input must be refused: ${pfExplicit.content}`)
+  assert(pfExplicit.content.includes(missingAbs), "the refusal must name the explicit input")
+  assert(!existsSync(join(testDir, ".opencode", "teamwork", pfExplicitRun)), "an explicit-input refusal must create no run directory")
+
+  // (d) the same missing input with allowMissingInputs: true -> planned + recorded bypass.
+  const pfBypassRun = "20261018-000000-preflight-bypass"
+  const pfBypass = await registeredTools.plan.execute({
+    sessionId: pfBypassRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: `Read ${missingAbs} before planning`,
+    allowMissingInputs: true,
+    tasks: [{ id: "PF1" }],
+  })
+  assert(pfBypass.content.startsWith("Planned"), `allowMissingInputs must permit the plan: ${pfBypass.content}`)
+  assert(/Preflight: MISSING \(bypassed: allowMissingInputs\)/.test(pfBypass.content), `the bypass must be visible: ${pfBypass.content}`)
+  const pfBypassPlan = JSON.parse(readFileSync(planFileOf(pfBypassRun), "utf8"))
+  assert.deepStrictEqual(pfBypassPlan.preflight, { status: "MISSING", bypassed: true }, "the bypass must be persisted in plan.dag.json")
+  const pfBypassCreated = readEvents(testDir, pfBypassRun).find((e) => e.event === "run_created")
+  assert(/preflight bypassed: MISSING \(1 item\)/.test(pfBypassCreated.note), `run_created must note the bypass: ${pfBypassCreated.note}`)
+
+  // (e) a relative path-like token that does not exist is advisory only.
+  const pfAdvisoryRun = "20261018-000000-preflight-advisory"
+  const pfAdvisory = await registeredTools.plan.execute({
+    sessionId: pfAdvisoryRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: "Review nonexistent/advisory-only.md before planning",
+    tasks: [{ id: "PF1" }],
+  })
+  assert(pfAdvisory.content.startsWith("Planned"), `an advisory path must never block: ${pfAdvisory.content}`)
+  assert(
+    /advisory path missing \(non-blocking\): nonexistent\/advisory-only\.md/.test(pfAdvisory.content),
+    `the advisory miss must be reported: ${pfAdvisory.content}`,
+  )
+  const pfAdvisoryPlan = JSON.parse(readFileSync(planFileOf(pfAdvisoryRun), "utf8"))
+  assert.deepStrictEqual(pfAdvisoryPlan.preflight, { status: "READY", bypassed: false }, "an advisory miss must leave the status READY")
+
+  // (f) a URL is UNCHECKED by default, and the plan proceeds.
+  const pfUncheckedRun = "20261018-000000-preflight-unchecked"
+  const uncheckedUrl = "http://127.0.0.1:1/unchecked"
+  const pfUnchecked = await registeredTools.plan.execute({
+    sessionId: pfUncheckedRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: `Watch ${uncheckedUrl} before planning`,
+    tasks: [{ id: "PF1" }],
+  })
+  assert(pfUnchecked.content.startsWith("Planned"), `an unchecked URL must not block: ${pfUnchecked.content}`)
+  assert(/1 unchecked/.test(pfUnchecked.content), `the plan result must report the unchecked URL: ${pfUnchecked.content}`)
+  assert.deepStrictEqual(JSON.parse(readFileSync(planFileOf(pfUncheckedRun), "utf8")).preflight, { status: "READY", bypassed: false })
+
+  // (g) URL checking against a local server (no internet): 200 is READY,
+  // 500 and connection refused are OUTAGE and refuse the plan.
+  let preflightServer
+  const stopServer = (server) =>
+    new Promise((resolve) => {
+      server.close(resolve)
+      if (typeof server.closeAllConnections === "function") server.closeAllConnections()
+    })
+  try {
+    preflightServer = createServer((req, res) => {
+      res.writeHead(req.url === "/ok" ? 200 : 500)
+      res.end()
+    })
+    await new Promise((resolve) => preflightServer.listen(0, "127.0.0.1", resolve))
+    const port = preflightServer.address().port
+    const base = `http://127.0.0.1:${port}`
+
+    const pfUrlOkRun = "20261018-000000-preflight-url-ok"
+    const pfUrlOk = await registeredTools.plan.execute({
+      sessionId: pfUrlOkRun,
+      topology: "iterative-coding",
+      skipInterview: true,
+      request: `Fetch ${base}/ok before planning`,
+      checkUrls: true,
+      tasks: [{ id: "PF1" }],
+    })
+    assert(pfUrlOk.content.startsWith("Planned"), `a 200 URL must be READY: ${pfUrlOk.content}`)
+    assert.deepStrictEqual(JSON.parse(readFileSync(planFileOf(pfUrlOkRun), "utf8")).preflight, { status: "READY", bypassed: false })
+
+    const pfUrlFailRun = "20261018-000000-preflight-url-500"
+    const pfUrlFail = await registeredTools.plan.execute({
+      sessionId: pfUrlFailRun,
+      topology: "iterative-coding",
+      skipInterview: true,
+      request: `Fetch ${base}/fail before planning`,
+      checkUrls: true,
+      tasks: [{ id: "PF1" }],
+    })
+    assert(pfUrlFail.content.startsWith("refused:"), `a 500 URL must be OUTAGE and refuse the plan: ${pfUrlFail.content}`)
+    assert(/OUTAGE/.test(pfUrlFail.content) && pfUrlFail.content.includes(`${base}/fail`), "the refusal must name the outage")
+    assert(!existsSync(join(testDir, ".opencode", "teamwork", pfUrlFailRun)), "a URL refusal must create no run directory")
+
+    // Closing the listener makes the same port refuse connections.
+    await stopServer(preflightServer)
+    preflightServer = undefined
+    const pfUrlDownRun = "20261018-000000-preflight-url-down"
+    const pfUrlDown = await registeredTools.plan.execute({
+      sessionId: pfUrlDownRun,
+      topology: "iterative-coding",
+      skipInterview: true,
+      request: `Fetch ${base}/down before planning`,
+      checkUrls: true,
+      tasks: [{ id: "PF1" }],
+    })
+    assert(pfUrlDown.content.startsWith("refused:"), `a refused connection must be OUTAGE and refuse the plan: ${pfUrlDown.content}`)
+    assert(/OUTAGE/.test(pfUrlDown.content), "the refusal must name the outage")
+    assert(!existsSync(join(testDir, ".opencode", "teamwork", pfUrlDownRun)), "a connection refusal must create no run directory")
+  } finally {
+    if (preflightServer) await stopServer(preflightServer)
+  }
+
+  // Standalone teamwork_preflight: re-reads ORIGINAL_REQUEST.md, writes
+  // preflight.json, and appends a preflight event (with a note when missing).
+  const standaloneMissing = join(testDir, "preflight-standalone-missing.txt")
+  const standalone = await registeredTools.preflight.execute({
+    sessionId: pfReadyRun,
+    inputs: [standaloneMissing],
+  })
+  assert.strictEqual(standalone.status, "MISSING", `the standalone report must sum to MISSING: ${standalone.content}`)
+  const standaloneReport = JSON.parse(readFileSync(runFile(testDir, pfReadyRun, "preflight.json"), "utf8"))
+  assert(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(standaloneReport.checkedAt), "checkedAt must be ISO8601 UTC")
+  assert.strictEqual(standaloneReport.integrityMode, "development", "preflight.json must record the run's integrity mode")
+  assert.strictEqual(standaloneReport.summary.status, "MISSING")
+  assert(
+    standaloneReport.items.some((i) => i.value === existingInput && i.status === "READY" && i.detail === "file"),
+    "the recorded request's input must be re-read from ORIGINAL_REQUEST.md",
+  )
+  assert(
+    standaloneReport.items.some((i) => i.value === standaloneMissing && i.status === "MISSING" && i.blocking === true),
+    "the explicit missing input must be reported as blocking",
+  )
+  const standaloneEvent = readEvents(testDir, pfReadyRun).find((e) => e.event === "preflight")
+  assert(standaloneEvent, "teamwork_preflight must append a preflight event")
+  assert.strictEqual(standaloneEvent.to, "MISSING", "the preflight event must record the status")
+  assert(/missing|unreachable/i.test(standaloneEvent.note), `the preflight event must note the miss: ${standaloneEvent.note}`)
+
+  console.log("✓ preflight blocks missing/outage inputs, ignores advisory paths, checks localhost URLs, records bypass; standalone tool writes preflight.json")
+
+  // ==========================================
   // Part 1c-ter: final_verify tool
   // ==========================================
   console.log("Testing the final_verify tool...")
@@ -744,6 +932,148 @@ try {
   )
 
   console.log("✓ final_verify computes PASS only from evidence, stamps provenance + seq, and cannot be overridden")
+
+  // ==========================================
+  // Part 1c-quater: integrity mode enforcement
+  // ==========================================
+  console.log("Testing integrity mode enforcement...")
+
+  const INTEGRITY_RULES = {
+    fabricated_output: "development",
+    core_logic_copied: "demo",
+    delegated_core_work: "demo",
+    test_source_read: "demo",
+    external_dependency_used: "benchmark",
+  }
+  const MODE_ORDER = ["development", "demo", "benchmark"]
+  const forbiddenAt = (rule, mode) => MODE_ORDER.indexOf(mode) >= MODE_ORDER.indexOf(INTEGRITY_RULES[rule])
+  const auditFileOf = (runId) => runFile(testDir, runId, "verify/security-audit.json")
+
+  // One run per mode, each with its mode recorded in ORIGINAL_REQUEST.md.
+  const modeRuns = {}
+  for (const mode of MODE_ORDER) {
+    const runId = `20261018-000000-integrity-${mode}`
+    const planned = await registeredTools.plan.execute({
+      sessionId: runId,
+      topology: "iterative-coding",
+      skipInterview: true,
+      request: `Run at ${mode}.`,
+      integrityMode: mode,
+      tasks: [{ id: "I1" }],
+    })
+    assert(planned.content.startsWith("Planned"), `integrity fixture ${mode} must plan: ${planned.content}`)
+    modeRuns[mode] = runId
+  }
+
+  // Full 5 rules x 3 modes matrix, driven by the table (15 cases).
+  let matrixCases = 0
+  for (const mode of MODE_ORDER) {
+    for (const rule of Object.keys(INTEGRITY_RULES)) {
+      const res = await registeredTools.security_audit.execute({
+        sessionId: modeRuns[mode],
+        status: "PASS",
+        findings: [],
+        integrityFindings: [{ rule, where: "src/core.ts:1", why: "reported by the auditor" }],
+      })
+      const expected = forbiddenAt(rule, mode) ? "FAIL" : "PASS"
+      assert.strictEqual(res.status, expected, `${rule} at ${mode} must be ${expected}: ${res.content}`)
+      const report = JSON.parse(readFileSync(auditFileOf(modeRuns[mode]), "utf8"))
+      assert.strictEqual(report.status, expected, `${rule} at ${mode}: artifact status must be ${expected}`)
+      assert.strictEqual(report.integrityMode, mode, `${rule} at ${mode}: artifact must record the run's mode`)
+      assert.strictEqual(report.integrityFindings.length, 1, "the supplied finding must be persisted as-is")
+      assert.strictEqual(report.integrityFindings[0].rule, rule)
+      assert.strictEqual(
+        report.integrityViolations.length,
+        expected === "FAIL" ? 1 : 0,
+        `${rule} at ${mode}: violations must be the forbidden subset only`,
+      )
+      if (expected === "FAIL") {
+        const violation = report.integrityViolations[0]
+        assert.strictEqual(violation.rule, rule)
+        assert.strictEqual(violation.forbiddenFrom, INTEGRITY_RULES[rule], "the violation must carry its threshold")
+        assert.strictEqual(violation.where, "src/core.ts:1")
+        assert.strictEqual(violation.why, "reported by the auditor")
+        assert(res.content.includes(rule), `the FAIL message must name ${rule}: ${res.content}`)
+        assert(res.content.includes(mode), `the FAIL message must name the mode ${mode}: ${res.content}`)
+      }
+      matrixCases++
+    }
+  }
+  assert.strictEqual(matrixCases, 15, "the matrix must cover 5 rules x 3 modes")
+
+  // A non-forbidden finding is recorded but never becomes a violation.
+  const nonForbidden = await registeredTools.security_audit.execute({
+    sessionId: modeRuns.demo,
+    status: "PASS",
+    findings: [],
+    integrityFindings: [{ rule: "external_dependency_used", where: "package.json:5", why: "uses a library" }],
+  })
+  assert.strictEqual(nonForbidden.status, "PASS", "a benchmark-only rule must not fail a demo run")
+  const nonForbiddenReport = JSON.parse(readFileSync(auditFileOf(modeRuns.demo), "utf8"))
+  assert.strictEqual(nonForbiddenReport.integrityFindings[0].rule, "external_dependency_used")
+  assert.deepStrictEqual(nonForbiddenReport.integrityViolations, [], "a non-forbidden rule must not be a violation")
+
+  // The input is capped at 50 findings.
+  const capped = await registeredTools.security_audit.execute({
+    sessionId: modeRuns.development,
+    status: "PASS",
+    findings: [],
+    integrityFindings: Array.from({ length: 51 }, (_, i) => ({ rule: "fabricated_output", where: `f${i}` })),
+  })
+  assert.strictEqual(capped.status, "FAIL")
+  assert.strictEqual(JSON.parse(readFileSync(auditFileOf(modeRuns.development), "utf8")).integrityFindings.length, 50, "at most 50 findings are persisted")
+
+  // An unknown rule id is refused before anything is written.
+  const unknownRun = "20261018-000000-integrity-unknown"
+  await registeredTools.plan.execute({
+    sessionId: unknownRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: "Unknown rule.",
+    integrityMode: "development",
+    tasks: [{ id: "I1" }],
+  })
+  assert(!existsSync(auditFileOf(unknownRun)), "fixture must start with no audit artifact")
+  const unknownRule = await registeredTools.security_audit.execute({
+    sessionId: unknownRun,
+    status: "PASS",
+    findings: [],
+    integrityFindings: [{ rule: "made_up_rule" }],
+  })
+  assert(unknownRule.content.startsWith("refused: unknown integrity rule"), `an unknown rule must be refused: ${unknownRule.content}`)
+  for (const rule of Object.keys(INTEGRITY_RULES)) {
+    assert(unknownRule.content.includes(rule), `the refusal must list ${rule}: ${unknownRule.content}`)
+  }
+  assert(!existsSync(auditFileOf(unknownRun)), "an unknown rule must write no artifact")
+
+  // End-to-end: a violation forces the audit FAIL, and final_verify inherits it.
+  const enforceRun = "20261018-000000-integrity-final"
+  await seedVerifiedRun(enforceRun, ["I1"], { request: "Ship the demo.", integrityMode: "demo" })
+  const enforceAudit = await registeredTools.security_audit.execute({
+    sessionId: enforceRun,
+    status: "PASS",
+    findings: [],
+    integrityFindings: [{ rule: "delegated_core_work", where: "src/gen.ts:9", why: "core produced by an external tool" }],
+  })
+  assert.strictEqual(enforceAudit.status, "FAIL", "a forbidden finding must force FAIL despite status PASS")
+  const enforceReport = JSON.parse(readFileSync(auditFileOf(enforceRun), "utf8"))
+  assert.strictEqual(enforceReport.status, "FAIL")
+  assert.strictEqual(enforceReport.integrityMode, "demo", "the artifact must record the run's mode")
+  assert(
+    enforceReport.integrityViolations.some((v) => v.rule === "delegated_core_work" && v.forbiddenFrom === "demo"),
+    "the artifact must persist the rule and its threshold",
+  )
+  const enforceFinal = await registeredTools.final_verify.execute({ sessionId: enforceRun })
+  assert.strictEqual(enforceFinal.status, "FAIL", `final_verify must inherit the audit failure: ${enforceFinal.content}`)
+  assert(
+    enforceFinal.reasons.some((r) => r.startsWith("security audit:") && r.includes("FAIL")),
+    `final_verify must name the security audit: ${JSON.stringify(enforceFinal.reasons)}`,
+  )
+  const enforceGate = await registeredTools.next.execute({ sessionId: enforceRun })
+  assert.strictEqual(enforceGate.status, "BLOCKED_BY_SECURITY", "the run must stay blocked after a violation")
+  assert.notStrictEqual(enforceGate.status, "ALL_PASSED")
+
+  console.log("✓ integrity findings enforced per mode, violations persisted with threshold, unknown rules refused")
 
   // ==========================================
   // Part 1d: Transition graph + evidence for verified_pass

@@ -12,7 +12,8 @@ Every run writes under one root:
 .opencode/teamwork/<session-id>/
 ├── prompt_draft.md          # spec (from the crafter, or inlined by the sentinel); required by teamwork_plan unless bypassed
 ├── ORIGINAL_REQUEST.md      # verbatim routed request + integrity mode (write-once; absent on legacy runs)
-├── plan.dag.json            # task DAG
+├── plan.dag.json            # task DAG (+ preflight gate result)
+├── preflight.json           # input-checks report (written by teamwork_preflight)
 ├── state.json               # resumable coordinator state
 ├── costs.json               # coordinator-maintained budget tracker
 ├── events.jsonl             # append-only lifecycle event log (JSON Lines)
@@ -57,7 +58,8 @@ Every run is routed with one integrity mode. It is recorded in
 `ORIGINAL_REQUEST.md`, copied to `state.json` and `plan.dag.json`, and read back
 by the security auditor and the final-verification gate from
 `ORIGINAL_REQUEST.md` (never from the caller). The orchestrator records and
-reports it; enforcement stays with the auditor.
+reports it; the auditor reports rule violations and the audit tool makes them
+binding (see [Integrity rules](#integrity-rules)).
 
 | Mode | Meaning |
 | --- | --- |
@@ -68,6 +70,30 @@ reports it; enforcement stays with the auditor.
 `development` is the default: `teamwork_plan` applies it when `integrityMode` is
 omitted, and the auditor and final gate apply it to legacy runs with no
 `ORIGINAL_REQUEST.md`. Any other value is refused before anything is written.
+
+### Integrity rules
+
+The auditor reports structured integrity claims as `integrityFindings` on
+`teamwork_security_audit`. Each rule is forbidden from a given mode onward, and
+every stricter mode inherits it:
+
+| Rule | Forbidden from |
+| --- | --- |
+| `fabricated_output` | `development` (always blocking) |
+| `core_logic_copied` | `demo` |
+| `delegated_core_work` | `demo` |
+| `test_source_read` | `demo` |
+| `external_dependency_used` | `benchmark` |
+
+A finding whose rule is forbidden at the run's mode is a **violation**. Any
+violation forces the audit to `FAIL` regardless of severity counts, so
+`teamwork_final_verify` cannot reach `PASS` and the merge stays blocked; the
+audit result names the violated rules and the mode. An unknown rule id is
+refused before anything is written.
+
+**Limitation.** The tool cannot detect dishonesty. It does not inspect the code
+to prove a rule was broken; it takes the auditor's report at face value and
+makes a reported violation binding on the gate.
 
 ## Schemas
 
@@ -132,6 +158,7 @@ Format:
   "sessionId": "20260112-101500-a1b2",
   "topology": "distributed-coding",
   "integrityMode": "development",
+  "preflight": { "status": "READY", "bypassed": false },
   "tasks": [
     {
       "id": "R1-impl",
@@ -234,6 +261,7 @@ The plugin provides deterministic orchestration tools for the Sentinel coordinat
 - `teamwork_task_update`: Enforces deterministic state transitions, tracks worker branch names and diff summaries, updates verifier metrics, and advances run `phase` to `MERGE` or `PRESENT_PARTIAL`.
 - `teamwork_final_verify`: Computes the run's final verdict from the artifacts on disk — every task must be `verified_pass`, every `verify/report-<taskId>.json` must be `PASS`, and `verify/security-audit.json` must be `PASS` — then writes `verify/final.json` atomically and appends a `final_verification` event. The verdict is computed from evidence; no input can turn a failing run into `PASS` (a caller-supplied `failReason` can only force `FAIL`). See [`verify/final.json`](#verifyfinaljson-final-verification-verdict).
 - `teamwork_worktree`: Isolates git worktrees outside the project repo (`setup` for sentinel and worker), inspects branch diffs (`diff`), performs clean merges into `teamwork/base-$SESSION_ID` with automatic conflict abort (`merge`), and prunes worktrees (`cleanup`).
+- `teamwork_preflight`: Re-checks the inputs named by an existing run's `ORIGINAL_REQUEST.md` (plus optional `inputs`), writes `<run>/preflight.json`, and appends a `preflight` event. It never throws and never blocks; it reports.
 
 **Spec gate (`teamwork_plan`).** A run must start from an approved spec: `<run>/prompt_draft.md`, present and non-empty after trimming. The check runs after topology/task-id validation and **before anything is written**, so a refusal creates no run directory and no plan files. Two inputs control it:
 
@@ -254,6 +282,77 @@ With no spec and neither override, the call is refused with an actionable messag
 The request record is a separate artifact from the approved spec: it does not
 satisfy the spec gate, and the spec gate does not replace it. `teamwork_security_audit`
 and the final-verification gate read the mode back from `ORIGINAL_REQUEST.md`.
+
+**Input preflight (`teamwork_plan`).** Before anything is written, the plan
+inventories the inputs the request names and checks them. The inventory comes
+from the explicit `inputs` array (highest trust) plus the routed `request`
+(when provided): URLs, and path tokens. It is deduplicated, keeps first-seen
+order, and is capped at 100 items.
+
+The block list is deliberately **narrow**:
+
+| Item | Blocking? | Check |
+| --- | --- | --- |
+| Explicit `inputs` entry | yes (even a relative path) | path or URL as classified |
+| URL (`/https?:\/\/[^\s)>\]}"']+/g`) | yes | `UNCHECKED` unless `checkUrls` |
+| Token starting `/`, `~/` or `file://` | yes | local path |
+| Other path-like token (contains `/`, no whitespace, not a URL) | **no — advisory** | local path, reported only |
+
+Path checks report `READY` (with `file`/`dir`) when the path exists and
+`MISSING` otherwise. URL checks record `UNCHECKED` when `checkUrls` is false
+(the default); with `checkUrls: true` each URL gets one `HEAD` request with a
+3 s timeout and is `READY` on 2xx/3xx or `OUTAGE` on any other status, error or
+timeout. The overall status is `OUTAGE` if any check is an outage, else
+`MISSING` if any **blocking** item is missing, else `READY`. Advisory misses
+never change the overall status.
+
+Three additive, optional plan inputs control the gate:
+
+| Input | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `inputs` | string[] | omitted | Extra blocking files/URLs to check (relative entries block too). |
+| `checkUrls` | boolean | `false` | When false URLs are `UNCHECKED`; when true they are HEAD-checked. |
+| `allowMissingInputs` | boolean | `false` | Explicit bypass when the status is `MISSING`/`OUTAGE`. Recorded as `preflight: { status, bypassed: true }` in `plan.dag.json` and as a `run_created` `note`. |
+
+When the overall status is `MISSING` or `OUTAGE` and `allowMissingInputs` is
+not `true`, the plan is **refused** with each blocking item and its status, and
+nothing is written (no run dir, no `ORIGINAL_REQUEST.md`, no plan files). When
+`request` and `inputs` are both absent the gate is skipped and `plan.dag.json`
+records `preflight: { status: "SKIPPED" }`; otherwise it records
+`{ status, bypassed }`.
+
+### `preflight.json` — input-checks report
+
+Written by `teamwork_preflight` for an existing run (`teamwork_plan` records
+the summary inline in `plan.dag.json` instead). The inventory is re-read from
+this run's `ORIGINAL_REQUEST.md` plus the tool's optional `inputs`.
+
+```json
+{
+  "checkedAt": "2026-01-12T10:20:00.000Z",
+  "integrityMode": "development",
+  "items": [
+    { "value": "/abs/path/spec.md", "kind": "path", "blocking": true, "advisory": false, "status": "READY", "detail": "file" },
+    { "value": "docs/draft.md", "kind": "path", "blocking": false, "advisory": true, "status": "MISSING" },
+    { "value": "https://example.com/issue/1", "kind": "url", "blocking": true, "advisory": false, "status": "UNCHECKED", "detail": "checkUrls: false" }
+  ],
+  "summary": {
+    "status": "READY",
+    "total": 3,
+    "blocking": 2,
+    "missing": 1,
+    "blockingMissing": 0,
+    "advisoryMissing": 1,
+    "outage": 0,
+    "unchecked": 1
+  }
+}
+```
+
+`summary.status` uses the same rule as the plan gate: `OUTAGE` beats `MISSING`
+beats `READY`, and advisory misses never change it. The tool also appends a
+`preflight` event (`to` is the status) with a `note` when any item is missing or
+unreachable. It reports; it does not block a run.
 
 ### `costs.json`
 
@@ -380,7 +479,7 @@ plus `agentSource` when an actor exists:
   **Optional on legacy lines**: logs written before `seq` existed have no
   `seq`, and they remain valid.
 - `event` (string): `run_created`, `task_transition`, `security_audit`,
-  `final_verification`, or `final_verification_bypass`
+  `final_verification`, `final_verification_bypass`, or `preflight`
 - `sessionId` (string): Run session id (≤64 chars)
 - `taskId` (string or null): Task id (≤64 chars); `null` for run-level events
 - `from` (string or null): Previous task status (≤32 chars)
@@ -397,11 +496,13 @@ plus `agentSource` when an actor exists:
 - `branch` (string or null): Task branch (≤120 chars)
 - `worktree` (string or null): Task worktree path (≤200 chars)
 - `phase` (string or null): Run phase after the event (≤32 chars)
-- `note` (string, optional): Reason an unstamped final verdict was accepted
-  (≤200 chars). Emitted **only** on `final_verification_bypass`; every other
-  event omits it. Sanitised with `clean()`.
+- `note` (string, optional): Why a bypass was taken or what input preflight
+  found (≤200 chars). Emitted on `final_verification_bypass`, on
+  `teamwork_preflight`'s `preflight` event, and on `run_created` when the
+  input-preflight gate was bypassed. Every other event omits it. Sanitised with
+  `clean()`.
 
-The five event kinds:
+The six event kinds:
 
 - `run_created`: written by `teamwork_plan` once the run is created. `taskId` and
   `from` are `null`, `to` is `"pending"`, `round` is `0`, `phase` is `"DAG_BUILD"`.
@@ -411,7 +512,9 @@ The five event kinds:
   **only** on `run_created`; every other event keeps the fields above.
   `specGate` and `specPath` also go through `clean()`. The timeline view parses
   events field by field and does not surface `specGate` (it is visible in
-  `events.jsonl` itself).
+  `events.jsonl` itself). When the input-preflight gate was bypassed with
+  `allowMissingInputs: true`, `run_created` also carries `note` (e.g.
+  `preflight bypassed: MISSING (2 items)`).
 - `task_transition`: written by `teamwork_task_update` after `state.json` is saved.
   `from` is the previous status and `to` the status that landed. `round`, `branch`,
   `worktree` and `phase` are the values after the transition. `agentSource`
@@ -419,6 +522,10 @@ The five event kinds:
 - `security_audit`: written by `teamwork_security_audit`. `to` is `"PASS"` or
   `"FAIL"`, and `phase` is the run phase. `taskId`, `from`, `branch`, `worktree` and
   `agent` are `null`, `round` is `0`, and `agentSource` is omitted.
+- `preflight`: written by `teamwork_preflight` after `preflight.json` is
+  saved. `to` is the overall preflight status (`READY`, `MISSING`, or
+  `OUTAGE`); `taskId` and `from` are `null`, `round` is `0`, and `phase` is the
+  run phase. `note` is present when any item is missing or unreachable.
 - `final_verification`: written by `teamwork_final_verify` after
   `verify/final.json` is saved. `to` is `"PASS"` or `"FAIL"`, `taskId` and `from`
   are `null`, `round` is `0`, and `phase` is the run phase. `agent` is the calling
@@ -512,15 +619,33 @@ to derived mode, with start and duration unknown.
       "location": "src/api.ts:42",
       "description": "Unbounded payload buffer could allow memory pressure under high concurrency."
     }
+  ],
+  "integrityFindings": [
+    { "rule": "external_dependency_used", "where": "src/parser.ts:3", "why": "uses a third-party parser" }
+  ],
+  "integrityViolations": [
+    {
+      "rule": "external_dependency_used",
+      "where": "src/parser.ts:3",
+      "why": "uses a third-party parser",
+      "forbiddenFrom": "benchmark"
+    }
   ]
 }
 ```
 
 `integrityMode` is read at audit time from `ORIGINAL_REQUEST.md` and recorded
 here; legacy runs with no request artifact record `development` and the tool
-result says the default was applied. The mode is disclosed, not enforced, by
-`teamwork_next`'s final-verification gate, whose responses carry the same
-`integrityMode` field.
+result says the default was applied. The mode itself is disclosed, not enforced,
+by `teamwork_next`'s final-verification gate (whose responses carry the same
+`integrityMode` field); enforcement happens in the audit tool when it records
+`integrityViolations`.
+
+`integrityFindings` records the auditor's sanitised claims (rule, optional
+`where`/`why`, capped at 50). `integrityViolations` is the subset whose rule is
+forbidden at the recorded mode; each entry also carries the rule's
+`forbiddenFrom` threshold (see [Integrity rules](#integrity-rules)). Any
+violation forces `status` to `FAIL`, independently of severity counts.
 
 If `critical` > 0 or `high` > 0, `status` is forced to `FAIL` and `teamwork_next` blocks final merge (`BLOCKED_BY_SECURITY`).
 

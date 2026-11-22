@@ -539,10 +539,37 @@ type IntegrityMode = (typeof INTEGRITY_MODES)[number]
 const DEFAULT_INTEGRITY_MODE: IntegrityMode = "development"
 const REQUEST_MAX = 20000
 
+/**
+ * Canonical integrity rules and the lowest mode that forbids each one
+ * (docs/ARTIFACTS.md). A higher mode inherits every prohibition below it.
+ * These are rules the auditor *reports* as violated; the tool cannot detect
+ * dishonesty, it only makes a reported violation binding.
+ */
+const INTEGRITY_RULES = {
+  fabricated_output: { forbiddenFrom: "development" },
+  core_logic_copied: { forbiddenFrom: "demo" },
+  delegated_core_work: { forbiddenFrom: "demo" },
+  test_source_read: { forbiddenFrom: "demo" },
+  external_dependency_used: { forbiddenFrom: "benchmark" },
+} as const satisfies Record<string, { forbiddenFrom: IntegrityMode }>
+type IntegrityRule = keyof typeof INTEGRITY_RULES
+const INTEGRITY_RULE_IDS = Object.keys(INTEGRITY_RULES) as IntegrityRule[]
+const INTEGRITY_FINDINGS_MAX = 50
+
 /** Normalise an integrity mode; undefined when it is not one of the three. */
 function normalizeIntegrityMode(value: unknown): IntegrityMode | undefined {
   const v = String(value ?? "").trim()
   return (INTEGRITY_MODES as readonly string[]).includes(v) ? (v as IntegrityMode) : undefined
+}
+
+/** Rank a mode by strictness: development < demo < benchmark. */
+function integrityModeRank(mode: IntegrityMode): number {
+  return INTEGRITY_MODES.indexOf(mode)
+}
+
+/** True when `rule` is forbidden at `mode` (at or above its threshold). */
+function isIntegrityRuleForbidden(rule: IntegrityRule, mode: IntegrityMode): boolean {
+  return integrityModeRank(mode) >= integrityModeRank(INTEGRITY_RULES[rule].forbiddenFrom)
 }
 
 /**
@@ -565,6 +592,174 @@ function readIntegrityMode(run: string): { mode: IntegrityMode; source: "artifac
     }
   } catch {}
   return { mode: DEFAULT_INTEGRITY_MODE, source: "default" }
+}
+
+// ---------------------------------------------------------------------------
+// Input preflight
+//
+// A routed request often names files or URLs the work depends on. Before a run
+// is created (or on demand for an existing run) the engine inventories those
+// inputs and reports whether they exist / answer. The block list is deliberately
+// narrow: explicit `inputs`, URLs, and tokens starting with `/`, `~/` or
+// `file://`; other path-like tokens are advisory and never block.
+// ---------------------------------------------------------------------------
+const PREFLIGHT_MAX = 100
+// The exact URL token grammar (docs/ARTIFACTS.md): no whitespace, no closing
+// punctuation, no quote characters.
+const PREFLIGHT_URL_RE = /https?:\/\/[^\s)>\]}"']+/g
+const PREFLIGHT_URL_TIMEOUT_MS = 3000
+
+type PreflightKind = "path" | "url"
+type PreflightItemStatus = "READY" | "MISSING" | "UNCHECKED" | "OUTAGE"
+
+interface PreflightItem {
+  /** Token exactly as named by the caller/request (or the local path it maps to). */
+  value: string
+  kind: PreflightKind
+  /** Explicit inputs, URLs and absolute/`~`/`file:` paths block; relative paths do not. */
+  blocking: boolean
+  /** A path-like relative token: reported, never blocking. */
+  advisory: boolean
+  status: PreflightItemStatus
+  /** `file`/`dir` for paths; an HTTP status or error/timeout for URLs. */
+  detail?: string
+}
+
+/** Strip surrounding prose punctuation from a whitespace token before checking it. */
+function trimInputToken(token: string): string {
+  return token.replace(/^[([`"'<]+/, "").replace(/[)\]`"'>,.;:!?]+$/, "")
+}
+
+function isUrlToken(value: string): boolean {
+  return /^https?:\/\//i.test(value)
+}
+
+/**
+ * Build the deduplicated input inventory from the explicit `inputs` (highest
+ * trust) and the routed `request`. First-seen order wins; capped at 100 items.
+ */
+function extractInventory(request: string | undefined, inputs: string[] | undefined): PreflightItem[] {
+  const seen = new Set<string>()
+  const items: PreflightItem[] = []
+  const add = (rawValue: string, kind: PreflightKind, blocking: boolean, advisory = false) => {
+    const value = clean(rawValue, 500).trim()
+    if (!value || seen.has(value) || items.length >= PREFLIGHT_MAX) return
+    seen.add(value)
+    items.push({ value, kind, blocking, advisory, status: kind === "url" ? "UNCHECKED" : "MISSING" })
+  }
+  // Explicit inputs are taken whole and always block, including relative paths.
+  for (const raw of inputs ?? []) {
+    if (raw) add(raw, isUrlToken(clean(raw, 500).trim()) ? "url" : "path", true)
+  }
+  if (typeof request === "string" && request) {
+    for (const match of request.matchAll(PREFLIGHT_URL_RE)) add(match[0], "url", true)
+    for (const rawToken of request.split(/\s+/)) {
+      const token = trimInputToken(rawToken)
+      if (!token || isUrlToken(token)) continue // URLs were captured above
+      if (token.startsWith("/") || token.startsWith("~/") || token.startsWith("file://")) {
+        add(token, "path", true)
+      } else if (token.includes("/") && !/\s/.test(token)) {
+        add(token, "path", false, true)
+      }
+    }
+  }
+  return items
+}
+
+/** Map a blocking path token (`~`, `~/`, `file:`) onto a local filesystem path. */
+function localInputPath(value: string): string {
+  let p = value
+  if (p.startsWith("file://")) {
+    p = p.slice("file://".length)
+    try {
+      p = decodeURIComponent(p)
+    } catch {}
+  }
+  if (p === "~") return homedir()
+  if (p.startsWith("~/")) return join(homedir(), p.slice(2))
+  return p
+}
+
+function checkInputPath(value: string): { status: PreflightItemStatus; detail?: string } {
+  const path = localInputPath(value)
+  try {
+    if (!existsSync(path)) return { status: "MISSING" }
+    const st = lstatSync(path)
+    return { status: "READY", detail: st.isDirectory() ? "dir" : st.isFile() ? "file" : "other" }
+  } catch {
+    return { status: "MISSING" }
+  }
+}
+
+async function checkInputUrl(value: string, checkUrls: boolean): Promise<{ status: PreflightItemStatus; detail?: string }> {
+  if (!checkUrls) return { status: "UNCHECKED", detail: "checkUrls: false" }
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), PREFLIGHT_URL_TIMEOUT_MS)
+  try {
+    // HEAD only: no body is read, and redirects are reported (not followed).
+    const res = await fetch(value, { method: "HEAD", signal: controller.signal, redirect: "manual" })
+    return {
+      status: res.status >= 200 && res.status < 400 ? "READY" : "OUTAGE",
+      detail: `HTTP ${res.status}`,
+    }
+  } catch (err: any) {
+    const why = err?.name === "AbortError" ? "timeout" : err?.message || "request failed"
+    return { status: "OUTAGE", detail: clean(why, 120) }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** Run every check. Never throws; each item lands on READY/MISSING/UNCHECKED/OUTAGE. */
+async function checkInventory(items: PreflightItem[], checkUrls: boolean): Promise<PreflightItem[]> {
+  await Promise.all(
+    items.map(async (item) => {
+      const result = item.kind === "url" ? await checkInputUrl(item.value, checkUrls) : checkInputPath(item.value)
+      item.status = result.status
+      if (result.detail) item.detail = result.detail
+    }),
+  )
+  return items
+}
+
+function summarizePreflight(items: PreflightItem[]) {
+  const missing = items.filter((i) => i.status === "MISSING")
+  const outage = items.filter((i) => i.status === "OUTAGE")
+  const blockingMissing = missing.filter((i) => i.blocking)
+  const advisoryMissing = missing.filter((i) => i.advisory)
+  // Advisory misses never change the overall status.
+  const status: "READY" | "MISSING" | "OUTAGE" = outage.length
+    ? "OUTAGE"
+    : blockingMissing.length
+      ? "MISSING"
+      : "READY"
+  return {
+    status,
+    total: items.length,
+    blocking: items.filter((i) => i.blocking).length,
+    missing: missing.length,
+    blockingMissing: blockingMissing.length,
+    advisoryMissing: advisoryMissing.length,
+    outage: outage.length,
+    unchecked: items.filter((i) => i.status === "UNCHECKED").length,
+  }
+}
+
+/** Read the verbatim request body back out of `<run>/ORIGINAL_REQUEST.md`. */
+function readRecordedRequest(run: string): string | undefined {
+  try {
+    const file = join(run, "ORIGINAL_REQUEST.md")
+    if (!existsSync(file)) return undefined
+    const text = readFileSync(file, "utf8")
+    const marker = "\n## Request\n"
+    const at = text.indexOf(marker)
+    if (at === -1) return undefined
+    let body = text.slice(at + marker.length)
+    if (body.startsWith("\n")) body = body.slice(1)
+    return body
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -896,7 +1091,7 @@ function nextEventSeq(file: string): number {
 async function appendEvent(
   run: string,
   ev: {
-    event: "run_created" | "task_transition" | "security_audit" | "final_verification" | "final_verification_bypass"
+    event: "run_created" | "task_transition" | "security_audit" | "final_verification" | "final_verification_bypass" | "preflight"
     sessionId: string
     taskId?: string | null
     from?: string | null
@@ -912,7 +1107,10 @@ async function appendEvent(
     specGate?: "satisfied" | "bypassed" | "not_required"
     /** run_created only: the spec file, when the gate was satisfied. */
     specPath?: string | null
-    /** final_verification_bypass only: why an unstamped verdict was accepted. */
+    /**
+     * final_verification_bypass: why an unstamped verdict was accepted.
+     * preflight / run_created: an input-preflight bypass or missing-input note.
+     */
     note?: string | null
   },
 ) {
@@ -1033,6 +1231,19 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           budgetSource: { type: "string", description: "Where the budget came from: credits | default | manual." },
           requireSpec: { type: "boolean", description: "Default true. When true, the run must have a non-empty prompt_draft.md (the approved spec) before the plan is written; see skipInterview for the explicit bypass." },
           skipInterview: { type: "boolean", description: "Default false. Explicit bypass of the spec gate: plan without an approved prompt_draft.md. Recorded in events.jsonl as specGate: bypassed." },
+          inputs: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional. Files/URLs this run depends on, checked before anything is written. Every entry is blocking, including relative paths (resolved from the engine's cwd).",
+          },
+          checkUrls: {
+            type: "boolean",
+            description: "Default false. When false, URLs are recorded UNCHECKED. When true, each URL gets a HEAD request with a 3 s timeout; failures refuse the plan.",
+          },
+          allowMissingInputs: {
+            type: "boolean",
+            description: "Default false. Explicit bypass: plan even when a blocking input is MISSING/OUTAGE. The bypass is recorded in plan.dag.json and events.jsonl.",
+          },
           tasks: {
             type: "array",
             items: {
@@ -1125,6 +1336,40 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             content: `refused: no spec found for this run (expected ${specFile}). Run /teamwork-craft to produce one, or re-call with skipInterview: true to proceed without an approved prompt.`,
           }
         }
+        // Input preflight. Runs before mkdir so a refusal writes NOTHING (no run
+        // dir, no ORIGINAL_REQUEST.md, no plan). Only a narrow block list can
+        // refuse: explicit inputs, URLs, and absolute/`~`/`file:` paths. Relative
+        // path-like tokens are advisory and can never block.
+        const explicitInputs = (Array.isArray(input.inputs) ? input.inputs : []).filter(
+          (v: unknown): v is string => typeof v === "string",
+        )
+        let preflight: { status: "READY" | "MISSING" | "OUTAGE" | "SKIPPED"; bypassed?: boolean } = { status: "SKIPPED" }
+        let preflightNote: string | undefined
+        let preflightLine = "Preflight: SKIPPED (no request or explicit inputs)."
+        if (request !== undefined || explicitInputs.length > 0) {
+          const items = await checkInventory(extractInventory(request, explicitInputs), input.checkUrls === true)
+          const summary = summarizePreflight(items)
+          const blockingProblems = items.filter(
+            (i) => i.blocking && (i.status === "MISSING" || i.status === "OUTAGE"),
+          )
+          if (blockingProblems.length > 0 && input.allowMissingInputs !== true) {
+            return {
+              content: [
+                `refused: ${blockingProblems.length} required input(s) are missing or unreachable; nothing was written.`,
+                ...blockingProblems.map((i) => `  ${i.status} ${i.value}${i.detail ? ` (${i.detail})` : ""}`),
+                "Fix the paths/URLs, or re-call with allowMissingInputs: true to proceed and record the bypass.",
+              ].join("\n"),
+            }
+          }
+          if (blockingProblems.length > 0) {
+            preflight = { status: summary.status, bypassed: true }
+            preflightNote = `preflight bypassed: ${summary.status} (${blockingProblems.length} item${blockingProblems.length === 1 ? "" : "s"})`
+          } else {
+            preflight = { status: summary.status, bypassed: false }
+          }
+          const advisory = items.filter((i) => i.advisory && i.status === "MISSING").map((i) => i.value)
+          preflightLine = `Preflight: ${summary.status}${preflight.bypassed ? " (bypassed: allowMissingInputs)" : ""} (${summary.total} item(s); ${summary.unchecked} unchecked)${advisory.length ? `; ${advisory.length} advisory path missing (non-blocking): ${advisory.join(", ")}` : ""}.`
+        }
         mkdirSync(run, { recursive: true })
         // The request record goes first: it is the artifact the auditor and the
         // final gate read the integrity mode from.
@@ -1146,6 +1391,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           sessionId,
           topology,
           integrityMode,
+          preflight,
           tasks,
           ...(routingReason ? { routingReason } : {}),
         })
@@ -1224,7 +1470,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           writeSnapshots(join(run, "snapshots.json"), snaps)
         })
         touch(join(run, "pitfalls.md"), "# Pitfalls\n\n_answer-agnostic failure modes; one per line_\n")
-        await appendEvent(run, { event: "run_created", sessionId, taskId: null, from: null, to: "pending", round: 0, phase: "DAG_BUILD", specGate, ...(specGate === "satisfied" ? { specPath: specFile } : {}) })
+        await appendEvent(run, { event: "run_created", sessionId, taskId: null, from: null, to: "pending", round: 0, phase: "DAG_BUILD", specGate, ...(specGate === "satisfied" ? { specPath: specFile } : {}), ...(preflightNote ? { note: preflightNote } : {}) })
         // Backstop: if console credits apply but the budget wasn't derived from
         // them, warn (advisory — the sentinel is instructed to run the preflight).
         let creditWarning = ""
@@ -1232,7 +1478,78 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           creditWarning = "\n⚠ opencode/ models + opencode_console connected — run teamwork_budget and derive budgetUsd from credits before dispatching."
         }
         return {
-          content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${creditWarning}`,
+          content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\n${preflightLine}\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${preflight.bypassed ? `\n⚠ Input preflight bypassed (allowMissingInputs: true): ${preflight.status}.` : ""}${creditWarning}`,
+        }
+      },
+    })
+
+    editor.add({
+      name: "preflight",
+      description:
+        "Re-run the input preflight for an existing run: check the files/URLs named by ORIGINAL_REQUEST.md plus any explicit inputs, write <run>/preflight.json, and append a preflight event. Never throws.",
+      input: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string", description: "Run to check; omit for the latest run." },
+          inputs: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional additional blocking files/URLs to check alongside the recorded request.",
+          },
+          checkUrls: {
+            type: "boolean",
+            description: "Default false. When false, URLs are recorded UNCHECKED. When true, each gets a HEAD request with a 3 s timeout.",
+          },
+        },
+        additionalProperties: false,
+      },
+      execute: async (input: any) => {
+        const resolved = resolveRun(root, input?.sessionId)
+        if (resolved.error) return { content: resolved.error }
+        const run = resolved.run as string
+        const explicitInputs = (Array.isArray(input?.inputs) ? input.inputs : []).filter(
+          (v: unknown): v is string => typeof v === "string",
+        )
+        const recorded = readRecordedRequest(run)
+        const items = await checkInventory(extractInventory(recorded, explicitInputs), input?.checkUrls === true)
+        const summary = summarizePreflight(items)
+        const integrity = readIntegrityMode(run)
+        const checkedAt = new Date().toISOString()
+        const report = { checkedAt, integrityMode: integrity.mode, items, summary }
+        const file = join(run, "preflight.json")
+        refuseSymlink(file)
+        writeJson(file, report)
+
+        const problems = items.filter((i) => i.status === "MISSING" || i.status === "OUTAGE")
+        const note = problems.length
+          ? `preflight ${summary.status}: ${problems.length} item(s) missing or unreachable`
+          : undefined
+        const state = readJson<any>(join(run, "state.json"), {})
+        await appendEvent(run, {
+          event: "preflight",
+          sessionId: basename(run),
+          taskId: null,
+          from: null,
+          to: summary.status,
+          round: 0,
+          phase: state?.phase ?? null,
+          ...(note ? { note } : {}),
+        })
+
+        const lines = items.map(
+          (i) => `  ${i.status} ${i.value}${i.detail ? ` (${i.detail})` : ""}${i.advisory ? " [advisory]" : ""}`,
+        )
+        return {
+          content: [
+            `Preflight ${summary.status}: ${summary.total} item(s), ${summary.blockingMissing} blocking missing, ${summary.outage} outage, ${summary.unchecked} unchecked.`,
+            ...lines,
+            `Artifact: ${file}`,
+          ].join("\n"),
+          status: summary.status,
+          summary,
+          items,
+          integrityMode: integrity.mode,
+          preflightPath: file,
         }
       },
     })
@@ -1984,7 +2301,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     editor.add({
       name: "security_audit",
       description:
-        "Record the findings of team/security-auditor and enforce the pre-merge security gate. Writes verify/security-audit.json. If Critical or High findings exist, marks status as FAIL and blocks final merge.",
+        "Record the findings of team/security-auditor and enforce the pre-merge security gate. Writes verify/security-audit.json. If Critical or High findings exist, or the auditor reports an integrity finding forbidden at the run's mode, marks status as FAIL and blocks final merge.",
       input: {
         type: "object",
         properties: {
@@ -2003,6 +2320,20 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               required: ["severity", "description"],
             },
           },
+          integrityFindings: {
+            type: "array",
+            description: `Optional. Up to ${INTEGRITY_FINDINGS_MAX} reported integrity-rule violations. An unknown rule refuses the call before anything is written.`,
+            items: {
+              type: "object",
+              properties: {
+                rule: { type: "string", description: INTEGRITY_RULE_IDS.join(" | ") },
+                where: { type: "string" },
+                why: { type: "string" },
+              },
+              required: ["rule"],
+              additionalProperties: false,
+            },
+          },
           summary: { type: "string", description: "Summary of the security audit." },
         },
         required: ["status"],
@@ -2012,12 +2343,42 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
-        const verifyDir = join(run, "verify")
-        mkdirSync(verifyDir, { recursive: true })
-        const auditFile = join(verifyDir, "security-audit.json")
         // The auditor works from the recorded request, not from its caller: the
         // mode is read from ORIGINAL_REQUEST.md (legacy runs default to development).
         const integrity = readIntegrityMode(run)
+
+        // Sanitise and validate the reported integrity findings BEFORE anything
+        // is written. An unknown rule id is refused outright (like a topology
+        // typo), listing the accepted ids.
+        const integrityFindings = (Array.isArray(input.integrityFindings) ? input.integrityFindings : [])
+          .slice(0, INTEGRITY_FINDINGS_MAX)
+          .map((f: any) => ({
+            rule: clean(f?.rule, 64).trim(),
+            where: clean(f?.where, 200),
+            why: clean(f?.why, 500),
+          }))
+        const unknownRule = integrityFindings.find(
+          (f: { rule: string }) => !Object.prototype.hasOwnProperty.call(INTEGRITY_RULES, f.rule),
+        )
+        if (unknownRule) {
+          return {
+            content: `refused: unknown integrity rule "${clean(unknownRule.rule, 64)}" (accepted: ${INTEGRITY_RULE_IDS.join(", ")}); nothing was written`,
+          }
+        }
+
+        const integrityViolations = integrityFindings
+          .filter((f: { rule: string }) =>
+            isIntegrityRuleForbidden(f.rule as IntegrityRule, integrity.mode),
+          )
+          .map((f: { rule: string; where: string; why: string }) => ({
+            ...f,
+            forbiddenFrom: INTEGRITY_RULES[f.rule as IntegrityRule].forbiddenFrom,
+          }))
+        const violationRules = [...new Set(integrityViolations.map((v) => v.rule))]
+
+        const verifyDir = join(run, "verify")
+        mkdirSync(verifyDir, { recursive: true })
+        const auditFile = join(verifyDir, "security-audit.json")
         const integrityModeNote =
           integrity.source === "artifact"
             ? `Integrity mode: ${integrity.mode} (from ORIGINAL_REQUEST.md).`
@@ -2032,7 +2393,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         }
 
         let status = clean(input.status, 16).toUpperCase()
+        // Severity forcing and integrity forcing are independent; either FAILs.
         if (counts.critical > 0 || counts.high > 0) {
+          status = "FAIL"
+        }
+        if (integrityViolations.length > 0) {
           status = "FAIL"
         }
 
@@ -2049,6 +2414,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             location: clean(f.location || "", 120),
             description: clean(f.description, 300),
           })),
+          integrityFindings,
+          integrityViolations,
         }
         writeJson(auditFile, report)
 
@@ -2078,8 +2445,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         })
 
         if (status === "FAIL") {
+          const violationNote =
+            integrityViolations.length > 0
+              ? `\nIntegrity violation(s) at mode ${integrity.mode}: ${violationRules.join(", ")}.`
+              : ""
           return {
-            content: `SECURITY AUDIT FAILED: ${counts.critical} Critical, ${counts.high} High, ${counts.medium} Medium findings. Final merge is BLOCKED until remediated.\n${integrityModeNote}\nReport saved to: ${auditFile}`,
+            content: `SECURITY AUDIT FAILED: ${counts.critical} Critical, ${counts.high} High, ${counts.medium} Medium findings.${violationNote} Final merge is BLOCKED until remediated.\n${integrityModeNote}\nReport saved to: ${auditFile}`,
             status: "FAIL",
             integrityMode: integrity.mode,
             reportPath: auditFile,
@@ -2087,7 +2458,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         }
 
         return {
-          content: `SECURITY AUDIT PASSED: ${findings.length} findings (${counts.medium} Medium, ${counts.low} Low, 0 High/Critical). Final merge is APPROVED.\n${integrityModeNote}\nReport saved to: ${auditFile}`,
+          content: `SECURITY AUDIT PASSED: ${findings.length} findings (${counts.medium} Medium, ${counts.low} Low, 0 High/Critical); no forbidden integrity findings at mode ${integrity.mode}. Final merge is APPROVED.\n${integrityModeNote}\nReport saved to: ${auditFile}`,
           status: "PASS",
           integrityMode: integrity.mode,
           reportPath: auditFile,

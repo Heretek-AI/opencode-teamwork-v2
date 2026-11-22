@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.9] - 2026-11-22
+
+### Added
+
+- `teamwork_security_audit` accepts `integrityFindings` (`{rule, where?, why?}`, max 50) and enforces a fixed rule table with per-rule thresholds: `fabricated_output` is forbidden from `development`; `core_logic_copied`, `delegated_core_work` and `test_source_read` from `demo`; `external_dependency_used` from `benchmark`. A finding forbidden at the run's mode becomes an `integrityViolation` and forces `status: "FAIL"` independently of Critical/High findings. Unknown rule ids are refused before anything is written. `verify/security-audit.json` persists `integrityMode`, `integrityFindings` and `integrityViolations` (each with its `forbiddenFrom` threshold); `teamwork_final_verify` inherits the FAIL, and `teamwork_next` reports `BLOCKED_BY_SECURITY`.
+- Input pre-flight gate. A shared inventory helper extracts explicit `inputs`, URLs, blocking absolute/`~`/`file:` paths and advisory relative path-like tokens from the routed request (deduplicated, capped at 100). `teamwork_plan` gains `inputs`, `checkUrls` and `allowMissingInputs`; `MISSING`/`OUTAGE` refuse the plan before anything is written. A bypass persists `plan.dag.json.preflight: {status, bypassed: true}` plus a `run_created` note; `READY` records `{status: "READY", bypassed: false}`, and a run with no inventory records `{status: "SKIPPED"}`.
+- `teamwork_preflight` re-runs the input check for an existing run and writes `<run>/preflight.json` (`checkedAt`, `integrityMode`, `items`, `summary`), appending a `preflight` event. URLs are `UNCHECKED` by default; `checkUrls: true` issues one 3 s HEAD request per URL and yields `READY` or `OUTAGE`.
+- `events.jsonl` gains the `preflight` event kind.
+
+### Changed
+
+- Planning can now be refused for missing blocking inputs, and the refusal writes no run directory. The `allowMissingInputs` bypass is explicit and recorded.
+- Integrity violations force the security audit to FAIL, which blocks merge and final verification.
+
 ## [0.5.8] - 2026-11-22
 
 ### Added
