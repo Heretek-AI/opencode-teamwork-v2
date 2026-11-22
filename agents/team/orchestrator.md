@@ -53,6 +53,8 @@ Look at the user's prompt in strict priority order and pick exactly one:
 
 Topologies are defined in `ARTIFACTS.md`.
 
+> **v2 Route Note:** Priority 1 (`document-review`) uses the v2 tools (`teamwork_document_triage` / `teamwork_document_record`) and `team/segment-reviewer`. When a request classifies as `document-review`, direct the user to `/teamwork` (`team/sentinel`) instead of running the legacy v1 loop.
+
 For hard problems that need the full v2 stack (DAG engine, git
 worktrees per agent, typed artifact bus, cost tracking, the
 crafter wizard), direct the user to `/teamwork` instead of running

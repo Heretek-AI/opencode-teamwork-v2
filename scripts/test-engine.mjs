@@ -2805,7 +2805,7 @@ try {
       skipInterview: true,
     })
     const cleanMap = readFileSync(join(docRoot, ".opencode", "teamwork", cleanRun, "document-review", "DOCUMENT_TEXT_MAP.md"), "utf8")
-    assert(!/[\x1b\u0085\u2028\u2029]/.test(cleanMap), "Control chars must be stripped from DOCUMENT_TEXT_MAP.md")
+    assert(!/[\u0085\u2028\u2029]/.test(cleanMap) && !cleanMap.includes("\x1b"), "Control chars must be stripped from DOCUMENT_TEXT_MAP.md")
 
     await tools.document_record.execute({
       sessionId: cleanRun,
@@ -2814,7 +2814,7 @@ try {
       content: "Detail\x1b[32mA\u0085B\u2028C",
     })
     const cleanRep = readFileSync(join(docRoot, ".opencode", "teamwork", cleanRun, "DOCUMENT_REVIEW_REPORT.md"), "utf8")
-    assert(!/[\x1b\u0085\u2028\u2029]/.test(cleanRep), "Control chars must be stripped from DOCUMENT_REVIEW_REPORT.md")
+    assert(!/[\u0085\u2028\u2029]/.test(cleanRep) && !cleanRep.includes("\x1b"), "Control chars must be stripped from DOCUMENT_REVIEW_REPORT.md")
     console.log("✓ 9.7 Security (traversal, symlinks, SEGMENT_ID, sanitisation) passed")
   } finally {
     rmSync(docRoot, { recursive: true, force: true })

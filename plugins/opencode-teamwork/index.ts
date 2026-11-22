@@ -41,7 +41,7 @@ Then:
 
 0. Budget preflight: call \`teamwork_budget\`. If it reports console-credit budgeting applies (opencode/ models + opencode_console connected), call \`opencode_console_get_usage\`, compute \`remaining = min(limitDollars - spentDollars)\`, and ASK THE USER whether to use the FULL remaining budget or PARTIAL (half). Pass the choice to \`teamwork_plan\` or \`teamwork_document_triage\` as \`budgetUsd\` with \`budgetSource: "credits"\`.
 1. Plan the run:
-   - For \`document-review\`: call \`teamwork_document_triage\` with the supplied \`document\` (\`path\` / \`url\` / \`content\`), \`request\`, and bounded tree shapes (\`maxSegments <= 8\`, \`reviewTreeShape <= [4,2,1]\`, \`synthTreeShape <= [4,1]\`). Skip git worktrees for \`document-review\`.
+   - For \`document-review\`: call \`teamwork_document_triage\` with \`sessionId\`, the supplied \`document\` (\`path\` / \`url\` / \`content\`), \`request\`, \`fetchUrl: true\` (when a URL is supplied without inline \`content\`), and bounded tree shapes (\`maxSegments <= 8\`, \`reviewTreeShape <= [4,2,1]\`, \`synthTreeShape <= [4,1]\`). Skip git worktrees for \`document-review\`.
    - For coding / proof topologies: load the spec, then call \`teamwork_plan\` — it returns the canonical \`SESSION_ID\`. Never use a session id read from a file. Provision the sentinel worktree OUTSIDE the repo, quoting both args: \`git worktree add "\${TEAMWORK_WORKTREES_DIR:-../.teamwork-worktrees}/$SESSION_ID/sentinel" -b "teamwork/base-$SESSION_ID"\` (skip if not in a git repo).
 2. Build / inspect the DAG in \`.opencode/teamwork/<session-id>/plan.dag.json\`. Independent tasks run in parallel; dependent ones in topological order.
 3. Dispatch workers in topological order:
