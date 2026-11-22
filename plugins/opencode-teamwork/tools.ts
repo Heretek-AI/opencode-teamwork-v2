@@ -34,6 +34,18 @@ import {
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { homedir } from "node:os"
 import { execFileSync } from "node:child_process"
+import {
+  MAX_FINDINGS,
+  MAX_SEGMENT_CHARS,
+  MAX_TEXT_MAP_CHARS,
+  SEGMENT_ID,
+  classifyRoute,
+  ingestDocument,
+  isSafeSegmentId,
+  resolveAndReadDocument,
+  segmentDocument,
+  validateTreeBounds,
+} from "./document-review.ts"
 
 // ---------------------------------------------------------------------------
 // OpenCode native cost tracking
@@ -820,6 +832,7 @@ const READ_ONLY_ACTIONS: Record<string, Set<string>> = {
   "team/falsifier": new Set(["edit", "shell", "subagent"]),
   "team/scout": new Set(["edit", "subagent"]),
   "team/security-auditor": new Set(["edit", "webfetch", "subagent"]),
+  "team/segment-reviewer": new Set(["edit", "shell", "subagent", "webfetch"]),
 }
 
 const pad = (n: number) => String(n).padStart(2, "0")
@@ -1207,6 +1220,307 @@ export function describeRun(root: string): string | undefined {
   ].join("\n")
 }
 
+function ensureSafeRunSubpath(run: string, targetFile: string) {
+  const absRun = resolve(run)
+  const absTarget = resolve(targetFile)
+  const rel = relative(absRun, absTarget)
+  if (!rel || isAbsolute(rel) || rel.startsWith("..")) {
+    throw new Error("refused: target path escapes run directory")
+  }
+  const realRun = existsSync(absRun) ? realpathSync(absRun) : absRun
+  let cur = absTarget
+  while (cur !== absRun && cur !== dirname(cur)) {
+    refuseSymlink(cur)
+    if (existsSync(cur)) {
+      const st = lstatSync(cur)
+      if (cur !== absTarget && !st.isDirectory()) {
+        throw new Error(`refused: parent "${basename(cur)}" is not a directory`)
+      }
+      if (cur === absTarget && !st.isFile()) {
+        throw new Error(`refused: target "${basename(cur)}" is not a regular file`)
+      }
+      const realRel = relative(realRun, realpathSync(cur))
+      if (!realRel || isAbsolute(realRel) || realRel.startsWith("..")) {
+        throw new Error("refused: path escapes run directory via realpath")
+      }
+    }
+    cur = dirname(cur)
+  }
+}
+
+function writeTextSafe(run: string, targetFile: string, content: string) {
+  ensureSafeRunSubpath(run, targetFile)
+  mkdirSync(dirname(targetFile), { recursive: true })
+  const tmp = targetFile + ".tmp"
+  refuseSymlink(tmp)
+  writeFileSync(tmp, content, "utf8")
+  renameSync(tmp, targetFile)
+}
+
+function writeJsonSafe(run: string, targetFile: string, value: unknown) {
+  ensureSafeRunSubpath(run, targetFile)
+  writeJson(targetFile, value)
+}
+
+function readRegularJson<T>(run: string, targetFile: string): { ok: true; data: T } | { ok: false; reason: "missing" | "symlink" | "invalid" } {
+  try {
+    const st = lstatSync(targetFile)
+    if (st.isSymbolicLink()) return { ok: false, reason: "symlink" }
+    if (!st.isFile()) return { ok: false, reason: "invalid" }
+    const realRun = realpathSync(run)
+    const realFile = realpathSync(targetFile)
+    const rel = relative(realRun, realFile)
+    if (!rel || isAbsolute(rel) || rel.startsWith("..")) return { ok: false, reason: "symlink" }
+    return { ok: true, data: JSON.parse(readFileSync(targetFile, "utf8")) as T }
+  } catch (err: any) {
+    if (err?.code === "ENOENT") return { ok: false, reason: "missing" }
+    return { ok: false, reason: "invalid" }
+  }
+}
+
+async function createPlanRun(
+  ctx: any,
+  root: string,
+  input: any,
+  context: any,
+  beforeMkdir?: (info: { sessionId: string; run: string; integrityMode: IntegrityMode; topology: string }) => Promise<string | undefined> | string | undefined,
+): Promise<{ ok: true; sessionId: string; run: string; tasks: any[]; topology: string; integrityMode: IntegrityMode; content: string } | { ok: false; content: string }> {
+  const sessionId = input.sessionId || newSessionId()
+  const resolved = resolveRun(root, sessionId)
+  if (resolved.error) return { ok: false, content: resolved.error }
+  const run = resolved.run as string
+  // Refuse an unknown topology before anything is written, so a typo can
+  // never become the run's permanent label.
+  const topology = normalizeTopology(input.topology)
+  if (!topology) {
+    return {
+      ok: false,
+      content: `refused: invalid topology "${clean(input.topology, 32)}" (accepted: ${TOPOLOGIES.join(", ")}; aliases: ${Object.keys(TOPOLOGY_ALIASES).join(", ")})`,
+    }
+  }
+  // Refuse an unknown integrity mode before anything is written. The mode
+  // is the run's integrity contract, so a typo must never be persisted.
+  const integrityMode =
+    input.integrityMode === undefined || input.integrityMode === null
+      ? DEFAULT_INTEGRITY_MODE
+      : normalizeIntegrityMode(input.integrityMode)
+  if (!integrityMode) {
+    return {
+      ok: false,
+      content: `refused: invalid integrityMode "${clean(input.integrityMode, 32)}" (accepted: ${INTEGRITY_MODES.join(", ")}; default: ${DEFAULT_INTEGRITY_MODE})`,
+    }
+  }
+  // The request record is verbatim, so refuse rather than truncate. The
+  // length check runs before anything is written.
+  const request = typeof input.request === "string" ? input.request : undefined
+  if (request !== undefined && request.length > REQUEST_MAX) {
+    return {
+      ok: false,
+      content: `refused: request is ${request.length} chars, over the ${REQUEST_MAX}-char limit; it must be recorded verbatim. Shorten it or start the run from a shorter routed request. Nothing was written.`,
+    }
+  }
+  // SEC-1: task ids become keys of state/costs maps and path/branch segments.
+  // Refuse the whole plan (before anything is written) on any unsafe id.
+  for (const t of input.tasks || []) {
+    const ids = [t?.id, ...(Array.isArray(t?.dependsOn) ? t.dependsOn : [])]
+    const i = ids.findIndex((id: unknown) => typeof id !== "string" || !isSafeTaskId(id))
+    if (i !== -1) {
+      return { ok: false, content: `refused: invalid task id "${clean(ids[i], 32)}" (must be a single segment matching ${TASK_ID})` }
+    }
+  }
+  // ORIGINAL_REQUEST.md is write-once. Check before the spec gate so a
+  // second request is refused for the right reason and writes nothing.
+  const originalRequestFile = join(run, "ORIGINAL_REQUEST.md")
+  if (request !== undefined) {
+    try {
+      if (existsSync(originalRequestFile) && readFileSync(originalRequestFile, "utf8").trim()) {
+        return {
+          ok: false,
+          content: `refused: ${originalRequestFile} already records this run's request and is write-once.\nUse a new session (a new teamwork_plan sessionId) for a different request. Nothing was written.`,
+        }
+      }
+    } catch {
+      return { ok: false, content: `refused: cannot read ${originalRequestFile}; refusing to overwrite a request that may already be recorded. Nothing was written.` }
+    }
+  }
+  // 3.4: a run starts from an approved spec (`<run>/prompt_draft.md`). The
+  // gate runs BEFORE mkdir, so a refusal leaves no run dir and no plan files
+  // behind. `skipInterview` is the explicit, recorded bypass.
+  const specFile = join(run, "prompt_draft.md")
+  let specText = ""
+  try {
+    if (existsSync(specFile)) specText = readFileSync(specFile, "utf8").trim()
+  } catch {
+    specText = "" // unreadable spec = no usable spec
+  }
+  const hasSpec = specText.length > 0
+  const specGate: "satisfied" | "bypassed" | "not_required" | undefined =
+    input.requireSpec === false ? "not_required" : hasSpec ? "satisfied" : input.skipInterview === true ? "bypassed" : undefined
+  if (!specGate) {
+    return {
+      ok: false,
+      content: `refused: no spec found for this run (expected ${specFile}). Run /teamwork-craft to produce one, or re-call with skipInterview: true to proceed without an approved prompt.`,
+    }
+  }
+  // Input preflight. Runs before mkdir so a refusal writes NOTHING (no run
+  // dir, no ORIGINAL_REQUEST.md, no plan). Only a narrow block list can
+  // refuse: explicit inputs, URLs, and absolute/`~`/`file:` paths. Relative
+  // path-like tokens are advisory and can never block.
+  const explicitInputs = (Array.isArray(input.inputs) ? input.inputs : []).filter(
+    (v: unknown): v is string => typeof v === "string",
+  )
+  let preflight: { status: "READY" | "MISSING" | "OUTAGE" | "SKIPPED"; bypassed?: boolean } = { status: "SKIPPED" }
+  let preflightNote: string | undefined
+  let preflightLine = "Preflight: SKIPPED (no request or explicit inputs)."
+  if (request !== undefined || explicitInputs.length > 0) {
+    const items = await checkInventory(extractInventory(request, explicitInputs), input.checkUrls === true)
+    const summary = summarizePreflight(items)
+    const blockingProblems = items.filter(
+      (i) => i.blocking && (i.status === "MISSING" || i.status === "OUTAGE"),
+    )
+    if (blockingProblems.length > 0 && input.allowMissingInputs !== true) {
+      return {
+        ok: false,
+        content: [
+          `refused: ${blockingProblems.length} required input(s) are missing or unreachable; nothing was written.`,
+          ...blockingProblems.map((i) => `  ${i.status} ${i.value}${i.detail ? ` (${i.detail})` : ""}`),
+          "Fix the paths/URLs, or re-call with allowMissingInputs: true to proceed and record the bypass.",
+        ].join("\n"),
+      }
+    }
+    if (blockingProblems.length > 0) {
+      preflight = { status: summary.status, bypassed: true }
+      preflightNote = `preflight bypassed: ${summary.status} (${blockingProblems.length} item${blockingProblems.length === 1 ? "" : "s"})`
+    } else {
+      preflight = { status: summary.status, bypassed: false }
+    }
+    const advisory = items.filter((i) => i.advisory && i.status === "MISSING").map((i) => i.value)
+    preflightLine = `Preflight: ${summary.status}${preflight.bypassed ? " (bypassed: allowMissingInputs)" : ""} (${summary.total} item(s); ${summary.unchecked} unchecked)${advisory.length ? `; ${advisory.length} advisory path missing (non-blocking): ${advisory.join(", ")}` : ""}.`
+  }
+
+  if (beforeMkdir) {
+    const preErr = await beforeMkdir({ sessionId, run, integrityMode, topology })
+    if (preErr) return { ok: false, content: preErr }
+  }
+
+  mkdirSync(run, { recursive: true })
+  // The request record goes first: it is the artifact the auditor and the
+  // final gate read the integrity mode from.
+  if (request !== undefined) {
+    const refused = writeOriginalRequest(run, request, integrityMode, sessionId)
+    if (refused) return { ok: false, content: refused }
+  }
+  const tasks = (input.tasks || []).map((t: any) => ({
+    id: clean(t.id, 64),
+    dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.map((d: any) => clean(d, 64)) : [],
+    requirements: Array.isArray(t.requirements) ? t.requirements.map((r: any) => clean(r, 120)) : [],
+    agent: clean(t.agent || "team/worker", 64),
+    status: "pending",
+    round: 0,
+    maxRounds: Number.isFinite(t.maxRounds) ? t.maxRounds : 4,
+  }))
+  const routingReason = typeof input.routingReason === "string" ? clean(input.routingReason, 200).trim() : ""
+  writeJson(join(run, "plan.dag.json"), {
+    sessionId,
+    topology,
+    integrityMode,
+    preflight,
+    tasks,
+    ...(routingReason ? { routingReason } : {}),
+  })
+  if (!existsSync(join(run, "state.json"))) {
+    writeJson(join(run, "state.json"), {
+      version: 1,
+      sessionId,
+      integrityMode,
+      phase: "DISPATCH",
+      tasks: nullMap(Object.fromEntries(tasks.map((t: any) => [t.id, { status: "pending", round: 0 }]))),
+      updatedAt: new Date().toISOString(),
+    })
+  } else {
+    // A re-plan keeps the run's checkpoint but must still carry the mode
+    // the caller chose (defaults to development when omitted).
+    const stateFile = join(run, "state.json")
+    const state = readJson<any>(stateFile, undefined)
+    if (state && state.integrityMode !== integrityMode) {
+      state.integrityMode = integrityMode
+      state.updatedAt = new Date().toISOString()
+      writeJson(stateFile, state)
+    }
+  }
+  // Use ?? (nullish coalescing) so budgetUsd: 0 is respected as "no budget"
+  const budget = input.budgetUsd ?? 20
+  const costsFile = join(run, "costs.json")
+  const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+  // Same lock as the cost tool so a re-plan cannot race a concurrent cost call.
+  await withFileLock(costsFile, async () => {
+    const existing = readJson<any>(costsFile, undefined)
+    if (!existing) {
+      writeJson(costsFile, {
+        sessionId,
+        rootSessionIds: callSession ? [callSession] : [],
+        budgetUsd: budget,
+        budgetSource: input.budgetSource ? clean(input.budgetSource, 32) : "default",
+        spentUsd: 0,
+        byTask: nullMap(),
+        byTaskTokens: nullMap(),
+        updatedAt: new Date().toISOString(),
+      })
+    } else {
+      existing.byTaskTokens = nullMap(existing.byTaskTokens)
+      existing.byTask = nullMap(existing.byTask)
+      if (callSession) {
+        const currentRoots = Array.isArray(existing.rootSessionIds) ? existing.rootSessionIds : []
+        if (!currentRoots.includes(callSession)) {
+          existing.rootSessionIds = [...currentRoots, callSession]
+        }
+      }
+      if (
+        existing.budgetUsd !== budget ||
+        (input.budgetSource && existing.budgetSource !== clean(input.budgetSource, 32))
+      ) {
+        // Update the budget/source but PRESERVE accumulated spend and
+        // per-task buckets (a re-plan must not wipe the run's measured cost).
+        existing.budgetUsd = budget
+        if (input.budgetSource) existing.budgetSource = clean(input.budgetSource, 32)
+      }
+      existing.updatedAt = new Date().toISOString()
+      writeJson(costsFile, existing)
+    }
+    // Establish the native cost baseline for the calling session, preserving
+    // any baselines already recorded for other sessions (merge, don't clobber).
+    const now = new Date().toISOString()
+    const snaps = readSnapshots(join(run, "snapshots.json")) ?? { sessionId, rootSessionIds: [], bySession: {} }
+    snaps.sessionId = sessionId
+    if (!snaps.rootSessionIds) snaps.rootSessionIds = []
+    if (callSession && !snaps.rootSessionIds.includes(callSession)) {
+      snaps.rootSessionIds.push(callSession)
+    }
+    const usage = await readSessionUsage(ctx, callSession)
+    if (callSession && usage && !snaps.bySession[callSession]) {
+      snaps.bySession[callSession] = { lastCost: usage.cost, lastTokens: usage.tokens, timestamp: now }
+    }
+    writeSnapshots(join(run, "snapshots.json"), snaps)
+  })
+  touch(join(run, "pitfalls.md"), "# Pitfalls\n\n_answer-agnostic failure modes; one per line_\n")
+  await appendEvent(run, { event: "run_created", sessionId, taskId: null, from: null, to: "pending", round: 0, phase: "DAG_BUILD", specGate, ...(specGate === "satisfied" ? { specPath: specFile } : {}), ...(preflightNote ? { note: preflightNote } : {}) })
+  // Backstop: if console credits apply but the budget wasn't derived from
+  // them, warn (advisory — the sentinel is instructed to run the preflight).
+  let creditWarning = ""
+  if (input.budgetSource !== "credits" && (await isConsoleMcpConnected(ctx)) && (await usesOpencodeModel(ctx, context?.sessionID))) {
+    creditWarning = "\n⚠ opencode/ models + opencode_console connected — run teamwork_budget and derive budgetUsd from credits before dispatching."
+  }
+  return {
+    ok: true,
+    sessionId,
+    run,
+    tasks,
+    topology,
+    integrityMode,
+    content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\n${preflightLine}\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${preflight.bypassed ? `\n⚠ Input preflight bypassed (allowMissingInputs: true): ${preflight.status}.` : ""}${creditWarning}`,
+  }
+}
+
 export async function registerTeamworkTools(ctx: any, root: string) {
   if (!ctx?.tool?.transform) return
   await ctx.tool.transform((editor: any) => {
@@ -1264,221 +1578,437 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         additionalProperties: false,
       },
       execute: async (input: any, context: any) => {
-        const sessionId = input.sessionId || newSessionId()
-        const resolved = resolveRun(root, sessionId)
+        const res = await createPlanRun(ctx, root, input, context)
+        return { content: res.content }
+      },
+    })
+
+    editor.add({
+      name: "route",
+      description:
+        "Deterministic route classifier. Evaluates Document Review (Priority 1, checked BEFORE Lean/LEMMA, massive-proof, and proof) with explicit supplied-document + critique-intent + negative-trigger guards, then Priorities 2-7. Read-only: writes nothing.",
+      input: {
+        type: "object",
+        properties: {
+          request: { type: "string", description: "User request text to route." },
+          document: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              url: { type: "string" },
+              content: { type: "string" },
+              format: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+          inputs: { type: "array", items: { type: "string" } },
+          checkPaths: { type: "boolean", description: "Default true. Verify explicit document paths in request exist as regular files inside root." },
+        },
+        additionalProperties: false,
+      },
+      execute: async (input: any) => {
+        const result = classifyRoute(input || {}, root)
+        return {
+          content: `Route: ${result.topology}\nDocument detected: ${result.documentDetected}\nReason: ${result.routingReason}`,
+          ...result,
+        }
+      },
+    })
+
+    editor.add({
+      name: "document_triage",
+      description:
+        "Ingest and partition a supplied Markdown/LaTeX/PDF/text/URL/inline document for the document-review topology. Validates bounds, path containment, and PDF headers BEFORE creating any run directory, then writes plan.dag.json (seg-01..seg-0K + doc-synthesis) and document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}.",
+      input: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string" },
+          request: { type: "string" },
+          routingReason: { type: "string" },
+          document: {
+            type: "object",
+            properties: {
+              path: { type: "string" },
+              url: { type: "string" },
+              content: { type: "string" },
+              format: { type: "string" },
+            },
+            additionalProperties: false,
+          },
+          integrityMode: { type: "string" },
+          skipInterview: { type: "boolean" },
+          requireSpec: { type: "boolean" },
+          budgetUsd: { type: "number" },
+          budgetSource: { type: "string" },
+          maxSegments: { type: "number" },
+          reviewTreeShape: { type: "array", items: { type: "number" } },
+          synthTreeShape: { type: "array", items: { type: "number" } },
+          fetchUrl: { type: "boolean" },
+          checkUrls: { type: "boolean" },
+          allowMissingInputs: { type: "boolean" },
+          inputs: { type: "array", items: { type: "string" } },
+        },
+        required: ["document"],
+        additionalProperties: false,
+      },
+      execute: async (input: any, context: any) => {
+        const sessionId = input?.sessionId || newSessionId()
+        const resolvedSession = resolveRun(root, sessionId)
+        if (resolvedSession.error) return { content: resolvedSession.error }
+
+        const boundsRes = validateTreeBounds({
+          maxSegments: input?.maxSegments,
+          reviewTreeShape: input?.reviewTreeShape,
+          synthTreeShape: input?.synthTreeShape,
+        })
+        if (!boundsRes.ok) return { content: boundsRes.error }
+        const bounds = boundsRes.bounds
+
+        const readRes = await resolveAndReadDocument(root, input?.document, {
+          fetchUrl: input?.fetchUrl === true,
+        })
+        if (!readRes.ok) return { content: readRes.error }
+
+        const ingested = ingestDocument(readRes.doc.bufferOrText, readRes.doc.format)
+        if (!ingested.ok) return { content: ingested.error }
+
+        const segments = segmentDocument(ingested.text, bounds.maxSegments)
+        const segTasks = segments.map((s) => ({
+          id: s.id,
+          dependsOn: [],
+          agent: "team/segment-reviewer",
+          requirements: [`Review segment ${s.id}: ${s.title}`],
+          maxRounds: 2,
+        }))
+        const docSynthesisTask = {
+          id: "doc-synthesis",
+          dependsOn: segments.map((s) => s.id),
+          agent: "team/synthesizer",
+          requirements: ["Cross-segment synthesis and final DOCUMENT_REVIEW_REPORT.md"],
+          maxRounds: 2,
+        }
+
+        const planRes = await createPlanRun(
+          ctx,
+          root,
+          {
+            sessionId,
+            topology: "document-review",
+            routingReason: input?.routingReason || "document-review triage",
+            request: input?.request,
+            integrityMode: input?.integrityMode,
+            budgetUsd: input?.budgetUsd,
+            budgetSource: input?.budgetSource,
+            requireSpec: input?.requireSpec,
+            skipInterview: input?.skipInterview,
+            inputs: input?.inputs,
+            checkUrls: input?.checkUrls,
+            allowMissingInputs: input?.allowMissingInputs,
+            tasks: [...segTasks, docSynthesisTask],
+          },
+          context,
+        )
+        if (!planRes.ok) return { content: planRes.content }
+
+        const run = planRes.run
+        const docDir = join(run, "document-review")
+        const manifestPath = join(docDir, "manifest.json")
+        const textMapPath = join(docDir, "DOCUMENT_TEXT_MAP.md")
+        const partitionPath = join(docDir, "ANALYSIS_PARTITION.md")
+
+        const manifest = {
+          version: 1,
+          sessionId: planRes.sessionId,
+          sourceType: readRes.doc.sourceType,
+          sourceLabel: readRes.doc.sourceLabel,
+          format: ingested.format,
+          byteLength: readRes.doc.byteLength,
+          extractionStatus: ingested.extractionStatus,
+          ...(ingested.warning ? { warning: clean(ingested.warning, 300) } : {}),
+          bounds,
+          segments: segments.map((s) => ({
+            id: s.id,
+            title: s.title,
+            charCount: s.charCount,
+            sha256: s.sha256,
+          })),
+          createdAt: new Date().toISOString(),
+        }
+
+        const textMapSections = segments
+          .map((s) => `## ${s.id}: ${s.title}\n\n- Characters: ${s.charCount}\n- SHA-256: ${s.sha256}\n\n${s.content.slice(0, MAX_SEGMENT_CHARS)}`)
+          .join("\n\n---\n\n")
+        const textMapBody = cleanBlock(
+          `# Document Text Map\n\n- Session: ${planRes.sessionId}\n- Source: ${readRes.doc.sourceLabel} (${readRes.doc.sourceType}, ${ingested.format})\n- Extraction status: ${ingested.extractionStatus}${ingested.warning ? `\n- Warning: ${ingested.warning}` : ""}\n\n${textMapSections}\n`,
+          MAX_TEXT_MAP_CHARS,
+        )
+
+        const partitionRows = segments
+          .map((s) => `| \`${s.id}\` | ${s.title.replace(/\|/g, "\\|")} | ${s.charCount} | \`${s.sha256.slice(0, 12)}\` |`)
+          .join("\n")
+        const partitionBody = cleanBlock(
+          `# Analysis Partition\n\n- Session: ${planRes.sessionId}\n- Segments: ${segments.length} (maxSegments=${bounds.maxSegments})\n- Per-segment RSA tree shape: [${bounds.reviewTreeShape.join(", ")}]\n- Cross-segment synthesis shape: [${bounds.synthTreeShape.join(", ")}]\n\n| Segment | Title | Chars | SHA-256 |\n| --- | --- | ---: | --- |\n${partitionRows}\n\n## Schedule\n\n1. Segment reviews (${segments.map((s) => `\`${s.id}\``).join(", ")}) run in parallel using \`team/segment-reviewer\` bounded by [${bounds.reviewTreeShape.join(", ")}].\n2. \`doc-synthesis\` runs \`team/synthesizer\` bounded by [${bounds.synthTreeShape.join(", ")}] after all segments pass.\n`,
+          64_000,
+        )
+
+        try {
+          writeJsonSafe(run, manifestPath, manifest)
+          writeTextSafe(run, textMapPath, textMapBody.endsWith("\n") ? textMapBody : textMapBody + "\n")
+          writeTextSafe(run, partitionPath, partitionBody.endsWith("\n") ? partitionBody : partitionBody + "\n")
+        } catch (err: any) {
+          return { content: `refused: failed to write document-review artifacts (${clean(err?.message, 160)})` }
+        }
+
+        return {
+          content: `${planRes.content}\nDocument triage: ${segments.length} segment(s) (${ingested.extractionStatus}).\nManifest: ${manifestPath}`,
+          sessionId: planRes.sessionId,
+          runDir: run,
+          topology: "document-review",
+          extractionStatus: ingested.extractionStatus,
+          ...(ingested.warning ? { warning: ingested.warning } : {}),
+          bounds,
+          segments: manifest.segments,
+          manifestPath,
+          textMapPath,
+          partitionPath,
+        }
+      },
+    })
+
+    editor.add({
+      name: "document_record",
+      description:
+        "Persist bounded RSA tree node outputs, segment unit-reports, synthesis candidates, or final DOCUMENT_REVIEW_REPORT.md for a document-review run. Enforces SEGMENT_ID allowlist, manifest bounds, symlink refusal, realpath containment, and text sanitisation.",
+      input: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string" },
+          stage: {
+            type: "string",
+            description: "segment_analysis | segment_aggregate | segment_report | synthesis_candidate | final_report",
+          },
+          segmentId: { type: "string" },
+          level: { type: "number" },
+          index: { type: "number" },
+          summary: { type: "string" },
+          findings: {
+            type: "array",
+            items: {
+              anyOf: [
+                { type: "string" },
+                {
+                  type: "object",
+                  properties: {
+                    id: { type: "string" },
+                    severity: { type: "string" },
+                    claim: { type: "string" },
+                    location: { type: "string" },
+                    evidence: { type: "string" },
+                  },
+                  additionalProperties: false,
+                },
+              ],
+            },
+          },
+          content: { type: "string" },
+          verdict: { type: "string" },
+        },
+        required: ["stage", "summary"],
+        additionalProperties: false,
+      },
+      execute: async (input: any) => {
+        const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
-        // Refuse an unknown topology before anything is written, so a typo can
-        // never become the run's permanent label.
-        const topology = normalizeTopology(input.topology)
-        if (!topology) {
-          return {
-            content: `refused: invalid topology "${clean(input.topology, 32)}" (accepted: ${TOPOLOGIES.join(", ")}; aliases: ${Object.keys(TOPOLOGY_ALIASES).join(", ")})`,
-          }
-        }
-        // Refuse an unknown integrity mode before anything is written. The mode
-        // is the run's integrity contract, so a typo must never be persisted.
-        const integrityMode =
-          input.integrityMode === undefined || input.integrityMode === null
-            ? DEFAULT_INTEGRITY_MODE
-            : normalizeIntegrityMode(input.integrityMode)
-        if (!integrityMode) {
-          return {
-            content: `refused: invalid integrityMode "${clean(input.integrityMode, 32)}" (accepted: ${INTEGRITY_MODES.join(", ")}; default: ${DEFAULT_INTEGRITY_MODE})`,
-          }
-        }
-        // The request record is verbatim, so refuse rather than truncate. The
-        // length check runs before anything is written.
-        const request = typeof input.request === "string" ? input.request : undefined
-        if (request !== undefined && request.length > REQUEST_MAX) {
-          return {
-            content: `refused: request is ${request.length} chars, over the ${REQUEST_MAX}-char limit; it must be recorded verbatim. Shorten it or start the run from a shorter routed request. Nothing was written.`,
-          }
-        }
-        // SEC-1: task ids become keys of state/costs maps and path/branch segments.
-        // Refuse the whole plan (before anything is written) on any unsafe id.
-        for (const t of input.tasks || []) {
-          const ids = [t?.id, ...(Array.isArray(t?.dependsOn) ? t.dependsOn : [])]
-          const i = ids.findIndex((id: unknown) => typeof id !== "string" || !isSafeTaskId(id))
-          if (i !== -1) {
-            return { content: `refused: invalid task id "${clean(ids[i], 32)}" (must be a single segment matching ${TASK_ID})` }
-          }
-        }
-        // ORIGINAL_REQUEST.md is write-once. Check before the spec gate so a
-        // second request is refused for the right reason and writes nothing.
-        const originalRequestFile = join(run, "ORIGINAL_REQUEST.md")
-        if (request !== undefined) {
-          try {
-            if (existsSync(originalRequestFile) && readFileSync(originalRequestFile, "utf8").trim()) {
-              return {
-                content: `refused: ${originalRequestFile} already records this run's request and is write-once.\nUse a new session (a new teamwork_plan sessionId) for a different request. Nothing was written.`,
-              }
-            }
-          } catch {
-            return { content: `refused: cannot read ${originalRequestFile}; refusing to overwrite a request that may already be recorded. Nothing was written.` }
-          }
-        }
-        // 3.4: a run starts from an approved spec (`<run>/prompt_draft.md`). The
-        // gate runs BEFORE mkdir, so a refusal leaves no run dir and no plan files
-        // behind. `skipInterview` is the explicit, recorded bypass.
-        const specFile = join(run, "prompt_draft.md")
-        let specText = ""
+
+        const docDir = join(run, "document-review")
         try {
-          if (existsSync(specFile)) specText = readFileSync(specFile, "utf8").trim()
-        } catch {
-          specText = "" // unreadable spec = no usable spec
-        }
-        const hasSpec = specText.length > 0
-        const specGate: "satisfied" | "bypassed" | "not_required" | undefined =
-          input.requireSpec === false ? "not_required" : hasSpec ? "satisfied" : input.skipInterview === true ? "bypassed" : undefined
-        if (!specGate) {
-          return {
-            content: `refused: no spec found for this run (expected ${specFile}). Run /teamwork-craft to produce one, or re-call with skipInterview: true to proceed without an approved prompt.`,
-          }
-        }
-        // Input preflight. Runs before mkdir so a refusal writes NOTHING (no run
-        // dir, no ORIGINAL_REQUEST.md, no plan). Only a narrow block list can
-        // refuse: explicit inputs, URLs, and absolute/`~`/`file:` paths. Relative
-        // path-like tokens are advisory and can never block.
-        const explicitInputs = (Array.isArray(input.inputs) ? input.inputs : []).filter(
-          (v: unknown): v is string => typeof v === "string",
-        )
-        let preflight: { status: "READY" | "MISSING" | "OUTAGE" | "SKIPPED"; bypassed?: boolean } = { status: "SKIPPED" }
-        let preflightNote: string | undefined
-        let preflightLine = "Preflight: SKIPPED (no request or explicit inputs)."
-        if (request !== undefined || explicitInputs.length > 0) {
-          const items = await checkInventory(extractInventory(request, explicitInputs), input.checkUrls === true)
-          const summary = summarizePreflight(items)
-          const blockingProblems = items.filter(
-            (i) => i.blocking && (i.status === "MISSING" || i.status === "OUTAGE"),
-          )
-          if (blockingProblems.length > 0 && input.allowMissingInputs !== true) {
-            return {
-              content: [
-                `refused: ${blockingProblems.length} required input(s) are missing or unreachable; nothing was written.`,
-                ...blockingProblems.map((i) => `  ${i.status} ${i.value}${i.detail ? ` (${i.detail})` : ""}`),
-                "Fix the paths/URLs, or re-call with allowMissingInputs: true to proceed and record the bypass.",
-              ].join("\n"),
+          refuseSymlink(docDir)
+          if (existsSync(docDir)) {
+            const st = lstatSync(docDir)
+            if (!st.isDirectory()) return { content: "refused: document-review is not a directory" }
+            const rel = relative(realpathSync(run), realpathSync(docDir))
+            if (!rel || isAbsolute(rel) || rel.startsWith("..")) {
+              return { content: "refused: document-review escapes run directory" }
             }
           }
-          if (blockingProblems.length > 0) {
-            preflight = { status: summary.status, bypassed: true }
-            preflightNote = `preflight bypassed: ${summary.status} (${blockingProblems.length} item${blockingProblems.length === 1 ? "" : "s"})`
-          } else {
-            preflight = { status: summary.status, bypassed: false }
+        } catch (err: any) {
+          return { content: `refused: ${clean(err?.message, 160)}` }
+        }
+
+        const manifestPath = join(docDir, "manifest.json")
+        const manifestRes = readRegularJson<any>(run, manifestPath)
+        if (!manifestRes.ok) {
+          return {
+            content:
+              manifestRes.reason === "symlink"
+                ? "refused: document-review/manifest.json is a symlink"
+                : "refused: document-review/manifest.json missing or invalid — call teamwork_document_triage first",
           }
-          const advisory = items.filter((i) => i.advisory && i.status === "MISSING").map((i) => i.value)
-          preflightLine = `Preflight: ${summary.status}${preflight.bypassed ? " (bypassed: allowMissingInputs)" : ""} (${summary.total} item(s); ${summary.unchecked} unchecked)${advisory.length ? `; ${advisory.length} advisory path missing (non-blocking): ${advisory.join(", ")}` : ""}.`
         }
-        mkdirSync(run, { recursive: true })
-        // The request record goes first: it is the artifact the auditor and the
-        // final gate read the integrity mode from.
-        if (request !== undefined) {
-          const refused = writeOriginalRequest(run, request, integrityMode, sessionId)
-          if (refused) return { content: refused }
+        const manifest = manifestRes.data
+        const reviewShape: number[] = Array.isArray(manifest?.bounds?.reviewTreeShape)
+          ? manifest.bounds.reviewTreeShape
+          : [4, 2, 1]
+        const synthShape: number[] = Array.isArray(manifest?.bounds?.synthTreeShape)
+          ? manifest.bounds.synthTreeShape
+          : [4, 1]
+        const knownSegs = new Set<string>(
+          Array.isArray(manifest?.segments) ? manifest.segments.map((s: any) => String(s?.id || "")) : [],
+        )
+
+        const stage = clean(input?.stage, 32).trim()
+        const VALID_STAGES = new Set([
+          "segment_analysis",
+          "segment_aggregate",
+          "segment_report",
+          "synthesis_candidate",
+          "final_report",
+        ])
+        if (!VALID_STAGES.has(stage)) {
+          return {
+            content: `refused: invalid stage "${stage}" (accepted: ${Array.from(VALID_STAGES).join(", ")})`,
+          }
         }
-        const tasks = (input.tasks || []).map((t: any) => ({
-          id: clean(t.id, 64),
-          dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.map((d: any) => clean(d, 64)) : [],
-          requirements: Array.isArray(t.requirements) ? t.requirements.map((r: any) => clean(r, 120)) : [],
-          agent: clean(t.agent || "team/worker", 64),
-          status: "pending",
-          round: 0,
-          maxRounds: Number.isFinite(t.maxRounds) ? t.maxRounds : 4,
-        }))
-        const routingReason = typeof input.routingReason === "string" ? clean(input.routingReason, 200).trim() : ""
-        writeJson(join(run, "plan.dag.json"), {
-          sessionId,
-          topology,
-          integrityMode,
-          preflight,
-          tasks,
-          ...(routingReason ? { routingReason } : {}),
+
+        const summary = clean(input?.summary, 500).trim()
+        if (!summary) return { content: "refused: summary must be non-empty" }
+        const verdict = input?.verdict !== undefined ? clean(input.verdict, 64).trim() : undefined
+        const bodyContent = input?.content !== undefined ? cleanBlock(input.content, 64_000) : ""
+        const rawFindings = Array.isArray(input?.findings) ? input.findings.slice(0, MAX_FINDINGS) : []
+        const findings = rawFindings.map((f: any) => {
+          if (typeof f === "string") return cleanBlock(f, 500)
+          return {
+            ...(f?.id ? { id: clean(f.id, 32) } : {}),
+            ...(f?.severity ? { severity: clean(f.severity, 32) } : {}),
+            ...(f?.claim ? { claim: cleanBlock(f.claim, 500) } : {}),
+            ...(f?.location ? { location: clean(f.location, 120) } : {}),
+            ...(f?.evidence ? { evidence: cleanBlock(f.evidence, 500) } : {}),
+          }
         })
-        if (!existsSync(join(run, "state.json"))) {
-          writeJson(join(run, "state.json"), {
-            version: 1,
-            sessionId,
-            integrityMode,
-            phase: "DISPATCH",
-            tasks: nullMap(Object.fromEntries(tasks.map((t: any) => [t.id, { status: "pending", round: 0 }]))),
-            updatedAt: new Date().toISOString(),
+
+        const formatFindingsMd = () => {
+          if (!findings.length) return ""
+          const lines = findings.map((f: any) => {
+            if (typeof f === "string") return `- ${f}`
+            const tag = [f.id, f.severity, f.location].filter(Boolean).join(" | ")
+            return `- ${tag ? `**[${tag}]** ` : ""}${f.claim || ""}${f.evidence ? ` — _Evidence:_ ${f.evidence}` : ""}`
           })
-        } else {
-          // A re-plan keeps the run's checkpoint but must still carry the mode
-          // the caller chose (defaults to development when omitted).
-          const stateFile = join(run, "state.json")
-          const state = readJson<any>(stateFile, undefined)
-          if (state && state.integrityMode !== integrityMode) {
-            state.integrityMode = integrityMode
-            state.updatedAt = new Date().toISOString()
-            writeJson(stateFile, state)
-          }
+          return `\n\n## Findings\n\n${lines.join("\n")}`
         }
-        // Use ?? (nullish coalescing) so budgetUsd: 0 is respected as "no budget"
-        const budget = input.budgetUsd ?? 20
-        const costsFile = join(run, "costs.json")
-        const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
-        // Same lock as the cost tool so a re-plan cannot race a concurrent cost call.
-        await withFileLock(costsFile, async () => {
-          const existing = readJson<any>(costsFile, undefined)
-          if (!existing) {
-            writeJson(costsFile, {
-              sessionId,
-              rootSessionIds: callSession ? [callSession] : [],
-              budgetUsd: budget,
-              budgetSource: input.budgetSource ? clean(input.budgetSource, 32) : "default",
-              spentUsd: 0,
-              byTask: nullMap(),
-              byTaskTokens: nullMap(),
-              updatedAt: new Date().toISOString(),
-            })
-          } else {
-            existing.byTaskTokens = nullMap(existing.byTaskTokens)
-            existing.byTask = nullMap(existing.byTask)
-            if (callSession) {
-              const currentRoots = Array.isArray(existing.rootSessionIds) ? existing.rootSessionIds : []
-              if (!currentRoots.includes(callSession)) {
-                existing.rootSessionIds = [...currentRoots, callSession]
+
+        if (stage === "segment_analysis" || stage === "segment_aggregate" || stage === "segment_report") {
+          const rawSegId = input?.segmentId
+          if (!isSafeSegmentId(rawSegId)) {
+            return {
+              content: `refused: invalid segmentId "${clean(rawSegId, 32)}" (must match ${SEGMENT_ID})`,
+            }
+          }
+          if (!knownSegs.has(rawSegId)) {
+            return { content: `refused: unknown segmentId "${rawSegId}" (not in manifest.json)` }
+          }
+          const segDir = join(docDir, "segments", rawSegId)
+
+          if (stage === "segment_analysis" || stage === "segment_aggregate") {
+            const level = input?.level
+            const index = input?.index
+            if (typeof level !== "number" || !Number.isInteger(level) || level < 0 || level >= reviewShape.length) {
+              return {
+                content: `refused: level ${clean(level, 16)} out of bounds for reviewTreeShape [${reviewShape.join(", ")}]`,
               }
             }
-            if (
-              existing.budgetUsd !== budget ||
-              (input.budgetSource && existing.budgetSource !== clean(input.budgetSource, 32))
-            ) {
-              // Update the budget/source but PRESERVE accumulated spend and
-              // per-task buckets (a re-plan must not wipe the run's measured cost).
-              existing.budgetUsd = budget
-              if (input.budgetSource) existing.budgetSource = clean(input.budgetSource, 32)
+            if (stage === "segment_aggregate" && reviewShape.length > 1 && level < 1) {
+              return { content: "refused: segment_aggregate requires level >= 1" }
             }
-            existing.updatedAt = new Date().toISOString()
-            writeJson(costsFile, existing)
+            if (typeof index !== "number" || !Number.isInteger(index) || index < 0 || index >= reviewShape[level]) {
+              return {
+                content: `refused: index ${clean(index, 16)} out of bounds for level ${level} width ${reviewShape[level]}`,
+              }
+            }
+            const outFile = join(segDir, `level-${level}-node-${index}.json`)
+            try {
+              writeJsonSafe(run, outFile, {
+                sessionId: basename(run),
+                segmentId: rawSegId,
+                stage,
+                level,
+                index,
+                summary,
+                ...(verdict ? { verdict } : {}),
+                findings,
+                ...(bodyContent ? { content: bodyContent } : {}),
+                recordedAt: new Date().toISOString(),
+              })
+            } catch (err: any) {
+              return { content: `refused: ${clean(err?.message, 160)}` }
+            }
+            return {
+              content: `Recorded ${stage} for ${rawSegId} (level=${level}, index=${index}) at ${outFile}`,
+              stage,
+              segmentId: rawSegId,
+              level,
+              index,
+              artifactPath: outFile,
+            }
           }
-          // Establish the native cost baseline for the calling session, preserving
-          // any baselines already recorded for other sessions (merge, don't clobber).
-          const now = new Date().toISOString()
-          const snaps = readSnapshots(join(run, "snapshots.json")) ?? { sessionId, rootSessionIds: [], bySession: {} }
-          snaps.sessionId = sessionId
-          if (!snaps.rootSessionIds) snaps.rootSessionIds = []
-          if (callSession && !snaps.rootSessionIds.includes(callSession)) {
-            snaps.rootSessionIds.push(callSession)
+
+          // segment_report -> unit-report.md
+          const outFile = join(segDir, "unit-report.md")
+          const md = `# Segment Report: ${rawSegId}\n\n- Summary: ${summary}${verdict ? `\n- Verdict: ${verdict}` : ""}${formatFindingsMd()}${bodyContent ? `\n\n## Details\n\n${bodyContent}` : ""}\n`
+          try {
+            writeTextSafe(run, outFile, md)
+          } catch (err: any) {
+            return { content: `refused: ${clean(err?.message, 160)}` }
           }
-          const usage = await readSessionUsage(ctx, callSession)
-          if (callSession && usage && !snaps.bySession[callSession]) {
-            snaps.bySession[callSession] = { lastCost: usage.cost, lastTokens: usage.tokens, timestamp: now }
+          return {
+            content: `Recorded unit-report.md for ${rawSegId} at ${outFile}`,
+            stage,
+            segmentId: rawSegId,
+            artifactPath: outFile,
           }
-          writeSnapshots(join(run, "snapshots.json"), snaps)
-        })
-        touch(join(run, "pitfalls.md"), "# Pitfalls\n\n_answer-agnostic failure modes; one per line_\n")
-        await appendEvent(run, { event: "run_created", sessionId, taskId: null, from: null, to: "pending", round: 0, phase: "DAG_BUILD", specGate, ...(specGate === "satisfied" ? { specPath: specFile } : {}), ...(preflightNote ? { note: preflightNote } : {}) })
-        // Backstop: if console credits apply but the budget wasn't derived from
-        // them, warn (advisory — the sentinel is instructed to run the preflight).
-        let creditWarning = ""
-        if (input.budgetSource !== "credits" && (await isConsoleMcpConnected(ctx)) && (await usesOpencodeModel(ctx, context?.sessionID))) {
-          creditWarning = "\n⚠ opencode/ models + opencode_console connected — run teamwork_budget and derive budgetUsd from credits before dispatching."
+        }
+
+        if (stage === "synthesis_candidate") {
+          const level = input?.level === undefined ? 0 : input.level
+          const index = input?.index
+          if (typeof level !== "number" || !Number.isInteger(level) || level < 0 || level >= synthShape.length) {
+            return {
+              content: `refused: synthesis level ${clean(level, 16)} out of bounds for synthTreeShape [${synthShape.join(", ")}]`,
+            }
+          }
+          if (typeof index !== "number" || !Number.isInteger(index) || index < 0 || index >= synthShape[level]) {
+            return {
+              content: `refused: synthesis index ${clean(index, 16)} out of bounds for level ${level} width ${synthShape[level]}`,
+            }
+          }
+          const outFile = join(docDir, "synthesis", `candidate-${index}.md`)
+          const md = `# Synthesis Candidate ${index}\n\n- Level: ${level}\n- Summary: ${summary}${verdict ? `\n- Verdict: ${verdict}` : ""}${formatFindingsMd()}${bodyContent ? `\n\n## Synthesis\n\n${bodyContent}` : ""}\n`
+          try {
+            writeTextSafe(run, outFile, md)
+          } catch (err: any) {
+            return { content: `refused: ${clean(err?.message, 160)}` }
+          }
+          return {
+            content: `Recorded synthesis candidate ${index} at ${outFile}`,
+            stage,
+            level,
+            index,
+            artifactPath: outFile,
+          }
+        }
+
+        // final_report -> DOCUMENT_REVIEW_REPORT.md
+        const outFile = join(run, "DOCUMENT_REVIEW_REPORT.md")
+        const md = `# Document Review Report\n\n- Session: ${basename(run)}\n- Source: ${clean(manifest?.sourceLabel, 240)}\n- Summary: ${summary}${verdict ? `\n- Verdict: ${verdict}` : ""}${formatFindingsMd()}${bodyContent ? `\n\n## Report\n\n${bodyContent}` : ""}\n`
+        try {
+          writeTextSafe(run, outFile, md)
+        } catch (err: any) {
+          return { content: `refused: ${clean(err?.message, 160)}` }
         }
         return {
-          content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\n${preflightLine}\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${preflight.bypassed ? `\n⚠ Input preflight bypassed (allowMissingInputs: true): ${preflight.status}.` : ""}${creditWarning}`,
+          content: `Recorded DOCUMENT_REVIEW_REPORT.md at ${outFile}`,
+          stage,
+          artifactPath: outFile,
         }
       },
     })
@@ -1824,6 +2354,17 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const taskDefs = new Map<string, any>(plan.tasks.map((t: any) => [t.id, t]))
         const taskStates = nullMap<any>(state.tasks)
 
+        let docManifest: any
+        if (plan.topology === "document-review") {
+          const mRes = readRegularJson<any>(run, join(run, "document-review", "manifest.json"))
+          if (mRes.ok) docManifest = mRes.data
+        }
+        const docSegMap = new Map<string, any>(
+          Array.isArray(docManifest?.segments)
+            ? docManifest.segments.map((s: any) => [String(s?.id || ""), s])
+            : [],
+        )
+
         const isPassed = (id: string) => {
           const s = taskStates[id]?.status
           return s === "verified_pass" || s === "pass"
@@ -1890,6 +2431,27 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             const unresolved = log
               .filter((e: any) => e && typeof e === "object" && e.resolved !== true)
               .map((e: any) => `R${Number(e.round) || 0}: ${clean(e.text, 500)}`)
+            const docSeg = docSegMap.get(id)
+            const documentReview = docManifest
+              ? id === "doc-synthesis"
+                ? {
+                    role: "cross-segment-synthesis",
+                    synthTreeShape: docManifest.bounds?.synthTreeShape ?? [4, 1],
+                    segmentIds: Array.isArray(docManifest.segments) ? docManifest.segments.map((s: any) => s.id) : [],
+                    artifactDir: join(run, "document-review", "synthesis"),
+                    reportPath: join(run, "DOCUMENT_REVIEW_REPORT.md"),
+                  }
+                : docSeg
+                  ? {
+                      role: "segment-review",
+                      segmentId: docSeg.id,
+                      segmentTitle: docSeg.title,
+                      reviewTreeShape: docManifest.bounds?.reviewTreeShape ?? [4, 2, 1],
+                      artifactDir: join(run, "document-review", "segments", docSeg.id),
+                      textMapPath: join(run, "document-review", "DOCUMENT_TEXT_MAP.md"),
+                    }
+                  : undefined
+              : undefined
             readyForWorker.push({
               id,
               agent: def.agent || "team/worker",
@@ -1901,6 +2463,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               // A legacy run has no ledger: keep the single latest `feedback` field.
               feedback: log.length ? cleanBlock(unresolved.join("\n"), 2000) : st.feedback,
               avoidPitfalls: pitfalls,
+              ...(documentReview ? { documentReview } : {}),
             })
           }
         }
@@ -2545,6 +3108,62 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             if (t.reportStatus !== "PASS") reasons.push(`task ${t.id}: report ${t.reportStatus}`)
           }
           if (securityAudit.status !== "PASS") reasons.push(`security audit: ${securityAudit.status}`)
+
+          let documentReviewEvidence:
+            | { checked: boolean; segmentReportsComplete: boolean; finalReportPresent: boolean }
+            | undefined
+          if (plan?.topology === "document-review") {
+            const manifestPath = join(run, "document-review", "manifest.json")
+            const mRes = readRegularJson<any>(run, manifestPath)
+            if (!mRes.ok && mRes.reason === "symlink") {
+              reasons.push("document-review/manifest.json is a symlink")
+              documentReviewEvidence = { checked: true, segmentReportsComplete: false, finalReportPresent: false }
+            } else if (!mRes.ok && mRes.reason === "invalid") {
+              reasons.push("document-review/manifest.json is unreadable or malformed")
+              documentReviewEvidence = { checked: true, segmentReportsComplete: false, finalReportPresent: false }
+            } else if (mRes.ok) {
+              const docManifest = mRes.data
+              const segs = Array.isArray(docManifest?.segments) ? docManifest.segments : []
+              let allUnitReportsOk = segs.length > 0
+              if (segs.length === 0) {
+                reasons.push("document-review/manifest.json has no segments")
+              }
+              const isRegularNonEmpty = (file: string): boolean => {
+                try {
+                  const st = lstatSync(file)
+                  if (st.isSymbolicLink() || !st.isFile()) return false
+                  const rel = relative(realpathSync(run), realpathSync(file))
+                  if (!rel || isAbsolute(rel) || rel.startsWith("..")) return false
+                  return readFileSync(file, "utf8").trim().length > 0
+                } catch {
+                  return false
+                }
+              }
+              for (const seg of segs) {
+                if (!isSafeSegmentId(seg?.id)) {
+                  reasons.push(`document-review manifest has unsafe segment id "${clean(seg?.id, 32)}"`)
+                  allUnitReportsOk = false
+                  continue
+                }
+                const unitPath = join(run, "document-review", "segments", seg.id, "unit-report.md")
+                if (!isRegularNonEmpty(unitPath)) {
+                  reasons.push(`document-review segment ${seg.id}: unit-report.md missing or empty`)
+                  allUnitReportsOk = false
+                }
+              }
+              const finalDocPath = join(run, "DOCUMENT_REVIEW_REPORT.md")
+              const finalReportPresent = isRegularNonEmpty(finalDocPath)
+              if (!finalReportPresent) {
+                reasons.push("DOCUMENT_REVIEW_REPORT.md missing or empty")
+              }
+              documentReviewEvidence = {
+                checked: true,
+                segmentReportsComplete: allUnitReportsOk,
+                finalReportPresent,
+              }
+            }
+          }
+
           // A supplied failReason can only make the verdict fail, never pass it.
           const failReason = typeof input?.failReason === "string" ? clean(input.failReason, 500).trim() : ""
           if (failReason) reasons.push(failReason)
@@ -2570,7 +3189,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             generatedBy: { agent: caller?.agent ?? null, session: callSession || basename(run) },
             generatedAt: new Date().toISOString(),
             integrityMode: integrity.mode,
-            evidence: { tasks, securityAudit, allTasksVerifiedPass },
+            evidence: {
+              tasks,
+              securityAudit,
+              allTasksVerifiedPass,
+              ...(documentReviewEvidence ? { documentReview: documentReviewEvidence } : {}),
+            },
             reasons: cappedReasons,
             ...(summary ? { summary } : {}),
             ...(findings.length ? { findings } : {}),

@@ -38,17 +38,18 @@ objectives and final acceptance; you are in charge of process.
 
 ## Picking a topology
 
-Look at the user's prompt and pick exactly one:
+Look at the user's prompt in strict priority order and pick exactly one:
 
-| Signal in the prompt | Topology |
-|---|---|
-| "prove", "conjecture", "show that", "∀", "∃", "lean", "coq", "isabelle", "open problem" | `proof` |
-| "implement", "fix bug", "make it work", tests, tight loop, single file or module | `iterative-coding` |
-| "build", "feature across N files", parallel workers, fan-out then merge | `distributed-coding` |
-| "review", "summarize", "what does this paper say", "analyze this doc" | `document-review` |
-| single small fix, "rename this", "tweak this one function" | `small-focused` |
-| "100+ searchers", "massively parallel proof search", "open conjecture, unlimited budget" | `massive-proof` |
-| ambiguous / multi-day / unclear scope | ask the user once, then default to `distributed-coding` |
+| Priority | Signal in the prompt | Topology |
+|---:|---|---|
+| 1 | **Supplied document** (path, URL, attachment, or inline doc) **AND** deliverable is a critique/review/assessment of that document — **checked BEFORE Math/Proof** (reject PR/diff/code reviews, bare filenames without a supplied doc, mentions, and theorem-solving/implementation tasks) | `document-review` |
+| 2 | Explicit formal math / Lean 4 prove or verify request (never bare `.lean` syntax alone) | `proof` |
+| 3 | Math/proof signals + explicit large-team opt-in ("100+ searchers", "very large team", "massively parallel proof search") | `massive-proof` |
+| 4 | "prove", "conjecture", "show that", "∀", "∃", "open problem" (without a supplied critique document) | `proof` |
+| 5a | single small fix + explicit lightness signal ("quick fix", "small change", "rename this", "tweak this one function") | `small-focused` |
+| 5b | "implement", "fix bug", "make it work", tests, tight loop, single file or module | `iterative-coding` |
+| 6 | "build", "feature across N files", parallel workers, fan-out then merge, PR/code review, or catch-all | `distributed-coding` |
+| — | ambiguous / multi-day / unclear scope | ask the user once, then default to `distributed-coding` |
 
 Topologies are defined in `ARTIFACTS.md`.
 

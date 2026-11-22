@@ -78,9 +78,11 @@ orchestrator may or may not ask the user — your job is to surface them.
 - **distributed-coding**: focus on the module boundaries, the public
   API surface, and the test fixtures. A diagram of dependencies
   (in prose) helps.
-- **document-review**: focus on the document being reviewed, the
-  cited sources, and any background reading the reviewer should know
-  about.
+- **document-review**: focus on the supplied document being reviewed
+  (`.opencode/teamwork/<session-id>/document-review/DOCUMENT_TEXT_MAP.md`),
+  cited sources, and background reading. If `manifest.json` reports
+  `extractionStatus: "needs_ingestor"`, report that gap explicitly rather than
+  fabricating missing PDF text.
 
 ## Anti-patterns
 

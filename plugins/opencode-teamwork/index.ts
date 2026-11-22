@@ -7,7 +7,7 @@
 //   * Default export is now an object definition `{ id, setup }` instead of the
 //     V1 async plugin function returning a `config` hook.
 //   * Agent registration moved OUT of the plugin. The V2 AgentEditor has no
-//     `add`, so plugins cannot create agents. The 10 `team/*` agents are
+//     `add`, so plugins cannot create agents. The 12 `team/*` agents are
 //     installed as markdown files under ~/.config/opencode/agents/team/.
 //   * Commands are still registered by the plugin, via ctx.command.transform,
 //     which is the V2 replacement for the V1 `config` hook's command injection.
@@ -35,19 +35,20 @@ const COMMANDS: CommandSpec[] = [
     agent: "team/sentinel",
     template: `$ARGUMENTS
 
-Look in \`.opencode/teamwork/\` for a recent \`prompt_draft.md\`. If you find one, ask the user to confirm the session ID. If not, ask 1-2 short questions to pick the topology, then either run the crafter (via /teamwork-craft) or inline the answers and proceed.
+Look in \`.opencode/teamwork/\` for a recent \`prompt_draft.md\`. If you find one, ask the user to confirm the session ID. If not, run \`teamwork_route\` first (which checks \`document-review\` BEFORE Math/Proof when a document is supplied for critique, while rejecting PR/code reviews, bare filenames without supplied docs, and theorem-solving/coding requests), then ask 1-2 short questions if ambiguous or run the crafter (via /teamwork-craft) or proceed.
 
 Then:
 
-0. Budget preflight: call \`teamwork_budget\`. If it reports console-credit budgeting applies (opencode/ models + opencode_console connected), call \`opencode_console_get_usage\`, compute \`remaining = min(limitDollars - spentDollars)\`, and ASK THE USER whether to use the FULL remaining budget or PARTIAL (half). Pass the choice to \`teamwork_plan\` as \`budgetUsd\` with \`budgetSource: "credits"\`.
-1. Load the spec, then call the \`teamwork_plan\` tool to create the run — it returns the canonical \`SESSION_ID\`. Never use a session id read from a file. Provision the sentinel worktree OUTSIDE the repo, quoting both args: \`git worktree add "\${TEAMWORK_WORKTREES_DIR:-../.teamwork-worktrees}/$SESSION_ID/sentinel" -b "teamwork/base-$SESSION_ID"\` (skip if not in a git repo).
-2. Build the DAG in \`.opencode/teamwork/<session-id>/plan.dag.json\`. Independent tasks run in parallel; dependent ones in topological order.
-3. Dispatch workers in topological order. Each gets:
-   - Its own worktree
-   - A scoped \`spec.json\`
-   - Returns: \`patch.diff\` + \`summary.md\` + cost metrics
-   - On return: \`teamwork_cost({ taskId })\`, then \`teamwork_task_update\` with \`agent: "team/worker"\`
-4. Dispatch verifiers against each worker's diff. Aggregated results go in \`.opencode/teamwork/<session-id>/verify/summary.json\`. On each verifier report: \`teamwork_cost({ taskId })\`, then \`teamwork_task_update\` with \`agent: "team/verifier"\`.
+0. Budget preflight: call \`teamwork_budget\`. If it reports console-credit budgeting applies (opencode/ models + opencode_console connected), call \`opencode_console_get_usage\`, compute \`remaining = min(limitDollars - spentDollars)\`, and ASK THE USER whether to use the FULL remaining budget or PARTIAL (half). Pass the choice to \`teamwork_plan\` or \`teamwork_document_triage\` as \`budgetUsd\` with \`budgetSource: "credits"\`.
+1. Plan the run:
+   - For \`document-review\`: call \`teamwork_document_triage\` with the supplied \`document\` (\`path\` / \`url\` / \`content\`), \`request\`, and bounded tree shapes (\`maxSegments <= 8\`, \`reviewTreeShape <= [4,2,1]\`, \`synthTreeShape <= [4,1]\`). Skip git worktrees for \`document-review\`.
+   - For coding / proof topologies: load the spec, then call \`teamwork_plan\` — it returns the canonical \`SESSION_ID\`. Never use a session id read from a file. Provision the sentinel worktree OUTSIDE the repo, quoting both args: \`git worktree add "\${TEAMWORK_WORKTREES_DIR:-../.teamwork-worktrees}/$SESSION_ID/sentinel" -b "teamwork/base-$SESSION_ID"\` (skip if not in a git repo).
+2. Build / inspect the DAG in \`.opencode/teamwork/<session-id>/plan.dag.json\`. Independent tasks run in parallel; dependent ones in topological order.
+3. Dispatch workers in topological order:
+   - For \`document-review\`: dispatch \`team/segment-reviewer\` per segment (\`seg-01\`..\`seg-0K\`) to persist bounded RSA nodes and \`unit-report.md\` via \`teamwork_document_record\`, then dispatch \`team/synthesizer\` on \`doc-synthesis\` to record \`synthesis/candidate-<I>.md\` and \`DOCUMENT_REVIEW_REPORT.md\` via \`teamwork_document_record\`.
+   - For coding topologies: each worker gets its own worktree and scoped \`spec.json\`, returning \`patch.diff\` + \`summary.md\` + cost metrics.
+   - On return: \`teamwork_cost({ taskId })\`, then \`teamwork_task_update\` with \`agent: "team/worker"\` (or \`"team/segment-reviewer"\` / \`"team/synthesizer"\`).
+4. Dispatch verifiers (\`team/verifier\`) against each worker diff or document-review \`unit-report.md\` / \`DOCUMENT_REVIEW_REPORT.md\` vs \`DOCUMENT_TEXT_MAP.md\`. Aggregated results go in \`.opencode/teamwork/<session-id>/verify/summary.json\`. On each verifier report: \`teamwork_cost({ taskId })\`, then \`teamwork_task_update\` with \`agent: "team/verifier"\`.
 5. If FAIL, send the verifier's \`feedback_for_worker.md\` back to the worker for the next round. Loop until PASS, maxRounds, or budget exhausted.
 6. When all tasks PASS, run the mandatory pre-merge security audit via @team/security-auditor and teamwork_security_audit. Once approved (PASS), merge the sentinel worktree back to the user's branch. On partial, present the partial + the open verification reports.
 7. After the run completes (full or partial), perform the independent final verification: spawn a \`team/verifier\` agent to check the final merged result against the spec's acceptance criteria, then have it call \`teamwork_final_verify\`. That tool computes the verdict from the per-task reports and the security audit, stamps provenance, and writes \`.opencode/teamwork/$SESSION_ID/verify/final.json\` — it is the writer, so never hand-write that file. (\`teamwork_next\` only completes a run on a stamped report; a hand-written legacy report needs the explicit \`allowUnstamped: true\` bypass, which is recorded.)

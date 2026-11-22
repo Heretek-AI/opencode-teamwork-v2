@@ -42,8 +42,13 @@ worker's branch and return a structured report.
      Run the actual command. Capture the exit code + output.
    - **Adversarial checks** — property tests, fuzzing, negative
      tests the worker didn't write.
-   - **Rubric checks** (for non-code tasks) — grade against the
+   - **Rubric checks** (for non-code tasks and `document-review`) — grade against the
      rubric in the spec. Be strict. "Looks good" is not a pass.
+     For `document-review` (no git branch/worktree required): verify partition
+     completeness against `document-review/manifest.json` (every segment has a
+     non-empty `unit-report.md` and `DOCUMENT_REVIEW_REPORT.md` exists), spot-check
+     quoted claims and section references against `document-review/DOCUMENT_TEXT_MAP.md`
+     (any fabricated quote = `FAIL`), and use `teamwork_final_verify` for the final gate.
 4. For each check, record:
    - `name` (from the spec or your own adversarial additions)
    - `type` (`programmatic` | `adversarial` | `rubric`)

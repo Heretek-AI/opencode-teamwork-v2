@@ -18,6 +18,14 @@ Every run writes under one root:
 ├── costs.json               # coordinator-maintained budget tracker
 ├── events.jsonl             # append-only lifecycle event log (JSON Lines)
 ├── pitfalls.md              # answer-agnostic failure registry
+├── document-review/         # present for document-review runs
+│   ├── manifest.json        # validated bounds, source metadata, segments
+│   ├── DOCUMENT_TEXT_MAP.md # sanitised extracted document text map
+│   ├── ANALYSIS_PARTITION.md # segment table & bounded RSA tree schedule
+│   ├── segments/<segId>/level-<L>-node-<I>.json # bounded RSA node output
+│   ├── segments/<segId>/unit-report.md          # adjudicated segment report
+│   └── synthesis/candidate-<I>.md               # cross-segment synthesis candidate
+├── DOCUMENT_REVIEW_REPORT.md # final synthesised critique report
 ├── scout-report.md          # scout output
 ├── candidates/cand-<n>.md   # one per proposer
 ├── critiques/crit-<n>.md    # one per falsifier
@@ -46,7 +54,7 @@ the repo are a footgun). Default root: `$TEAMWORK_WORKTREES_DIR` or
 | `distributed-coding` | N workers fan-out + merge |
 | `proof` | 1 strategist + 3-5 searchers + 1 formal checker |
 | `massive-proof` | 1 meta-coordinator + 100+ searchers (opt-in) |
-| `document-review` | 1 chair + 3 critics + 1 aggregator |
+| `document-review` | segment triage (1–8 segments, default 6) → bounded per-segment RSA tree `[4,2,1]` → cross-segment synthesis `[4,1]` |
 
 Legacy aliases — accept them, normalize on write:
 `large-swarm` → `distributed-coding`, `doc-review` → `document-review`,
@@ -257,9 +265,12 @@ field, exactly as before.
 
 The plugin provides deterministic orchestration tools for the Sentinel coordinator:
 - `teamwork_plan`: Creates the run directory and writes `plan.dag.json`, `state.json` and `costs.json`. It is gated on a spec by default (`requireSpec`, see below). `skipInterview` is the explicit, recorded bypass.
+- `teamwork_route`: Deterministic read-only route classifier checking `document-review` FIRST (before Math/Proof) when a supplied document has critique intent while rejecting PR/code reviews, bare filenames without supplied docs, and problem-solving/coding tasks.
+- `teamwork_document_triage`: Validates bounds (`maxSegments <= 8`, `reviewTreeShape <= [4,2,1]`, `synthTreeShape <= [4,1]`), path containment (`realpathSync` + `O_NOFOLLOW`), URL/inline limits, and PDF headers **before** creating any directory, ingests and partitions the document into `seg-01`..`seg-0K` + `doc-synthesis`, and writes `document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}`.
+- `teamwork_document_record`: Persists bounded RSA node outputs (`level-<L>-node-<I>.json`), `unit-report.md`, `synthesis/candidate-<I>.md`, and `DOCUMENT_REVIEW_REPORT.md` with `SEGMENT_ID` allowlist, manifest bounds, symlink refusal, and `clean()`/`cleanBlock()` sanitisation.
 - `teamwork_next`: Evaluates the DAG dependencies against current task lifecycle statuses. Categorizes tasks into `readyForWorker`, `readyForVerifier`, `inProgress`, or terminal conditions (`ALL_TASKS_PASSED` / `DEADLOCK`). Completion additionally requires a stamped `verify/final.json` from `teamwork_final_verify`, unless the caller passes the recorded `allowUnstamped: true` legacy bypass.
 - `teamwork_task_update`: Enforces deterministic state transitions, tracks worker branch names and diff summaries, updates verifier metrics, and advances run `phase` to `MERGE` or `PRESENT_PARTIAL`.
-- `teamwork_final_verify`: Computes the run's final verdict from the artifacts on disk — every task must be `verified_pass`, every `verify/report-<taskId>.json` must be `PASS`, and `verify/security-audit.json` must be `PASS` — then writes `verify/final.json` atomically and appends a `final_verification` event. The verdict is computed from evidence; no input can turn a failing run into `PASS` (a caller-supplied `failReason` can only force `FAIL`). See [`verify/final.json`](#verifyfinaljson-final-verification-verdict).
+- `teamwork_final_verify`: Computes the run's final verdict from the artifacts on disk — every task must be `verified_pass`, every `verify/report-<taskId>.json` must be `PASS`, `verify/security-audit.json` must be `PASS`, and when `document-review/manifest.json` exists, every segment's `unit-report.md` and `DOCUMENT_REVIEW_REPORT.md` must exist as non-empty regular files — then writes `verify/final.json` atomically and appends a `final_verification` event. The verdict is computed from evidence; no input can turn a failing run into `PASS` (a caller-supplied `failReason` can only force `FAIL`). See [`verify/final.json`](#verifyfinaljson-final-verification-verdict).
 - `teamwork_worktree`: Isolates git worktrees outside the project repo (`setup` for sentinel and worker), inspects branch diffs (`diff`), performs clean merges into `teamwork/base-$SESSION_ID` with automatic conflict abort (`merge`), and prunes worktrees (`cleanup`).
 - `teamwork_preflight`: Re-checks the inputs named by an existing run's `ORIGINAL_REQUEST.md` (plus optional `inputs`), writes `<run>/preflight.json`, and appends a `preflight` event. It never throws and never blocks; it reports.
 

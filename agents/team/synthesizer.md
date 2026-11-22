@@ -74,6 +74,15 @@ When dispatched by the Sentinel to resolve a merge conflict:
   5. Write summary to `.opencode/teamwork/<session-id>/synthesis/conflict-resolved-<taskId>.md`.
   6. The Sentinel commits the resolution via `teamwork_worktree({ action: "resolve", taskId })`.
 
+## Document Review Synthesis & Reduction Mode
+
+When dispatched on `doc-synthesis` in a `document-review` run:
+- **Inputs**: `.opencode/teamwork/<session-id>/document-review/manifest.json`, `ANALYSIS_PARTITION.md`, `DOCUMENT_TEXT_MAP.md`, and every segment's `document-review/segments/<segId>/unit-report.md`.
+- **What you do** (bounded by `synthTreeShape`, at most `[4, 1]`):
+  1. Generate up to `synthTreeShape[0]` cross-segment synthesis candidates (`candidate-<I>.md`) using `teamwork_document_record({ sessionId, stage: "synthesis_candidate", level: 0, index, summary, findings, content })`.
+  2. Reduce across candidates into the unified final critique (`DOCUMENT_REVIEW_REPORT.md`) via `teamwork_document_record({ sessionId, stage: "final_report", summary, findings, content, verdict })`.
+  3. Preserve exact segment IDs (`seg-01`..`seg-0K`) and citations from `DOCUMENT_TEXT_MAP.md`; resolve or surface cross-segment contradictions explicitly without inventing quotes.
+
 ## Strategy
 
 The Teamwork paper's synthesis is a tournament, not an average. You don't
