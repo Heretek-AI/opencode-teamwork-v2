@@ -77,6 +77,7 @@ AD
    - Inspect branch diff via `teamwork_worktree({ action: "diff", taskId })` (or `git diff "teamwork/base-$SESSION_ID..teamwork/$SESSION_ID-<taskId>"`)
    - Dispatch verifier subagent with `agent: "team/verifier"` in read-only mode (never `"general"`).
    - The verifier produces `verify/report-<task>.json`.
+   - **Strict mode only (`plan.dag.json` has `verification: "strict"`):** once that report is `PASS`, dispatch one `team/falsifier` (`kind: "challenge"`, verdict `PASS`) and one `team/security-auditor` (`kind: "audit"`, verdict `CLEAN`) in parallel for the task. Each calls `teamwork_wave_record`; the trusted session identity authorizes the call, so never pass an agent override. This is exactly one challenge + one audit per task — the wave scales by adding tasks and iterations, never by hardcoding extra fixed rows. Standard runs skip this step unchanged.
    - On verifier report, attribute its spend: `teamwork_cost({ taskId })`.
    - Update task status with verification results:
      `teamwork_task_update({ taskId, status: "verified_pass" | "verified_fail", verification: { status, passedChecks, totalChecks, fatalFindings }, feedback, agent: "team/verifier" })`.
@@ -97,6 +98,7 @@ AD
     - If `FAIL` (Critical/High findings), `teamwork_next` blocks final merge (`BLOCKED_BY_SECURITY`). Remediate findings before proceeding.
     - If `PASS`, `teamwork_next` transitions to `READY_FOR_FINAL_VERIFICATION`.
 11. **Final verification (Mandatory Stamped Gate).** Once all tasks and the security audit pass, spawn a dedicated verifier with `agent: "team/verifier"` to independently verify the final merged result against the spec's acceptance criteria and call `teamwork_final_verify` to stamp `.opencode/teamwork/$SESSION_ID/verify/final.json`.
+    - In strict mode, `teamwork_next` first returns `NEEDS_STRICT_WAVE` (or `BLOCKED_BY_STRICT_WAVE`) until every task has both wave verdicts. Dispatch the missing falsifier/security-auditor calls, then run `teamwork_final_verify`. A strict PASS also writes `GATE_STATUS.md` with worker/verifier/challenger/auditor rows; cite it when reporting completion.
 12. **Independent victory audit (Mandatory Fidelity Gate).** After the milestone gate PASS, dispatch a **fresh-session** `agent: "team/victory-auditor"` with `ORIGINAL_REQUEST.md` and `requirements.json`. It must inspect the delivered artifacts and run/inspect the tests itself. It records the result with `teamwork_victory_audit`:
     - `VICTORY CONFIRMED` means completion may be reported.
     - `VICTORY REJECTED` means completion is blocked: forward its `findings` and resume the team for another round, then re-run final verification and a new audit.
@@ -123,6 +125,7 @@ AD
 - `teamwork_task_update` — deterministic task state machine transitions (`pending` → `worker_active` → `worker_done` → `verifier_active` → `verified_pass` | `verified_fail` | `blocked`), tracking rounds, branches, diff summaries, and verification results
 - `teamwork_security_audit` — records `team/security-auditor` findings in `verify/security-audit.json`, enforcing the pre-merge security gate (blocks final merge if Critical/High findings exist)
 - `teamwork_victory_audit` — records the independent `team/victory-auditor` verdict in `verify/victory.json`; only that trusted agent may call it, every `requirements.json` id must be reported exactly once, and a `CONFIRMED` verdict is write-once and bound to the current `ORIGINAL_REQUEST.md` hash
+- `teamwork_wave_record` — strict mode only: records one `team/falsifier` challenge (`PASS`) or one `team/security-auditor` audit (`CLEAN`) per task in `verify/challenge-<task>.json` / `verify/audit-<task>.json`; authorization comes from the trusted session identity, the verifier report must already be `PASS`, and each verdict is write-once
 - `teamwork_final_verify` — computes `verify/final.json` from disk evidence (including the victory audit, and LEMMA `lemma/manifest.json`, `problem.lean`, `formalization-review.json`, and stamped `verify-<r>.json` when `lemmaMode: true`)
 - `teamwork_route` — read-only priority-ordered route classifier (`document-review` > explicit LEMMA > non-opt-in `.lean` → `distributed-coding` > `massive-proof` > `proof` > coding)
 - `teamwork_lemma_probe` — read-only probe for `lean`, `lake`, and the LEAP CLI (`leap`; legacy `leap-tools` accepted) on `PATH`
@@ -141,6 +144,7 @@ AD
 - Self-certify. The whole point of the architecture is that
   implementers are biased.
 - Report completion before the independent victory audit is `CONFIRMED`.
+- Report completion in strict mode before `teamwork_next` returns `ALL_PASSED` with both wave verdicts present (or skip the wave in a standard run).
 - Let the implementer or verifier stand in for `team/victory-auditor`.
 - Skip or soften a `VICTORY REJECTED` verdict.
 - Exceed `budget.maxSessionCostUsd`. Halt non-essential workers
