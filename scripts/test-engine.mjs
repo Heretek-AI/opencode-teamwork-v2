@@ -115,6 +115,7 @@ try {
   assert(registeredTools.next, "next tool must be registered")
   assert(registeredTools.task_update, "task_update tool must be registered")
   assert(registeredTools.security_audit, "security_audit tool must be registered")
+  assert(registeredTools.wave_record, "wave_record tool must be registered")
   assert(registeredTools.final_verify, "final_verify tool must be registered")
   assert(registeredTools.worktree, "worktree tool must be registered")
 
@@ -837,13 +838,14 @@ try {
     mkdirSync(dirname(file), { recursive: true })
     writeFileSync(file, JSON.stringify({ taskId, status, timestamp: new Date().toISOString() }) + "\n")
   }
-  const seedVerifiedRun = async (runId, taskIds, { request, integrityMode, auditStatus = "PASS", stampVictory = request !== undefined, victoryAudit } = {}) => {
+  const seedVerifiedRun = async (runId, taskIds, { request, integrityMode, auditStatus = "PASS", stampVictory = request !== undefined, victoryAudit, verification } = {}) => {
     await registeredTools.plan.execute({
       sessionId: runId,
       topology: "iterative-coding",
       skipInterview: true,
       ...(request !== undefined ? { request, integrityMode } : {}),
       ...(victoryAudit !== undefined ? { victoryAudit } : {}),
+      ...(verification !== undefined ? { verification } : {}),
       tasks: taskIds.map((id) => ({ id })),
     })
     for (const taskId of taskIds) {
@@ -1397,6 +1399,350 @@ try {
   assert.strictEqual(vSkipGate.status, "ALL_PASSED")
 
   console.log("✓ requirements baseline, trusted victory-auditor identity, write-once verdict, and completion gate verified")
+
+  // ==========================================
+  // Part 1c-ter-strict: opt-in strict verification wave
+  // ==========================================
+  console.log("Testing opt-in strict verification wave...")
+
+  const strictRunDir = (runId) => join(testDir, ".opencode", "teamwork", runId)
+  const strictPlanFile = (runId) => join(strictRunDir(runId), "plan.dag.json")
+  const strictStateFile = (runId) => join(strictRunDir(runId), "state.json")
+  const strictWaveFile = (runId, kind, taskId) => join(strictRunDir(runId), "verify", `${kind}-${taskId}.json`)
+  const strictGateFile = (runId) => join(strictRunDir(runId), "GATE_STATUS.md")
+  const withAgent = async (agent, fn) => {
+    const previous = mockCtx.session.get
+    mockCtx.session.get = async () => ({ agent })
+    try {
+      return await fn()
+    } finally {
+      mockCtx.session.get = previous
+    }
+  }
+  const recordWave = async (runId, taskId, kind, verdict, agent, { sessionID = `ses_${kind}_wave`, notes, evidence } = {}) =>
+    withAgent(agent, () =>
+      registeredTools.wave_record.execute(
+        {
+          sessionId: runId,
+          taskId,
+          kind,
+          verdict,
+          ...(notes !== undefined ? { notes } : {}),
+          ...(evidence !== undefined ? { evidence } : {}),
+        },
+        { sessionID },
+      ),
+    )
+
+  // Standard is the default and is persisted in both artifacts.
+  const strictDefaultRun = "20261018-000000-sv-default"
+  const strictDefaultPlan = await registeredTools.plan.execute({
+    sessionId: strictDefaultRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    tasks: [{ id: "S1" }],
+  })
+  assert(strictDefaultPlan.content.startsWith("Planned"), `default plan must succeed: ${strictDefaultPlan.content}`)
+  assert.strictEqual(JSON.parse(readFileSync(strictPlanFile(strictDefaultRun), "utf8")).verification, "standard")
+  assert.strictEqual(JSON.parse(readFileSync(strictStateFile(strictDefaultRun), "utf8")).verification, "standard")
+  assert(strictDefaultPlan.content.includes("Verification: standard"), "the plan result must report the default mode")
+
+  // Invalid modes are refused before any write.
+  const strictBadRun = "20261018-000000-sv-bad"
+  const strictBad = await registeredTools.plan.execute({
+    sessionId: strictBadRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    verification: "paranoid",
+    tasks: [{ id: "S1" }],
+  })
+  assert(strictBad.content.startsWith("refused:"), `an invalid verification mode must be refused: ${strictBad.content}`)
+  assert(!existsSync(strictRunDir(strictBadRun)), "an invalid verification mode must create no run dir")
+
+  // Strict persists in plan.dag.json and state.json, and a matching re-plan keeps it.
+  const strictPlanRun = "20261018-000000-sv-plan"
+  const strictPlan = await registeredTools.plan.execute({
+    sessionId: strictPlanRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    verification: "strict",
+    tasks: [{ id: "S1" }],
+  })
+  assert(strictPlan.content.startsWith("Planned"), `strict plan must succeed: ${strictPlan.content}`)
+  assert.strictEqual(JSON.parse(readFileSync(strictPlanFile(strictPlanRun), "utf8")).verification, "strict")
+  assert.strictEqual(JSON.parse(readFileSync(strictStateFile(strictPlanRun), "utf8")).verification, "strict")
+  assert(strictPlan.content.includes("Verification: strict"), "the plan result must report strict")
+  assert(strictPlan.content.includes("falsifier"), "the strict plan result must name the wave")
+  const strictReplan = await registeredTools.plan.execute({
+    sessionId: strictPlanRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    verification: "strict",
+    tasks: [{ id: "S1" }],
+  })
+  assert(strictReplan.content.startsWith("Planned"), `a matching re-plan must be accepted: ${strictReplan.content}`)
+  const strictReplanOmitted = await registeredTools.plan.execute({
+    sessionId: strictPlanRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    tasks: [{ id: "S1" }],
+  })
+  assert(strictReplanOmitted.content.startsWith("Planned"), `omitting verification on re-plan must keep the mode: ${strictReplanOmitted.content}`)
+  assert.strictEqual(JSON.parse(readFileSync(strictPlanFile(strictPlanRun), "utf8")).verification, "strict")
+  const strictModeChange = await registeredTools.plan.execute({
+    sessionId: strictPlanRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    verification: "standard",
+    tasks: [{ id: "S1" }],
+  })
+  assert(strictModeChange.content.startsWith("refused:"), `a re-plan must not change strict to standard: ${strictModeChange.content}`)
+  assert.strictEqual(JSON.parse(readFileSync(strictPlanFile(strictPlanRun), "utf8")).verification, "strict")
+  assert.strictEqual(JSON.parse(readFileSync(strictStateFile(strictPlanRun), "utf8")).verification, "strict")
+
+  // A standard plan cannot be upgraded to strict by a re-plan either.
+  const strictUpgrade = await registeredTools.plan.execute({
+    sessionId: strictDefaultRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    verification: "strict",
+    tasks: [{ id: "S1" }],
+  })
+  assert(strictUpgrade.content.startsWith("refused:"), `a re-plan must not change standard to strict: ${strictUpgrade.content}`)
+  assert.strictEqual(JSON.parse(readFileSync(strictPlanFile(strictDefaultRun), "utf8")).verification, "standard")
+
+  // Wave authorization, validation, schema, atomic write, and write-once.
+  const strictWaveRun = "20261018-000000-sv-wave"
+  await seedVerifiedRun(strictWaveRun, ["W1", "W2"], {
+    request: "Exercise the strict wave tool.",
+    victoryAudit: "skip",
+    verification: "strict",
+    stampVictory: false,
+  })
+  const strictWrongChallenge = await recordWave(strictWaveRun, "W1", "challenge", "PASS", "team/verifier")
+  assert(strictWrongChallenge.content.startsWith("refused:"), `team/verifier must not record a challenge: ${strictWrongChallenge.content}`)
+  assert(!existsSync(strictWaveFile(strictWaveRun, "challenge", "W1")), "a refused caller must write no challenge")
+  const strictUnknownCaller = await registeredTools.wave_record.execute(
+    { sessionId: strictWaveRun, taskId: "W1", kind: "challenge", verdict: "PASS" },
+    { sessionID: "ses_unknown_wave" },
+  )
+  assert(strictUnknownCaller.content.startsWith("refused:"), `an unknown session agent must be refused: ${strictUnknownCaller.content}`)
+  const strictWrongAudit = await recordWave(strictWaveRun, "W2", "audit", "CLEAN", "team/falsifier")
+  assert(strictWrongAudit.content.startsWith("refused:"), `team/falsifier must not record an audit: ${strictWrongAudit.content}`)
+  assert(!existsSync(strictWaveFile(strictWaveRun, "audit", "W2")), "a refused caller must write no audit")
+
+  const strictChallenge = await recordWave(strictWaveRun, "W1", "challenge", "PASS", "team/falsifier", {
+    notes: "  Tried\tempty input, overflow, and TOCTOU.  ",
+    evidence: "verify/report-W1.json + src/core.ts:42",
+  })
+  assert.strictEqual(strictChallenge.verdict?.verdict, "PASS", `a trusted falsifier must record PASS: ${strictChallenge.content}`)
+  const strictChallengeJson = JSON.parse(readFileSync(strictWaveFile(strictWaveRun, "challenge", "W1"), "utf8"))
+  assert.deepStrictEqual(
+    {
+      version: strictChallengeJson.version,
+      sessionId: strictChallengeJson.sessionId,
+      taskId: strictChallengeJson.taskId,
+      kind: strictChallengeJson.kind,
+      verdict: strictChallengeJson.verdict,
+      agent: strictChallengeJson.agent,
+      agentSessionId: strictChallengeJson.agentSessionId,
+    },
+    {
+      version: 1,
+      sessionId: strictWaveRun,
+      taskId: "W1",
+      kind: "challenge",
+      verdict: "PASS",
+      agent: "team/falsifier",
+      agentSessionId: "ses_challenge_wave",
+    },
+  )
+  assert.strictEqual(strictChallengeJson.notes, "Tried empty input, overflow, and TOCTOU.", "notes must be sanitized and trimmed")
+  assert.strictEqual(strictChallengeJson.evidence, "verify/report-W1.json + src/core.ts:42")
+  assert(/^\d{4}-\d{2}-\d{2}T/.test(strictChallengeJson.generatedAt), "generatedAt must be recorded")
+  const strictChallengeAgain = await recordWave(strictWaveRun, "W1", "challenge", "PASS", "team/falsifier")
+  assert(/write-once/.test(strictChallengeAgain.content), `a recorded challenge must be write-once: ${strictChallengeAgain.content}`)
+
+  const strictMissingTask = await recordWave(strictWaveRun, "NOPE", "challenge", "PASS", "team/falsifier")
+  assert(strictMissingTask.content.startsWith("refused:"), `a missing task must be refused: ${strictMissingTask.content}`)
+  const strictBadVerdict = await recordWave(strictWaveRun, "W2", "challenge", "CLEAN", "team/falsifier")
+  assert(strictBadVerdict.content.startsWith("refused:"), `a challenge with the wrong verdict must be refused: ${strictBadVerdict.content}`)
+  assert(!existsSync(strictWaveFile(strictWaveRun, "challenge", "W2")), "a bad verdict must write no file")
+  const strictBadAuditVerdict = await recordWave(strictWaveRun, "W2", "audit", "PASS", "team/security-auditor")
+  assert(strictBadAuditVerdict.content.startsWith("refused:"), `an audit with the wrong verdict must be refused: ${strictBadAuditVerdict.content}`)
+  assert(!existsSync(strictWaveFile(strictWaveRun, "audit", "W2")), "a bad audit verdict must write no file")
+
+  const strictWaveEvents = readEvents(testDir, strictWaveRun).filter((e) => e.event === "verification_wave")
+  assert.strictEqual(strictWaveEvents.length, 1, "only successful wave records append an event")
+  assert.strictEqual(strictWaveEvents[0].taskId, "W1")
+  assert.strictEqual(strictWaveEvents[0].agent, "team/falsifier")
+  assert.strictEqual(strictWaveEvents[0].to, "PASS")
+  assert.strictEqual(strictWaveEvents[0].agentSource, "session")
+
+  // A missing verifier report is refused: the wave supplements the review.
+  const strictNoReportRun = "20261018-000000-sv-noreport"
+  await seedVerifiedRun(strictNoReportRun, ["N1"], { victoryAudit: "skip", verification: "strict", stampVictory: false })
+  rmSync(runFile(testDir, strictNoReportRun, "verify/report-N1.json"))
+  const strictNoReport = await recordWave(strictNoReportRun, "N1", "challenge", "PASS", "team/falsifier")
+  assert(/report-N1\.json is missing/.test(strictNoReport.content), `a missing verifier report must be refused: ${strictNoReport.content}`)
+  assert(!existsSync(strictWaveFile(strictNoReportRun, "challenge", "N1")), "no verdict may be written without a report")
+
+  console.log("✓ strict mode persists, re-plans are locked, and wave verdicts are authorized, validated, and write-once")
+
+  // Strict completion gate: NEEDS_STRICT_WAVE, PASS with GATE_STATUS.md, and FAIL.
+  const strictHappyRun = "20261018-000000-sv-happy"
+  await seedVerifiedRun(strictHappyRun, ["H1"], {
+    request: "Deliver the strict happy-path fixture.",
+    victoryAudit: "skip",
+    verification: "strict",
+    stampVictory: false,
+  })
+  const strictNextMissing = await registeredTools.next.execute({ sessionId: strictHappyRun })
+  assert.strictEqual(
+    strictNextMissing.status,
+    "NEEDS_STRICT_WAVE",
+    `next must stop before the strict wave: ${strictNextMissing.content}`,
+  )
+  assert.notStrictEqual(strictNextMissing.status, "ALL_PASSED")
+  assert.deepStrictEqual(
+    strictNextMissing.missing,
+    [
+      { taskId: "H1", kind: "challenge" },
+      { taskId: "H1", kind: "audit" },
+    ],
+    "NEEDS_STRICT_WAVE must list the missing task/kind pairs",
+  )
+  assert(strictNextMissing.content.includes("H1:challenge") && strictNextMissing.content.includes("H1:audit"))
+
+  await recordWave(strictHappyRun, "H1", "challenge", "PASS", "team/falsifier", {
+    notes: "No fatal or serious flaw found.",
+    evidence: "verify/report-H1.json",
+  })
+  const strictNextHalf = await registeredTools.next.execute({ sessionId: strictHappyRun })
+  assert.strictEqual(strictNextHalf.status, "NEEDS_STRICT_WAVE")
+  assert.deepStrictEqual(strictNextHalf.missing, [{ taskId: "H1", kind: "audit" }], "only the audit may remain missing")
+  await recordWave(strictHappyRun, "H1", "audit", "CLEAN", "team/security-auditor", {
+    notes: "No Critical/High findings.",
+    evidence: "npm test tail",
+  })
+  const strictNextReady = await registeredTools.next.execute({ sessionId: strictHappyRun })
+  assert.strictEqual(
+    strictNextReady.status,
+    "READY_FOR_FINAL_VERIFICATION",
+    `the completed wave must unlock final verification: ${strictNextReady.content}`,
+  )
+  assert(!existsSync(strictGateFile(strictHappyRun)), "GATE_STATUS.md is written by final_verify, not next")
+  const strictHappyFinal = await registeredTools.final_verify.execute({ sessionId: strictHappyRun })
+  assert.strictEqual(strictHappyFinal.status, "PASS", `complete strict evidence must PASS: ${strictHappyFinal.content}`)
+  assert.strictEqual(strictHappyFinal.strictGate, "PASS")
+  assert(existsSync(strictGateFile(strictHappyRun)), "strict final_verify must write GATE_STATUS.md")
+  const strictGateText = readFileSync(strictGateFile(strictHappyRun), "utf8")
+  assert(/^\| Agent \| Role \| Verdict \| Source \|$/m.test(strictGateText), "GATE_STATUS.md must carry the exact table header")
+  assert(strictGateText.includes("| team/worker | worker | verified_pass | state.json#tasks.H1 |"))
+  assert(strictGateText.includes("| team/verifier | verifier | PASS | verify/report-H1.json |"))
+  assert(strictGateText.includes("| team/falsifier | challenger | PASS | verify/challenge-H1.json |"))
+  assert(strictGateText.includes("| team/security-auditor | auditor | CLEAN | verify/audit-H1.json |"))
+  assert(strictGateText.includes("Gate Result: **PASS**"), `GATE_STATUS.md must state the gate result: ${strictGateText}`)
+  const strictHappyFinalJson = JSON.parse(readFileSync(finalFileOf(strictHappyRun), "utf8"))
+  assert.strictEqual(strictHappyFinalJson.status, "PASS")
+  assert.strictEqual(strictHappyFinalJson.evidence.strict.status, "PASS")
+  assert.strictEqual(strictHappyFinalJson.evidence.strict.tasks[0].challenge.status, "PASS")
+  assert.strictEqual(strictHappyFinalJson.evidence.strict.tasks[0].audit.status, "CLEAN")
+  const strictHappyNext = await registeredTools.next.execute({ sessionId: strictHappyRun })
+  assert.strictEqual(strictHappyNext.status, "ALL_PASSED", `the strict run must complete: ${strictHappyNext.content}`)
+
+  const seedStrictGateRun = async (runId, taskId) => {
+    await seedVerifiedRun(runId, [taskId], {
+      request: `Strict gate fixture ${runId}.`,
+      victoryAudit: "skip",
+      verification: "strict",
+      stampVictory: false,
+    })
+  }
+  const writeRawWave = (runId, taskId, kind, verdict, agent) => {
+    const file = strictWaveFile(runId, kind, taskId)
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: 1,
+        sessionId: runId,
+        taskId,
+        kind,
+        verdict,
+        agent,
+        agentSessionId: `ses_${kind}_forged`,
+        notes: "",
+        evidence: "",
+        generatedAt: new Date().toISOString(),
+      }) + "\n",
+    )
+  }
+
+  // Missing challenge -> FAIL with a named reason and a FAIL gate table.
+  const strictNoChallengeRun = "20261018-000000-sv-nochallenge"
+  await seedStrictGateRun(strictNoChallengeRun, "C1")
+  await recordWave(strictNoChallengeRun, "C1", "audit", "CLEAN", "team/security-auditor")
+  const strictNoChallenge = await registeredTools.final_verify.execute({ sessionId: strictNoChallengeRun })
+  assert.strictEqual(strictNoChallenge.status, "FAIL", `a missing challenge must FAIL: ${strictNoChallenge.content}`)
+  assert(
+    strictNoChallenge.reasons.some((r) => r.includes("strict challenge C1") && r.includes("missing")),
+    `the reason must name the missing challenge: ${JSON.stringify(strictNoChallenge.reasons)}`,
+  )
+  assert(readFileSync(strictGateFile(strictNoChallengeRun), "utf8").includes("Gate Result: **FAIL**"), "a strict failure must write a FAIL gate table")
+
+  // Missing audit -> FAIL with a named reason.
+  const strictNoAuditRun = "20261018-000000-sv-noaudit"
+  await seedStrictGateRun(strictNoAuditRun, "A1")
+  await recordWave(strictNoAuditRun, "A1", "challenge", "PASS", "team/falsifier")
+  const strictNoAudit = await registeredTools.final_verify.execute({ sessionId: strictNoAuditRun })
+  assert.strictEqual(strictNoAudit.status, "FAIL", `a missing audit must FAIL: ${strictNoAudit.content}`)
+  assert(
+    strictNoAudit.reasons.some((r) => r.includes("strict audit A1") && r.includes("missing")),
+    `the reason must name the missing audit: ${JSON.stringify(strictNoAudit.reasons)}`,
+  )
+
+  // A present but non-PASS challenge fails.
+  const strictChallengeFailRun = "20261018-000000-sv-challenge-fail"
+  await seedStrictGateRun(strictChallengeFailRun, "CF")
+  await recordWave(strictChallengeFailRun, "CF", "audit", "CLEAN", "team/security-auditor")
+  writeRawWave(strictChallengeFailRun, "CF", "challenge", "FAIL", "team/falsifier")
+  const strictChallengeFail = await registeredTools.final_verify.execute({ sessionId: strictChallengeFailRun })
+  assert.strictEqual(strictChallengeFail.status, "FAIL", "a FAIL challenge must FAIL final_verify")
+  assert(
+    strictChallengeFail.reasons.some((r) => r.includes("strict challenge CF") && r.includes("verdict FAIL") && r.includes("expected PASS")),
+    `the reason must name the challenge verdict: ${JSON.stringify(strictChallengeFail.reasons)}`,
+  )
+
+  // A present but non-CLEAN audit fails.
+  const strictAuditBadRun = "20261018-000000-sv-audit-bad"
+  await seedStrictGateRun(strictAuditBadRun, "AB")
+  await recordWave(strictAuditBadRun, "AB", "challenge", "PASS", "team/falsifier")
+  writeRawWave(strictAuditBadRun, "AB", "audit", "INTEGRITY VIOLATION", "team/security-auditor")
+  const strictAuditBad = await registeredTools.final_verify.execute({ sessionId: strictAuditBadRun })
+  assert.strictEqual(strictAuditBad.status, "FAIL", "a non-CLEAN audit must FAIL final_verify")
+  assert(
+    strictAuditBad.reasons.some((r) => r.includes("strict audit AB") && r.includes("INTEGRITY VIOLATION") && r.includes("expected CLEAN")),
+    `the reason must name the audit verdict: ${JSON.stringify(strictAuditBad.reasons)}`,
+  )
+
+  // Standard mode ignores stray wave files entirely (today's behaviour).
+  const strictStdRun = "20261018-000000-sv-standard"
+  await seedVerifiedRun(strictStdRun, ["STD"], {
+    request: "Deliver the standard fixture.",
+    victoryAudit: "skip",
+    stampVictory: false,
+  })
+  assert.strictEqual(JSON.parse(readFileSync(strictPlanFile(strictStdRun), "utf8")).verification, "standard")
+  writeRawWave(strictStdRun, "STD", "challenge", "FAIL", "team/verifier")
+  writeRawWave(strictStdRun, "STD", "audit", "INTEGRITY VIOLATION", "team/verifier")
+  const strictStdFinal = await registeredTools.final_verify.execute({ sessionId: strictStdRun })
+  assert.strictEqual(strictStdFinal.status, "PASS", `standard mode must ignore stray wave files: ${strictStdFinal.content}`)
+  assert(!existsSync(strictGateFile(strictStdRun)), "standard mode must not write GATE_STATUS.md")
+  const strictStdJson = JSON.parse(readFileSync(finalFileOf(strictStdRun), "utf8"))
+  assert.strictEqual(strictStdJson.evidence.strict, undefined, "standard mode must not add strict evidence")
+
+  console.log("✓ strict gate requires per-task challenge PASS + audit CLEAN, names gaps, and writes GATE_STATUS.md; standard is unchanged")
 
   // ==========================================
   // Part 1c-quater: integrity mode enforcement
