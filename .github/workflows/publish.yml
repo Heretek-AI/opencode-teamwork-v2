@@ -35,6 +35,27 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false # never cache in release builds
 
+      - name: Test
+        run: npm test
+
+      # Guards the npm `files` whitelist: docs/re must never ship, and the
+      # published package must still contain the shipped docs and plugin entry.
+      - name: Packaging guard
+        run: |
+          npm pack --dry-run --json > "$RUNNER_TEMP/pack.json"
+          node -e '
+          const fs = require("fs");
+          const p = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/pack.json", "utf8"));
+          const paths = p[0].files.map((f) => f.path);
+          const bad = paths.filter((x) => x === "docs/re" || x.startsWith("docs/re/"));
+          const need = ["docs/ARTIFACTS.md", "docs/GUARDRAILS.md", "plugins/opencode-teamwork/index.ts"];
+          const miss = need.filter((n) => !paths.includes(n));
+          console.log(`packed files: ${paths.length}`);
+          if (bad.length) console.error("forbidden docs/re paths:\n" + bad.join("\n"));
+          if (miss.length) console.error("missing required paths:\n" + miss.join("\n"));
+          process.exit(bad.length + miss.length ? 1 : 0);
+          '
+
       # Trusted publishing (OIDC) needs npm >= 11.5.1. Prefer the latest npm but
       # fall back to the newest 11.x if the latest requires a newer Node.
       - name: Ensure recent npm

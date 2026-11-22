@@ -50,7 +50,7 @@ Then:
 4. Dispatch verifiers against each worker's diff. Aggregated results go in \`.opencode/teamwork/<session-id>/verify/summary.json\`. On each verifier report: \`teamwork_cost({ taskId })\`, then \`teamwork_task_update\` with \`agent: "team/verifier"\`.
 5. If FAIL, send the verifier's \`feedback_for_worker.md\` back to the worker for the next round. Loop until PASS, maxRounds, or budget exhausted.
 6. When all tasks PASS, run the mandatory pre-merge security audit via @team/security-auditor and teamwork_security_audit. Once approved (PASS), merge the sentinel worktree back to the user's branch. On partial, present the partial + the open verification reports.
-7. After the run completes (full or partial), spawn a \`team/verifier\` agent to independently verify the final merged result against the spec's acceptance criteria; write its report to \`.opencode/teamwork/$SESSION_ID/verify/final.json\`.
+7. After the run completes (full or partial), perform the independent final verification: spawn a \`team/verifier\` agent to check the final merged result against the spec's acceptance criteria, then have it call \`teamwork_final_verify\`. That tool computes the verdict from the per-task reports and the security audit, stamps provenance, and writes \`.opencode/teamwork/$SESSION_ID/verify/final.json\` — it is the writer, so never hand-write that file. (\`teamwork_next\` only completes a run on a stamped report; a hand-written legacy report needs the explicit \`allowUnstamped: true\` bypass, which is recorded.)
 
 Hard caps (override in the spec if the user asks):
 - 4 rounds per task (6 for proof, 1 for small-focused, 24h for massive-proof)

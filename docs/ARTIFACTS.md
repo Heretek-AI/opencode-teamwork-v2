@@ -230,8 +230,9 @@ field, exactly as before.
 
 The plugin provides deterministic orchestration tools for the Sentinel coordinator:
 - `teamwork_plan`: Creates the run directory and writes `plan.dag.json`, `state.json` and `costs.json`. It is gated on a spec by default (`requireSpec`, see below). `skipInterview` is the explicit, recorded bypass.
-- `teamwork_next`: Evaluates the DAG dependencies against current task lifecycle statuses. Categorizes tasks into `readyForWorker`, `readyForVerifier`, `inProgress`, or terminal conditions (`ALL_TASKS_PASSED` / `DEADLOCK`).
+- `teamwork_next`: Evaluates the DAG dependencies against current task lifecycle statuses. Categorizes tasks into `readyForWorker`, `readyForVerifier`, `inProgress`, or terminal conditions (`ALL_TASKS_PASSED` / `DEADLOCK`). Completion additionally requires a stamped `verify/final.json` from `teamwork_final_verify`, unless the caller passes the recorded `allowUnstamped: true` legacy bypass.
 - `teamwork_task_update`: Enforces deterministic state transitions, tracks worker branch names and diff summaries, updates verifier metrics, and advances run `phase` to `MERGE` or `PRESENT_PARTIAL`.
+- `teamwork_final_verify`: Computes the run's final verdict from the artifacts on disk — every task must be `verified_pass`, every `verify/report-<taskId>.json` must be `PASS`, and `verify/security-audit.json` must be `PASS` — then writes `verify/final.json` atomically and appends a `final_verification` event. The verdict is computed from evidence; no input can turn a failing run into `PASS` (a caller-supplied `failReason` can only force `FAIL`). See [`verify/final.json`](#verifyfinaljson-final-verification-verdict).
 - `teamwork_worktree`: Isolates git worktrees outside the project repo (`setup` for sentinel and worker), inspects branch diffs (`diff`), performs clean merges into `teamwork/base-$SESSION_ID` with automatic conflict abort (`merge`), and prunes worktrees (`cleanup`).
 
 **Spec gate (`teamwork_plan`).** A run must start from an approved spec: `<run>/prompt_draft.md`, present and non-empty after trimming. The check runs after topology/task-id validation and **before anything is written**, so a refusal creates no run directory and no plan files. Two inputs control it:
@@ -378,11 +379,12 @@ plus `agentSource` when an actor exists:
   `withFileLock` as the append, so concurrent appends cannot duplicate it.
   **Optional on legacy lines**: logs written before `seq` existed have no
   `seq`, and they remain valid.
-- `event` (string): `run_created`, `task_transition`, or `security_audit`
+- `event` (string): `run_created`, `task_transition`, `security_audit`,
+  `final_verification`, or `final_verification_bypass`
 - `sessionId` (string): Run session id (≤64 chars)
 - `taskId` (string or null): Task id (≤64 chars); `null` for run-level events
 - `from` (string or null): Previous task status (≤32 chars)
-- `to` (string): New task status, or `PASS`/`FAIL` for `security_audit` (≤32 chars)
+- `to` (string): New task status, or `PASS`/`FAIL` for `security_audit` and `final_verification` (≤32 chars)
 - `round` (integer): Task round; `0` when not applicable
 - `agent` (string or null): Actor that performed the transition (≤64 chars). **Caller-reported (self-reported)**, see the **Actor** paragraph below.
 - `agentSource` (string, optional): Provenance of `agent` — `"explicit"` (the
@@ -390,12 +392,16 @@ plus `agentSource` when an actor exists:
   agent, from the session tree or `snapshots.json`), or `"plan"` (the agent
   declared for the task in `plan.dag.json`). Emitted **only** when `agent` is
   non-null; `run_created` and `security_audit` carry no actor, so they omit it.
-  Legacy lines also omit it.
+  `final_verification` records the calling session's agent (`"session"`) when it
+  can be resolved. Legacy lines also omit it.
 - `branch` (string or null): Task branch (≤120 chars)
 - `worktree` (string or null): Task worktree path (≤200 chars)
 - `phase` (string or null): Run phase after the event (≤32 chars)
+- `note` (string, optional): Reason an unstamped final verdict was accepted
+  (≤200 chars). Emitted **only** on `final_verification_bypass`; every other
+  event omits it. Sanitised with `clean()`.
 
-The three event kinds:
+The five event kinds:
 
 - `run_created`: written by `teamwork_plan` once the run is created. `taskId` and
   `from` are `null`, `to` is `"pending"`, `round` is `0`, `phase` is `"DAG_BUILD"`.
@@ -413,6 +419,19 @@ The three event kinds:
 - `security_audit`: written by `teamwork_security_audit`. `to` is `"PASS"` or
   `"FAIL"`, and `phase` is the run phase. `taskId`, `from`, `branch`, `worktree` and
   `agent` are `null`, `round` is `0`, and `agentSource` is omitted.
+- `final_verification`: written by `teamwork_final_verify` after
+  `verify/final.json` is saved. `to` is `"PASS"` or `"FAIL"`, `taskId` and `from`
+  are `null`, `round` is `0`, and `phase` is the run phase. `agent` is the calling
+  session's agent when it could be resolved (with `agentSource: "session"`);
+  otherwise it is `null` and `agentSource` is omitted.
+- `final_verification_bypass`: written by `teamwork_next` when it accepts an
+  **unstamped** `verify/final.json` through the explicit `allowUnstamped: true`
+  bypass. `to` is `"ALL_PASSED"`, `taskId` and `from` are `null`, `round` is
+  `0`, and `phase` is the run phase after the bypass (normally `"MERGE"`).
+  `agent` is the calling session's agent when it could be resolved (with
+  `agentSource: "session"`), otherwise `null`. It carries a `note` explaining
+  that the verdict was not produced by `teamwork_final_verify`. A stamped
+  verdict never emits this event.
 
 Example (one `task_transition` line, wrapped here for readability):
 
@@ -435,8 +454,8 @@ the transition. No engine decision reads it; the timeline view only displays it.
 Treat it as a label, not as evidence of who acted.
 
 **Sanitising.** The caller-supplied and file-derived string fields (`sessionId`,
-`taskId`, `from`, `to`, `agent`, `branch`, `worktree`, `phase`) are passed through
-`clean()` and truncated to the limit above. `ts` is generated by the engine
+`taskId`, `from`, `to`, `agent`, `branch`, `worktree`, `phase`, `note`) are
+passed through `clean()` and truncated to the limit above. `ts` is generated by the engine
 (`new Date().toISOString()`), `seq` is assigned by the engine, `event` is a
 code-supplied literal, and `agentSource` is only emitted for one of the three
 fixed values above, so none of those goes through `clean()`. `clean()` replaces
@@ -504,6 +523,75 @@ result says the default was applied. The mode is disclosed, not enforced, by
 `integrityMode` field.
 
 If `critical` > 0 or `high` > 0, `status` is forced to `FAIL` and `teamwork_next` blocks final merge (`BLOCKED_BY_SECURITY`).
+
+### `verify/final.json` (final verification verdict)
+
+```json
+{
+  "status": "PASS|FAIL",
+  "generatedBy": { "agent": "team/verifier", "session": "ses_abc123" },
+  "generatedAt": "ISO8601",
+  "integrityMode": "development",
+  "evidence": {
+    "tasks": [
+      {
+        "id": "R1-impl",
+        "status": "verified_pass",
+        "report": "verify/report-R1-impl.json",
+        "reportStatus": "PASS"
+      }
+    ],
+    "securityAudit": { "path": "verify/security-audit.json", "status": "PASS" },
+    "allTasksVerifiedPass": true
+  },
+  "reasons": [],
+  "summary": "Independent final check passed.",
+  "findings": [
+    { "where": "src/api.ts:42", "why": "...", "fix": "..." }
+  ]
+}
+```
+
+`teamwork_final_verify` writes this file atomically. `status` is `PASS` **only**
+when every task in `state.json` is `verified_pass`, every task report
+(`verify/report-<taskId>.json`, task ids validated with the same safe-id
+allowlist) reports `PASS`, and `verify/security-audit.json` reports `PASS`. Any
+unmet condition yields `FAIL` with one entry per condition in `reasons` (capped
+at 100). The verdict is computed from these artifacts and cannot be overridden
+by input: a supplied `failReason` only appends a reason and forces `FAIL`.
+
+`generatedBy` records provenance: `agent` is the calling session's agent (or
+`null` when it could not be resolved) and `session` is the calling OpenCode
+session id (or the run id when no caller session is available). `generatedAt` is
+the write time. `integrityMode` is read from `ORIGINAL_REQUEST.md` and defaults
+to `development`. `summary` and `findings` are optional (the verifier's prose and
+up to 50 `{where, why, fix}` entries).
+
+**Stamped requirement.** `teamwork_next` treats a report as *stamped* only when
+it has a non-empty `generatedBy` object containing a non-empty `session`, a
+parseable `generatedAt`, and an `evidence` object. A report missing any of those
+was written outside the engine (by hand, or before the stamp existed): it is
+unstamped/legacy and cannot complete a run by default. Recompute it with
+`teamwork_final_verify`.
+
+**Completion gate.** With every task `verified_pass` and the security audit
+`PASS`, `teamwork_next` evaluates `verify/final.json`:
+
+| Report state | Result | Phase |
+| --- | --- | --- |
+| missing/unreadable/malformed | `READY_FOR_FINAL_VERIFICATION` | `FINAL_VERIFICATION` |
+| `status: "FAIL"` | `BLOCKED_BY_FINAL_VERIFICATION` | unchanged |
+| `status: "PASS"`, stamped | `ALL_PASSED` with `stamped: true` | `MERGE` |
+| `status: "PASS"`, unstamped, default | `FINAL_VERIFICATION_UNVERIFIED` | `FINAL_VERIFICATION` |
+| `status: "PASS"`, unstamped, `allowUnstamped: true` | `ALL_PASSED` with `stamped: false`, `unstampedBypass: true` | `MERGE` |
+
+`allowUnstamped` (boolean, default `false`) is a legacy migration escape hatch.
+It accepts a hand-written report and appends one `final_verification_bypass`
+event whose `note` records the acceptance. Use it only to finish runs that
+predate `teamwork_final_verify`; every new run should complete through a stamped
+verdict. `FINAL_VERIFICATION_UNVERIFIED` results carry `finalReport`,
+`passedCount` and `integrityMode`, and the message names both remedies (run the
+tool, or re-call with the bypass).
 
 ### `synthesis/conflict-<task>.json` (git 3-way merge conflict artifact)
 

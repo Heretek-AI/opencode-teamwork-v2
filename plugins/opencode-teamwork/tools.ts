@@ -660,6 +660,23 @@ function cleanBlock(value: unknown, max = 2000): string {
 }
 
 /**
+ * A `verify/final.json` counts as *stamped* only when `teamwork_final_verify`
+ * wrote it: a non-empty `generatedBy` object with a non-empty `session`, a
+ * parseable `generatedAt`, and an `evidence` object. Anything else was written
+ * by hand (or by an engine older than the stamp), and cannot complete a run
+ * without the explicit, recorded `allowUnstamped` bypass.
+ */
+function isStampedFinalReport(report: any): boolean {
+  if (!report || typeof report !== "object" || Array.isArray(report)) return false
+  const by = report.generatedBy
+  if (!by || typeof by !== "object" || Array.isArray(by)) return false
+  if (typeof by.session !== "string" || by.session.trim() === "") return false
+  if (typeof report.generatedAt !== "string" || Number.isNaN(Date.parse(report.generatedAt))) return false
+  const ev = report.evidence
+  return !!ev && typeof ev === "object" && !Array.isArray(ev)
+}
+
+/**
  * Null-prototype copy of an object-keyed map (byTask, byTaskTokens, state.tasks).
  * With no prototype, no inherited member name (constructor, __proto__, ...) can
  * collide with a task/bucket key. Own keys are copied with [[Set]] onto a
@@ -879,7 +896,7 @@ function nextEventSeq(file: string): number {
 async function appendEvent(
   run: string,
   ev: {
-    event: "run_created" | "task_transition" | "security_audit"
+    event: "run_created" | "task_transition" | "security_audit" | "final_verification" | "final_verification_bypass"
     sessionId: string
     taskId?: string | null
     from?: string | null
@@ -895,6 +912,8 @@ async function appendEvent(
     specGate?: "satisfied" | "bypassed" | "not_required"
     /** run_created only: the spec file, when the gate was satisfied. */
     specPath?: string | null
+    /** final_verification_bypass only: why an unstamped verdict was accepted. */
+    note?: string | null
   },
 ) {
   try {
@@ -903,6 +922,7 @@ async function appendEvent(
       refuseSymlink(eventsFile)
       const opt = (v: unknown, max: number) => (v === null || v === undefined || v === "" ? null : clean(v, max))
       const agent = opt(ev.agent, 64)
+      const note = opt(ev.note, 200)
       const source =
         agent && (ev.agentSource === "explicit" || ev.agentSource === "session" || ev.agentSource === "plan")
           ? ev.agentSource
@@ -921,6 +941,7 @@ async function appendEvent(
         branch: opt(ev.branch, 120),
         worktree: opt(ev.worktree, 200),
         phase: opt(ev.phase, 32),
+        ...(note ? { note } : {}),
         // Only run_created carries the spec-gate decision. Every line now also
         // carries seq (and agentSource when an actor exists); legacy lines on
         // disk keep their old shape and remain valid.
@@ -1461,10 +1482,15 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         type: "object",
         properties: {
           sessionId: { type: "string", description: "Teamwork session id (defaults to active run)." },
+          allowUnstamped: {
+            type: "boolean",
+            description:
+              "Legacy migration escape hatch (default false). When true, a PASS verify/final.json without teamwork_final_verify provenance is accepted for completion and the bypass is recorded as a final_verification_bypass event. Do not use for new runs.",
+          },
         },
         additionalProperties: false,
       },
-      execute: async (input: any) => {
+      execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
@@ -1601,7 +1627,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
 
           // "Done" needs an independent final verdict, not just per-task PASSes.
-          // Missing, unreadable, or malformed reports are NOT done.
+          // Missing, unreadable, or malformed reports are NOT done. A PASS is
+          // only sufficient when `teamwork_final_verify` stamped it; an
+          // unstamped (hand-written or legacy) report needs the explicit,
+          // recorded `allowUnstamped` bypass.
           const finalFile = join(run, "verify", "final.json")
           const finalReport = existsSync(finalFile) ? readJson<any>(finalFile, undefined) : undefined
 
@@ -1629,9 +1658,53 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
 
+          const stamped = isStampedFinalReport(finalReport)
+          const allowUnstamped = input?.allowUnstamped === true
+
+          if (!stamped && !allowUnstamped) {
+            if (state.phase !== "FINAL_VERIFICATION") {
+              state.phase = "FINAL_VERIFICATION"
+              writeJson(join(run, "state.json"), state)
+            }
+            return {
+              content: `FINAL_VERIFICATION_UNVERIFIED: verify/final.json reports PASS but is not stamped by teamwork_final_verify (no usable generatedBy.session, generatedAt, or evidence), so it cannot complete the run.\nRun teamwork_final_verify to compute the verdict from the per-task reports and the security audit and stamp provenance. To accept this hand-written or legacy report instead, re-call teamwork_next with allowUnstamped: true; that is recorded as a bypass event.\n${integrityModeNote}`,
+              status: "FINAL_VERIFICATION_UNVERIFIED",
+              finalReport: finalFile,
+              passedCount: passedTasks.length,
+              integrityMode: integrity.mode,
+            }
+          }
+
           if (state.phase !== "MERGE" && state.phase !== "DONE") {
             state.phase = "MERGE"
             writeJson(join(run, "state.json"), state)
+          }
+
+          if (!stamped) {
+            // Explicit legacy escape hatch: accept, but record who did it and why.
+            const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+            const caller = await deriveCallerAgent(ctx, run, callSession)
+            await appendEvent(run, {
+              event: "final_verification_bypass",
+              sessionId: basename(run),
+              taskId: null,
+              to: "ALL_PASSED",
+              round: 0,
+              agent: caller?.agent ?? null,
+              agentSource: caller?.agent ? "session" : undefined,
+              phase: state.phase ?? null,
+              note: "unstamped verify/final.json accepted via allowUnstamped; verdict was not produced by teamwork_final_verify",
+            })
+            return {
+              content: `ALL_TASKS_PASSED: All ${taskDefs.size} tasks have passed verification, security audit PASSED, and verify/final.json reports PASS — but that verdict was not produced by teamwork_final_verify (unstamped hand-written or legacy report). Accepted via allowUnstamped: true; the bypass was recorded in events.jsonl. Ready to merge Sentinel base worktree to user branch and present final artifact.\n${integrityModeNote}`,
+              status: "ALL_PASSED",
+              integrityMode: integrity.mode,
+              passedCount: passedTasks.length,
+              securityAuditPassed: true,
+              finalReport: finalFile,
+              stamped: false,
+              unstampedBypass: true,
+            }
           }
 
           return {
@@ -1641,6 +1714,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             passedCount: passedTasks.length,
             securityAuditPassed: true,
             finalReport: finalFile,
+            stamped: true,
           }
         }
 
@@ -2018,6 +2092,153 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           integrityMode: integrity.mode,
           reportPath: auditFile,
         }
+      },
+    })
+
+    editor.add({
+      name: "final_verify",
+      description:
+        "Compute and stamp the run's final verdict from artifacts. PASS requires every task to be verified_pass, every verify/report-<taskId>.json to be PASS, and verify/security-audit.json to be PASS. Writes verify/final.json atomically and appends a final_verification event. The verdict is computed from evidence and cannot be overridden by input.",
+      input: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string" },
+          summary: { type: "string", description: "Optional. The verifier's prose; recorded in verify/final.json (max 2000 chars)." },
+          findings: {
+            type: "array",
+            description: "Optional. Up to 50 findings; recorded in verify/final.json.",
+            items: {
+              type: "object",
+              properties: {
+                where: { type: "string" },
+                why: { type: "string" },
+                fix: { type: "string" },
+              },
+              required: ["where", "why", "fix"],
+              additionalProperties: false,
+            },
+          },
+          failReason: { type: "string", description: "Optional. A reason to force FAIL; appended to the computed reasons." },
+        },
+        additionalProperties: false,
+      },
+      execute: async (input: any, context: any) => {
+        const resolved = resolveRun(root, input?.sessionId)
+        if (resolved.error) return { content: resolved.error }
+        const run = resolved.run as string
+        const finalFile = join(run, "verify", "final.json")
+        const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+
+        return await withFileLock(finalFile, async () => {
+          const state = readJson<any>(join(run, "state.json"), undefined)
+          if (!state || typeof state.tasks !== "object") {
+            return { content: `Error: No state.json found for run ${basename(run)}.` }
+          }
+          const plan = readJson<any>(join(run, "plan.dag.json"), undefined)
+          // SEC-1: null-prototype map; ids are read as data, never used as paths
+          // unless they pass isSafeTaskId.
+          const taskStates = nullMap<any>(state.tasks)
+          const planIds: string[] = Array.isArray(plan?.tasks)
+            ? plan.tasks.map((t: any) => t?.id).filter((id: any) => typeof id === "string")
+            : []
+          const ids: string[] = []
+          for (const id of [...planIds, ...Object.keys(taskStates)]) {
+            if (!ids.includes(id)) ids.push(id)
+          }
+
+          // Evidence comes from disk only; no input can supply or alter it.
+          const tasks = ids.map((id) => {
+            const safe = isSafeTaskId(id)
+            const reportRel = safe ? `verify/report-${id}.json` : null
+            const report = reportRel ? readJson<any>(join(run, reportRel), undefined) : undefined
+            const rawStatus = taskStates[id]?.status
+            return {
+              id: clean(id, 64),
+              status: typeof rawStatus === "string" ? clean(rawStatus, 32) : "pending",
+              report: reportRel,
+              reportStatus:
+                report?.status === "PASS" ? "PASS" : report?.status === "FAIL" ? "FAIL" : "MISSING",
+            }
+          })
+          const audit = readJson<any>(join(run, "verify", "security-audit.json"), undefined)
+          const securityAudit = {
+            path: "verify/security-audit.json",
+            status: audit?.status === "PASS" ? "PASS" : audit?.status === "FAIL" ? "FAIL" : "MISSING",
+          }
+          const allTasksVerifiedPass = tasks.length > 0 && tasks.every((t) => t.status === "verified_pass")
+
+          const reasons: string[] = []
+          if (tasks.length === 0) reasons.push("no tasks in plan or state")
+          for (const t of tasks) {
+            if (t.status !== "verified_pass") reasons.push(`task ${t.id}: state status ${t.status} (not verified_pass)`)
+            if (t.reportStatus !== "PASS") reasons.push(`task ${t.id}: report ${t.reportStatus}`)
+          }
+          if (securityAudit.status !== "PASS") reasons.push(`security audit: ${securityAudit.status}`)
+          // A supplied failReason can only make the verdict fail, never pass it.
+          const failReason = typeof input?.failReason === "string" ? clean(input.failReason, 500).trim() : ""
+          if (failReason) reasons.push(failReason)
+
+          const status = reasons.length === 0 ? "PASS" : "FAIL"
+          // Bound both the artifact and the message; 100 conditions is already far
+          // beyond a useful verdict.
+          const cappedReasons = reasons.slice(0, 100)
+          const integrity = readIntegrityMode(run)
+          const caller = await deriveCallerAgent(ctx, run, callSession)
+          const summary = typeof input?.summary === "string" ? clean(input.summary, 2000).trim() : ""
+          const findings = Array.isArray(input?.findings)
+            ? input.findings.slice(0, 50).map((f: any) => ({
+                where: clean(f?.where, 200),
+                why: clean(f?.why, 500),
+                fix: clean(f?.fix, 500),
+              }))
+            : []
+
+          refuseSymlink(finalFile)
+          writeJson(finalFile, {
+            status,
+            generatedBy: { agent: caller?.agent ?? null, session: callSession || basename(run) },
+            generatedAt: new Date().toISOString(),
+            integrityMode: integrity.mode,
+            evidence: { tasks, securityAudit, allTasksVerifiedPass },
+            reasons: cappedReasons,
+            ...(summary ? { summary } : {}),
+            ...(findings.length ? { findings } : {}),
+          })
+
+          await appendEvent(run, {
+            event: "final_verification",
+            sessionId: basename(run),
+            taskId: null,
+            to: status,
+            round: 0,
+            agent: caller?.agent ?? null,
+            agentSource: caller?.agent ? "session" : undefined,
+            phase: state.phase ?? null,
+          })
+
+          const integrityModeNote =
+            integrity.source === "artifact"
+              ? `Integrity mode: ${integrity.mode} (from ORIGINAL_REQUEST.md).`
+              : `Integrity mode: ${integrity.mode} (default applied; no ORIGINAL_REQUEST.md for this run).`
+          const evidenceLine = `Evidence: ${tasks.length} task(s), allTasksVerifiedPass=${allTasksVerifiedPass}, security audit ${securityAudit.status}.`
+
+          if (status === "FAIL") {
+            return {
+              content: `FINAL VERIFICATION FAILED: ${reasons.length} unmet condition(s). Final merge is BLOCKED.\nReasons:\n${cappedReasons.map((r) => `  - ${r}`).join("\n")}\n${evidenceLine}\n${integrityModeNote}\nArtifact: ${finalFile}`,
+              status: "FAIL",
+              finalReport: finalFile,
+              integrityMode: integrity.mode,
+              reasons: cappedReasons,
+            }
+          }
+
+          return {
+            content: `FINAL VERIFICATION PASSED: every task is verified_pass, every task report is PASS, and the security audit is PASS.\n${evidenceLine}\n${integrityModeNote}\nArtifact: ${finalFile}`,
+            status: "PASS",
+            finalReport: finalFile,
+            integrityMode: integrity.mode,
+          }
+        })
       },
     })
 

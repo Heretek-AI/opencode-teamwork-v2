@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.8] - 2026-11-22
+
+### Added
+
+- `teamwork_final_verify` computes the run's final verdict from the artifacts on disk — every task `verified_pass`, every `verify/report-<task>.json` PASS, and `verify/security-audit.json` PASS — writes `verify/final.json` atomically, and stamps `generatedBy`, `generatedAt`, `integrityMode` and `evidence`. The verdict is evidence-derived: a caller cannot produce a PASS the artifacts do not support, and a supplied `failReason` can only force FAIL.
+- `events.jsonl` gains `final_verification` (written by `teamwork_final_verify`) and `final_verification_bypass` (written when `teamwork_next` accepts an unstamped report), plus an optional `note` field recording why a bypass was accepted.
+- CI now runs `npm test` on Node 22 and 24, followed by a packaging guard that fails if `docs/re/**` would ship or if required docs and the plugin entry are missing (`.github/workflows/ci.yml`). `publish.yml` runs the same suite and guard before publishing.
+
+### Changed
+
+- Completion now requires a stamped `verify/final.json`. `teamwork_next` treats a PASS report without `generatedBy` (with a session), `generatedAt` or `evidence` as unstamped and returns `FINAL_VERIFICATION_UNVERIFIED`; `allowUnstamped: true` is the explicit, recorded legacy bypass, logged as a `final_verification_bypass` event with a `note`.
+- The `/teamwork` sentinel instructions now direct the verifier to call `teamwork_final_verify` instead of hand-writing `verify/final.json`.
+
 ## [0.5.7] - 2026-11-21
 
 ### Added

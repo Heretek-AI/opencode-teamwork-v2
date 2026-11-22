@@ -32,6 +32,7 @@ try {
   assert(registeredTools.next, "next tool must be registered")
   assert(registeredTools.task_update, "task_update tool must be registered")
   assert(registeredTools.security_audit, "security_audit tool must be registered")
+  assert(registeredTools.final_verify, "final_verify tool must be registered")
   assert(registeredTools.worktree, "worktree tool must be registered")
 
   // ==========================================
@@ -195,14 +196,25 @@ try {
   assert.strictEqual(nextRes.finalReport, finalFile)
   assert.strictEqual(nextRes.integrityMode, "development", "BLOCKED_BY_FINAL_VERIFICATION must disclose the default mode")
 
-  // (c) Only a PASS final report completes the run.
+  // (c) A hand-written PASS report is UNSTAMPED: only the explicit legacy
+  //     bypass lets it complete the run. (Before A2 any PASS was accepted.)
   writeFileSync(finalFile, JSON.stringify({ status: "PASS", summary: "independent final check passed" }) + "\n")
   nextRes = await registeredTools.next.execute({ sessionId: "20261018-000000-test" })
-  assert.strictEqual(nextRes.status, "ALL_PASSED", "A PASS final report is required for ALL_PASSED")
+  assert.strictEqual(nextRes.status, "FINAL_VERIFICATION_UNVERIFIED", "an unstamped PASS must not reach ALL_PASSED by default")
+  assert.strictEqual(nextRes.finalReport, finalFile, "FINAL_VERIFICATION_UNVERIFIED must include the final report path")
+  assert.strictEqual(nextRes.integrityMode, "development", "FINAL_VERIFICATION_UNVERIFIED must disclose the default mode")
+  phase = JSON.parse(readFileSync(mainStateFile, "utf8")).phase
+  assert.strictEqual(phase, "FINAL_VERIFICATION", "an unstamped PASS must leave the run in FINAL_VERIFICATION")
+
+  nextRes = await registeredTools.next.execute({ sessionId: "20261018-000000-test", allowUnstamped: true })
+  assert.strictEqual(nextRes.status, "ALL_PASSED", "allowUnstamped must accept a hand-written PASS")
+  assert.strictEqual(nextRes.stamped, false, "the bypassed verdict must not claim to be stamped")
+  assert.strictEqual(nextRes.unstampedBypass, true, "the result must flag the bypass")
   assert.strictEqual(nextRes.finalReport, finalFile, "ALL_PASSED must include the final report path")
   assert.strictEqual(nextRes.integrityMode, "development", "ALL_PASSED must disclose the default mode")
+  assert(/not produced by teamwork_final_verify/.test(nextRes.content), `the message must state the verdict was unverified: ${nextRes.content}`)
   phase = JSON.parse(readFileSync(mainStateFile, "utf8")).phase
-  assert.strictEqual(phase, "MERGE", "Phase must advance to MERGE only after final PASS")
+  assert.strictEqual(phase, "MERGE", "Phase must advance to MERGE after the recorded bypass")
 
   console.log("✓ DAG engine, dynamic pitfall injection & security gate verified")
 
@@ -477,13 +489,261 @@ try {
   assert.strictEqual(gateRes.integrityMode, "demo", "BLOCKED_BY_FINAL_VERIFICATION must carry integrityMode")
   assert(gateRes.content.includes("Integrity mode: demo"), `BLOCKED message must mention the mode: ${gateRes.content}`)
 
+  // The gate demo's report is hand-written, so reaching ALL_PASSED here takes
+  // the explicit bypass (the default refusal is covered in Part 1c(c) above).
   writeFileSync(gateFinal, JSON.stringify({ status: "PASS", summary: "ok" }) + "\n")
   gateRes = await registeredTools.next.execute({ sessionId: gateRun })
+  assert.strictEqual(gateRes.status, "FINAL_VERIFICATION_UNVERIFIED", "a hand-written PASS must be refused by default")
+  gateRes = await registeredTools.next.execute({ sessionId: gateRun, allowUnstamped: true })
   assert.strictEqual(gateRes.status, "ALL_PASSED")
+  assert.strictEqual(gateRes.stamped, false, "the bypassed verdict must not claim to be stamped")
   assert.strictEqual(gateRes.integrityMode, "demo", "ALL_PASSED must carry integrityMode")
   assert(gateRes.content.includes("Integrity mode: demo"), `ALL_PASSED message must mention the mode: ${gateRes.content}`)
 
   console.log("✓ request recorded verbatim once, modes validated/persisted, audit & final gate read the artifact")
+
+  // ==========================================
+  // Part 1c-ter: final_verify tool
+  // ==========================================
+  console.log("Testing the final_verify tool...")
+
+  const reportFileOf = (runId, taskId) => runFile(testDir, runId, `verify/report-${taskId}.json`)
+  const writeTaskReport = (runId, taskId, status = "PASS") => {
+    const file = reportFileOf(runId, taskId)
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(file, JSON.stringify({ taskId, status, timestamp: new Date().toISOString() }) + "\n")
+  }
+  const seedVerifiedRun = async (runId, taskIds, { request, integrityMode, auditStatus = "PASS" } = {}) => {
+    await registeredTools.plan.execute({
+      sessionId: runId,
+      topology: "iterative-coding",
+      skipInterview: true,
+      ...(request !== undefined ? { request, integrityMode } : {}),
+      tasks: taskIds.map((id) => ({ id })),
+    })
+    for (const taskId of taskIds) {
+      for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+        await registeredTools.task_update.execute({ sessionId: runId, taskId, status })
+      }
+      await registeredTools.task_update.execute({
+        sessionId: runId,
+        taskId,
+        status: "verified_pass",
+        verification: { status: "PASS" },
+      })
+      writeTaskReport(runId, taskId, "PASS")
+    }
+    await registeredTools.security_audit.execute({
+      sessionId: runId,
+      status: auditStatus,
+      findings: auditStatus === "FAIL" ? [{ severity: "Critical", description: "hardcoded secret" }] : [],
+    })
+  }
+  const finalFileOf = (runId) => runFile(testDir, runId, "verify/final.json")
+
+  // (a) All tasks verified_pass + every report PASS + audit PASS -> PASS, stamped, event appended.
+  const fvPassRun = "20261018-000000-fv-pass"
+  await seedVerifiedRun(fvPassRun, ["F1", "F2"])
+  assert(!existsSync(runFile(testDir, fvPassRun, "ORIGINAL_REQUEST.md")), "fixture run must have no request artifact")
+  const fvPassEventsBefore = readEvents(testDir, fvPassRun).length
+  const fvPass = await registeredTools.final_verify.execute(
+    { sessionId: fvPassRun, summary: "  All acceptance criteria met.  " },
+    { sessionID: "ses_final_verify" },
+  )
+  assert.strictEqual(fvPass.status, "PASS", `complete evidence must PASS: ${fvPass.content}`)
+  assert.strictEqual(fvPass.finalReport, finalFileOf(fvPassRun), "the result must name verify/final.json")
+  assert(fvPass.content.includes("FINAL VERIFICATION PASSED"), `result must state the verdict: ${fvPass.content}`)
+  assert(fvPass.content.includes("development"), "result must state the integrity mode")
+  const fvPassReport = JSON.parse(readFileSync(finalFileOf(fvPassRun), "utf8"))
+  assert.strictEqual(fvPassReport.status, "PASS", "verify/final.json must record PASS")
+  assert.strictEqual(fvPassReport.generatedBy.session, "ses_final_verify", "generatedBy.session must record the calling session")
+  assert.strictEqual(fvPassReport.generatedBy.agent, null, "no session agent is available in this test")
+  assert(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(fvPassReport.generatedAt), "generatedAt must be ISO8601 UTC")
+  assert.strictEqual(fvPassReport.integrityMode, "development", "a run with no request artifact defaults to development")
+  assert.strictEqual(fvPassReport.summary, "All acceptance criteria met.", "summary must be cleaned and recorded")
+  assert.deepStrictEqual(
+    fvPassReport.evidence.tasks,
+    [
+      { id: "F1", status: "verified_pass", report: "verify/report-F1.json", reportStatus: "PASS" },
+      { id: "F2", status: "verified_pass", report: "verify/report-F2.json", reportStatus: "PASS" },
+    ],
+    "evidence.tasks must list each task id with its report path and status",
+  )
+  assert.deepStrictEqual(
+    fvPassReport.evidence.securityAudit,
+    { path: "verify/security-audit.json", status: "PASS" },
+    "evidence must record the security audit",
+  )
+  assert.strictEqual(fvPassReport.evidence.allTasksVerifiedPass, true)
+  assert.deepStrictEqual(fvPassReport.reasons, [], "a PASS verdict carries no reasons")
+  const fvPassEvents = readEvents(testDir, fvPassRun)
+  assert.strictEqual(fvPassEvents.length, fvPassEventsBefore + 1, "final_verify must append exactly one event")
+  const fvEvent = fvPassEvents[fvPassEvents.length - 1]
+  assert.strictEqual(fvEvent.event, "final_verification", "the event must be final_verification")
+  assert.strictEqual(fvEvent.to, "PASS")
+  assert.strictEqual(fvEvent.taskId, null)
+  assert.strictEqual(fvEvent.round, 0)
+  assert.strictEqual(typeof fvEvent.seq, "number", "the event must carry an engine-assigned seq")
+  assert(fvEvent.seq > 0, "seq must be positive")
+
+  // (h) The stamped PASS completes the run: ALL_PASSED with stamped: true.
+  const fvStampedGate = await registeredTools.next.execute({ sessionId: fvPassRun })
+  assert.strictEqual(fvStampedGate.status, "ALL_PASSED", `a stamped PASS must complete the run: ${fvStampedGate.content}`)
+  assert.strictEqual(fvStampedGate.stamped, true, "a stamped verdict must report stamped: true")
+  assert.notStrictEqual(fvStampedGate.unstampedBypass, true, "a stamped verdict is not a bypass")
+  assert.strictEqual(fvStampedGate.finalReport, finalFileOf(fvPassRun))
+  assert.strictEqual(fvStampedGate.integrityMode, "development")
+  assert.strictEqual(JSON.parse(readFileSync(runFile(testDir, fvPassRun, "state.json"), "utf8")).phase, "MERGE")
+
+  // (i) A hand-written PASS (no stamp) cannot complete the run by default.
+  const fvHandRun = "20261018-000000-fv-handwritten"
+  await seedVerifiedRun(fvHandRun, ["F1"])
+  const fvHandFile = finalFileOf(fvHandRun)
+  mkdirSync(dirname(fvHandFile), { recursive: true })
+  writeFileSync(fvHandFile, JSON.stringify({ status: "PASS", summary: "looks fine to me" }) + "\n")
+  const fvHandDefault = await registeredTools.next.execute({ sessionId: fvHandRun })
+  assert.strictEqual(
+    fvHandDefault.status,
+    "FINAL_VERIFICATION_UNVERIFIED",
+    `an unstamped PASS must be refused by default: ${fvHandDefault.content}`,
+  )
+  assert.strictEqual(fvHandDefault.finalReport, fvHandFile)
+  assert.strictEqual(fvHandDefault.integrityMode, "development")
+  assert(/teamwork_final_verify/.test(fvHandDefault.content), "the message must point at teamwork_final_verify")
+  assert(/allowUnstamped/.test(fvHandDefault.content), "the message must name the legacy bypass")
+  assert.strictEqual(
+    JSON.parse(readFileSync(runFile(testDir, fvHandRun, "state.json"), "utf8")).phase,
+    "FINAL_VERIFICATION",
+    "an unstamped PASS must leave the run in FINAL_VERIFICATION",
+  )
+
+  // (j) The same report with allowUnstamped: true completes, flagged and recorded.
+  const fvHandBypass = await registeredTools.next.execute({ sessionId: fvHandRun, allowUnstamped: true })
+  assert.strictEqual(fvHandBypass.status, "ALL_PASSED", `allowUnstamped must complete the run: ${fvHandBypass.content}`)
+  assert.strictEqual(fvHandBypass.stamped, false, "a bypassed verdict must report stamped: false")
+  assert.strictEqual(fvHandBypass.unstampedBypass, true, "a bypassed verdict must report unstampedBypass: true")
+  assert(/not produced by teamwork_final_verify/.test(fvHandBypass.content), "the message must state the verdict was not tool-produced")
+  assert.strictEqual(
+    JSON.parse(readFileSync(runFile(testDir, fvHandRun, "state.json"), "utf8")).phase,
+    "MERGE",
+    "the recorded bypass advances the run to MERGE",
+  )
+  const bypassEvent = readEvents(testDir, fvHandRun).filter((e) => e.event === "final_verification_bypass").pop()
+  assert(bypassEvent, "the bypass must be recorded as a final_verification_bypass event")
+  assert.strictEqual(bypassEvent.to, "ALL_PASSED")
+  assert.strictEqual(bypassEvent.taskId, null)
+  assert.strictEqual(bypassEvent.phase, "MERGE")
+  assert.strictEqual(typeof bypassEvent.note, "string", "the bypass event must carry a note")
+  assert(bypassEvent.note.includes("allowUnstamped"), `the note must explain the bypass: ${bypassEvent.note}`)
+  assert.strictEqual(typeof bypassEvent.seq, "number", "the bypass event must carry an engine-assigned seq")
+  assert(bypassEvent.seq > 0, "the bypass event seq must be positive")
+  assert.strictEqual(bypassEvent.agent, null, "no session agent is available in this test")
+
+  // (k) A report with provenance but no evidence is still unstamped.
+  const fvNoEvidenceRun = "20261018-000000-fv-noevidence"
+  await seedVerifiedRun(fvNoEvidenceRun, ["F1"])
+  writeFileSync(
+    finalFileOf(fvNoEvidenceRun),
+    JSON.stringify({
+      status: "PASS",
+      generatedBy: { agent: "team/verifier", session: "ses_handwritten" },
+      generatedAt: new Date().toISOString(),
+      integrityMode: "development",
+      reasons: [],
+    }) + "\n",
+  )
+  const fvNoEvidence = await registeredTools.next.execute({ sessionId: fvNoEvidenceRun })
+  assert.strictEqual(
+    fvNoEvidence.status,
+    "FINAL_VERIFICATION_UNVERIFIED",
+    `a report without evidence must be refused by default: ${fvNoEvidence.content}`,
+  )
+
+  // (l) A stamped FAIL still blocks the run (unchanged behaviour).
+  const fvStampedFailRun = "20261018-000000-fv-stampedfail"
+  await seedVerifiedRun(fvStampedFailRun, ["F1"])
+  const fvStampedFail = await registeredTools.final_verify.execute({
+    sessionId: fvStampedFailRun,
+    failReason: "acceptance criterion 1 is unmet",
+  })
+  assert.strictEqual(fvStampedFail.status, "FAIL")
+  const fvStampedFailGate = await registeredTools.next.execute({ sessionId: fvStampedFailRun })
+  assert.strictEqual(
+    fvStampedFailGate.status,
+    "BLOCKED_BY_FINAL_VERIFICATION",
+    "a stamped FAIL must still block the run",
+  )
+  assert.notStrictEqual(fvStampedFailGate.status, "ALL_PASSED")
+
+  // (b) A missing task report -> FAIL naming the task; the written file is FAIL too.
+  const fvMissingRun = "20261018-000000-fv-missing"
+  await seedVerifiedRun(fvMissingRun, ["F1", "F2"])
+  rmSync(reportFileOf(fvMissingRun, "F2"))
+  const fvMissing = await registeredTools.final_verify.execute({ sessionId: fvMissingRun })
+  assert.strictEqual(fvMissing.status, "FAIL", `a missing report must FAIL: ${fvMissing.content}`)
+  assert(
+    fvMissing.reasons.some((r) => r.includes("F2") && r.includes("MISSING")),
+    `the reason must name the task and the missing report: ${JSON.stringify(fvMissing.reasons)}`,
+  )
+  assert(fvMissing.content.includes("F2") && fvMissing.content.includes("MISSING"), "the message must state the reason")
+  assert.strictEqual(JSON.parse(readFileSync(finalFileOf(fvMissingRun), "utf8")).status, "FAIL", "the file must be written as FAIL")
+
+  // (f) Re-running cannot upgrade a FAIL file while the evidence still fails.
+  const fvSecond = await registeredTools.final_verify.execute({ sessionId: fvMissingRun })
+  assert.strictEqual(fvSecond.status, "FAIL", "a second call must recompute FAIL, not trust the previous call")
+  assert.strictEqual(
+    JSON.parse(readFileSync(finalFileOf(fvMissingRun), "utf8")).status,
+    "FAIL",
+    "a second call must not upgrade the artifact to PASS",
+  )
+
+  // (c) Security audit FAIL -> FAIL.
+  const fvAuditRun = "20261018-000000-fv-auditfail"
+  await seedVerifiedRun(fvAuditRun, ["F1"], { auditStatus: "FAIL" })
+  const fvAudit = await registeredTools.final_verify.execute({ sessionId: fvAuditRun })
+  assert.strictEqual(fvAudit.status, "FAIL", `a FAIL audit must FAIL the verdict: ${fvAudit.content}`)
+  assert(
+    fvAudit.reasons.some((r) => r.startsWith("security audit:") && r.includes("FAIL")),
+    `the reason must name the security audit: ${JSON.stringify(fvAudit.reasons)}`,
+  )
+  assert.strictEqual(JSON.parse(readFileSync(finalFileOf(fvAuditRun), "utf8")).status, "FAIL")
+
+  // (d) A task that is not verified_pass -> FAIL.
+  const fvPendingRun = "20261018-000000-fv-notpassed"
+  await registeredTools.plan.execute({ sessionId: fvPendingRun, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "F1" }] })
+  writeTaskReport(fvPendingRun, "F1", "PASS")
+  await registeredTools.security_audit.execute({ sessionId: fvPendingRun, status: "PASS", findings: [] })
+  const fvPending = await registeredTools.final_verify.execute({ sessionId: fvPendingRun })
+  assert.strictEqual(fvPending.status, "FAIL", `an unverified task must FAIL: ${fvPending.content}`)
+  assert(
+    fvPending.reasons.some((r) => r.includes("F1") && r.includes("pending")),
+    `the reason must name the task and its status: ${JSON.stringify(fvPending.reasons)}`,
+  )
+  assert.strictEqual(JSON.parse(readFileSync(finalFileOf(fvPendingRun), "utf8")).status, "FAIL")
+
+  // (e) failReason forces FAIL even when the evidence is all PASS.
+  const fvForced = await registeredTools.final_verify.execute({
+    sessionId: fvPassRun,
+    failReason: "acceptance criterion 2 is unmet",
+  })
+  assert.strictEqual(fvForced.status, "FAIL", "failReason must force FAIL despite PASS evidence")
+  assert(fvForced.reasons.includes("acceptance criterion 2 is unmet"), "failReason must be appended to reasons")
+  assert.strictEqual(JSON.parse(readFileSync(finalFileOf(fvPassRun), "utf8")).status, "FAIL", "the forced FAIL must be written")
+
+  // (g) integrityMode comes from ORIGINAL_REQUEST.md when present, else development.
+  const fvBenchRun = "20261018-000000-fv-benchmark"
+  await seedVerifiedRun(fvBenchRun, ["F1"], { request: "Ship it.", integrityMode: "benchmark" })
+  const fvBench = await registeredTools.final_verify.execute({ sessionId: fvBenchRun })
+  assert.strictEqual(fvBench.status, "PASS", `complete benchmark evidence must PASS: ${fvBench.content}`)
+  assert.strictEqual(fvBench.integrityMode, "benchmark", "the result must carry the artifact's mode")
+  assert(fvBench.content.includes("benchmark"), "the message must state the artifact's mode")
+  assert.strictEqual(
+    JSON.parse(readFileSync(finalFileOf(fvBenchRun), "utf8")).integrityMode,
+    "benchmark",
+    "verify/final.json must record the artifact's mode",
+  )
+
+  console.log("✓ final_verify computes PASS only from evidence, stamps provenance + seq, and cannot be overridden")
 
   // ==========================================
   // Part 1d: Transition graph + evidence for verified_pass
