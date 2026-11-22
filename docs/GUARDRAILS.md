@@ -30,7 +30,8 @@ remove the sharpest edges.
   edit outside your worktree," but with `resource: "*"` nothing enforces it.
   `git worktree` isolation is prompt-level. (Mitigated only by the permission
   hook: for the verifier, scout and security auditor it denies `edit` but not
-  `shell`, which can write anywhere; the falsifier also has `shell` denied.)
+  `shell`, which can write anywhere; both the falsifier and segment reviewer
+  also have `shell` denied.)
 - **`constraints.network` / `constraints.sandbox`** in `docs/ARTIFACTS.md` are
   descriptive; they are not enforced. "Network: denied" is honor-system.
 - **Plugin tools are not agent-scoped.** The permission layer does not mediate

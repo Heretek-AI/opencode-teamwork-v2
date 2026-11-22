@@ -2285,6 +2285,26 @@ try {
       skipInterview: true,
     })
     assert.strictEqual(scannedRes.extractionStatus, "needs_ingestor", `Empty PDF must report needs_ingestor: ${scannedRes.content}`)
+
+    // Image-only PDF with empty PATH (pdftotext unavailable) cleanly returns needs_ingestor
+    const savedPath = process.env.PATH
+    try {
+      process.env.PATH = ""
+      const noPdfTextRun = "20261122-000002-nopathpdf"
+      const noPdfTextRes = await tools.document_triage.execute({
+        sessionId: noPdfTextRun,
+        document: { path: "scanned.pdf" },
+        skipInterview: true,
+      })
+      assert.strictEqual(
+        noPdfTextRes.extractionStatus,
+        "needs_ingestor",
+        `Empty PDF without pdftotext on PATH must return needs_ingestor: ${noPdfTextRes.content}`,
+      )
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH
+      else process.env.PATH = savedPath
+    }
     console.log("✓ 9.2 Positive PDF + FlateDecode + corrupt refusal + needs_ingestor passed")
 
     // --- 9.3: Positive inline content & localhost URL ---
@@ -2386,6 +2406,28 @@ try {
     })
     assert.strictEqual(inlineMathPaperRoute.topology, "document-review", "Inline math paper must beat proof")
 
+    // Line-0 multiline structured math & Markdown papers + trailing critique instruction
+    const line0MathPaperRoute = await tools.route.execute({
+      request:
+        "\\section{Introduction}\n\\begin{theorem}\n\\forall x \\exists y, P(x,y).\n\\end{theorem}\n" +
+        "A".repeat(180) +
+        "\n\nPlease critique this paper for soundness.",
+    })
+    assert.strictEqual(
+      line0MathPaperRoute.topology,
+      "document-review",
+      "Line-0 multiline structured math paper with trailing critique instruction must route to document-review",
+    )
+    assert.strictEqual(line0MathPaperRoute.documentDetected, true)
+
+    const line0MdPaperRoute = await tools.route.execute({
+      request:
+        "# Introduction\nThis draft specifies the consensus protocol.\n\n## Soundness\n" +
+        "B".repeat(200) +
+        "\n\nPlease critique this paper for soundness.",
+    })
+    assert.strictEqual(line0MdPaperRoute.topology, "document-review")
+
     const posedProof = await tools.route.execute({
       request: "Prove that there are infinitely many primes ∀ n ∃ p > n.",
     })
@@ -2406,6 +2448,8 @@ try {
     writeFileSync(join(docRoot, "README.md"), "# Readme\n")
     writeFileSync(join(docRoot, "notes.md"), "# Notes\n")
     writeFileSync(join(docRoot, "paper.pdf"), "%PDF-1.4\n%%EOF\n")
+    mkdirSync(join(docRoot, "src"), { recursive: true })
+    writeFileSync(join(docRoot, "src", "foo.md"), "# Foo\nSome documentation.\n")
     const negCases = [
       ["review this PR", "distributed-coding"],
       ["review PR #42", "distributed-coding"],
@@ -2414,8 +2458,22 @@ try {
       ["Mentioning paper.pdf", "distributed-coding"],
       ["check README.md and implement the missing flag", "distributed-coding"],
       ["fix the bug in notes.md", "iterative-coding"],
+      ["analyze the bug in src/foo.md", "distributed-coding"],
+      ["investigate the error in src/foo.md", "distributed-coding"],
+      ["diagnose the crash in src/foo.md", "distributed-coding"],
+      ["debug src/foo.md", "distributed-coding"],
       ["see ./paper.pdf and solve problem 3", "proof"],
       ["prove Theorem 2 from ./math-paper.md", "proof"],
+      [
+        "\\section{Introduction}\n\\begin{theorem}\n\\forall x \\exists y, P(x,y).\n\\end{theorem}\n" +
+          "A".repeat(180) +
+          "\n\nProve that this holds.",
+        "proof",
+      ],
+      [
+        "# Introduction\n" + "C".repeat(240) + "\n\n# Conclusion\nWe analyze these results in Section 2.",
+        "distributed-coding",
+      ],
     ]
     for (const [req, expected] of negCases) {
       const r = await tools.route.execute({ request: req })
@@ -2499,6 +2557,27 @@ try {
     assert.strictEqual(fvMissing.status, "FAIL", "final_verify must FAIL when unit-report.md and DOCUMENT_REVIEW_REPORT.md are missing")
     assert(fvMissing.reasons.some((r) => r.includes("unit-report.md missing")))
     assert(fvMissing.reasons.some((r) => r.includes("DOCUMENT_REVIEW_REPORT.md missing")))
+
+    // Deleting/omitting document-review/manifest.json on a document-review run must FAIL final_verify
+    rmSync(join(docRoot, ".opencode", "teamwork", packRun, "document-review", "manifest.json"))
+    const fvMissingManifest = await tools.final_verify.execute({ sessionId: packRun })
+    assert.strictEqual(
+      fvMissingManifest.status,
+      "FAIL",
+      "final_verify must FAIL when document-review/manifest.json is missing",
+    )
+    assert(
+      fvMissingManifest.reasons.some((r) => r.includes("document-review/manifest.json missing")),
+      `Expected missing manifest reason, got: ${JSON.stringify(fvMissingManifest.reasons)}`,
+    )
+    const fvMissingManifestJson = JSON.parse(
+      readFileSync(join(docRoot, ".opencode", "teamwork", packRun, "verify", "final.json"), "utf8"),
+    )
+    assert.deepStrictEqual(fvMissingManifestJson.evidence.documentReview, {
+      checked: true,
+      segmentReportsComplete: false,
+      finalReportPresent: false,
+    })
     console.log("✓ 9.6 Bounded depth/width, packing, and final_verify completeness passed")
 
     // --- 9.7: Security (traversal, symlinks, sanitisation) ---
