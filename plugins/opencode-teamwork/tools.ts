@@ -1178,56 +1178,91 @@ export function nextEventSeq(file: string): number {
     const stat = fstatSync(fd)
     // A FIFO/device/socket must never be followed or block an append.
     if (!stat.isFile()) return 1
-    const size = stat.size
-    const len = Math.min(size, 8192)
-    let tail = ""
-    if (len > 0) {
-      const buf = Buffer.alloc(len)
-      let read = 0
-      while (read < len) {
-        const n = readSync(fd, buf, read, len - read, size - len + read)
-        if (n === 0) break
-        read += n
-      }
-      tail = buf.subarray(0, read).toString("utf8")
-    }
-    const lines = tail.split("\n")
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const l = lines[i].trim()
-      if (!l) continue
-      try {
-        const seq = (JSON.parse(l) as any)?.seq
-        if (Number.isInteger(seq) && seq > 0) return seq + 1
-      } catch {}
-      break // last line is legacy or corrupt: count lines instead
-    }
-    // Fallback: count non-empty lines through the SAME fd, in fixed-size chunks
-    // (positional reads: no lseek needed, no unbounded buffer).
-    let count = 0
-    let pending = false // non-whitespace bytes seen on the current line
-    let position = 0
-    const chunk = Buffer.alloc(64 * 1024)
-    for (;;) {
-      const n = readSync(fd, chunk, 0, chunk.length, position)
-      if (n === 0) break
-      position += n
-      for (let i = 0; i < n; i++) {
-        const b = chunk[i]
-        if (b === 0x0a) {
-          if (pending) count++
-          pending = false
-        } else if (b !== 0x20 && b !== 0x09 && b !== 0x0d && b !== 0x0b && b !== 0x0c) {
-          pending = true
-        }
-      }
-    }
-    if (pending) count++
-    return count + 1
+    const fromTail = seqFromTail(readTail(fd, stat.size))
+    if (fromTail !== null) return fromTail
+    return countNonEmptyLines(fd) + 1
   } catch {
     return 1
   } finally {
     closeSync(fd)
   }
+}
+
+/** Read the last ≤8 KiB of a file through an already-open fd. */
+function readTail(fd: number, size: number): string {
+  const len = Math.min(size, 8192)
+  if (len <= 0) return ""
+  const buf = Buffer.alloc(len)
+  let read = 0
+  while (read < len) {
+    const n = readSync(fd, buf, read, len - read, size - len + read)
+    if (n === 0) break
+    read += n
+  }
+  return buf.subarray(0, read).toString("utf8")
+}
+
+/**
+ * `seq` of the last non-empty line of `tail`, plus one — or null when that line
+ * is legacy (no seq) or corrupt, in which case the caller counts lines instead.
+ */
+function seqFromTail(tail: string): number | null {
+  const lines = tail.split("\n")
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i].trim()
+    if (!l) continue
+    try {
+      const seq = (JSON.parse(l) as any)?.seq
+      if (Number.isInteger(seq) && seq > 0) return seq + 1
+    } catch {}
+    break // last line is legacy or corrupt: count lines instead
+  }
+  return null
+}
+
+/**
+ * Count non-empty lines through an already-open fd, in fixed-size 64 KiB
+ * positional reads (no lseek, no unbounded buffer). ASCII whitespace does not
+ * make a line non-empty.
+ */
+function countNonEmptyLines(fd: number): number {
+  let count = 0
+  let pending = false // non-whitespace bytes seen on the current line
+  let position = 0
+  const chunk = Buffer.alloc(64 * 1024)
+  for (;;) {
+    const n = readSync(fd, chunk, 0, chunk.length, position)
+    if (n === 0) break
+    position += n
+    const scanned = scanLineChunk(chunk, n, count, pending)
+    count = scanned.count
+    pending = scanned.pending
+  }
+  return pending ? count + 1 : count
+}
+
+/** ASCII whitespace: it never makes a line non-empty. */
+function isBlankByte(b: number): boolean {
+  return b === 0x20 || b === 0x09 || b === 0x0d || b === 0x0b || b === 0x0c
+}
+
+/** Advance the pending/count state across one chunk of bytes. */
+function scanLineChunk(
+  chunk: Buffer,
+  n: number,
+  count: number,
+  pending: boolean,
+): { count: number; pending: boolean } {
+  for (let i = 0; i < n; i++) {
+    const b = chunk[i]
+    if (b === 0x0a) {
+      if (pending) count++
+      pending = false
+    } else if (!isBlankByte(b)) {
+      pending = true
+    }
+  }
+  return { count, pending }
 }
 
 /**

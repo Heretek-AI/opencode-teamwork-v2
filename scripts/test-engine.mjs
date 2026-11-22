@@ -23,7 +23,7 @@ import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { createServer } from "node:http"
 import { execFileSync, spawnSync } from "node:child_process"
-import { fileURLToPath, pathToFileURL } from "node:url"
+import { fileURLToPath } from "node:url"
 import { deflateSync } from "node:zlib"
 import { randomBytes } from "node:crypto"
 import assert from "node:assert"
@@ -1806,8 +1806,10 @@ try {
     {
       const fifo = join(secDir, "seq-fifo", "events.jsonl")
       mkdirSync(dirname(fifo), { recursive: true })
-      const made = spawnSync("mkfifo", [fifo], { stdio: "ignore" })
-      if (made.status !== 0) {
+      // Absolute-path lookup: never resolve a command through PATH (S4036).
+      const mkfifo = ["/usr/bin/mkfifo", "/bin/mkfifo", "/usr/local/bin/mkfifo"].find((p) => existsSync(p))
+      const made = mkfifo ? spawnSync(mkfifo, [fifo], { stdio: "ignore" }) : undefined
+      if (!made || made.status !== 0) {
         console.log("⊘ skipped FIFO regression: mkfifo is unavailable")
       } else {
         const script = `import { nextEventSeq } from ${JSON.stringify(TOOLS_URL)}; process.stdout.write(String(nextEventSeq(process.argv[1])))`
