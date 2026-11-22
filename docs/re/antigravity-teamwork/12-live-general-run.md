@@ -1,6 +1,6 @@
 # Live General Run — One Completed Single-Cycle `/teamwork` Dispatch
 
-**Status: OBSERVED — one completed General-route run, timed out only after the gate passed.** Recorded on **2026-11-22** against the installed Antigravity CLI **1.5.14**, the same binary analysed throughout this corpus (`00-artifact-identity.md`). This document is the first runtime record in the set of a `/teamwork` invocation that **routed, decomposed, implemented, verified and gated a task end to end**. It is deliberately narrow: **one** run, one route, one milestone. It does not establish a default, a fixed gate, or a route-selection rule.
+**Status: OBSERVED — one completed General-route run, timed out only after the gate passed.** Recorded on **2026-11-22** against the installed Antigravity CLI **1.5.14**, the same binary analysed throughout this corpus (`00-artifact-identity.md`). This document is the first runtime record in the set of a `/teamwork` invocation that **routed, decomposed, implemented, verified and gated a task end to end**. It is deliberately narrow: **one** run, one route, one milestone. It does not establish a default, a fixed gate, or a route-selection rule. The companion SWE Light run is [`13-live-swe-light-run.md`](13-live-swe-light-run.md); it selected a different route and a different gate mechanism, and was killed by a server restart before its loop closed.
 
 The run is the reference sample for four things the corpus previously held only statically or from prior state trees:
 
@@ -422,35 +422,25 @@ The contrast is useful: the six-row/multi-milestone run completed its victory au
 | Succession | Threshold literal only | Rule and 6/32 counter observed; **not triggered** | `08` A20 (ADR 0003); this doc §8.4 |
 | Victory audit | One prior confirmed verdict | Gate PASS then **timeout before verdict**; prior run supplies the confirmed case | this doc §9 |
 
+The second live run adds a third data point and changes the framing: SWE Light writes no gate table at all, so the corpus must describe a **route-specific verification contract**, not only 4-row vs. 6-row counts. That is recorded in [`13`](13-live-swe-light-run.md) §9 and reflected in `11` §5.3 and `08` A9/A11.
+
 ### 10.1 Structured for the next run
 
-This document is the **first** entry in a two-run live series. The follow-up SWE Light run is reserved as **§11 — Live SWE Light run**, keeping §1–§10 as the General baseline and adding a side-by-side comparison table in §11.5. Do not merge the two runs into one set of counts: the point of the series is the **difference** in route, gate composition and artifact set.
+This document is the **first** entry in a two-run live series. The follow-up SWE Light run is recorded separately in [`13-live-swe-light-run.md`](13-live-swe-light-run.md); §11 below is a pointer, and the side-by-side comparison is `13` §9. Do not merge the two runs into one set of counts: the point of the series is the **difference** in route, gate mechanism and artifact set.
 
 ---
 
-## 11. Live SWE Light run (pending)
+## 11. Live SWE Light run — recorded in `13`
 
-Reserved. When the SWE Light run completes, append one subsection per axis and keep the General baseline above unchanged:
+The SWE Light run began on the same binary and the same `[skip-interview]` request shape, selected `teamwork_swe`, wrote **no `GATE_STATUS.md`**, **no `PROJECT.md`** and **no handoffs**, and gated on a sequential `teamwork_implementer` → `teamwork_reviewer` loop. It was killed by a server restart in Round 2 before the loop closed or the victory auditor was dispatched.
 
-| Subsection | What to record |
-|---|---|
-| §11.1 | Identity: conversation, coordinator, orchestrator, victory auditor, model(s), exit code/reason, usage |
-| §11.2 | Command shape and `## Parameters` block |
-| §11.3 | Route decision quote — the SWE Light rationale, not the General one |
-| §11.4 | Timeline: survey → milestone(s) → worker → reviewer rounds → gate → victory audit |
-| §11.5 | Gate table verbatim, plus a side-by-side row-count comparison with §5 (General 4 rows; multi-milestone 6 rows; SWE Light **?**) |
-| §11.6 | Artifact layout and file count, including whether `TEST_INFRA.md` / `TEST_READY.md` appear |
-| §11.7 | Handoff structure and any SWE-specific sections |
-| §11.8 | Crons, succession counter, terminal state, victory verdict |
-| §11.9 | What the second run changes in §10's table |
-
-Do not rewrite §1–§10 to fit the second run. If the two runs disagree, record the disagreement; two samples do not establish a default.
+Read [`13-live-swe-light-run.md`](13-live-swe-light-run.md) for the identity, timeline, missing-handoff caveat, termination analysis and the General-vs-SWE-Light comparison. This section is deliberately only a pointer so the General record above stays self-contained.
 
 ---
 
 ## 12. Limits
 
-- One General run. It does not show what SWE Light, Document Review, LEMMA, Math/Proof or a multi-milestone General run would write.
+- One General run. It does not show what a completed SWE Light loop (`13` stops mid-loop), Document Review, LEMMA, Math/Proof or a multi-milestone General run would write.
 - The top-level model and the teamwork models differ (§1.1); which tier the route or the harness selected is `UNKNOWN`.
 - The command's argv is reconstructed, not recorded (§2.1). The prompt length and each flag are observed; the exact flag order and quoting are `INFERRED`.
 - The `[skip-interview]` → no-interview causality is `INFERRED` from absence; there is no log line naming the token as the cause.
