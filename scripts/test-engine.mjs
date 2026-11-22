@@ -20,7 +20,6 @@ import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock,
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import {
   currentModels,
-  readRawModelMap,
   writeModelMap,
   installAgents,
   ensureAgents,
@@ -5421,7 +5420,8 @@ process.exit(0);
       assert.strictEqual(second.backupDir, undefined, "an unchanged install must not create backups")
 
       // update: backup holds the previous content and the mode is preserved
-      writeFileSync(sentinel, readFileSync(sentinel, "utf8") + "\nLOCAL EDIT\n")
+      const sentinelBefore = readFileSync(sentinel, "utf8")
+      writeFileSync(sentinel, sentinelBefore + "\nLOCAL EDIT\n")
       chmodSync(sentinel, 0o640)
       const beforeUpdate = readFileSync(sentinel, "utf8")
       const updated = installAgents({ configDir, models: { "team/sentinel": "custom/new-model" } })
@@ -5435,7 +5435,8 @@ process.exit(0);
       const refreshDir = join(root, "refresh-config")
       installAgents({ configDir: refreshDir })
       const scout = join(refreshDir, "agents", "team", "scout.md")
-      writeFileSync(scout, readFileSync(scout, "utf8") + "\nLOCAL SCOUT EDIT\n")
+      const scoutBefore = readFileSync(scout, "utf8")
+      writeFileSync(scout, scoutBefore + "\nLOCAL SCOUT EDIT\n")
       const refreshed = installAgents({ configDir: refreshDir, refresh: true, models: { "team/scout": "custom/scout" } })
       assert(refreshed.updated.includes("scout.md"), "refresh must update scout.md")
       const refreshedText = readFileSync(scout, "utf8")

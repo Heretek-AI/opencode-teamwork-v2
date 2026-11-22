@@ -17,6 +17,7 @@ import { join, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 import { spawnSync, execFileSync } from "node:child_process"
 import assert from "node:assert"
+import { runFifoProbe } from "./test-fifo.mjs"
 
 // Sonar S6324: build ESC without embedding a control character in a regex literal.
 const ESC_CHAR = String.fromCharCode(27)
@@ -1217,31 +1218,19 @@ await check("tournament: symlinked tournament/ dir is refused with diagnostic wa
 
 await check("reader: a FIFO events.jsonl does not hang buildTimeline", () => {
   const root = makeRun({ events: null })
-  const timelineUrl = new URL("../lib/timeline.mjs", import.meta.url).href
-  const code = [
-    `import { buildTimeline, timelineWarnings } from ${JSON.stringify(timelineUrl)}`,
-    `import { execFileSync } from "node:child_process"`,
-    `import { join } from "node:path"`,
-    `const root = process.argv[1]`,
-    `const events = join(root, ".opencode", "teamwork", ${JSON.stringify(SESSION)}, "events.jsonl")`,
-    `try {`,
-    `  execFileSync("mkfifo", [events], { stdio: "ignore" })`,
-    `} catch (err) {`,
-    `  if (err && err.code === "ENOENT") { console.log("SKIP: mkfifo unavailable"); process.exit(0) }`,
-    `  throw err`,
-    `}`,
-    `const t = buildTimeline(root, ${JSON.stringify(SESSION)})`,
-    `if (t.mode !== "derived") throw new Error("FIFO events.jsonl must not yield events mode: " + t.mode)`,
-    `if (!timelineWarnings(t).some((w) => w.includes("events.jsonl") && w.includes("not a regular file"))) throw new Error("FIFO events must be reported: " + JSON.stringify(timelineWarnings(t)))`,
-    `console.log("REFUSED")`,
-  ].join("\n")
-  const res = spawnSync(process.execPath, [...process.execArgv, "--input-type=module", "-e", code, root], {
-    encoding: "utf8",
-    timeout: 15000,
+  runFifoProbe({
+    root,
+    session: SESSION,
+    moduleUrl: new URL("../lib/timeline.mjs", import.meta.url).href,
+    importNames: "buildTimeline, timelineWarnings",
+    assertionLines: [
+      `const t = buildTimeline(root, ${JSON.stringify(SESSION)})`,
+      `if (t.mode !== "derived") throw new Error("FIFO events.jsonl must not yield events mode: " + t.mode)`,
+      `if (!timelineWarnings(t).some((w) => w.includes("events.jsonl") && w.includes("not a regular file"))) throw new Error("FIFO events must be reported: " + JSON.stringify(timelineWarnings(t)))`,
+    ],
+    failureLabel: "FIFO timeline child",
+    timeoutMessage: "buildTimeline hung on a FIFO (timeout guard fired)",
   })
-  if (res.error && res.error.code === "ETIMEDOUT") assert.fail("buildTimeline hung on a FIFO (timeout guard fired)")
-  assert.strictEqual(res.status, 0, `FIFO timeline child failed (status ${res.status}): ${res.stderr || ""}`)
-  assert(/REFUSED|SKIP/.test(res.stdout || ""), `FIFO child must report REFUSED or SKIP: ${res.stdout || ""}`)
 })
 
 // ---------------------------------------------------------------- cleanup

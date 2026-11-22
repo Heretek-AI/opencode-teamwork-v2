@@ -29,6 +29,7 @@ import { join, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 import { spawnSync } from "node:child_process"
 import assert from "node:assert"
+import { runFifoProbe } from "./test-fifo.mjs"
 
 const here = dirname(fileURLToPath(import.meta.url))
 /** Mirror lib/export.mjs md(): escape the same characters, backslash first. */
@@ -835,31 +836,19 @@ await check("reader: an oversize pitfalls.md is reported as oversize, never abse
 
 await check("reader: a FIFO events.jsonl does not hang the export", () => {
   const root = makeRun({ events: null })
-  const exportUrl = new URL("../lib/export.mjs", import.meta.url).href
-  const code = [
-    `import { buildExportData } from ${JSON.stringify(exportUrl)}`,
-    `import { execFileSync } from "node:child_process"`,
-    `import { join } from "node:path"`,
-    `const root = process.argv[1]`,
-    `const events = join(root, ".opencode", "teamwork", ${JSON.stringify(SESSION)}, "events.jsonl")`,
-    `try {`,
-    `  execFileSync("mkfifo", [events], { stdio: "ignore" })`,
-    `} catch (err) {`,
-    `  if (err && err.code === "ENOENT") { console.log("SKIP: mkfifo unavailable"); process.exit(0) }`,
-    `  throw err`,
-    `}`,
-    `const data = buildExportData(root, ${JSON.stringify(SESSION)})`,
-    `if (data.timing === "events") throw new Error("FIFO events.jsonl must not be read")`,
-    `if (!data.warnings.some((w) => w.includes("events.jsonl") && w.includes("not a regular file"))) throw new Error("FIFO events must be reported: " + JSON.stringify(data.warnings))`,
-    `console.log("REFUSED")`,
-  ].join("\n")
-  const res = spawnSync(process.execPath, [...process.execArgv, "--input-type=module", "-e", code, root], {
-    encoding: "utf8",
-    timeout: 15000,
+  runFifoProbe({
+    root,
+    session: SESSION,
+    moduleUrl: new URL("../lib/export.mjs", import.meta.url).href,
+    importNames: "buildExportData",
+    assertionLines: [
+      `const data = buildExportData(root, ${JSON.stringify(SESSION)})`,
+      `if (data.timing === "events") throw new Error("FIFO events.jsonl must not be read")`,
+      `if (!data.warnings.some((w) => w.includes("events.jsonl") && w.includes("not a regular file"))) throw new Error("FIFO events must be reported: " + JSON.stringify(data.warnings))`,
+    ],
+    failureLabel: "FIFO export child",
+    timeoutMessage: "buildExportData hung on a FIFO (timeout guard fired)",
   })
-  if (res.error && res.error.code === "ETIMEDOUT") assert.fail("buildExportData hung on a FIFO (timeout guard fired)")
-  assert.strictEqual(res.status, 0, `FIFO export child failed (status ${res.status}): ${res.stderr || ""}`)
-  assert(/REFUSED|SKIP/.test(res.stdout || ""), `FIFO child must report REFUSED or SKIP: ${res.stdout || ""}`)
 })
 
 // ==========================================
