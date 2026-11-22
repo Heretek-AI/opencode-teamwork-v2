@@ -243,8 +243,23 @@ function splitInstructionAndInlineDoc(request: string): { instructionText: strin
       if (firstStructIdx > 0) {
         working = working.slice(0, firstStructIdx)
       } else {
-        // Inline doc starts at line 0 (only if there's an instruction prefix or no prose)
-        working = lines[0] ?? ""
+        // Inline doc starts at line 0: preserve trailing non-structural instruction
+        // lines/paragraph (e.g., "\n\nPlease critique this paper.") or text after \end{document}.
+        const endDocMatch = [...working.matchAll(/\\end\{document\}/gi)].pop()
+        if (endDocMatch && endDocMatch.index !== undefined) {
+          working = working.slice(endDocMatch.index + endDocMatch[0].length).trim()
+        } else {
+          const paras = working
+            .split(/\r?\n\s*\r?\n/)
+            .map((p) => p.trim())
+            .filter(Boolean)
+          const lastPara = paras.length >= 2 ? paras[paras.length - 1] : ""
+          const isStructPara =
+            /^(?:#{1,3}\s+\S|\\(?:part|chapter|section|subsection)\*?\{|\\(?:begin|end)\{(?:theorem|lemma|abstract|document)\})/m.test(
+              lastPara,
+            )
+          working = lastPara && !isStructPara ? lastPara : ""
+        }
       }
     }
   }
@@ -305,9 +320,9 @@ export function classifyRoute(rawInput: RouteClassifyInput | string, root: strin
       instructionText,
     )
 
-  // Negative Trigger Guard B: primary deliverable is implementing, fixing a bug, or solving/proving a problem
+  // Negative Trigger Guard B: primary deliverable is implementing, fixing/analyzing/debugging a bug, or solving/proving a problem
   const rejectedAsImplementOrSolve =
-    /\b(?:implement|fix\s+(?:the\s+|this\s+|a\s+)?bug|fix\s+this|refactor|write\s+(?:a\s+|the\s+)?(?:function|module|script|test|code|patch|class|cli)|build\s+(?:a|the)|add\s+(?:a|the)\s+(?:feature|flag|endpoint|test|option|command)|make\s+tests\s+pass|edit\s+(?:the\s+)?(?:file|code)|update\s+(?:the\s+)?(?:code|docs|readme)|solve\s+(?:problem|exercise|question|equation|this|the\s+problem)|answer\s+(?:problem|question|exercise)|prove\s+(?:theorem|lemma|conjecture|proposition|corollary|that\b|the\s+following|it\b)|disprove|find\s+(?:a\s+)?(?:proof|solution|counterexample)\s+(?:for|of|to))\b/i.test(
+    /\b(?:implement|fix\s+(?:the\s+|this\s+|a\s+)?bug|fix\s+this|(?:analy[sz]e|investigate|debug|diagnose|troubleshoot|trace|reproduce)\s+(?:the\s+|this\s+|a\s+|an\s+)?(?:bug|issue|error|crash|failure|regression|exception|defect)|debug|diagnose|troubleshoot|refactor|write\s+(?:a\s+|the\s+)?(?:function|module|script|test|code|patch|class|cli)|build\s+(?:a|the)|add\s+(?:a|the)\s+(?:feature|flag|endpoint|test|option|command)|make\s+tests\s+pass|edit\s+(?:the\s+)?(?:file|code)|update\s+(?:the\s+)?(?:code|docs|readme)|solve\s+(?:problem|exercise|question|equation|this|the\s+problem)|answer\s+(?:problem|question|exercise)|prove\s+(?:theorem|lemma|conjecture|proposition|corollary|that\b|the\s+following|it\b)|disprove|find\s+(?:a\s+)?(?:proof|solution|counterexample)\s+(?:for|of|to))\b/i.test(
       instructionText,
     )
 

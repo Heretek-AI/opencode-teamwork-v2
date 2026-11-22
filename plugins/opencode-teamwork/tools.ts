@@ -3115,7 +3115,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (plan?.topology === "document-review") {
             const manifestPath = join(run, "document-review", "manifest.json")
             const mRes = readRegularJson<any>(run, manifestPath)
-            if (!mRes.ok && mRes.reason === "symlink") {
+            if (!mRes.ok && mRes.reason === "missing") {
+              reasons.push("document-review/manifest.json missing")
+              documentReviewEvidence = { checked: true, segmentReportsComplete: false, finalReportPresent: false }
+            } else if (!mRes.ok && mRes.reason === "symlink") {
               reasons.push("document-review/manifest.json is a symlink")
               documentReviewEvidence = { checked: true, segmentReportsComplete: false, finalReportPresent: false }
             } else if (!mRes.ok && mRes.reason === "invalid") {
