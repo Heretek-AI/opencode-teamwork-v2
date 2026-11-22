@@ -430,7 +430,7 @@ export function evaluateStrictGate(
 }
 
 function cell(value: unknown): string {
-  return clean(value, 200).replace(/\|/g, "\\|")
+  return clean(value, 200).replace(/\\/g, "\\\\").replace(/\|/g, "\\|")
 }
 
 /** Verdict cell: a stale/invalid present artifact is a FAIL, not its old label. */
