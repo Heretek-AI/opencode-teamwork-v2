@@ -31,6 +31,7 @@ import {
   fstatSync,
   closeSync,
   constants as fsConstants,
+  statSync,
 } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { homedir } from "node:os"
@@ -1361,7 +1362,7 @@ async function createPlanRun(
       content: `refused: invalid topology "${clean(input.topology, 32)}" (accepted: ${TOPOLOGIES.join(", ")}; aliases: ${Object.keys(TOPOLOGY_ALIASES).join(", ")})`,
     }
   }
-  const rawRoute = typeof input.route === "string" ? clean(input.route, 32).trim() : ""
+  const rawRoute = typeof input.route === "string" ? clean(input.route, 32).trim().toLowerCase() : ""
   const isLemma = input.lemmaMode === true || rawRoute === "lemma"
   if (input.lemmaMode === true && rawRoute && rawRoute !== "lemma") {
     return {
@@ -1775,8 +1776,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
         } else if (
           doc.topology === "proof" &&
-          lemma.signals?.hasLeanSignal &&
-          !lemma.signals?.hasExplicitLeanRequest
+          lemma.route === "general" &&
+          /(?:\b(?:theorem|lemma)\s+[A-Za-z_]|:=\s*by\b|\bimport\s+Mathlib\b|\.lean\b)/i.test(request)
         ) {
           // Bare `.lean`/Lean syntax without an explicit opt-in must not become
           // a proof run; the LEMMA classifier owns this negative-gate decision.
@@ -3941,12 +3942,38 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const worktreesBase = resolve(
             process.env.TEAMWORK_WORKTREES_DIR ? process.env.TEAMWORK_WORKTREES_DIR : join(root, "..", ".teamwork-worktrees"),
           )
-          const inRoot = !containmentError(root, cand) || resolve(root) === cand
-          const inWt = !containmentError(worktreesBase, cand)
-          if (!inRoot && !inWt) {
-            return { content: "refused: cwd escapes project root and worktrees base" }
+          const resolveContainedDir = (baseDir: string, targetDir: string, allowEqual: boolean): string | null => {
+            const absBase = resolve(baseDir)
+            const absTarget = resolve(targetDir)
+            const lexRel = relative(absBase, absTarget)
+            if (isAbsolute(lexRel) || lexRel.startsWith("..")) return null
+            if (!allowEqual && !lexRel) return null
+            try {
+              let cur = absBase
+              const segments = lexRel ? lexRel.split(/[\\/]+/).filter(Boolean) : []
+              for (const seg of segments) {
+                cur = join(cur, seg)
+                if (lstatSync(cur).isSymbolicLink()) return null
+              }
+              if (lstatSync(absTarget).isSymbolicLink()) return null
+              if (!statSync(absTarget).isDirectory()) return null
+              const realBase = realpathSync(absBase)
+              const realTarget = realpathSync(absTarget)
+              const realRel = relative(realBase, realTarget)
+              if (isAbsolute(realRel) || realRel.startsWith("..")) return null
+              if (!allowEqual && !realRel) return null
+              return realTarget
+            } catch {
+              return null
+            }
           }
-          verifiedCwd = cand
+          const resolvedInRoot = resolveContainedDir(root, cand, true)
+          const resolvedInWt = resolvedInRoot ? null : resolveContainedDir(worktreesBase, cand, false)
+          const safeCwd = resolvedInRoot ?? resolvedInWt
+          if (!safeCwd) {
+            return { content: "refused: cwd must be an existing non-symlink directory inside project root or worktrees base" }
+          }
+          verifiedCwd = safeCwd
         }
         const manifestFile = join(run, "lemma", "manifest.json")
         return await withFileLock(manifestFile, async () => {

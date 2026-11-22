@@ -19,7 +19,8 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs"
-import { execFileSync } from "node:child_process"
+import { execFileSync, spawnSync } from "node:child_process"
+import { createHash } from "node:crypto"
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path"
 
 export const MAX_LEMMA_DEPTH = 3
@@ -422,11 +423,22 @@ export function formatMissingToolchainRefusal(probe: LemmaProbeResult): string {
 // ---------------------------------------------------------------------------
 
 export function maskFencedCodeBlocks(rawText: string): string {
-  // Replace paired ```...``` and ~~~...~~~ fenced blocks with spaces so embedded
-  // code comments (e.g. `-- Prove theorem in Lean 4`) cannot trigger opt-in prose routing.
+  // Replace paired ```...``` / ~~~...~~~ blocks, unclosed trailing fences,
+  // multi-backtick spans, and inline backtick code spans so embedded code
+  // comments/phrases (e.g. `Prove this theorem in Lean 4`) cannot trigger opt-in
+  // prose routing. Preserve single-token `sorry` or `*.lean` inside inline
+  // backticks so prompts like "Fill in the `sorry` in Lemma1.lean" still route.
   return rawText
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/~~~[\s\S]*?~~~/g, " ")
+    .replace(/```[\s\S]*$/g, " ")
+    .replace(/~~~[\s\S]*$/g, " ")
+    .replace(/``[\s\S]*?``/g, " ")
+    .replace(/`([^`\r\n]*)`/g, (_m, inner: string) => {
+      const trimmed = inner.trim()
+      if (/^(?:sorry|[A-Za-z0-9_./-]+\.lean)$/i.test(trimmed)) return trimmed
+      return " "
+    })
 }
 
 export function hasLeanSignal(rawText: string): boolean {
@@ -479,23 +491,39 @@ export function hasExplicitLeanRequest(proseOnly: string): boolean {
 
   // Explicit prove / formalize / disprove / verify / typecheck / complete-proof / fill-sorry
   // targeted at Lean 4 / .lean / theorem / lemma / proof.
+  const leanTargetRe = "(?:Lean\\s*4|Lean(?!\\s+(?:startup|manufacturing|agile|management|methodology|ux|product)\\b)|[A-Za-z0-9_./-]+\\.lean\\b)"
   const proveOrFormalize =
-    /\b(?:prove|formalize|formalise|disprove|refute|solve)\b[\s\S]{0,80}?\b(?:in|using|with|via|for)?\s*(?:Lean\s*4|Lean\b|[A-Za-z0-9_./-]+\.lean\b)/i.test(
-      proseOnly,
+    new RegExp(
+      `\\b(?:prove|formalize|formalise|disprove|refute)\\b[\\s\\S]{0,80}?\\b(?:in|using|with|via)\\s+${leanTargetRe}`,
+      "i",
+    ).test(proseOnly) ||
+    (
+      /\b(?:Lean\s*4|Lean(?!\s+(?:startup|manufacturing|agile|management|methodology|ux|product)\b))\s+(?:formalization|formalisation|proof|verification)\b/i.test(
+        proseOnly,
+      ) &&
+      !/^\s*(?:what\s+is|explain|describe)\b/i.test(proseOnly)
     ) ||
-    /\b(?:Lean\s*4|Lean\b)\s+(?:formalization|formalisation|proof|verification)\b/i.test(proseOnly) ||
-    /\b(?:prove|formalize|formalise|disprove|refute)\s+(?:this|the|a|an)?\s*(?:theorem|lemma|conjecture|proposition|claim|result|statement)\b[\s\S]{0,60}?\bLean(?:\s*4)?\b/i.test(
-      proseOnly,
-    ) ||
-    /\b(?:prove|formalize|formalise|verify|typecheck|type-check|kernel[- ]check|compile)\s+[A-Za-z0-9_./-]+\.lean\b/i.test(
+    /\b(?:formalize|formalise)\s+(?:the\s+(?:theorem|lemma|proof|claim|statement)s?\s+(?:in|from)\s+)?[A-Za-z0-9_./-]+\.lean\b/i.test(
       proseOnly,
     )
 
   const checkProof =
-    /\b(?:verify|typecheck|type-check|kernel[- ]check|check)\b[\s\S]{0,60}?\b(?:proof|theorem|lemma|formalization|formalisation|[A-Za-z0-9_./-]+\.lean)\b[\s\S]{0,60}?\b(?:in|with|using)?\s*(?:Lean\s*4|Lean\b|\.lean\b)?/i.test(
+    (
+      new RegExp(
+        `\\b(?:verify|typecheck|type-check|kernel[- ]check|check)\\b[\\s\\S]{0,60}?\\b(?:proof|theorem|lemma|formalization|formalisation)\\b[\\s\\S]{0,60}?\\b(?:in|with|using|via)\\s+${leanTargetRe}`,
+        "i",
+      ).test(proseOnly) ||
+      /\b(?:verify|typecheck|type-check|kernel[- ]check)\s+(?:the\s+)?(?:(?:proof|theorem|lemma|formalization|formalisation)s?\s+(?:in|of)\s+)?[A-Za-z0-9_./-]+\.lean\b/i.test(
+        proseOnly,
+      ) ||
+      /\b(?:verify|typecheck|type-check|kernel[- ]check|check)\s+(?:this|the|a)?\s*[A-Za-z0-9_./-]+\.lean\s+(?:proof|theorem|lemma|formalization|formalisation)\b/i.test(
+        proseOnly,
+      )
+    ) &&
+    !/\b(?:check|verify)\s+(?:the\s+|all\s+)?(?:(?:proof|code|file|lean)\s+)?(?:formatting|style|lint(?:ing)?|spelling|indentation|whitespace|syntax\s+highlighting|filename|names?|imports?\s+only)\b/i.test(
       proseOnly,
     ) &&
-    !/\b(?:check|verify)\s+(?:the\s+)?(?:formatting|style|spelling|syntax\s+highlighting|filename|names?|imports?\s+only|if\s+\S+\.lean\s+exists)\b/i.test(
+    !/\b(?:check|verify)\s+(?:if|whether)\s+[A-Za-z0-9_./-]+\.lean\s+(?:exists|is\s+(?:present|tracked|committed|in))\b/i.test(
       proseOnly,
     )
 
@@ -542,7 +570,7 @@ export function classifyRoute(
 
   const proseOnly = maskFencedCodeBlocks(rawText)
   const docReview = isDocumentReviewRequest(rawText, proseOnly, inputs, hasDocument)
-  const leanSignal = hasLeanSignal(rawText) || inputs.some((i) => /\.lean\b/i.test(i))
+  const leanSignal = hasLeanSignal(proseOnly) || inputs.some((i) => /\.lean\b/i.test(i))
   const explicitLean = hasExplicitLeanRequest(proseOnly)
 
   // Priority 1: document-review FIRST (math/Lean papers submitted for critique stay document-review)
@@ -638,10 +666,12 @@ export function classifyRoute(
 // ---------------------------------------------------------------------------
 
 /**
- * Strip Lean 4 line comments (`-- ...`) and nested block comments (`/- ... -/`)
- * while preserving string literals (`"..."`) and line breaks.
+ * Lexical pass over Lean 4 source: strips `-- ...` line comments and nested
+ * `/- ... -/` block comments, handles Char literals (`'"'`) so quotes inside
+ * Char literals do not open strings, and optionally strips string literal
+ * interiors (`"..."` -> `""`, preserving newlines).
  */
-export function stripLeanComments(source: string): string {
+function scanLeanSource(source: string, stripStrings: boolean): string {
   let out = ""
   let blockDepth = 0
   let inLine = false
@@ -676,16 +706,33 @@ export function stripLeanComments(source: string): string {
     }
 
     if (inString) {
-      out += c
       if (c === "\\") {
         if (n !== undefined) {
-          out += n
+          if (!stripStrings) out += c + n
+          else if (n === "\n") out += "\n"
           i++
+        } else if (!stripStrings) {
+          out += c
         }
       } else if (c === '"') {
         inString = false
+        out += '"'
+      } else if (!stripStrings) {
+        out += c
+      } else if (c === "\n") {
+        out += "\n"
       }
       continue
+    }
+
+    // Handle Lean 4 Char literals like `'"'` when `'` is not a trailing identifier prime.
+    if (c === "'" && (i === 0 || !/[A-Za-z0-9_.'»]/.test(source[i - 1]))) {
+      const charLit = source.slice(i).match(/^'(?:[^'\\\r\n]|\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|[^\r\n]))'/)
+      if (charLit) {
+        out += stripStrings ? "' '" : charLit[0]
+        i += charLit[0].length - 1
+        continue
+      }
     }
 
     if (c === '"') {
@@ -706,6 +753,22 @@ export function stripLeanComments(source: string): string {
   return out
 }
 
+/**
+ * Strip Lean 4 line comments (`-- ...`) and nested block comments (`/- ... -/`)
+ * while preserving string literals (`"..."`) and line breaks.
+ */
+export function stripLeanComments(source: string): string {
+  return scanLeanSource(source, false)
+}
+
+/**
+ * Strip Lean 4 comments AND string literal interiors (`"..."` -> `""`) so
+ * proof-hole and axiom scans never false-positive on strings or comments.
+ */
+export function stripLeanCommentsAndStrings(source: string): string {
+  return scanLeanSource(source, true)
+}
+
 export interface ProofHoleCheck {
   hasSorry: boolean
   hasAdmit: boolean
@@ -713,34 +776,46 @@ export interface ProofHoleCheck {
   findings: string[]
 }
 
+function stripGuillemets(name: string): string {
+  return name.startsWith("«") && name.endsWith("»") && name.length >= 2 ? name.slice(1, -1) : name
+}
+
 export function detectLeanProofHoles(
   source: string,
   compilerOutput = "",
   allowedAxioms: string[] = [],
 ): ProofHoleCheck {
-  const stripped = stripLeanComments(source)
-  const allowed = new Set(allowedAxioms.map((a) => String(a).trim()).filter(Boolean))
+  const codeOnly = stripLeanCommentsAndStrings(source)
+  const allowed = new Set<string>()
+  for (const a of allowedAxioms) {
+    const trimmed = String(a).trim()
+    if (!trimmed) continue
+    allowed.add(trimmed)
+    allowed.add(stripGuillemets(trimmed))
+  }
   const findings: string[] = []
   let hasSorry = false
   let hasAdmit = false
   let hasUnauthorizedAxiom = false
 
-  if (/\bsorry\b/.test(stripped)) {
+  if (/\bsorry\b/.test(codeOnly)) {
     hasSorry = true
     findings.push("source contains 'sorry'")
   }
-  if (/\bsorryAx\b/.test(stripped)) {
+  if (/\bsorryAx\b/.test(codeOnly)) {
     hasSorry = true
     findings.push("source references 'sorryAx'")
   }
-  if (/\badmit\b/.test(stripped)) {
+  if (/\badmit\b/.test(codeOnly)) {
     hasAdmit = true
     findings.push("source contains 'admit'")
   }
 
-  for (const m of stripped.matchAll(/^\s*(?:private\s+|protected\s+)?axiom\s+([A-Za-z_][A-Za-z0-9_'.]*)/gm)) {
+  // Match `axiom <name>` anywhere outside comments/strings (handles noncomputable,
+  // unsafe, @[extern ...], @[simp], same-line declarations, «guillemets», and Unicode).
+  for (const m of codeOnly.matchAll(/\baxiom\b\s+(«[^»]+»|[^\s:({[]+)/g)) {
     const axName = m[1]
-    if (!allowed.has(axName)) {
+    if (!allowed.has(axName) && !allowed.has(stripGuillemets(axName))) {
       hasUnauthorizedAxiom = true
       findings.push(`unauthorized axiom declaration: ${clean(axName, 64)}`)
     }
@@ -848,31 +923,34 @@ export function verifyLeanFile(options: LeanVerifyOptions): LeanVerifyResult {
           ? ["build", options.lakeTarget]
           : ["build"]
 
-  let exitCode = 0
-  let stdout = ""
-  let stderr = ""
+  const proc = spawnSync(binPath, args, {
+    cwd: options.cwd ?? dirname(options.filePath),
+    env,
+    timeout: timeoutMs,
+    maxBuffer: 1024 * 1024,
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+    shell: false,
+  })
+
+  const stdout = typeof proc.stdout === "string" ? proc.stdout : String(proc.stdout ?? "")
+  const stderr = typeof proc.stderr === "string" ? proc.stderr : String(proc.stderr ?? "")
+  let exitCode = typeof proc.status === "number" ? proc.status : -1
   let execFailed = false
   let execErrorMsg = ""
 
-  try {
-    stdout = execFileSync(binPath, args, {
-      cwd: options.cwd ?? dirname(options.filePath),
-      env,
-      timeout: timeoutMs,
-      maxBuffer: 1024 * 1024,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-    })
-  } catch (err: any) {
-    stdout = String(err?.stdout ?? "")
-    stderr = String(err?.stderr ?? "")
-    if (typeof err?.status === "number") {
-      exitCode = err.status
-    } else {
-      execFailed = true
-      exitCode = -1
-      execErrorMsg = clean(err?.message ?? "execution failed", 200)
-    }
+  if (proc.error) {
+    execFailed = true
+    exitCode = typeof proc.status === "number" ? proc.status : -1
+    const errCode = (proc.error as any)?.code
+    execErrorMsg =
+      errCode === "ETIMEDOUT"
+        ? `${binName} timed out after ${timeoutMs}ms`
+        : clean(proc.error.message || errCode || `${binName} execution failed`, 200)
+  } else if (proc.status === null) {
+    execFailed = true
+    exitCode = -1
+    execErrorMsg = `${binName} terminated by signal ${proc.signal ?? "unknown"}`
   }
 
   if (execFailed) {
@@ -991,6 +1069,7 @@ export interface FormalizationReviewFile {
     executed: boolean
     exitCode: number
     compiled: boolean
+    draftHash?: string
     findings: string[]
     timestamp: string
   } | null
@@ -1069,15 +1148,19 @@ export function recordFormalizationDraft(
     return { error: `refused: formalization round limit (${MAX_FORMALIZATION_ROUNDS}) reached` }
   }
 
-  const wDraft = writeTextAtomicSafe(runDir, "lemma/problem_draft.lean", leanCode.endsWith("\n") ? leanCode : leanCode + "\n")
+  const normalizedLean = leanCode.endsWith("\n") ? leanCode : leanCode + "\n"
+  const wDraft = writeTextAtomicSafe(runDir, "lemma/problem_draft.lean", normalizedLean)
   if (wDraft.error || !wDraft.path) return { error: wDraft.error ?? "failed to write problem_draft.lean" }
+  const draftHash = createHash("sha256").update(normalizedLean, "utf8").digest("hex")
 
   const rRead = readJsonSafe<FormalizationReviewFile>(runDir, "lemma/formalization-review.json")
   const review: FormalizationReviewFile = rRead.value ?? { rounds: [], draftVerification: null, preSearch: null, final: null }
+  // Always invalidate any previous draft verification when writing a new draft.
+  review.draftVerification = null
 
-  let compiled = true
-  let exitCode = 0
-  let findings: string[] = []
+  let compiled = false
+  let exitCode = -1
+  let findings: string[] = ["draft verification skipped (verifyDraft=false)"]
   if (options?.verifyDraft !== false) {
     // Phase 0 formalization draft may contain placeholder `sorry` in the proof body;
     // it must elaborate/compile with exitCode === 0.
@@ -1094,6 +1177,7 @@ export function recordFormalizationDraft(
       executed: v.executed,
       exitCode: v.exitCode,
       compiled,
+      draftHash,
       findings: v.findings.map((f) => clean(f, 200)),
       timestamp: v.timestamp,
     }
@@ -1133,18 +1217,17 @@ export function recordFormalizationPreReview(
   const review: FormalizationReviewFile = rRead.value ?? { rounds: [], draftVerification: null, preSearch: null, final: null }
 
   if (norm === "APPROVE") {
+    const currentDraftHash = createHash("sha256").update(draftRead.text, "utf8").digest("hex")
     if (!review.draftVerification) {
-      const v = verifyLeanFile({
-        filePath: draftSafe.path,
-        cwd: dirname(draftSafe.path),
-        allowSorry: true,
-      })
-      review.draftVerification = {
-        executed: v.executed,
-        exitCode: v.exitCode,
-        compiled: v.executed && v.exitCode === 0,
-        findings: v.findings.map((f) => clean(f, 200)),
-        timestamp: v.timestamp,
+      return {
+        error:
+          "refused: cannot APPROVE promotion to lemma/problem.lean because problem_draft.lean has not been verified (re-run action=\"draft\" with verifyDraft=true)",
+      }
+    }
+    if (review.draftVerification.draftHash !== currentDraftHash) {
+      return {
+        error:
+          "refused: cannot APPROVE promotion to lemma/problem.lean because problem_draft.lean changed since last verified draft (re-run action=\"draft\" with verifyDraft=true)",
       }
     }
     if (!review.draftVerification.compiled) {
@@ -1309,6 +1392,11 @@ export function mutateLemmaNode(
     if (!VALID_NODE_STATUSES.has(status)) {
       return { error: `refused: invalid node status "${status}"` }
     }
+    if (status === "proved" || status === "disproved") {
+      return {
+        error: `refused: use teamwork_lemma_verify to mark a node ${status} with executed kernel verification`,
+      }
+    }
     const node: LemmaNodeRecord = {
       id: lemmaId,
       parentId,
@@ -1323,6 +1411,9 @@ export function mutateLemmaNode(
     }
     nodes[lemmaId] = node
     manifest.nodes = nodes
+    if (manifest.phase === "VERIFIED") {
+      manifest.phase = "SOLVING"
+    }
     manifest.updatedAt = now
 
     const wNode = writeJsonAtomicSafe(runDir, `lemma/nodes/${lemmaId}/state.json`, node)
@@ -1395,9 +1486,11 @@ export function mutateLemmaNode(
     if (!VALID_NODE_STATUSES.has(nextStatus)) {
       return { error: `refused: invalid node status "${nextStatus}"` }
     }
-    // Never allow jumping straight to "proved" without stamped verification.
-    if (nextStatus === "proved") {
-      return { error: "refused: use teamwork_lemma_verify to mark a node proved with executed kernel verification" }
+    // Never allow jumping straight to "proved" or "disproved" without stamped verification.
+    if (nextStatus === "proved" || nextStatus === "disproved") {
+      return {
+        error: `refused: use teamwork_lemma_verify to mark a node ${nextStatus} with executed kernel verification`,
+      }
     }
     node.status = nextStatus as LemmaNodeRecord["status"]
   }
@@ -1418,6 +1511,7 @@ export interface StampedLemmaVerifyReport extends LeanVerifyResult {
   lemmaId: string
   round: number
   attemptFile: string
+  allowedAxioms: string[]
 }
 
 export function verifyLemmaNodeAttempt(
@@ -1455,18 +1549,23 @@ export function verifyLemmaNodeAttempt(
     return { error: `refused: attempt file ${attemptRel} does not exist` }
   }
 
+  const normalizedAllowedAxioms = Array.isArray(params.allowedAxioms)
+    ? params.allowedAxioms.map((a) => clean(a, 128).trim()).filter(Boolean)
+    : []
+
   const res = verifyLeanFile({
     filePath: attemptSafe.path,
     cwd: params.cwd ?? dirname(attemptSafe.path),
     mode: params.mode ?? "lean",
     env: params.env,
-    allowedAxioms: params.allowedAxioms,
+    allowedAxioms: normalizedAllowedAxioms,
   })
 
   const report: StampedLemmaVerifyReport = {
     lemmaId: params.lemmaId,
     round,
     attemptFile: attemptRel,
+    allowedAxioms: normalizedAllowedAxioms,
     ...res,
   }
   const verifyRel = `lemma/nodes/${params.lemmaId}/verify-${round}.json`
@@ -1483,8 +1582,14 @@ export function verifyLemmaNodeAttempt(
   }
   node.updatedAt = now
 
+  const revRead = readJsonSafe<FormalizationReviewFile>(runDir, "lemma/formalization-review.json")
+  const finalVerdict = revRead.value?.final?.verdict
+  const formalizationBlocked = finalVerdict === "UNFAITHFUL" || finalVerdict === "MISFORMALIZED"
+
   const allNodes = Object.values(nodes)
-  if (allNodes.length > 0 && allNodes.every((n) => n.status === "proved" || n.status === "disproved")) {
+  if (formalizationBlocked) {
+    manifest.phase = "BLOCKED"
+  } else if (allNodes.length > 0 && allNodes.every((n) => n.status === "proved" || n.status === "disproved")) {
     manifest.phase = "VERIFIED"
   } else if (allNodes.some((n) => n.status === "blocked")) {
     manifest.phase = "BLOCKED"
@@ -1554,6 +1659,10 @@ export function evaluateLemmaFinalEvidence(runDir: string): LemmaFinalEvidence {
     }
   }
   const manifest = mRead.value
+  const manifestPhase = typeof manifest.phase === "string" ? clean(manifest.phase, 32) : null
+  if (manifestPhase !== "VERIFIED") {
+    reasons.push(`lemma manifest phase is ${manifestPhase ?? "MISSING"} (must be VERIFIED)`)
+  }
   const boundsCheck = validateLemmaBounds(manifest.bounds)
   if (boundsCheck.error) {
     reasons.push(`lemma bounds invalid: ${boundsCheck.error}`)
