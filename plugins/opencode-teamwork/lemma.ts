@@ -520,7 +520,7 @@ export function hasExplicitLeanRequest(proseOnly: string): boolean {
         proseOnly,
       )
     ) &&
-    !/\b(?:check|verify)\s+(?:the\s+|all\s+)?(?:(?:proof|code|file|lean)\s+)?(?:formatting|style|lint(?:ing)?|spelling|indentation|whitespace|syntax\s+highlighting|filename|names?|imports?\s+only)\b/i.test(
+    !/\b(?:check|verify|typecheck|type-check|kernel[- ]check)\s+(?:the\s+|this\s+|all\s+)?(?:[A-Za-z0-9_./-]+\.lean\s+)?(?:(?:proof|code|file|lean)\s+)?(?:formatting|style|lint(?:ing)?|spelling|indentation|whitespace|syntax\s+highlighting|filename|names?|imports?\s+only)\b/i.test(
       proseOnly,
     ) &&
     !/\b(?:check|verify)\s+(?:if|whether)\s+[A-Za-z0-9_./-]+\.lean\s+(?:exists|is\s+(?:present|tracked|committed|in))\b/i.test(
