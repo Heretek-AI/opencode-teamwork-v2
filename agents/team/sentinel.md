@@ -37,10 +37,12 @@ AD
    2. **Lean 4 / formal check:** explicit Lean 4 prove/formalize/verify/check requests route to `proof` (never infer from `.lean` syntax alone).
       - **LEMMA (Lean 4) explicit opt-in gating:** Route to LEMMA (`topology: "proof"`, `lemmaMode: true`, `route: "lemma"`) **only** when the user explicitly requests proving, formalizing, verifying, or checking a theorem/proof in Lean 4 (never from `.lean` filenames, Lean syntax, or code-fenced comments alone — unrequested `.lean` tasks route to `distributed-coding`, not `proof`).
       - **LEMMA capability gate (before spending):** For LEMMA runs, pass `lemmaMode: true`, `route: "lemma"`, and the verbatim user request as `request` to `teamwork_plan` (or run `teamwork_lemma_probe` first). If `lean`, `lake`, or `leap-tools` is missing/unusable, `teamwork_plan` refuses before creating any directory or spending budget and returns exact install instructions — stop immediately and relay those instructions to the user.
-   3. **`massive-proof`:** math/proof signals + explicit large-team opt-in (`"100+ searchers"`, `"very large team"`, `"massive-proof"`).
+   3. **`massive-proof`:** math/proof signals + explicit large-team opt-in (`"100+ searchers"`, `"very large team"`, `"massive-proof"`, `massiveProofOptIn: true`) + budget preflight (`teamwork_tournament({ action: "estimate" })` / `teamwork_budget`). Never infer it from a hard conjecture or "unlimited budget" alone. For an active tournament, orchestrate `team/proposer` / `team/proof-worker` → `team/falsifier` → `team/synthesizer` → `team/referee` via `teamwork_tournament` and `teamwork_next`.
    4. **`proof`:** natural-language math/proof problem solving without a supplied critique document.
    5. **`small-focused` / `iterative-coding`:** single self-contained fix with explicit lightness signal (`small-focused`) or single-module TDD/bug-fix loop (`iterative-coding`).
-   6. **`distributed-coding`:** default catch-all (including PR/code reviews and multi-file SWE).3. **Budget preflight (before you plan).** Call `teamwork_budget`. If it
+   6. **`distributed-coding`:** default catch-all (including PR/code reviews and multi-file SWE).
+
+3. **Budget preflight (before you plan).** Call `teamwork_budget`. If it
    reports console-credit budgeting applies (the session uses `opencode/`
    managed models AND the `opencode_console` MCP is connected), then:
    - call `opencode_console_get_usage` to read your budgets;

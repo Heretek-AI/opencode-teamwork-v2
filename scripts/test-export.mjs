@@ -18,6 +18,8 @@ import { spawnSync } from "node:child_process"
 import assert from "node:assert"
 
 const here = dirname(fileURLToPath(import.meta.url))
+/** Mirror lib/export.mjs md(): escape the same characters, backslash first. */
+const escMd = (s) => String(s).replace(/[\\`*_[\]<>|~!&]/g, "\\$&")
 const cliPath = join(here, "..", "bin", "opencode-teamwork.mjs")
 
 // Root temp dir for this run; every fixture lives under it and it is removed in the end.
@@ -646,6 +648,148 @@ await check("LEMMA: buildExportData & renderExport render lemma/ artifacts safel
   assert(symData.warnings.some((w) => w.includes("lemma/")), "symlinked lemma/ must emit warning")
 })
 
+// 7. Tournament export & partial/cancelled status checks
+// ==========================================
+
+await check("tournament: completed tournament renders ## Tournament with HTML escaping & URL defanging", () => {
+  const root = makeRoot()
+  const sid = "20261018-130000-tex1"
+  const dir = writeRun(root, {
+    id: sid,
+    plan: { ...PASS_PLAN, sessionId: sid, topology: "massive-proof" },
+    state: { ...PASS_STATE, sessionId: sid, phase: "DONE" },
+    finalReport: FINAL_STAMPED,
+    reports: PASS_REPORTS,
+  })
+  writeJson(join(dir, "tournament", "manifest.json"), {
+    version: 1,
+    sessionId: sid,
+    phase: "COMPLETED",
+    iteration: 1,
+    currentLevel: 1,
+    config: { levels: 2, branchingFactor: 2, maxCandidates: 8, maxIterations: 2 },
+    candidates: {
+      "cand-1": { id: "cand-1", status: "winner" },
+      "cand-2": { id: "cand-2", status: "pruned" },
+    },
+    rankedCandidates: [
+      { rank: 1, id: "cand-1", iteration: 1, level: 1, status: "winner", refereeVerdict: "PASS", score: 92, survivalsCount: 2 },
+    ],
+  })
+  writeJson(join(dir, "tournament", "verdict.json"), {
+    version: 1,
+    sessionId: sid,
+    status: "PASS",
+    verdict: "ACCEPT",
+    refereeAgent: "team/referee",
+    phase: "COMPLETED",
+    winnerId: "cand-1",
+    summary: `Winner verified at https://example.com/proof ${XSS}`,
+    totalCandidates: 2,
+    survivingCandidates: 1,
+    iterationsCompleted: 1,
+    rankedCandidates: [
+      { rank: 1, id: "cand-1", iteration: 1, level: 1, status: "winner", refereeVerdict: "PASS", score: 92, survivalsCount: 2 },
+    ],
+  })
+
+  const data = buildExportData(root, sid)
+  assert.strictEqual(data.status, "PASS")
+  assert.strictEqual(data.tournament.phase, "COMPLETED")
+  assert.strictEqual(data.tournament.winnerId, "cand-1")
+
+  const html = renderExport(data, { format: "html" })
+  assert(html.includes("<h2>Tournament</h2>"), "HTML must include Tournament section")
+  assert(!html.includes(XSS), "HTML must escape XSS in tournament summary")
+  assert(!/https?:\/\//i.test(html), "HTML must defang URLs in tournament summary")
+  assert(html.includes("https[://]example.com/proof"), "defanged URL must appear")
+
+  const mdOut = renderExport(data, { format: "markdown" })
+  assert(mdOut.includes("## Tournament"), "Markdown must include ## Tournament")
+  assert(mdOut.includes("cand-1"), "Markdown must include winner id")
+})
+
+await check("tournament: cancelled or budget-halted tournament NEVER reports PASS even when DAG tasks are verified_pass", () => {
+  for (const phase of ["CANCELLED", "BUDGET_HALTED"]) {
+    const root = makeRoot()
+    const sid = `20261018-130100-${phase.toLowerCase().slice(0, 4)}`
+    const dir = writeRun(root, {
+      id: sid,
+      plan: { ...PASS_PLAN, sessionId: sid, topology: "massive-proof" },
+      state: { ...PASS_STATE, sessionId: sid, phase: "PRESENT_PARTIAL" },
+      finalReport: null,
+      reports: PASS_REPORTS,
+    })
+    writeJson(join(dir, "tournament", "manifest.json"), {
+      version: 1,
+      sessionId: sid,
+      phase,
+      iteration: 1,
+      currentLevel: 0,
+      config: { levels: 2, branchingFactor: 2, maxCandidates: 8, maxIterations: 2 },
+      candidates: { "cand-1": { id: "cand-1", status: "survives" } },
+      rankedCandidates: [{ rank: 1, id: "cand-1", iteration: 1, level: 0, status: "survives", refereeVerdict: null, score: null, survivalsCount: 1 }],
+      cancelled: { trigger: phase === "CANCELLED" ? "explicit" : "budget_exhausted", reason: `Halted via ${phase}` },
+    })
+    writeJson(join(dir, "tournament", "verdict.json"), {
+      version: 1,
+      sessionId: sid,
+      status: "PARTIAL",
+      verdict: "PARTIAL",
+      phase,
+      winnerId: "cand-1",
+      summary: `Partial due to ${phase}`,
+      rankedCandidates: [{ rank: 1, id: "cand-1", iteration: 1, level: 0, status: "survives", refereeVerdict: null, score: null, survivalsCount: 1 }],
+    })
+
+    const data = buildExportData(root, sid)
+    assert.strictEqual(data.status, "INCOMPLETE", `${phase} tournament must not return PASS`)
+    const mdOut = renderExport(data, { format: "markdown" })
+    const banner = `> **Partial / halted (${escMd(phase)}):** ${escMd(`Halted via ${phase}`)}`
+    assert(mdOut.includes(banner), `Markdown must show the exact partial banner for ${phase}: ${mdOut}`)
+  }
+})
+
+await check("tournament: symlinked tournament/ dir is refused with warning and NEVER exports PASS", () => {
+  const root = makeRoot()
+  const sid = "20261018-130200-tsym"
+  const dir = writeRun(root, { id: sid, plan: { ...PASS_PLAN, sessionId: sid, topology: "massive-proof" }, state: PASS_STATE, reports: PASS_REPORTS })
+  const outside = mkdtempSync(join(testDir, "outside-exp-"))
+  writeJson(join(outside, "manifest.json"), { phase: "COMPLETED", candidates: {} })
+  symlinkSync(outside, join(dir, "tournament"))
+
+  const data = buildExportData(root, sid)
+  assert(!data.tournament, "symlinked tournament/ must not be loaded")
+  assert.notStrictEqual(data.status, "PASS", "massive-proof run with symlinked tournament/ must NEVER return PASS")
+  assert.strictEqual(data.status, "INCOMPLETE", "massive-proof run with symlinked tournament/ must return INCOMPLETE")
+  assert(data.warnings.some((w) => w.includes("tournament/") && w.includes("symlink")), `must record symlink warning: ${JSON.stringify(data.warnings)}`)
+
+  // Even when finalReport says PASS, symlinked tournament/ must still never export PASS;
+  // when finalReport says FAIL, status must be FAIL.
+  const rootPassFinal = makeRoot()
+  const dirPassFinal = writeRun(rootPassFinal, {
+    id: sid,
+    plan: { ...PASS_PLAN, sessionId: sid, topology: "massive-proof" },
+    state: PASS_STATE,
+    finalReport: FINAL_STAMPED,
+    reports: PASS_REPORTS,
+  })
+  symlinkSync(outside, join(dirPassFinal, "tournament"))
+  const dataPassFinal = buildExportData(rootPassFinal, sid)
+  assert.strictEqual(dataPassFinal.status, "INCOMPLETE", "symlinked tournament/ must override stamped PASS finalReport to INCOMPLETE")
+
+  const rootFailFinal = makeRoot()
+  const dirFailFinal = writeRun(rootFailFinal, {
+    id: sid,
+    plan: { ...PASS_PLAN, sessionId: sid, topology: "massive-proof" },
+    state: PASS_STATE,
+    finalReport: { ...FINAL_STAMPED, status: "FAIL" },
+    reports: PASS_REPORTS,
+  })
+  symlinkSync(outside, join(dirFailFinal, "tournament"))
+  const dataFailFinal = buildExportData(rootFailFinal, sid)
+  assert.strictEqual(dataFailFinal.status, "FAIL", "FAIL finalReport must still export FAIL even when tournament/ is symlinked")
+})
 // ---------------------------------------------------------------- cleanup
 
 rmSync(testDir, { recursive: true, force: true })

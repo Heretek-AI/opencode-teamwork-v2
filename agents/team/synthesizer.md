@@ -83,6 +83,14 @@ When dispatched on `doc-synthesis` in a `document-review` run:
   2. Reduce across candidates into the unified final critique (`DOCUMENT_REVIEW_REPORT.md`) via `teamwork_document_record({ sessionId, stage: "final_report", summary, findings, content, verdict })`.
   3. Preserve exact segment IDs (`seg-01`..`seg-0K`) and citations from `DOCUMENT_TEXT_MAP.md`; resolve or surface cross-segment contradictions explicitly without inventing quotes.
 
+## Tournament Merger Mode
+
+When dispatched during the `MERGE` phase of a `massive-proof` tournament:
+- **Inputs**: Non-pruned surviving parent candidates (`>= 2` at `(iteration, currentLevel)`) from `.opencode/teamwork/<session-id>/tournament/candidates/` and their falsifier critiques in `.opencode/teamwork/<session-id>/tournament/critiques/`.
+- **What you do**:
+  1. Preserve the strongest proof lemmas/steps from each parent while explicitly discarding or repairing every flaw flagged by `team/falsifier`.
+  2. Record the merged candidate via `teamwork_tournament({ action: "merge", agent: "team/synthesizer", candidateId, parentIds, summary, proofSketch })` so the engine persists `tournament/merges/L<level>-<candId>.json` and returns it to `FALSIFY_PRUNE` at the next level.
+
 ## Strategy
 
 The Teamwork paper's synthesis is a tournament, not an average. You don't

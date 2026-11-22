@@ -13,8 +13,8 @@ an effect or setup function. (cause: SchemaError(Expected object at ["default"])
 ```
 
 This repo is the ported, V2-native version: the original 10 agents plus a
-security auditor, document segment reviewer, and formalization reviewer
-(13 total) and 7 slash commands,
+security auditor, document segment reviewer, formalization reviewer, and
+tournament referee (14 total) and 7 slash commands,
 rewritten for the V2 plugin + agent APIs. Verified against **OpenCode `v2.0.26`**.
 
 ## What changed (V1 → V2)
@@ -35,6 +35,7 @@ index → plugins/opencode-teamwork/index.ts   # V2 plugin, registers the 7 comm
 plugins/opencode-teamwork/tools.ts           # engine tools + hooks (V2 API)
 plugins/opencode-teamwork/document-review.ts # Document Review route classifier, PDF/MD ingestion, RSA bounds
 plugins/opencode-teamwork/lemma.ts           # LEMMA (Lean 4) probe, classifier, verifier
+plugins/opencode-teamwork/tournament.ts      # bounded massive-proof tournament & opt-in router
 agents/team/*.md                  # 12 team agents (markdown, V2 frontmatter)
 docs/ARTIFACTS.md                 # canonical artifact layout, topologies, schemas
 lib/team.mjs                      # installer core (config dir, model map, agent files)
@@ -60,10 +61,11 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 | Tool | Purpose |
 | --- | --- |
 | `teamwork_budget` | budget preflight: console credit derivation |
-| `teamwork_route` | deterministic route classifier (`document-review` checked first with negative-trigger guards) |
-| `teamwork_plan` | create the run dir + `plan.dag.json` / `state.json` / `costs.json` |
+| `teamwork_route` | priority-ordered route classifier (`document-review` first and before Math/Proof, then explicit Lean 4/LEMMA, then opt-in `massive-proof`; rejects PR/code reviews, bare filenames without a supplied doc, and theorem-solving requests) |
+| `teamwork_plan` | create the run dir + `plan.dag.json` / `state.json` / `costs.json` (with pre-`mkdir` tournament preflight) |
 | `teamwork_document_triage` | ingest/partition a supplied document into `seg-01`..`seg-0K` + `doc-synthesis` with pre-`mkdir` bounds & path containment checks |
 | `teamwork_document_record` | persist bounded RSA tree node outputs, `unit-report.md`, `candidate-<I>.md`, and `DOCUMENT_REVIEW_REPORT.md` |
+| `teamwork_tournament` | bounded `massive-proof` tournament state machine (`estimate`, `init`, `propose`, `falsify`, `merge`, `score`, `audit`, `cancel`, `status`) |
 | `teamwork_preflight` | re-check a run's named inputs, write `preflight.json` (reports, never blocks) |
 | `teamwork_status` | per-task progress for the active run |
 | `teamwork_resume` | tasks still open, for a restart |
@@ -73,7 +75,6 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 | `teamwork_task_update` | deterministic task state machine transitions (`pending` → `worker_active` → `worker_done` → `verifier_active` → `verified_pass` / `verified_fail` / `blocked`) |
 | `teamwork_security_audit` | mandatory pre-merge security gate (`verify/security-audit.json`) |
 | `teamwork_final_verify` | compute the final verdict from the task reports + security audit (plus `lemma/` artifacts when in LEMMA mode), stamp it, write `verify/final.json` |
-| `teamwork_route` | read-only priority-ordered route classifier (`document-review` > explicit LEMMA > non-opt-in `.lean` → `distributed-coding` > `massive-proof` > `proof` > coding) |
 | `teamwork_lemma_probe` | read-only probe for `lean`, `lake`, and `leap-tools` on `PATH` |
 | `teamwork_lemma_formalize` | LEMMA Phase 0 `problem_draft.lean` / `review_pre` → `problem.lean` and `review_final` faithfulness gate |
 | `teamwork_lemma_node` | bounded lemma decomposition tree (`create`, `update`, `blueprint`, `attempt`) |
@@ -83,14 +84,15 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 Hooks: `permission.evaluate` enforces the per-agent read-only policy **in code**
 (not just in their prompts). The read-only agents (`team/verifier`,
 `team/falsifier`, `team/scout`, `team/security-auditor`,
-`team/segment-reviewer`, `team/formalization-reviewer`) all deny the `edit`
-tool, so none of them can write through it. `shell` is still available to the
-verifier, scout and security auditor, and it can modify files; the falsifier,
-segment reviewer, and formalization reviewer also have `shell` denied, and the
-segment and formalization reviewers deny `webfetch` and `subagent` as well.
-In short: no writes through `edit` for all six, and no `shell` writes for the
-falsifier, segment reviewer, or formalization reviewer. The hook also enforces
-network constraints
+`team/segment-reviewer`, `team/formalization-reviewer`, `team/referee`) all
+deny the `edit` tool, so none of them can write through it. `shell` is still
+available to the verifier, scout and security auditor, and it can modify files;
+the falsifier, segment reviewer, formalization reviewer, and referee also have
+`shell` denied, and the segment, formalization, and referee roles deny
+`webfetch` and `subagent` as well (the verifier and security auditor deny
+`webfetch`). In short: no writes through `edit` for all seven, and no `shell`
+writes for the falsifier, segment reviewer, formalization reviewer, or referee.
+The hook also enforces network constraints
 (`constraints.network: denied`), and `session.context` injects the active run's
 state + recent pitfalls into every team agent's system prompt.
 
@@ -300,7 +302,7 @@ format details.
 Each agent's model lives in the `model:` frontmatter of its markdown file. The
 shipped defaults are:
 
-- `deepseek/deepseek-v4-pro`: sentinel, orchestrator, synthesizer, verifier, falsifier, proof-worker, formalization-reviewer, security-auditor
+- `deepseek/deepseek-v4-pro`: sentinel, orchestrator, synthesizer, verifier, falsifier, proof-worker, formalization-reviewer, security-auditor, referee
 - `deepseek/deepseek-flash`: crafter, worker, proposer, scout, segment-reviewer
 
 Change them with `opencode-teamwork init` (interactive), the flags above
@@ -369,10 +371,11 @@ built-ins.
 
 ## Agents
 
-The 13 shipped agents are: `team/crafter`, `team/sentinel`, `team/worker`,
+The 14 shipped agents are: `team/crafter`, `team/sentinel`, `team/worker`,
 `team/proof-worker`, `team/verifier`, `team/security-auditor`,
 `team/segment-reviewer`, `team/formalization-reviewer`, `team/orchestrator`,
-`team/proposer`, `team/falsifier`, `team/synthesizer`, `team/scout`.
+`team/proposer`, `team/falsifier`, `team/synthesizer`, `team/scout`,
+`team/referee`.
 
 Model assignments live in each agent's frontmatter (`model:`); see
 [Model assignment](#model-assignment) for how to set them.

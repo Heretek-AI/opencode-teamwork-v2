@@ -41,6 +41,14 @@ Every run writes under one root:
 │   ├── problem.lean           # approved Phase 0 formalization
 │   ├── formalization-review.json # preSearch (APPROVE/REQUEST_CHANGES) + final (FAITHFUL/...)
 │   └── nodes/<lemmaId>/       # state.json, blueprint.md, attempt-<r>.lean, verify-<r>.json
+├── tournament/                # optional: bounded massive-proof tournament state (explicit opt-in)
+│   ├── manifest.json          # opt-in proof, bounds, budget estimate, phase, level, cancellation state
+│   ├── candidates/<candId>.json # candidate metadata, level, parents, status, refutations, score
+│   ├── candidates/<candId>.md   # sanitized candidate strategy/proof body
+│   ├── critiques/<candId>-falser.json # team/falsifier structured critique + counterexamples
+│   ├── merges/L<level>-<candId>.json  # team/synthesizer level aggregation record
+│   └── verdict.json           # team/referee ranked candidates + ACCEPT | REJECT | PARTIAL verdict
+├── TOURNAMENT_REPORT.md       # deterministic tournament summary (COMPLETED, FAILED, or PARTIAL)
 ├── final.md                 # presented result
 ├── report.html / report.md  # optional export output (`opencode-teamwork export`)
 └── interrupted.md           # present when the user stops a run
@@ -60,7 +68,7 @@ the repo are a footgun). Default root: `$TEAMWORK_WORKTREES_DIR` or
 | `iterative-coding` | 1 worker, test-driven tight loop on one module |
 | `distributed-coding` | N workers fan-out + merge |
 | `proof` | 1 strategist + 3-5 searchers + 1 formal checker (plus explicit opt-in LEMMA / Lean 4 mode via `lemmaMode: true`) |
-| `massive-proof` | 1 meta-coordinator + 100+ searchers (opt-in) |
+| `massive-proof` | Bounded multi-level tournament search + falsers + mergers + referee (explicit opt-in only; 1 meta-coordinator + up to 100+ searchers) |
 | `document-review` | segment triage (1–8 segments, default 6) → bounded per-segment RSA tree `[4,2,1]` → cross-segment synthesis `[4,1]` |
 
 Legacy aliases — accept them, normalize on write:
@@ -783,6 +791,33 @@ When the toolchain is ready, the run initializes `.opencode/teamwork/<session-id
 Free-form markdown following the section structure described in the scout,
 proposer, falsifier and synthesizer agent files.
 
+### Tournament artifacts (`massive-proof`, explicit opt-in)
+
+When `massive-proof` runs in tournament mode (`teamwork_plan` with explicit opt-in or
+`teamwork_tournament({ action: "init" })`), the engine validates bounds (`levels <= 4`,
+`branchingFactor <= 8`, `maxCandidates <= 64`, `maxIterations <= 32`, `unitCostUsd >= 0.05`)
+and runs budget preflight (`budgetUsd > 0`, `spentPct < 80`, `remainingUsd >= estimatedMinUsd`)
+**strictly before `mkdirSync`**. All tournament IDs match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`,
+and every path under `tournament/` enforces segment-wise `lstatSync` symlink refusal,
+`realpathSync` containment, bounded `O_NOFOLLOW | O_NONBLOCK` reads, and
+`O_CREAT | O_EXCL` temp files (a planted symlink/hard link at a temp path cannot
+redirect an atomic write).
+
+**Known limitations (same threat model).** `O_NOFOLLOW` covers only the final path
+component: an intermediate directory swapped for a symlink between the segment
+checks and the open is still a race. Closing it fully needs component-by-component
+`openat`/`O_PATH` traversal, which is not implemented. The run-context line injected
+by `describeRun` is sanitised (`clean()`, bounded reads that refuse symlinks and
+non-regular files) but not authenticated: a writer that can already modify the run
+directory can influence what agents read there. Verdicts are not affected — they are
+recomputed from the evidence artifacts, not from injected context. `events.jsonl`
+remains a best-effort, fail-open path with the same final-component TOCTOU caveat.
+
+- `tournament/manifest.json`: 5-phase bounded state machine (`PROPOSE → FALSIFY_PRUNE → MERGE → REFEREE_SCORE → VICTORY_AUDIT` → `COMPLETED | FAILED | CANCELLED | BUDGET_HALTED`), `optInProof`, `budgetEstimate`, `candidates`, and deterministic `rankedCandidates`.
+- `tournament/verdict.json`: written by `team/referee` on `audit` (`ACCEPT`/`REJECT`) or by `finalizeTournamentPartial` on cancellation/budget halt (`PARTIAL`).
+- `TOURNAMENT_REPORT.md` (+ `interrupted.md` + `state.json` `phase: "PRESENT_PARTIAL"` + `tournament_cancelled` event on `AbortSignal`, explicit `cancel`, or `shouldHalt` / budget exhaustion).
+- `teamwork_final_verify` stamps `evidence.tournament` into `verify/final.json` and refuses `PASS` unless `manifest.phase === "COMPLETED"` with a `team/referee` `ACCEPT` verdict.
+
 ## Export report (`report.html` / `report.md`)
 
 `opencode-teamwork export` writes a human-readable report of one run. It is a
@@ -830,7 +865,7 @@ The overall status is decided from three inputs: the tasks, the security audit, 
    `verified_pass`).
 3. `PASS` when there is at least one task, every task is `verified_pass`, and the
    audit did not fail.
-4. Otherwise `INCOMPLETE`.
+4. Otherwise `INCOMPLETE`. (If `tournament/` is present with phase `CANCELLED`, `BUDGET_HALTED`, or any non-`COMPLETED` phase, `export` never promotes the run to `PASS` via task fallback and reports `FAIL` or `INCOMPLETE`.)
 
 Missing `events.jsonl` data is shown
 as "timing unknown" rather than guessed.
