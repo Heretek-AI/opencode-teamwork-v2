@@ -2,7 +2,7 @@
 
 Static-analysis reconstruction of the **dispatch graph** of Antigravity's `/teamwork` subsystem: which agent starts which, in what order, for each of the six routes the sentinel can choose. [OBSERVED for every edge so labelled] Everything here was measured from the extracted Linux CLI binary `antigravity` (SHA-256 `37873b8062391b6202a3d3199ec012abc9e53aab720d26cd65699441497d8c94`, 273,240,776 bytes). The binary was **never executed**. All offsets are **decimal file offsets** into that binary.
 
-Companion documents: [`00-artifact-identity.md`](00-artifact-identity.md) (binary identity, section map), [`01-command-contract.md`](01-command-contract.md) (route set, Route Summary mapping, pre-flight audit semantics, completion verification), [`02-agent-registry.md`](02-agent-registry.md) (agent types, the eight verbatim role descriptions D1–D8, the length-bucketed string limitation), [`05-coordination-and-artifacts.md`](05-coordination-and-artifacts.md) (board, members, on-disk artifacts, conductor/updater roles), [`prompts/sentinel-routing.md`](prompts/sentinel-routing.md) (verbatim sentinel prompt).
+Companion documents: [`00-artifact-identity.md`](00-artifact-identity.md) (binary identity, section map), [`01-command-contract.md`](01-command-contract.md) (route set, Route Summary mapping, pre-flight audit semantics, completion verification), [`02-agent-registry.md`](02-agent-registry.md) (agent types, the eight verbatim role descriptions D1–D8, the length-bucketed string limitation), [`05-coordination-and-artifacts.md`](05-coordination-and-artifacts.md) (board, members, on-disk artifacts, conductor/updater roles), [`10-official-docs-cross-check.md`](10-official-docs-cross-check.md) (docs role names → registry names, and docs-vs-binary divergences), [`prompts/sentinel-routing.md`](prompts/sentinel-routing.md) (verbatim sentinel prompt).
 
 **Scope.** This document covers dispatch edges only — entry, parent/child, loop, and terminal-verification edges for the six routes — and the artifacts that carry state between nodes. It does not re-derive the command surface (`01-command-contract.md`), the roster and its type bindings (`02-agent-registry.md`), the board/member substrate (`05-coordination-and-artifacts.md`), or model tiers and admin gating (deferred to the planned `06-config-gates-and-model-tiers.md`). Offsets quoted here are evidence pointers into the same artifact, not independent re-measurements.
 
@@ -531,6 +531,38 @@ On the three "tournament judging candidates" named in the extraction brief: two 
 | W16 | `teamwork_test_writer` participates | Type @ 106,479,099; no SWE prompt names it | UNKNOWN (R5) |
 
 **What this diagram does not claim.** It does not claim parallel review panels: the prompt forbids them ("Two agents that run the code beat eight agents that have opinions about it" @ 113,722,904). It does not claim the reviewer is read-only: the reviewer is explicitly allowed to fix ("tries to BREAK that diff, then fixes it"). And it does not claim the sentinel audits on this route — the SWE orchestrator owns a **blocking** auditor, and the sentinel only spawns one if a victory claim arrives **without** citing `VICTORY CONFIRMED` @ 113,273,475.
+
+---
+
+### 2.7 Documented roles vs registry roles
+
+The official documentation (`https://antigravity.google/docs/teamwork/`, *Multi-agent architecture and roles*) describes eight roles. Several of those names are literal in the prompts; none is a registry short name. This table is the translation layer, so that a docs role can be followed into the edge tables above without re-deriving it from prose. [DOCS for the role names and their descriptions; OBSERVED for every registry row cited; INFERRED for the mapping, which rests on role semantics — the descriptions on both sides, not on a shared identifier]
+
+| Docs role (DOCS) | Registry short name (OBSERVED) | Runtime type | Row in `02` | Where it appears in this document |
+|---|---|---|---|---|
+| **Sentinel** | `sentinel@external` | `teamwork` | 46 | Spine §1; no route table |
+| **Project Orchestrator** | `orchestrator_pure` (general); `orchestrator_pure@swe_light`; `orchestrator_pure@document_review` | `teamwork_orchestrator` / `teamwork_swe` / `teamwork_document` | 22, 48, 43 | §2.1, §2.6, §2.2 |
+| **Explorers** | `explorer` (also `strategy_explorer`, same runtime type) | `teamwork_explorer` | 9, 32 | §2.1, §5.5 |
+| **Workers** | `armed_worker`, `armed_worker@colosseum`, `armed_worker@document_review`, `lemma_proof_worker` | `teamwork_worker` | 2, 40, 41, 20 | every route |
+| **Critic** | `armed_critic` (and `reviewer_critic` for the combined review+challenge role) | `teamwork_critic` / `teamwork_reviewer` | 1, 26 | §2.1, §2.6, §5.1 |
+| **Challenger** | `empirical_challenger` | `teamwork_challenger` | 6 | §2.1, §5.5 |
+| **Auditor** | `forensic_auditor` | `teamwork_auditor` | 10 | milestone gates, §4 |
+| **Success Auditor** | `victory_auditor`, `victory_auditor@document_review` | `teamwork_victory_auditor` / `teamwork_document_victory_auditor` | 39, 45 | §4, spine outcome |
+
+**Three warnings when using this table.**
+
+1. **"Success Auditor" is not in the binary.** `grep -aobFi 'success auditor'` returns zero hits. The role is real and is described at length, but under the short name `victory_auditor`. A literal search is a false negative, not evidence of absence.
+2. **"Project Orchestrator" is prompt vocabulary, not a type.** The phrase is literal in the sentinel prompt — "You manage one subagent: the Project Orchestrator." @ 113,255,284 — and in the orchestrator's own architecture @ 114,750,837, but no registry entry carries that name. The general route's type is `teamwork_orchestrator` (short name `orchestrator_pure`), and the same short name is re-armed for SWE Light and Document Review with different prompts.
+3. **"Critic" is not one registry entry.** `armed_critic` is the domain-expert adversarial reviewer; `reviewer_critic` "both objectively reviews AND adversarially challenges". Which one the docs' single role denotes depends on the stage. Do not collapse them.
+
+**A documented edge whose cadence the binary does not state — DOCS-ONLY in its documented form.** The docs say the Project Orchestrator "hands off to a fresh successor between milestones to prevent context degradation". The binary has the succession subsystem — `successor` is a named orchestrator role ("handles self-succession when context grows too large. Writes state, spawns replacement, and exits" @ 114,727,128); the architecture draws `[Project Orchestrator] … self-succeeds … [Successor]` @ 114,750,837–114,750,863; `succession_threshold` appears at 113,710,972 and per-route at 114,116,924 / 114,738,827 / …; `Spawn count: [0] / [succession_threshold]` @ 113,710,952 — but its trigger is a **spawn count**, not a milestone boundary. The edge, labelled:
+
+```text
+[Project Orchestrator] --(DOCS-ONLY: between milestones)--> [fresh Successor]
+[Project Orchestrator] --(OBSERVED: at succession_threshold spawns)--> [fresh Successor]
+```
+
+The second form is the shipped one. `[DOCS for the milestone wording; OBSERVED for the successor role, the self-succeeds edge and the threshold literal; DIVERGENT on cadence — see 10-official-docs-cross-check.md §3.4]` This edge is **not** drawn in the §1 spine or any route diagram, because it is a property of the orchestrator's own context management (like `BRIEFING.md` re-reading), not a dispatch edge between pipeline nodes.
 
 ---
 

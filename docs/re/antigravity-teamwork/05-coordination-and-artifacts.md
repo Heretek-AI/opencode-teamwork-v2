@@ -1,14 +1,17 @@
 # Coordination and Artifacts — Antigravity `/teamwork`
 
-Static-analysis reconstruction of how the Google Antigravity Linux CLI's `/teamwork` subsystem coordinates multiple agents, and what it leaves on disk. [OBSERVED] Every fact labelled OBSERVED below was measured from the extracted binary identified in `00-artifact-identity.md` (SHA-256 `37873b8062391b6202a3d3199ec012abc9e53aab720d26cd65699441497d8c94`) by string and offset inspection. No part of the binary was executed, and no network or authentication was used. [OBSERVED]
+Static-analysis reconstruction of how the Google Antigravity Linux CLI's `/teamwork` subsystem coordinates multiple agents, and what it leaves on disk. [OBSERVED] Every fact labelled OBSERVED below was measured either from the extracted binary identified in `00-artifact-identity.md` (SHA-256 `37873b8062391b6202a3d3199ec012abc9e53aab720d26cd65699441497d8c94`) by string and offset inspection, or — where marked **OBSERVED — source** — from the shipped builtin tree at a cited `file:line`. No part of the binary was executed, and no network or authentication was used. [OBSERVED]
 
-Companion documents: `00-artifact-identity.md` (binary identity, section map), `01-command-contract.md` (command surface), `02-agent-registry.md` (the 49-entry agent roster, now fully bound name → runtime type → description → tool allowlist via pclntab + RELA decoding; the remaining unknowns are per-agent model tiers, cascade config and the `indexByName` key), `PROVENANCE.md` (chain of custody, licensing, method limits), `prompts/sentinel-routing.md` (recovered routing prompt text).
+Companion documents: `00-artifact-identity.md` (binary identity, section map), `01-command-contract.md` (command surface), `02-agent-registry.md` (the 49-entry agent roster, now fully bound name → runtime type → description → tool allowlist via pclntab + RELA decoding; the remaining unknowns are per-agent model tiers, cascade config and the `indexByName` key), `09-swarm-board-and-skills.md` (the coordination layer re-derived from the materialised builtin source: board files, ordering, channels, wake/park/nudge, concurrency), `PROVENANCE.md` (chain of custody, licensing, method limits), `prompts/sentinel-routing.md` (recovered routing prompt text).
+
+**Reconciliation with the materialised source.** This edition is cross-checked against the shipped builtin tree under `/home/john/.gemini/antigravity-cli/builtin` (captured into `assets/builtin/`). Statements taken from it are cited as `path:line` and analysed in `09-swarm-board-and-skills.md`; the binary-offset citations of this document are unchanged. The two evidence kinds are labelled separately: **OBSERVED** with a decimal offset means read from the binary, **OBSERVED — source** with `file:line` means read from the shipped text. Where the binary left the board's storage, ordering or channel semantics `UNKNOWN`, the sidecar that reads those files settles them; the Go struct shapes below remain the **in-memory superset**, and the persisted record is the subset that survives `omitempty` (§2.1).
 
 ## Confidence Legend
 
 | Label | Meaning |
 |---|---|
 | **OBSERVED** | Directly read from the artifact: a byte sequence at a measured file offset, or a type/function path present in the binary. Earned by quoting the value and its offset. |
+| **OBSERVED — source** | Read directly in the shipped builtin tree at a cited `path:line` (sidecar JavaScript, manifests, skills). Used for statements about the board files and the Swarm feature that the binary cannot show; `09-swarm-board-and-skills.md` owns the full analysis. |
 | **INFERRED** | Derived by reasoning over observed data (field names, JSON tags, function-name morphology, prompt prose). Earned by stating the premises. |
 | **UNKNOWN** | Not measured, or not determinable from the available evidence. Written literally as `UNKNOWN`; never guessed. |
 
@@ -18,15 +21,15 @@ Reading note: a field's **existence, name, type, and JSON tag** are OBSERVED whe
 
 ## 1. Coordination model overview
 
-The `/teamwork` subsystem uses three coordination mechanisms that are visible in the binary as (a) a Go message type, (b) a member-registry type, and (c) a set of on-disk path literals. [OBSERVED for the types and paths; INFERRED for the composition]
+The `/teamwork` subsystem uses three coordination mechanisms that are visible in the binary as (a) a Go message type, (b) a member-registry type, and (c) a set of on-disk path literals. [OBSERVED for the types and paths; INFERRED for the composition] The board's file format, location and ordering are now read from the shipped sidecar that consumes it (§2.1, §4.3, §6.2), which is why its entry below carries source citations as well as binary ones.
 
-**A shared, append-ordered board.** [OBSERVED type: `board.Message`] The `cortex/core/native_swarm/board` package defines a `Message` with a `Seq uint64` sequence field, an `Agent` author field, a `Text` body, a `Channel`, and a `RequestID`. A `View` type with `Since` and `Unread`/`AnyUnread` operations sits over it. [OBSERVED — `board.(*View).Since` at file offset 40,762,550; `board.View.AnyUnread` at 40,757,786] The prose model that follows — that posts are append-only and addressed by agent name, with channels and request/response correlation — is **INFERRED from the field set and the accessor names**, not proven by control-flow analysis.
+**A shared, append-ordered board.** [OBSERVED type: `board.Message`] The `cortex/core/native_swarm/board` package defines a `Message` with a `Seq uint64` sequence field, an `Agent` author field, a `Text` body, a `Channel`, and a `RequestID`. A `View` type with `Since` and `Unread`/`AnyUnread` operations sits over it. [OBSERVED — `board.(*View).Since` at file offset 40,762,550; `board.View.AnyUnread` at 40,757,786] The board is now established as an append-only JSONL log, one record per line, addressed by agent name and optionally by channel: the materialised sidecar reads `board.jsonl`, derives recipients from `@name`/`@all`/`@#channel` in the text, and replays channel controls in file order (`09` §§3–5). What remains **INFERRED** is request/response correlation: `request_id` has no consumer in the native-swarm reader, so this document does not claim it as part of the swarm protocol.
 
 **A member registry with lifecycle state.** [OBSERVED type: `swarm.Member`] The `cli/swarm` package defines a `Member` carrying `Name`, `Role`, `Model`, `State`, `ConversationID`, `Workspace`, and an `Openable bool`. A separate `board.Member` type exists in the native-swarm board package with methods `Live`, `Killed`, `MarkKilled`, `SetState`, `State`, `Sees`, `EffectiveChannels`, and `HomeChannelIn`. [OBSERVED — e.g. `board.(*Member).MarkKilled` at 40,759,106; `board.(*Member).Sees` at 40,756,473; `board.(*Lifecycle).Note` at 40,755,746] That the registry tracks per-agent liveness and channel membership is **INFERRED from those method names**.
 
-**Per-task artifact files on disk.** [OBSERVED path literals] The prompts direct every agent to write into a `.agents/teamwork/` state tree: a single `ORIGINAL_REQUEST.md`, per-agent `BRIEFING.md` / `handoff.md` / `progress.md`, per-segment `handoff_<index>.md`, and per-synthesis `candidate_<index>.md`. Scratch work goes to a `teamwork_tmp` directory. [OBSERVED — offsets tabulated in §6] The board itself is plausibly persisted alongside as `board.jsonl`. [OBSERVED that the literal `board.jsonl` exists at 105,759,229; INFERRED that it is this board's backing file — the binding is not proven; see §8]
+**Per-task artifact files on disk.** [OBSERVED path literals] The prompts direct every agent to write into a `.agents/teamwork/` state tree: a single `ORIGINAL_REQUEST.md`, per-agent `BRIEFING.md` / `handoff.md` / `progress.md`, per-segment `handoff_<index>.md`, and per-synthesis `candidate_<index>.md`. Scratch work goes to a `teamwork_tmp` directory. [OBSERVED — offsets tabulated in §6] Separately, the **native swarm** board persists as `board.jsonl` in `<appData>/brain/<coordinatorConv>/.system_generated/swarm/`, beside a `members.json` roster. [OBSERVED — source: `plugins/swarm/sidecars/swarm_board/main.mjs:134`, `:724`; `09` §§2–3] That binding is proven for the Swarm feature; it is **not** proven for `/teamwork-preview`, and no recovered `/teamwork-preview` prompt or symbol binds it to `board.jsonl` (`09` §11). The earlier reading of `board.jsonl` as a probable `/teamwork` artifact is withdrawn as unsupported.
 
-The three mechanisms are complementary rather than redundant [INFERRED]: the board carries agent-to-agent **traffic** (posts, requests, control), the registry carries **presence** (who is alive, on which model, in which channel), and the filesystem carries **durable per-task handoff state** that survives context loss and succession.
+The mechanisms are complementary rather than redundant [INFERRED]: the board carries agent-to-agent **traffic** (posts, channel controls, wake cursors) and belongs to the native-swarm feature; the registry carries **presence** (who is alive, on which model, in which channel); and the `.agents/teamwork/` filesystem carries **durable per-task handoff state** for `/teamwork-preview` that survives context loss and succession. The board and the teamwork file tree are not shown to be the same substrate, and this document does not merge them.
 
 ---
 
@@ -49,22 +52,46 @@ struct {
 
 | # | Field | Go type | JSON key | Inferred purpose |
 |---:|---|---|---|---|
-| 1 | `Seq` | `uint64` | `seq` | Monotonic sequence number, assigned per post and used to order the board. [OBSERVED field+tag; INFERRED purpose] |
+| 1 | `Seq` | `uint64` | `seq` | Per-board sequence number, assigned per post. The board's head is the last line's `seq` and unread is `head − last_read_seq`; the reader displays file order and does not sort by `seq` (§2.1, §4.3). [OBSERVED field+tag; OBSERVED — source for use; allocation site UNKNOWN] |
 | 2 | `Agent` | `string` | `agent` | Author's registered name; the address used for `@name` posts. [INFERRED from name + prompt's `@%s` usage] |
 | 3 | `Text` | `string` | `text` | Message body. [INFERRED from name] |
-| 4 | `Time` | `string` | `time` | Timestamp. Stored as `string`, so the wire format is not constrained by the type. Actual layout is UNKNOWN. [OBSERVED type; INFERRED purpose] |
-| 5 | `Kind` | `board.MessageKind` | `kind,omitempty` | Message-class enum (e.g. ordinary post vs. control). The enum's member values are UNKNOWN. [OBSERVED field; INFERRED purpose; UNKNOWN values] |
-| 6 | `RequestID` | `string` | `request_id,omitempty` | Correlation key pairing a request with its response(s) across agents. [INFERRED from name] |
-| 7 | `Channel` | `string` | `channel,omitempty` | Channel/topic the post belongs to. Optional in JSON. Semantics are UNKNOWN (§8). [OBSERVED field; UNKNOWN semantics] |
-| 8 | `Control` | `*board.Control` | `control,omitempty` | Optional pointer to a control payload (the board also exposes `board.ApplyControl` at 40,757,947 and `board.HasControl`). **The `board.Control` struct itself is UNKNOWN** — no instantiation-printing literal for it was recovered. [OBSERVED field+accessors; UNKNOWN schema] |
+| 4 | `Time` | `string` | `time` | Timestamp. Stored as `string`. **Settled** from the reader: `"YYYY-MM-DD HH:MM:SS"` in the Language Server host's local time, parsed by replacing the space with `T` (`main.mjs:509-515`; `09` §3.1). [OBSERVED type; OBSERVED — source layout] |
+| 5 | `Kind` | `board.MessageKind` | `kind,omitempty` | Message-class enum (e.g. ordinary post vs. control). No consumer in the native-swarm reader and no value observed on disk, so whether native swarm emits it, and the enum's members, are UNKNOWN (`09` §3.1). [OBSERVED field; INFERRED purpose; UNKNOWN values] |
+| 6 | `RequestID` | `string` | `request_id,omitempty` | Plausible correlation key pairing a request with its response(s), but not established: the native-swarm reader never consults it and the board pairs nothing (`09` §3.4). [INFERRED from name; usage UNKNOWN] |
+| 7 | `Channel` | `string` | `channel,omitempty` | Channel/topic the post belongs to; absent or `""` means `main`, and a named channel exists only after a `create` control. **Established** from the materialised source (`channels.mjs:66-67`, `:203-220`; `09` §5). [OBSERVED field and semantics] |
+| 8 | `Control` | `*board.Control` | `control,omitempty` | Optional control payload (the board also exposes `board.ApplyControl` at 40,757,947 and `board.HasControl`). The **key names are now established** from the reader's mirror: `{op, channel, topic, members, prev, next}`, with `op ∈ create, archive, subscribe, unsubscribe`; `prev`/`next` map a member name to its stored set or `null` (`channels.mjs:8-10`, `:86-96`, `:203-220`; `09` §5). The Go struct's own field types and tags remain unrecovered. [OBSERVED field+accessors; OBSERVED — source for keys and ops; UNKNOWN Go layout] |
 
 Tag-level observations [OBSERVED]:
 
 - `seq`, `agent`, `text`, and `time` have **no** `omitempty`; `kind`, `request_id`, `channel`, and `control` do. This means the first four are always serialized and the last four are dropped when zero-valued. [OBSERVED — read from the tags]
 - `Seq` is `uint64`, not `int64` or a string, which is consistent with a monotonic counter rather than a timestamp-derived identifier. [OBSERVED type; INFERRED intent]
-- `RequestID` is present on the **message**, not on a separate envelope, so request/response correlation is a per-post property. [OBSERVED layout; INFERRED consequence]
+- `RequestID` is present on the **message**, not on a separate envelope, so *if* request/response correlation exists it is a per-post property. [OBSERVED layout; INFERRED consequence; whether it is used at all is UNKNOWN — §2.1]
 
 The `board.MessageKind` type name appears in the same blob at file offset 40,757,481. [OBSERVED]
+
+### 2.1 In-memory superset vs persisted record
+
+The sidecar reads each line of `board.jsonl` for `seq`, `agent`, `text` and `time`, plus two optional keys, `channel` and `control`. Nothing in the tree reads `kind` or `request_id`. [OBSERVED — source: `board_cache.mjs:367-382`; `channels.mjs:66-70`; negative result for `kind`/`request_id`]
+
+| Field | On disk? | Evidence |
+|---|---|---|
+| `seq` | always | read at `board_cache.mjs:371`; tag has no `omitempty` |
+| `agent` | always | read at `board_cache.mjs:372`; tag has no `omitempty` |
+| `text` | always | read at `board_cache.mjs:373`; tag has no `omitempty` |
+| `time` | always | read at `board_cache.mjs:374`; tag has no `omitempty` |
+| `channel` | only when not `main` | `channels.mjs:66-67`; `omitempty` |
+| `control` | only on control lines | `channels.mjs:70`; `omitempty` |
+| `kind` | never observed | no consumer in this tree |
+| `request_id` | never observed | no consumer in this tree |
+
+[OBSERVED — source for the left and middle columns; INFERRED that the persisted line is exactly the `omitempty` projection of `board.Message`]
+
+The four always-present keys are precisely the four tags without `omitempty`, and the two optional keys are two of the four tags that carry it. That is a direct structural match, not a naming coincidence: the Go struct printed at 40,757,180 is the **in-memory superset**, and `board.jsonl` stores the subset that survives encoding. [INFERRED from the tag set (OBSERVED at 40,757,180) and the reader's field access (OBSERVED at `board_cache.mjs:367-382`); premises both stated]
+
+Two further settlements for §8:
+
+- **`time` encoding.** The reader documents and implements `"YYYY-MM-DD HH:MM:SS"` in the Language Server host's local time, parsed by replacing the space with `T`; an unparseable value becomes `null` rather than a guessed instant (`main.mjs:509-515`). [OBSERVED — source; the comment states the writer's format and the parser accepts exactly that shape]
+- **Board identity.** A board is one `board.jsonl` under the coordinator's conversation, and workers' panes resolve to it by roster membership (`main.mjs:220-225`, `:268-288`; `09` §2.1). It is not a per-run or per-agent file. [OBSERVED — source]
 
 ---
 
@@ -103,7 +130,16 @@ struct {
 Two structural observations [OBSERVED, consequences INFERRED]:
 
 - **No JSON tags.** Unlike `board.Message`, `swarm.Member`'s instantiation carries no struct tags. This is consistent with `swarm.Member` being an in-process/UI model rather than the board wire format. It is a negative observation, so the conclusion is INFERRED.
-- **A second, distinct member type exists.** `board.Member` (package `cortex/core/native_swarm/board`) is *not* the same type as `swarm.Member`. `board.Member` exposes methods `Live` (40,758,947), `Killed` (40,758,866), `MarkKilled` (40,759,106), `SetState` (40,759,730), `State` (40,759,650), `Sees` (40,756,473), `EffectiveChannels` (40,756,060), `HomeChannelIn` (40,756,314), plus free functions `board.RoleOf`, `board.StateOf`, `board.AddedByOf`, and `board.(*Roster).SortedNames`. [OBSERVED symbol names] Its field layout was not recovered as an instantiation string, so the `board.Member` struct is **UNKNOWN**; only its method surface is OBSERVED. Do not conflate the two `Member` types.
+- **A second, distinct member type exists.** `board.Member` (package `cortex/core/native_swarm/board`) is *not* the same type as `swarm.Member`. `board.Member` exposes methods `Live` (40,758,947), `Killed` (40,758,866), `MarkKilled` (40,759,106), `SetState` (40,759,730), `State` (40,759,650), `Sees` (40,756,473), `EffectiveChannels` (40,756,060), `HomeChannelIn` (40,756,314), plus free functions `board.RoleOf`, `board.StateOf`, `board.AddedByOf`, and `board.(*Roster).SortedNames`. [OBSERVED symbol names] Its field layout was not recovered as an instantiation string, so the `board.Member` struct is still **UNKNOWN**; only its method surface is OBSERVED. Do not conflate the two `Member` types.
+
+**The persisted roster is a third shape.** `members.json` — the file the pane reads — is
+
+```text
+{"title","members":{name:{conversation_id,model,role,wake_mode,wait_since,
+                         last_read_seq,last_nudged_seq,last_park_blocked_seq,killed}}}
+```
+
+with optional `channels`, `workspace` and `workspace_mode`. [OBSERVED — source: `plugins/swarm/sidecars/swarm_board/README.md:25`; `main.mjs:817-845`; `09` §4] It is neither `swarm.Member` (the CLI/UI model above) nor `board.Member`: it stores four cursors (`wait_since`, `last_read_seq`, `last_nudged_seq`, `last_park_blocked_seq`) that neither Go shape shows, and it omits `ModelLabel`, `State`, `Failure`, `AddedBy` and `Openable`. The three shapes share `role`, `model` and `conversation_id` naming but are distinct models; this document does not treat one as another's serialisation.
 
 ### 3.1 Live-swarm state (`cli/swarm/live`)
 
@@ -151,36 +187,53 @@ Argument roles [INFERRED from placeholder order]:
 
 | Literal (verbatim) | File offset | Reading |
 |---|---:|---|
-| `read swarm board head: %w` | 106,837,128 | Error-wrapper for a **head-read** operation: the board is read from its head (oldest end) and a failure is wrapped as `read swarm board head: <err>`. [OBSERVED string; INFERRED direction from "head"] |
+| `read swarm board head: %w` | 106,837,128 | Error-wrapper for reading the board's **head**. In this product the head is the *newest* position — the `seq` of the last line (`main.mjs:765`), from which unread is measured as `head − last_read_seq` (`main.mjs:808`). The earlier reading of "head" as the oldest end is withdrawn; the sidecar's vocabulary is unambiguous. [OBSERVED string; OBSERVED — source for the meaning] |
 | `open swarm %s: %w` | 106,303,574 | Error-wrapper for opening a named swarm (`%s`), typically when rehydrating from disk. [OBSERVED string; INFERRED purpose] |
 
-The `read ... head:` phrasing implies a file-backed log read from the beginning rather than a random-access query. [INFERRED] The literal `read %s: %w` also occurs adjacent to `board.jsonl` at 105,759,229, which is consistent with a single read routine used for the board file. [OBSERVED adjacency; INFERRED]
+`read ... head:` is consistent with reading the log up to its current position, which is exactly what the sidecar does: a full read of `board.jsonl` from offset 0, then a verified tail read on each poll (`board_cache.mjs:164-212`). The literal `read %s: %w` also occurs adjacent to `board.jsonl` at 105,759,229, which is consistent with a single read routine used for the board file. [OBSERVED adjacency; INFERRED — and now corroborated by the reader]
 
-### 4.3 Ordering — what is and is not established
+### 4.3 Ordering and sequencing — now settled as to scope
 
-- **Within a message, ordering is carried by `Seq uint64`.** [OBSERVED field] That `Seq` is assigned monotonically and used to sort the board is **INFERRED** from its type, the `seq #%d` format, and the presence of view operations `board.(*View).Since`, `board.View.Latest`, `board.View.Unread`, and `board.View.AnyUnread`. [OBSERVED symbols]
-- **Whether `seq` is global across the whole board or allocated per-channel is UNKNOWN.** No evidence recovered distinguishes the two. The coexistence of a single `Seq` field with a `Channel` field is compatible with either scheme. [UNKNOWN]
-- **Per-viewer read position is plausible.** `board.(*MemberState).CatchUp` (40,759,813) and `board.(*MemberState).FastForwardAuthor` (40,759,900) suggest each member tracks how far it has consumed the board and can advance past a specific author; `board.(*View).Since` (40,762,550) suggests a "give me everything after position *x*" query. [OBSERVED symbols; INFERRED semantics] This is *consistent with* a single monotonic sequence space, but is **not proof** of one.
-- **Concurrency is guarded.** A `board.LockedStore` type exists; its method value `board.LockedStore.ChannelActive-fm` is spelled out at 40,782,928. `board.NewRateLimiter` and `board.(*RateLimiter).Allow` exist at 40,755,277 and 40,759,565. [OBSERVED symbols] That a lock protects the board store and that a rate limiter throttles posting is **INFERRED from names**. The actual conflict-resolution policy is UNKNOWN (§8).
-- **Write-path validation exists.** `board.ValidatePost` (40,760,158), `board.ValidatePostChannel`, `board.validateAuthor`, `board.ValidateChannelName`, and `board.NormalizeChannel` (40,756,847) are all OBSERVED symbol names. [OBSERVED] Their rules are UNKNOWN.
+- **Within a message, ordering is carried by `Seq uint64`.** [OBSERVED field] That `Seq` is monotonic in practice is **INFERRED** from its type, the `seq #%d` format, and the view operations `board.(*View).Since`, `board.View.Latest`, `board.View.Unread`, and `board.View.AnyUnread`. [OBSERVED symbols]
+- **`seq` is one number space per board, shared by every channel.** This is now established from how the file is consumed: the board head is the last line's `seq` regardless of channel (`main.mjs:765`); a member has one `last_read_seq` and `unread = head − last_read_seq` (`main.mjs:801-808`); the delta cursor is a message index validated against the `seq` at that index (`main.mjs:1407-1411`); channel `create`/`archive` controls carry `seq` into the same axis (`channels.mjs:157-177`); and subscription state is replayed from the log in array order (`channels.mjs:98-111`, `:203-220`). [OBSERVED — source expressions; INFERRED that the scope follows]
+- **Message order is file order, not a `seq` sort.** No reader sorts messages; `seq` is an identifier and cursor, and the file is assumed to be written in order. A line written out of order would display in file order while `head` follows the last line. [OBSERVED — absence of a comparator; INFERRED consequence]
+- **`seq` allocation is not established.** The sidecar neither appends nor increments `seq`; it reads whatever each line carries (`board_cache.mjs:371`; `main.mjs:12`). Where the Go writer keeps its counter, and whether it survives a board rewrite, is outside the materialised source and remains UNKNOWN (§8). The `head` fallback `|| msgs.length` (`main.mjs:765`) is consistent with a 1-based contiguous board but does not prove one. [OBSERVED — source; UNKNOWN allocator]
+- **Per-viewer read position is established.** `board.(*MemberState).CatchUp` (40,759,813) and `board.(*MemberState).FastForwardAuthor` (40,759,900) suggested it; the roster's `last_read_seq` and the unread computation prove the concept, and the skill's "set its board cursor past the startup briefs" (`skills/native_swarm/SKILL.md:347-350`) shows it is advanced on `add`. [OBSERVED — source; the free functions' own rules remain UNKNOWN]
+- **Concurrency is guarded on both ends, by different means.** The binary has a `board.LockedStore` type (method value `board.LockedStore.ChannelActive-fm` at 40,782,928) and a rate limiter (`board.NewRateLimiter` 40,755,277, `board.(*RateLimiter).Allow` 40,759,565). [OBSERVED symbols; their policy INFERRED from names, UNKNOWN] The read side needs no lock because it only reads: it verifies inode, head anchor, tail anchor and the unremembered trailing bytes, and falls back to a full read on any mismatch (`board_cache.mjs:78-117`, `:147-162`; `09` §7). What the writer's lock protects, and whether a line append is one atomic write, remains UNKNOWN.
+- **Write-path validation exists, and one rule is now known.** `board.ValidatePost` (40,760,158), `board.ValidatePostChannel`, `board.validateAuthor`, `board.ValidateChannelName`, and `board.NormalizeChannel` (40,756,847) are OBSERVED symbol names. [OBSERVED] The channel-name rule is established from the reader's mirror: `^[a-z][a-z0-9-]{0,23}$`, with `main`, `all` and `here` reserved (`channels.mjs:119-120`). The remaining validation rules are UNKNOWN.
 
 ---
 
-## 5. Channel model — existence only
+## 5. Channel model — established from the reader's mirror
 
-Channels are more than a vestigial field, but their rules are not recovered. [OBSERVED names; UNKNOWN semantics]
+The binary gave only symbol names. The materialised sidecar carries an explicit, pure-JS mirror of the board package's channel rules, and states that it is tested against the same table as the Go code:
 
-| Symbol | File offset | Inference |
-|---|---:|---|
-| `board.DefaultChannels` | 40,756,142 | A default channel set exists. [INFERRED] |
-| `board.EffectiveChannels` / `board.(*Member).EffectiveChannels` | 40,756,060 | A member's channels are computed, not just stored — likely defaults + inheritance + explicit subscriptions. [INFERRED] |
-| `board.InheritChannels` | 40,758,402 | Channels can be inherited (e.g. child agents from a parent). [INFERRED] |
-| `board.ChannelMentions` / `board.MentionsIn` / `board.SeesIn` | 40,755,356 / 40,755,436 / 40,756,402 | `@name` addressing is channel-scoped. [INFERRED] |
-| `board.NormalizeChannel` / `board.ValidateChannelName` | 40,756,847 / 40,760,484 | Channel names are canonicalised and validated. [INFERRED] |
-| `board.(*Member).HomeChannelIn` | 40,756,314 | A member has a "home" channel within a context. [INFERRED] |
-| `board.PrepareChannelOp` / `board.SubscribeOp` | 40,758,167 / 40,758,091 | Channel membership changes are explicit operations. [INFERRED] |
+> "Mentions and channel visibility for the Swarm pane, mirroring the native_swarm board package (board/mentions.go, board.ChannelsAt and board.Member.Sees). Pure functions, no I/O … the Go test runs them against the same table as the Go code, board/testdata/sees_cases.json, so the two cannot drift."
 
-What a channel *does* — broadcast scope, delivery ordering, whether posts are visible only to members whose effective channels include the message's channel, whether channels are per-conversation or per-swarm — is **UNKNOWN**. [UNKNOWN]
+[OBSERVED — source: `plugins/swarm/sidecars/swarm_board/channels.mjs:1-11`]
+
+That makes the rules below **OBSERVED — source**, with one honest caveat: the Go implementation is the original and the JavaScript is the mirror, so a mirror bug would show up as a rule stated here that the writer does not implement. The mirror's own README and tests are the defence, not this document.
+
+| Symbol (binary offset) | What the mirror establishes | Evidence |
+|---|---|---|
+| `board.DefaultChannels` (40,756,142) / `board.EffectiveChannels` (40,756,060) | A member's set is explicit if stored; otherwise coordinator/narrator/monitor get `["*"]` and workers get `main` only. `main` is implied, never stored. | `channels.mjs:72-84` |
+| `board.InheritChannels` (40,758,402) | A helper added by a worker "joins its adder's channels unless `channels` says otherwise" (skill prose, not mirror code). | `skills/native_swarm/SKILL.md:269-271` [INFERRED] |
+| `board.ChannelMentions` (40,755,356) / `board.MentionsIn` (40,755,436) | `@#name` parses at a word start, lowercases, must match the channel grammar, and addresses every member whose set (as of that message) holds the channel or `*`, while the channel is active. `@#main` is parsed but calls nobody. | `channels.mjs:113-150` |
+| `board.SeesIn` (40,756,402) | A message is visible if it is on `main`, the member's own post, a channel the set holds (or `*`), or a post that calls on the member. | `channels.mjs:179-187` |
+| `board.NormalizeChannel` (40,756,847) / `board.ValidateChannelName` (40,760,484) | Channel names are `^[a-z][a-z0-9-]{0,23}$`; `main`, `all`, `here` are reserved. | `channels.mjs:119-120` |
+| `board.(*Member).HomeChannelIn` (40,756,314) | The brief is posted in the worker's first channel, which is where its posts go by default (skill prose). | `skills/native_swarm/SKILL.md:266-268` [INFERRED] |
+| `board.PrepareChannelOp` (40,758,167) / `board.SubscribeOp` (40,758,091) | Subscription changes are log controls (`subscribe`/`unsubscribe`) carrying `members` and `prev`/`next` maps; each takes effect from its own message onward. | `channels.mjs:86-111` |
+
+The model in full:
+
+- **One `main`, plus named channels created on demand.** `main` is the absence of a `channel` value (`channels.mjs:66-67`); a named channel exists only after an `op:"create"` control, and `op:"archive"` stops it without deleting history (`channels.mjs:203-220`).
+- **Broadcast scope is subscription-based, not sender-based.** The sender writes a channel name; the reader decides who can see it from each member's set *as of that message* (`channels.mjs:98-111`, `:179-187`). It is therefore possible for a post in `#parser` to be invisible to a worker who was moved out of `#parser` later, and visible to one who was moved in before it — the history is positional.
+- **Mentions cross channels; channel posts do not.** `@name`/`@all` reach a member regardless of channel (`channels.mjs:141-150`); an unaddressed post in `#parser` reaches only `#parser`'s subscribers, plus the roles that see every channel (`skills/native_swarm/SKILL.md:297-300`, `:352-355`).
+- **"Unread" means "visible and after my cursor".** Control messages never count, and a message the member cannot see is not unread even if its `seq` is newer (`channels.mjs:189-191`, `:232-240`).
+- **Channels are per board.** One channel registry serves the whole swarm; the board itself is rooted at the coordinator's conversation (§2.1), so a worker's pane resolves to the same channels as the coordinator's.
+- **Ordering is not per channel.** One log, one `seq` space (§4.3).
+
+What remains open about channels is not the visibility rule but its **enforcement and delivery**: whether the writer rejects a post to an unknown/archived channel at post time (`board.ValidatePostChannel` exists; its rule is not recovered), and whether delivery is push-to-subscriber inside the Language Server or pull by each member on wake. The mirror proves what a member *sees*; it does not prove what wakes a parked member for a channel post. The skill's contract says an `anything` waiter wakes for its own channels and `main`, and a `mentions` waiter only for a name/`@all`/`@#its-channel` (`skills/native_swarm/SKILL.md:297-305`, `:322-324`), and that is the best available statement of delivery. [OBSERVED — source for visibility; INFERRED for delivery]
 
 ---
 
@@ -196,7 +249,7 @@ All paths below are OBSERVED literals unless a row says otherwise. Templated seg
 | `.agents/teamwork/segment_<segment_name>/handoff_<candidate_index>.md` | Candidate review written by an analyst for one segment, read by the group orchestrator. | Literal `.agents/teamwork/segment_<segment_name>/handoff_<candidate_index>.md` at 115,094,780; concrete example at 115,094,866. [OBSERVED] |
 | `.agents/teamwork/synthesis/candidate_<index>.md` | Candidate report written by a level-0 synthesizer before reduction. | Literal at 115,099,834; example at 115,099,895. [OBSERVED] |
 | `teamwork_tmp` (scratch) | Per-run scratch area; prompt: use `<appDataDir>/scratch/teamwork_tmp/<conversation-id>` (or `<appDataDir>/brain/<conversation-id>/scratch/teamwork_tmp` when unwritable) and "delete only that directory" before handoff. | Literal `teamwork_tmp` at 111,760,275. [OBSERVED] |
-| `board.jsonl` | Probable board persistence file (JSONL = one JSON object per line, matching an append-only board). Its directory binding is not proven. | Literal at 105,759,229, 111,917,078, 112,244,999. [OBSERVED literal; INFERRED purpose] |
+| `board.jsonl` | The **native-swarm** board log: append-only JSONL, one message per line, under `<appData>/brain/<coordinatorConv>/.system_generated/swarm/`. Its directory binding is proven for the Swarm feature; it is not part of `.agents/teamwork/` and is not proven for `/teamwork-preview` (`09` §11). | Literal at 105,759,229, 111,917,078, 112,244,999 [OBSERVED literal]; binding OBSERVED — source: `main.mjs:134`, `main.mjs:724`; `SB/README.md:19-24` |
 
 ### 6.1 The `.agents/` versus `agents/` discrepancy — flagged
 
@@ -207,6 +260,22 @@ The evidence brief listed several paths **without** the leading dot: `agents/tea
 - A search for a standalone dotless `agents/teamwork/...` literal (one not preceded by `.`) found **none**. [OBSERVED — negative result]
 
 **Conclusion:** the canonical form in the prompts is **`.agents/teamwork/`**; the dotless forms in the brief were substring artefacts of a `grep -F` match landing one byte into the same literal. This is a reporting inconsistency in the evidence summary, not two competing path conventions in the product. Separately, the prompt makes the `.agents/` tree *relocatable*: it may resolve to `<appDataDir>/scratch/teamwork/<run_id>/.agents/teamwork/` rather than a workspace-relative directory (`<appDataDir>/scratch/teamwork` literal at 111,756,294; `<run_id>` at 111,756,307). [OBSERVED prompt prose; consequence INFERRED] An unrelated literal `agents/*.md` at 105,656,027 is a glob for agent markdown files and is **not** part of the task-artifact set.
+
+### 6.2 Native-swarm state files (not `/teamwork-preview` artifacts)
+
+Beside the task tree, the Swarm feature writes its own coordination state. These files are **not** `.agents/teamwork/` artifacts and no recovered `/teamwork-preview` prompt names them; they are listed here so the two on-disk footprints are not confused (`09` §§2–5).
+
+| File | Shape | Purpose |
+|---|---|---|
+| `.system_generated/swarm/board.jsonl` | JSONL, one message per line | the append-only board |
+| `.system_generated/swarm/members.json` | `{title, members:{name:{…}}}` | roster + wake/read cursors (§3) |
+| `.system_generated/swarm/view.json` | narrator Overview data | presentation only; never read for control |
+| `.system_generated/swarm/view.html` | narrator template, sandboxed | presentation only |
+| `.system_generated/swarm/plan.json` | `{goal,tasks,threads}` | built-in Overview input |
+| `.system_generated/logs/transcript.jsonl` (per member) | one step per line | step counts, activity, failure/stuck detection |
+| `.system_generated/swarm/swarm.json` (remote) | `{backend,swarm_id,db}` | anchor for a multi-machine board; no local log |
+
+[OBSERVED — source: `SB/README.md:22-28`; `main.mjs:297-298`, `:720-731`, `:921-931`; `skills/swarm_pane/SKILL.md:22-29`]
 
 ---
 
@@ -222,7 +291,7 @@ Each entry names the source-file provenance string for the role's implementation
 
 **Sentinel agent** — `pipeline_sentinel_agent.go` at 48,231,161. [OBSERVED] The sentinel is the top-level router and monitor: the recovered prompt (`prompts/sentinel-routing.md`) has it record `ORIGINAL_REQUEST.md`, spawn the orchestrator, and run two crons. [OBSERVED prompt text] "Agent" in the filename may denote the sentinel's own agent definition rather than a separate worker. [INFERRED]
 
-**Follower** — `swarm_follower.go` at 48,232,279; role text at 108,449,168. [OBSERVED] Verbatim: "coordinate on the board, and do not repeat @%s's work." [OBSERVED] This is direct evidence that followers communicate through the board and are addressed by `@name`, and that duplicate-work avoidance is delegated to the follower itself rather than enforced centrally.
+**Follower** — `swarm_follower.go` at 48,232,279; role text at 108,449,168. [OBSERVED] Verbatim: "coordinate on the board, and do not repeat @%s's work." [OBSERVED] This is direct evidence that followers are told to coordinate through a board and are addressed by `@name`, and that duplicate-work avoidance is delegated to the follower itself rather than enforced centrally. **Caution:** the sentence is `/teamwork-preview` prompt prose and uses "the board" as a teamwork concept. No recovered teamwork file writes `board.jsonl`, and the persisted board is bound to the native-swarm feature (`09` §11). The quote proves the instruction, not the substrate.
 
 **Assembler / synthesizer** — `swarm_synthesizer.go` at 48,232,435, with the sibling `swarm_orchestrator.go` at 48,232,355. [OBSERVED] The synthesizer writes `synthesis/candidate_<index>.md` and later levels reduce candidates. [OBSERVED prompt text at 115,099,834] "Assembler" is not an observed name; it is the prompt's aggregation/reduction concept. [INFERRED]
 
@@ -232,20 +301,31 @@ Each entry names the source-file provenance string for the role's implementation
 
 ## 8. What is not established (UNKNOWN)
 
-The following are not determinable from the recovered static evidence. Each is written literally as UNKNOWN; none is inferred past the point the evidence supports.
+The first edition's ten unknowns were partly a consequence of static-only evidence. The materialised sidecar settles six of them without disassembly, because it reads the same files the Go writer produces. Those are listed first as **closed**; the table after them is everything that remains open.
+
+| Was unknown | Now | Evidence |
+|---|---|---|
+| Board persistence format and location | `board.jsonl` (one JSON message per line) plus `members.json`, under `<appData>/brain/<coordinatorConv>/.system_generated/swarm/` | §2.1, §6.2; `main.mjs:134`, `:724` |
+| Reader-side concurrency and malformed lines | Append-verified tail read (inode + 64-byte head/tail anchors + remainder), full-read fallback, epoch invalidation; malformed lines skipped, torn tail retried | §4.3, `09` §7 |
+| Channel semantics | `main` + named channels; role-based defaults; log-replayed subscriptions; visibility, unread and `@#` rules | §5 |
+| `board.Control` schema | Key names and ops established: `{op, channel, topic, members, prev, next}`; `op ∈ create, archive, subscribe, unsubscribe` | §5; `channels.mjs:8-10`, `:86-96` |
+| Whether `seq` is global or per-channel | One number space per board, shared by all channels and control lines; display order is file order | §4.3, `09` §3.3 |
+| `Time` encoding | `"YYYY-MM-DD HH:MM:SS"` in the LS host's local time | §2.1; `main.mjs:509-515` |
+
+Remaining unknowns:
 
 | # | Unknown | Why it remains unknown |
 |---:|---|---|
-| 1 | **Board persistence format and location.** A `board.jsonl` literal exists (105,759,229) and `open swarm %s: %w` / `read swarm board head: %w` exist, but no literal binds `board.jsonl` to a directory, and no serialisation schema beyond the `Message` JSON tags was recovered. Whether one board file exists per swarm, per conversation, or per run is UNKNOWN. |
-| 2 | **Concurrency control and conflict handling.** `board.LockedStore` and `board.RateLimiter` exist as names, but the lock scope, contention policy, and what happens on a rejected post are not recoverable. Whether posting is optimistic, serialised, or best-effort is UNKNOWN. |
-| 3 | **Channel semantics.** `DefaultChannels`, `EffectiveChannels`, `InheritChannels`, `ChannelMentions`, `NormalizeChannel`, `PrepareChannelOp`, and `SubscribeOp` exist as names, but broadcast scope, visibility rules, and per-channel ordering are not established. |
-| 4 | **`board.Control` schema.** It is observed only as a `*board.Control` field plus the accessors `board.ApplyControl` and `board.HasControl`. Its fields, its `Kind` values, and the operations it can command are UNKNOWN. |
-| 5 | **Retention and compaction.** No trimming, compaction, or rotation literal was found (`Trim*`, `Compact*`, and `Rotate*` scans returned nothing attributable to the board). Whether boards grow unbounded, and what `Seq` does after any reset, is UNKNOWN. |
-| 6 | **Whether `seq` is global or per-board/per-channel.** Only a single `uint64` field is observed; its allocation scope is not evidenced. This directly blocks any claim about cross-channel total order. |
-| 7 | **`board.Member` field layout and `State`/`Kind` enumerations.** The method surface is OBSERVED, the struct is not. Concrete values of `swarm.Member.State`, `board.Member.State`, and `board.MessageKind` are UNKNOWN. |
-| 8 | **`Time` encoding.** The field is `string`; RFC 3339 versus another layout, and whether it is UTC, are UNKNOWN. (Prompt prose asks agents to "Use UTC timestamps" for request records at 113,277,215, but that is prompt policy, not board encoding.) |
-| 9 | **Rendering of the post-progress line.** The format string has no closing `)` byte at 106,837,153; whether one is appended at runtime is UNKNOWN. |
-| 10 | **Runtime behaviour generally.** No execution was performed. Every "does X" statement in this document is either quoted prompt text or INFERRED from symbol/field names. |
+| 1 | **`seq` allocation.** Where the counter lives, how it is made monotonic, and whether it survives a board rewrite or reset. | The reader consumes `seq` and never writes or increments it (`board_cache.mjs:371`; `main.mjs:12`). Only a writer-side read or a live run can settle it. |
+| 2 | **Writer serialisation and conflict policy.** What `board.LockedStore` locks, whether a line append is one atomic write, and what happens to a rejected post. | Symbol names only; `board.ValidatePost`/`board.NewRateLimiter` are not disassembled here. The reader's anchor checks make it *tolerant* of a torn tail, not proof of a writer policy. |
+| 3 | **`board.Control` Go layout.** Field types, JSON tags, and whether `Kind` participates in control dispatch. | The JavaScript mirror gives key names and operations, not the struct declaration. |
+| 4 | **Retention and compaction.** Whether `board.jsonl` is ever trimmed, rotated, or compacted, and what `Seq` does after any reset. | No such code exists in the sidecar; the skill says the board is permanent (`skills/native_swarm/SKILL.md:351-352`), which is a contract, not a writer implementation. |
+| 5 | **`board.Member` field layout and enumerations.** Concrete values of `swarm.Member.State`, `board.Member.State` and `board.MessageKind`. | Method surface OBSERVED, struct not recovered; the persisted roster is a different shape and does not carry `State`. |
+| 6 | **`kind` / `request_id` usage.** Whether native swarm ever emits them, and whether another consumer pairs requests by `request_id`. | No consumer in the materialised tree; both are dropped by `omitempty` and never observed on disk. |
+| 7 | **Channel-post delivery.** Whether a channel post is pushed to subscribers or each member discovers it on wake, and whether the writer rejects a post to an unknown/archived channel. | The mirror proves visibility and unread; it does not prove delivery. Skill prose is the only evidence for wake scope. |
+| 8 | **Whether `/teamwork-preview` uses this board.** | The board is bound to the native-swarm feature (`main.mjs:134`; package `cortex/core/native_swarm/board`); no recovered `/teamwork-preview` file names it, and the two features use different tool verbs and flags (`09` §11). Coexistence in one binary does not establish composition. |
+| 9 | **Rendering of the post-progress line.** | The format string still has no closing `)` byte at 106,837,153; whether one is appended at runtime is UNKNOWN. |
+| 10 | **Runtime behaviour of `/teamwork-preview` generally.** | No execution of the workflow was performed (`07` is quota-blocked). Every "does X" statement about teamwork remains prompt text or INFERRED from symbols. |
 
 ---
 
@@ -281,6 +361,29 @@ The following are not determinable from the recovered static evidence. Each is w
 | `How this run was launched; not part of the task.` | 113,277,002 | §6 |
 | `.agents/teamwork/segment_*/handoff_*.md` | 115,094,780 | §6 |
 | `.agents/teamwork/synthesis/candidate_*.md` | 115,099,834 | §6 |
+
+Materialised-source citations added in this edition (all relative to the builtin tree; see `09` for the full index):
+
+| Item | Location | Section |
+|---|---|---|
+| Swarm state directory | `plugins/swarm/sidecars/swarm_board/main.mjs:134` | §2.1, §6.2 |
+| `board.jsonl` read | `plugins/swarm/sidecars/swarm_board/main.mjs:724` | §2.1 |
+| Board head / unread | `main.mjs:765`, `main.mjs:801-816` | §2.1, §4.3 |
+| Roster projection | `main.mjs:817-845`; `plugins/swarm/sidecars/swarm_board/README.md:25` | §3, §6.2 |
+| Delta cursor validation | `main.mjs:1407-1413` | §4.3 |
+| Board parse / skip policy | `plugins/swarm/sidecars/swarm_board/board_cache.mjs:33-46` | §2.1, §4.3 |
+| Append-verified tail read | `board_cache.mjs:78-117`, `:147-162` | §4.3 |
+| `seq` consumption | `board_cache.mjs:367-382` | §2.1, §4.3 |
+| Channel accessors / defaults | `plugins/swarm/sidecars/swarm_board/channels.mjs:66-84` | §5 |
+| Channel history / registry | `channels.mjs:98-111`, `:203-230` | §5 |
+| Visibility / unread | `channels.mjs:179-240` | §5 |
+| Mentions / `@#channel` | `channels.mjs:22-60`, `:113-150` | §5 |
+| `wake_mode` / status fallback | `main.mjs:495-507` | §3, §8 |
+| `swarm_wait` DONE boundary | `main.mjs:428-460` | §4.3, §8 |
+| `time` format | `main.mjs:509-515` | §2.1, §8 |
+| Status vocabulary (four values) | `skills/native_swarm/SKILL.md:140-151` | §8 |
+| Board tools injected late | `skills/native_swarm/SKILL.md:331-336` | §8 |
+| Sidecar flags | `plugins/swarm/sidecars/swarm_board/sidecar.json:1-26` | §6.2 |
 
 Reproduce offsets with, for example:
 
