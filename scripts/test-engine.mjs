@@ -68,6 +68,31 @@ function mentionsExactUrl(text, expected) {
   return false
 }
 
+// Record a default CONFIRMED victory verdict through the real tool, with a
+// trusted session identity that only the fixture controls. Tests that expect a
+// later final_verify PASS on a request-bearing run use this instead of
+// weakening the victory requirement.
+async function stampVictoryFor(tools, ctx, root, runId, { sessionID = "ses_victory_auditor", summary = "Fixture audit: delivered work matches the request." } = {}) {
+  const reqs = JSON.parse(readFileSync(join(root, ".opencode", "teamwork", runId, "requirements.json"), "utf8"))
+  const originalGet = ctx?.session?.get
+  if (ctx?.session) ctx.session.get = async () => ({ agent: "team/victory-auditor" })
+  try {
+    const res = await tools.victory_audit.execute(
+      {
+        sessionId: runId,
+        verdict: "VICTORY CONFIRMED",
+        requirements: reqs.items.map((item) => ({ id: item.id, met: true, evidence: `Fixture evidence for ${item.id}` })),
+        summary,
+      },
+      { sessionID },
+    )
+    assert.strictEqual(res.verdict?.verdict, "VICTORY CONFIRMED", `stampVictoryFor(${runId}) failed: ${res.content}`)
+    return res
+  } finally {
+    if (ctx?.session) ctx.session.get = originalGet
+  }
+}
+
 try {
   let registeredTools = {}
   const mockCtx = {
@@ -586,6 +611,7 @@ try {
     verification: { status: "PASS" },
   })
   await registeredTools.security_audit.execute({ sessionId: gateRun, status: "PASS", findings: [] })
+  await stampVictoryFor(registeredTools, mockCtx, testDir, gateRun)
 
   const gateFinal = runFile(testDir, gateRun, "verify/final.json")
   let gateRes = await registeredTools.next.execute({ sessionId: gateRun })
@@ -811,12 +837,13 @@ try {
     mkdirSync(dirname(file), { recursive: true })
     writeFileSync(file, JSON.stringify({ taskId, status, timestamp: new Date().toISOString() }) + "\n")
   }
-  const seedVerifiedRun = async (runId, taskIds, { request, integrityMode, auditStatus = "PASS" } = {}) => {
+  const seedVerifiedRun = async (runId, taskIds, { request, integrityMode, auditStatus = "PASS", stampVictory = request !== undefined, victoryAudit } = {}) => {
     await registeredTools.plan.execute({
       sessionId: runId,
       topology: "iterative-coding",
       skipInterview: true,
       ...(request !== undefined ? { request, integrityMode } : {}),
+      ...(victoryAudit !== undefined ? { victoryAudit } : {}),
       tasks: taskIds.map((id) => ({ id })),
     })
     for (const taskId of taskIds) {
@@ -836,13 +863,18 @@ try {
       status: auditStatus,
       findings: auditStatus === "FAIL" ? [{ severity: "Critical", description: "hardcoded secret" }] : [],
     })
+    if (stampVictory && request !== undefined) await stampVictoryFor(registeredTools, mockCtx, testDir, runId)
   }
   const finalFileOf = (runId) => runFile(testDir, runId, "verify/final.json")
 
   // (a) All tasks verified_pass + every report PASS + audit PASS -> PASS, stamped, event appended.
   const fvPassRun = "20261018-000000-fv-pass"
-  await seedVerifiedRun(fvPassRun, ["F1", "F2"])
-  assert(!existsSync(runFile(testDir, fvPassRun, "ORIGINAL_REQUEST.md")), "fixture run must have no request artifact")
+  await seedVerifiedRun(fvPassRun, ["F1", "F2"], { request: "Implement and verify the fixture functionality." })
+  assert(existsSync(runFile(testDir, fvPassRun, "ORIGINAL_REQUEST.md")), "fixture run records the request it is audited against")
+  const fvPassRequirements = JSON.parse(readFileSync(runFile(testDir, fvPassRun, "requirements.json"), "utf8"))
+  assert.strictEqual(fvPassRequirements.source, "request", "the request-derived baseline must be recorded")
+  assert.strictEqual(fvPassRequirements.items[0].id, "R1")
+  assert(!existsSync(finalFileOf(fvPassRun)), "fixture must start without final.json")
   const fvPassEventsBefore = readEvents(testDir, fvPassRun).length
   const fvPass = await registeredTools.final_verify.execute(
     { sessionId: fvPassRun, summary: "  All acceptance criteria met.  " },
@@ -873,6 +905,9 @@ try {
     "evidence must record the security audit",
   )
   assert.strictEqual(fvPassReport.evidence.allTasksVerifiedPass, true)
+  assert.strictEqual(fvPassReport.victory, "CONFIRMED", "a PASS must record the confirmed victory audit")
+  assert.strictEqual(fvPassReport.evidence.victory.status, "CONFIRMED")
+  assert.strictEqual(fvPassReport.evidence.victory.auditor, "team/victory-auditor")
   assert.deepStrictEqual(fvPassReport.reasons, [], "a PASS verdict carries no reasons")
   const fvPassEvents = readEvents(testDir, fvPassRun)
   assert.strictEqual(fvPassEvents.length, fvPassEventsBefore + 1, "final_verify must append exactly one event")
@@ -1042,6 +1077,326 @@ try {
   )
 
   console.log("✓ final_verify computes PASS only from evidence, stamps provenance + seq, and cannot be overridden")
+
+  // ==========================================
+  // Part 1c-ter-victory: requirements baseline + independent victory audit
+  // ==========================================
+  console.log("Testing requirements baseline & independent victory audit...")
+
+  const vRunDir = (runId) => join(testDir, ".opencode", "teamwork", runId)
+  const vPlanFile = (runId) => join(vRunDir(runId), "plan.dag.json")
+  const vRequirementsFile = (runId) => join(vRunDir(runId), "requirements.json")
+  const vVictoryFile = (runId) => join(vRunDir(runId), "verify", "victory.json")
+
+  // Caller requirements are persisted verbatim in id order and make victory required.
+  const vCallerRun = "20261018-000000-v-caller"
+  const vCallerPlan = await registeredTools.plan.execute({
+    sessionId: vCallerRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: "Build the caller-requirements fixture.",
+    requirements: [
+      { id: "R1", text: "First behaviour is observable." },
+      { id: "R2", text: "Second behaviour is observable." },
+    ],
+    tasks: [{ id: "V1" }],
+  })
+  assert(vCallerPlan.content.startsWith("Planned"), `caller requirements must plan: ${vCallerPlan.content}`)
+  const vCallerReqs = JSON.parse(readFileSync(vRequirementsFile(vCallerRun), "utf8"))
+  assert.deepStrictEqual(vCallerReqs, {
+    version: 1,
+    source: "caller",
+    items: [
+      { id: "R1", text: "First behaviour is observable." },
+      { id: "R2", text: "Second behaviour is observable." },
+    ],
+  })
+  assert.strictEqual(JSON.parse(readFileSync(vPlanFile(vCallerRun), "utf8")).victoryAudit, "required")
+  assert.strictEqual(JSON.parse(readFileSync(join(vRunDir(vCallerRun), "state.json"), "utf8")).victoryAudit, "required")
+
+  // A request with no explicit requirements yields the single R1 baseline.
+  const vRequestRun = "20261018-000000-v-request"
+  await registeredTools.plan.execute({
+    sessionId: vRequestRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: "Ship the request-derived item.",
+    tasks: [{ id: "V1" }],
+  })
+  const vRequestReqs = JSON.parse(readFileSync(vRequirementsFile(vRequestRun), "utf8"))
+  assert.strictEqual(vRequestReqs.source, "request")
+  assert.strictEqual(vRequestReqs.items.length, 1)
+  assert.strictEqual(vRequestReqs.items[0].id, "R1")
+  assert(vRequestReqs.items[0].text.includes("request-derived item"), "R1 must contain the verbatim request text")
+
+  // Invalid ids, duplicates, empty text, and over-cap baselines are refused before mkdir.
+  for (const [label, requirements] of [
+    ["bad-id", [{ id: "bad id", text: "x" }]],
+    ["duplicate-id", [{ id: "R1", text: "a" }, { id: "R1", text: "b" }]],
+    ["empty-text", [{ id: "R1", text: "   " }]],
+    ["over-long-text", [{ id: "R1", text: "x".repeat(2001) }]],
+    ["over-cap", Array.from({ length: 51 }, (_, i) => ({ id: `R${i + 1}`, text: "x" }))],
+  ]) {
+    const sid = `20261018-000000-v-bad-${label}`
+    const res = await registeredTools.plan.execute({
+      sessionId: sid,
+      topology: "iterative-coding",
+      skipInterview: true,
+      requirements,
+      tasks: [{ id: "V1" }],
+    })
+    assert(res.content.startsWith("refused:"), `${label} requirements must be refused: ${res.content}`)
+    assert(!existsSync(vRunDir(sid)), `${label} refusal must create no run dir`)
+  }
+
+  // Victory tool authorization: an unknown/other trusted session agent is refused,
+  // and there is no caller-supplied label that can self-authorize.
+  const vAuthRun = "20261018-000000-v-auth"
+  await seedVerifiedRun(vAuthRun, ["V1"], { request: "Authorize the victory auditor.", stampVictory: false })
+  const vAuthRequirements = JSON.parse(readFileSync(vRequirementsFile(vAuthRun), "utf8")).items.map((item) => ({
+    id: item.id,
+    met: true,
+    evidence: "observed",
+  }))
+  const vWrongAgent = await registeredTools.victory_audit.execute(
+    { sessionId: vAuthRun, verdict: "VICTORY CONFIRMED", requirements: vAuthRequirements },
+    { sessionID: "ses_not_victory" },
+  )
+  assert(vWrongAgent.content.startsWith("refused:"), `unknown session identity must be refused: ${vWrongAgent.content}`)
+  const originalAuditorGet = mockCtx.session.get
+  mockCtx.session.get = async () => ({ agent: "team/verifier" })
+  try {
+    const vVerifier = await registeredTools.victory_audit.execute(
+      { sessionId: vAuthRun, verdict: "VICTORY CONFIRMED", requirements: vAuthRequirements },
+      { sessionID: "ses_not_victory" },
+    )
+    assert(vVerifier.content.startsWith("refused:"), `team/verifier must not self-authorize: ${vVerifier.content}`)
+  } finally {
+    mockCtx.session.get = originalAuditorGet
+  }
+  assert(!existsSync(vVictoryFile(vAuthRun)), "a refused caller must write no verdict")
+
+  // Requirement result validation: missing, unknown, duplicate, and met-without-evidence.
+  const originalVictoryGet = mockCtx.session.get
+  mockCtx.session.get = async () => ({ agent: "team/victory-auditor" })
+  try {
+    const vMissingId = await registeredTools.victory_audit.execute(
+      { sessionId: vAuthRun, verdict: "VICTORY CONFIRMED", requirements: [] },
+      { sessionID: "ses_victory_auditor" },
+    )
+    assert(/missing/.test(vMissingId.content), `missing requirement id must be refused: ${vMissingId.content}`)
+    const vUnknownId = await registeredTools.victory_audit.execute(
+      {
+        sessionId: vAuthRun,
+        verdict: "VICTORY CONFIRMED",
+        requirements: [{ id: "R1", met: true, evidence: "x" }, { id: "RX", met: true, evidence: "x" }],
+      },
+      { sessionID: "ses_victory_auditor" },
+    )
+    assert(/not in this run/.test(vUnknownId.content), `unknown requirement id must be refused: ${vUnknownId.content}`)
+    const vDuplicateId = await registeredTools.victory_audit.execute(
+      {
+        sessionId: vAuthRun,
+        verdict: "VICTORY CONFIRMED",
+        requirements: [
+          { id: "R1", met: true, evidence: "x" },
+          { id: "R1", met: true, evidence: "x" },
+        ],
+      },
+      { sessionID: "ses_victory_auditor" },
+    )
+    assert(/duplicate/.test(vDuplicateId.content), `duplicate requirement id must be refused: ${vDuplicateId.content}`)
+    const vNoEvidence = await registeredTools.victory_audit.execute(
+      { sessionId: vAuthRun, verdict: "VICTORY CONFIRMED", requirements: [{ id: "R1", met: true, evidence: "  " }] },
+      { sessionID: "ses_victory_auditor" },
+    )
+    assert(/no evidence/.test(vNoEvidence.content), `met without evidence must be refused: ${vNoEvidence.content}`)
+  } finally {
+    mockCtx.session.get = originalVictoryGet
+  }
+  assert(!existsSync(vVictoryFile(vAuthRun)), "invalid audit results must write no verdict")
+
+  // CONFIRMED without ORIGINAL_REQUEST.md is refused (requestHash cannot be forged).
+  const vNoRequestRun = "20261018-000000-v-norequest"
+  await registeredTools.plan.execute({
+    sessionId: vNoRequestRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    requirements: [{ id: "R1", text: "Caller-only baseline." }],
+    tasks: [{ id: "V1" }],
+  })
+  mockCtx.session.get = async () => ({ agent: "team/victory-auditor" })
+  try {
+    const vNoRequest = await registeredTools.victory_audit.execute(
+      { sessionId: vNoRequestRun, verdict: "VICTORY CONFIRMED", requirements: [{ id: "R1", met: true, evidence: "seen" }] },
+      { sessionID: "ses_victory_auditor" },
+    )
+    assert(/without ORIGINAL_REQUEST/.test(vNoRequest.content), `CONFIRMED without a request must be refused: ${vNoRequest.content}`)
+  } finally {
+    mockCtx.session.get = originalVictoryGet
+  }
+
+  // Happy path: confirmed audit -> final_verify PASS -> next ALL_PASSED.
+  const vHappyRun = "20261018-000000-v-happy"
+  await seedVerifiedRun(vHappyRun, ["V1"], { request: "Deliver the happy-path fixture.", stampVictory: false })
+  const vHappyReqs = JSON.parse(readFileSync(vRequirementsFile(vHappyRun), "utf8")).items.map((item) => ({
+    id: item.id,
+    met: true,
+    evidence: `Observed ${item.id} in the fixture artifact.`,
+  }))
+  mockCtx.session.get = async () => ({ agent: "team/victory-auditor" })
+  try {
+    const vHappyAudit = await registeredTools.victory_audit.execute(
+      { sessionId: vHappyRun, verdict: "VICTORY CONFIRMED", requirements: vHappyReqs, summary: "Fixture matches." },
+      { sessionID: "ses_victory_auditor" },
+    )
+    assert.strictEqual(vHappyAudit.verdict?.verdict, "VICTORY CONFIRMED")
+    assert.strictEqual(vHappyAudit.verdict?.auditor, "team/victory-auditor")
+    assert.strictEqual(vHappyAudit.verdict?.auditorSessionId, "ses_victory_auditor")
+    assert(/^[0-9a-f]{64}$/.test(vHappyAudit.verdict?.requestHash), "the verdict must bind to a sha256 request hash")
+    // A second CONFIRMED is refused (write-once).
+    const vOverwrite = await registeredTools.victory_audit.execute(
+      { sessionId: vHappyRun, verdict: "VICTORY CONFIRMED", requirements: vHappyReqs },
+      { sessionID: "ses_victory_auditor" },
+    )
+    assert(/write-once/.test(vOverwrite.content), `a confirmed verdict must be write-once: ${vOverwrite.content}`)
+  } finally {
+    mockCtx.session.get = originalVictoryGet
+  }
+  const vHappyEvents = readEvents(testDir, vHappyRun).filter((e) => e.event === "victory_audit")
+  assert.strictEqual(vHappyEvents.length, 1, "the audit must append exactly one victory_audit event")
+  assert.strictEqual(vHappyEvents[0].agent, "team/victory-auditor")
+  assert.strictEqual(vHappyEvents[0].to, "VICTORY CONFIRMED")
+  const vHappyFinal = await registeredTools.final_verify.execute({ sessionId: vHappyRun })
+  assert.strictEqual(vHappyFinal.status, "PASS", `confirmed victory must PASS final_verify: ${vHappyFinal.content}`)
+  assert.strictEqual(vHappyFinal.victory, "CONFIRMED")
+  const vHappyFinalJson = JSON.parse(readFileSync(finalFileOf(vHappyRun), "utf8"))
+  assert.strictEqual(vHappyFinalJson.victory, "CONFIRMED")
+  assert.strictEqual(vHappyFinalJson.evidence.victory.auditor, "team/victory-auditor")
+  const vHappyGate = await registeredTools.next.execute({ sessionId: vHappyRun })
+  assert.strictEqual(vHappyGate.status, "ALL_PASSED")
+  assert.strictEqual(vHappyGate.victory, "CONFIRMED")
+
+  // Missing verdict: final_verify FAIL, and next never reports ALL_PASSED.
+  const vMissingRun = "20261018-000000-v-missing"
+  await seedVerifiedRun(vMissingRun, ["V1"], { request: "Deliver the missing-verdict fixture.", stampVictory: false })
+  const vMissingFinal = await registeredTools.final_verify.execute({ sessionId: vMissingRun })
+  assert.strictEqual(vMissingFinal.status, "FAIL", "missing victory.json must FAIL final_verify")
+  assert(vMissingFinal.reasons.some((r) => /victory audit:.*victory\.json missing/.test(r)), `the reason must name the missing verdict: ${JSON.stringify(vMissingFinal.reasons)}`)
+  const vMissingGate = await registeredTools.next.execute({ sessionId: vMissingRun })
+  assert.notStrictEqual(vMissingGate.status, "ALL_PASSED", "next must not complete without a victory verdict")
+
+  // A stamped PASS with no victory verdict is blocked at the dedicated gate.
+  const vNextRun = "20261018-000000-v-next-gate"
+  await seedVerifiedRun(vNextRun, ["V1"], { request: "Deliver the next-gate fixture.", stampVictory: false })
+  const vNextFinalFile = finalFileOf(vNextRun)
+  mkdirSync(dirname(vNextFinalFile), { recursive: true })
+  writeFileSync(
+    vNextFinalFile,
+    JSON.stringify({
+      status: "PASS",
+      generatedBy: { agent: "team/verifier", session: "ses_next_fixture" },
+      generatedAt: new Date().toISOString(),
+      evidence: {},
+      reasons: [],
+    }) + "\n",
+  )
+  const vNextBefore = await registeredTools.next.execute({ sessionId: vNextRun })
+  assert.strictEqual(vNextBefore.status, "READY_FOR_VICTORY_AUDIT", `next must stop at the victory gate: ${vNextBefore.content}`)
+  assert.notStrictEqual(vNextBefore.status, "ALL_PASSED")
+  await stampVictoryFor(registeredTools, mockCtx, testDir, vNextRun)
+  const vNextAfter = await registeredTools.next.execute({ sessionId: vNextRun })
+  assert.strictEqual(vNextAfter.status, "ALL_PASSED", `confirmed victory must unblock next: ${vNextAfter.content}`)
+
+  // REJECTED -> FAIL and no completion.
+  const vRejectedRun = "20261018-000000-v-rejected"
+  await seedVerifiedRun(vRejectedRun, ["V1"], { request: "Deliver the rejected fixture.", stampVictory: false })
+  mockCtx.session.get = async () => ({ agent: "team/victory-auditor" })
+  try {
+    const vRejectedAudit = await registeredTools.victory_audit.execute(
+      {
+        sessionId: vRejectedRun,
+        verdict: "VICTORY REJECTED",
+        requirements: [{ id: "R1", met: false, evidence: "The requested behavior is absent." }],
+        findings: ["R1 is not implemented."],
+      },
+      { sessionID: "ses_victory_auditor" },
+    )
+    assert.strictEqual(vRejectedAudit.verdict?.verdict, "VICTORY REJECTED")
+  } finally {
+    mockCtx.session.get = originalVictoryGet
+  }
+  const vRejectedFinal = await registeredTools.final_verify.execute({ sessionId: vRejectedRun })
+  assert.strictEqual(vRejectedFinal.status, "FAIL", "a rejected victory must FAIL final_verify")
+  assert(vRejectedFinal.reasons.some((r) => r.includes("VICTORY REJECTED")), `the reason must name the rejection: ${JSON.stringify(vRejectedFinal.reasons)}`)
+  const vRejectedGate = await registeredTools.next.execute({ sessionId: vRejectedRun })
+  assert.notStrictEqual(vRejectedGate.status, "ALL_PASSED")
+
+  // One unmet requirement -> FAIL with the requirement id.
+  const vUnmetRun = "20261018-000000-v-unmet"
+  await seedVerifiedRun(vUnmetRun, ["V1"], { request: "Deliver the unmet fixture.", stampVictory: false })
+  mockCtx.session.get = async () => ({ agent: "team/victory-auditor" })
+  try {
+    await registeredTools.victory_audit.execute(
+      {
+        sessionId: vUnmetRun,
+        verdict: "VICTORY CONFIRMED",
+        requirements: [{ id: "R1", met: false, evidence: "" }],
+      },
+      { sessionID: "ses_victory_auditor" },
+    )
+  } finally {
+    mockCtx.session.get = originalVictoryGet
+  }
+  const vUnmetFinal = await registeredTools.final_verify.execute({ sessionId: vUnmetRun })
+  assert.strictEqual(vUnmetFinal.status, "FAIL", "an unmet requirement must FAIL final_verify")
+  assert(vUnmetFinal.reasons.some((r) => r.includes('requirement "R1" is not met')), `the reason must name R1: ${JSON.stringify(vUnmetFinal.reasons)}`)
+
+  // A forged verdict with a missing requirement result -> FAIL.
+  const vForgedMissingRun = "20261018-000000-v-forged-missing"
+  await seedVerifiedRun(vForgedMissingRun, ["V1"], { request: "Deliver the missing-result fixture.", stampVictory: false })
+  await stampVictoryFor(registeredTools, mockCtx, testDir, vForgedMissingRun)
+  const vForgedMissing = JSON.parse(readFileSync(vVictoryFile(vForgedMissingRun), "utf8"))
+  vForgedMissing.requirements = []
+  writeFileSync(vVictoryFile(vForgedMissingRun), JSON.stringify(vForgedMissing, null, 2) + "\n")
+  const vForgedMissingFinal = await registeredTools.final_verify.execute({ sessionId: vForgedMissingRun })
+  assert.strictEqual(vForgedMissingFinal.status, "FAIL", "a missing requirement result must FAIL final_verify")
+  assert(vForgedMissingFinal.reasons.some((r) => r.includes("missing from the audit result")), `the reason must name the missing result: ${JSON.stringify(vForgedMissingFinal.reasons)}`)
+
+  // Stale requestHash -> FAIL.
+  const vStaleRun = "20261018-000000-v-stale"
+  await seedVerifiedRun(vStaleRun, ["V1"], { request: "Deliver the stale fixture.", stampVictory: false })
+  await stampVictoryFor(registeredTools, mockCtx, testDir, vStaleRun)
+  appendFileSync(runFile(testDir, vStaleRun, "ORIGINAL_REQUEST.md"), "\n- tampered after audit\n")
+  const vStaleFinal = await registeredTools.final_verify.execute({ sessionId: vStaleRun })
+  assert.strictEqual(vStaleFinal.status, "FAIL", "a stale request hash must FAIL final_verify")
+  assert(vStaleFinal.reasons.some((r) => r.includes("requestHash does not match")), `the reason must name the stale hash: ${JSON.stringify(vStaleFinal.reasons)}`)
+
+  // Forged auditor label -> FAIL.
+  const vForgedAuditorRun = "20261018-000000-v-forged-auditor"
+  await seedVerifiedRun(vForgedAuditorRun, ["V1"], { request: "Deliver the forged-auditor fixture.", stampVictory: false })
+  await stampVictoryFor(registeredTools, mockCtx, testDir, vForgedAuditorRun)
+  const vForgedAuditor = JSON.parse(readFileSync(vVictoryFile(vForgedAuditorRun), "utf8"))
+  vForgedAuditor.auditor = "team/verifier"
+  writeFileSync(vVictoryFile(vForgedAuditorRun), JSON.stringify(vForgedAuditor, null, 2) + "\n")
+  const vForgedAuditorFinal = await registeredTools.final_verify.execute({ sessionId: vForgedAuditorRun })
+  assert.strictEqual(vForgedAuditorFinal.status, "FAIL", "a forged auditor label must FAIL final_verify")
+  assert(vForgedAuditorFinal.reasons.some((r) => r.includes("auditor must be team/victory-auditor")), `the reason must name the forged label: ${JSON.stringify(vForgedAuditorFinal.reasons)}`)
+
+  // Explicit plan skip is recorded and completes as SKIPPED (explicit).
+  const vSkipRun = "20261018-000000-v-skip"
+  await seedVerifiedRun(vSkipRun, ["V1"], { request: "Deliver the explicit-skip fixture.", victoryAudit: "skip", stampVictory: false })
+  assert.strictEqual(JSON.parse(readFileSync(vPlanFile(vSkipRun), "utf8")).victoryAudit, "skip")
+  assert.strictEqual(JSON.parse(readFileSync(join(vRunDir(vSkipRun), "state.json"), "utf8")).victoryAudit, "skip")
+  const vSkipFinal = await registeredTools.final_verify.execute({ sessionId: vSkipRun })
+  assert.strictEqual(vSkipFinal.status, "PASS", `an explicit skip must complete: ${vSkipFinal.content}`)
+  assert.strictEqual(vSkipFinal.victory, "SKIPPED (explicit)")
+  const vSkipJson = JSON.parse(readFileSync(finalFileOf(vSkipRun), "utf8"))
+  assert.strictEqual(vSkipJson.victory, "SKIPPED (explicit)")
+  const vSkipGate = await registeredTools.next.execute({ sessionId: vSkipRun })
+  assert.strictEqual(vSkipGate.status, "ALL_PASSED")
+
+  console.log("✓ requirements baseline, trusted victory-auditor identity, write-once verdict, and completion gate verified")
 
   // ==========================================
   // Part 1c-quater: integrity mode enforcement
@@ -2288,6 +2643,7 @@ try {
     { id: "team/segment-reviewer", deny: ["edit", "shell", "subagent", "webfetch"] },
     { id: "team/formalization-reviewer", deny: ["edit", "shell", "subagent", "webfetch"] },
     { id: "team/referee", deny: ["edit", "shell", "subagent", "webfetch"] },
+    { id: "team/victory-auditor", deny: ["edit", "subagent", "webfetch"] },
   ].map((p) => ({ ...p, deny: [...p.deny].sort() }))
 
   // --- 8a: READ_ONLY_ACTIONS holds exactly the documented deny sets.
@@ -2306,7 +2662,7 @@ try {
   for (const p of POLICY) {
     assert.deepStrictEqual(enforced[p.id], p.deny, `${p.id}: code deny set drifted: ${JSON.stringify(enforced[p.id])}`)
   }
-  console.log("✓ READ_ONLY_ACTIONS matches the expected deny set for all five read-only agents")
+  console.log("✓ READ_ONLY_ACTIONS matches the expected deny set for all read-only agents")
 
   // --- 8b: every agent whose code policy denies `edit` is documented in the
   // README read-only paragraph (parsed, not a duplicate hard-coded list).
@@ -2533,6 +2889,7 @@ try {
 
     await passTask(mdRun, "doc-synthesis")
     await tools.security_audit.execute({ sessionId: mdRun, status: "PASS", summary: "Clean" })
+    await stampVictoryFor(tools, ctx, docRoot, mdRun)
     const fvPass = await tools.final_verify.execute({ sessionId: mdRun, summary: "Verified all segments." })
     assert.strictEqual(fvPass.status, "PASS", `final_verify must PASS: ${fvPass.content}`)
     const finalJson = JSON.parse(readFileSync(join(mdRunDir, "verify", "final.json"), "utf8"))
@@ -3568,6 +3925,9 @@ try {
       assert.strictEqual(audRes.verdict.winnerId, "merge-ab")
       assert(existsSync(join(runPath, "TOURNAMENT_REPORT.md")))
 
+      // The tournament has its own victory audit; the independent final
+      // acceptance audit is separate and still required for completion.
+      await stampVictoryFor(tools9, ctx9, testDir9, sid)
       const fvDone = await tools9.final_verify.execute({ sessionId: sid })
       assert.strictEqual(fvDone.status, "PASS")
       const finalObj = JSON.parse(readFileSync(join(runPath, "verify", "final.json"), "utf8"))
