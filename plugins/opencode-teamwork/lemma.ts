@@ -880,14 +880,274 @@ export function normalizeLeanStatement(statement: unknown): string {
     .trim()
 }
 
+export interface LeanMaskResult {
+  text?: string
+  error?: string
+}
+
+function findLeanQuotationEnd(source: string, openParen: number): number {
+  let depth = 0
+  let i = openParen
+  while (i < source.length) {
+    const c = source[i]
+    if (c === '"') {
+      i++
+      while (i < source.length) {
+        if (source[i] === "\\") {
+          i += 2
+          continue
+        }
+        if (source[i] === '"') {
+          i++
+          break
+        }
+        i++
+      }
+      continue
+    }
+    if (c === "-" && source[i + 1] === "-") {
+      while (i < source.length && source[i] !== "\n") i++
+      continue
+    }
+    if (c === "/" && source[i + 1] === "-") {
+      let block = 1
+      i += 2
+      while (i < source.length && block > 0) {
+        if (source[i] === "/" && source[i + 1] === "-") {
+          block++
+          i += 2
+        } else if (source[i] === "-" && source[i + 1] === "/") {
+          block--
+          i += 2
+        } else {
+          i++
+        }
+      }
+      continue
+    }
+    if (c === "'" && (i === 0 || !/[A-Za-z0-9_.'»]/.test(source[i - 1]))) {
+      const charLit = source.slice(i).match(/^'(?:[^'\\\r\n]|\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|[^\r\n]))'/)
+      if (charLit) {
+        i += charLit[0].length
+        continue
+      }
+    }
+    if (c === "(") depth++
+    else if (c === ")") {
+      depth--
+      if (depth === 0) return i + 1
+    }
+    i++
+  }
+  return -1
+}
+
 /**
- * Extract top-level `theorem`/`lemma` declarations (name + the type written
- * between the name and the terminating `:=`). Comments are stripped first, so
- * commented-out declarations are ignored. This is intentionally a lexical
- * helper: it is used for proposition binding before/without invoking Lean.
+ * Mask comments, string/char literals, and `( ... )` syntax quotations so a
+ * declaration scan only sees real top-level commands. Line structure is kept.
+ * Unreliable delimiters fail closed: a caller must not guess what a quotation
+ * contains. This is a lexical defense, not a Lean parser.
  */
-export function parseLeanDeclarations(source: string): LeanDeclaration[] {
-  const code = stripLeanComments(String(source ?? ""))
+export function maskLeanDeclarationsSource(source: string): LeanMaskResult {
+  const src = String(source ?? "")
+  let out = ""
+  let i = 0
+  while (i < src.length) {
+    const c = src[i]
+    if (c === "-" && src[i + 1] === "-") {
+      while (i < src.length && src[i] !== "\n") {
+        out += " "
+        i++
+      }
+      continue
+    }
+    if (c === "/" && src[i + 1] === "-") {
+      let depth = 1
+      out += "  "
+      i += 2
+      while (i < src.length && depth > 0) {
+        if (src[i] === "/" && src[i + 1] === "-") {
+          depth++
+          out += "  "
+          i += 2
+        } else if (src[i] === "-" && src[i + 1] === "/") {
+          depth--
+          out += "  "
+          i += 2
+        } else {
+          out += src[i] === "\n" ? "\n" : " "
+          i++
+        }
+      }
+      if (depth > 0) return { error: "refused: unterminated block comment; cannot scan declarations" }
+      continue
+    }
+    if (c === '"') {
+      out += " "
+      i++
+      let closed = false
+      while (i < src.length) {
+        if (src[i] === "\\") {
+          out += src[i + 1] === "\n" ? "\n" : " "
+          i += 2
+          continue
+        }
+        if (src[i] === '"') {
+          out += " "
+          i++
+          closed = true
+          break
+        }
+        out += src[i] === "\n" ? "\n" : " "
+        i++
+      }
+      if (!closed) return { error: "refused: unterminated string literal; cannot scan declarations" }
+      continue
+    }
+    if (c === "'" && (i === 0 || !/[A-Za-z0-9_.'»]/.test(src[i - 1]))) {
+      const charLit = src.slice(i).match(/^'(?:[^'\\\r\n]|\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|[^\r\n]))'/)
+      if (charLit) {
+        for (let k = 0; k < charLit[0].length; k++) out += charLit[0][k] === "\n" ? "\n" : " "
+        i += charLit[0].length
+        continue
+      }
+    }
+    if (c === "`") {
+      let j = i
+      while (j < src.length && src[j] === "`") j++
+      if (src[j] !== "(") {
+        return { error: "refused: cannot delimit syntax quotation; declaration binding is unavailable" }
+      }
+      const end = findLeanQuotationEnd(src, j)
+      if (end < 0) return { error: "refused: unterminated syntax quotation; cannot scan declarations" }
+      for (let k = i; k < end; k++) out += src[k] === "\n" ? "\n" : " "
+      i = end
+      continue
+    }
+    out += c
+    i++
+  }
+  return { text: out }
+}
+
+function findTopLevelBinderColon(text: string): number {
+  let depth = 0
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    if (c === "(" || c === "[" || c === "{") depth++
+    else if (c === ")" || c === "]" || c === "}") depth = Math.max(0, depth - 1)
+    else if (c === ":" && depth === 0) return i
+  }
+  return -1
+}
+
+function stripSimpleBinderParens(binders: string): string | null {
+  let rest = binders.trim()
+  let out = ""
+  while (rest) {
+    const m = rest.match(/^[([{]([^()[\]{}]*)[)\]}]/)
+    if (!m) return null
+    out += (out ? " " : "") + m[1].trim()
+    rest = rest.slice(m[0].length).trim()
+  }
+  return out || null
+}
+
+/**
+ * Comparison forms for a Lean type. Text comparison alone would reject the
+ * equivalent `(n : Nat) : P` and `∀ n : Nat, P` spellings, so binder forms are
+ * expanded. This is still a syntactic comparison, never semantic equality.
+ */
+export function leanStatementVariants(statement: unknown): string[] {
+  const raw = normalizeLeanStatement(statement)
+  const variants = new Set<string>()
+  if (!raw) return []
+  variants.add(raw)
+  for (const base of [...variants]) {
+    variants.add(base.replace(/¬\s+/g, "¬"))
+    variants.add(base.replace(/\bNot\s+\(/g, "Not("))
+  }
+  if (/^[([{]/.test(raw)) {
+    const idx = findTopLevelBinderColon(raw)
+    if (idx > 0) {
+      const binders = raw.slice(0, idx).trim()
+      const body = raw.slice(idx + 1).trim()
+      if (binders && body) {
+        variants.add(normalizeLeanStatement(`∀ ${binders}, ${body}`))
+        const simple = stripSimpleBinderParens(binders)
+        if (simple) variants.add(normalizeLeanStatement(`∀ ${simple}, ${body}`))
+      }
+    }
+  }
+  const forall = raw.match(/^∀\s+([\s\S]+?),\s*([\s\S]+)$/)
+  if (forall) {
+    const simple = stripSimpleBinderParens(forall[1])
+    if (simple) variants.add(normalizeLeanStatement(`∀ ${simple}, ${forall[2]}`))
+  }
+  return [...variants].filter(Boolean)
+}
+
+/** Syntactic proposition match, including binder and negation spelling forms. */
+export function leanStatementMatches(actual: unknown, expected: unknown, disproof = false): boolean {
+  const actualForms = new Set(leanStatementVariants(actual))
+  const expectedForms = leanStatementVariants(expected)
+  if (actualForms.size === 0 || expectedForms.length === 0) return false
+  if (!disproof) return expectedForms.some((form) => actualForms.has(form))
+
+  const candidates = new Set<string>()
+  for (const statement of expectedForms) {
+    for (const negated of [`Not (${statement})`, `¬(${statement})`, `¬ (${statement})`, `¬${statement}`, `Not ${statement}`]) {
+      for (const form of leanStatementVariants(negated)) candidates.add(form)
+    }
+    // `(n : Nat) : ¬P n` proves `∀ n, ¬P n`, which implies `¬∀ n, P n`.
+    // Binder-local negation is therefore a sound (stronger) disproof.
+    if (/^[([{]/.test(statement)) {
+      const idx = findTopLevelBinderColon(statement)
+      if (idx > 0) {
+        const binders = statement.slice(0, idx).trim()
+        const body = statement.slice(idx + 1).trim()
+        if (binders && body) {
+          for (const negatedBody of [`¬(${body})`, `¬ (${body})`, `Not (${body})`]) {
+            for (const form of leanStatementVariants(`${binders} : ${negatedBody}`)) candidates.add(form)
+          }
+        }
+      }
+    }
+    const forall = statement.match(/^∀\s+([\s\S]+?),\s*([\s\S]+)$/)
+    if (forall) {
+      for (const negatedBody of [`¬(${forall[2]})`, `¬ (${forall[2]})`, `Not (${forall[2]})`]) {
+        for (const form of leanStatementVariants(`∀ ${forall[1]}, ${negatedBody}`)) candidates.add(form)
+      }
+    }
+  }
+  return [...actualForms].some((form) => candidates.has(form))
+}
+
+export interface LeanDeclarationScan {
+  declarations: LeanDeclaration[]
+  errors: string[]
+}
+
+/**
+ * Extract top-level `theorem`/`lemma` declarations from masked source. Rejects
+ * ambiguous files (namespaces/sections, private/protected declarations, and
+ * duplicate names) instead of taking a first match: the axiom probe resolves
+ * one unqualified name, so a second declaration with the same name is unsafe.
+ */
+export function analyzeLeanDeclarations(source: string): LeanDeclarationScan {
+  const masked = maskLeanDeclarationsSource(source)
+  if (masked.error || masked.text === undefined) {
+    return { declarations: [], errors: [masked.error ?? "refused: cannot scan declarations"] }
+  }
+  const code = masked.text
+  const errors: string[] = []
+
+  const scopeTokens = new Set<string>()
+  for (const m of code.matchAll(/\b(namespace|section|private|protected)\b/g)) scopeTokens.add(m[1])
+  for (const token of scopeTokens) {
+    errors.push(`refused: ${token} declarations/blocks are not supported for declaration binding; flatten the attempt`)
+  }
+
   const starts: Array<{ name: string; bodyStart: number; start: number }> = []
   for (const m of code.matchAll(LEAN_DECL_START_RE)) {
     const start = m.index ?? 0
@@ -905,20 +1165,40 @@ export function parseLeanDeclarations(source: string): LeanDeclaration[] {
     const type = rawSignature.replace(/^:\s*/, "").trim()
     declarations.push({ name: starts[i].name, type, normalizedType: normalizeLeanStatement(type) })
   }
-  return declarations
+
+  const counts = new Map<string, number>()
+  for (const d of declarations) {
+    const name = stripGuillemets(d.name)
+    counts.set(name, (counts.get(name) ?? 0) + 1)
+  }
+  for (const [name, count] of counts) {
+    if (count > 1) errors.push(`refused: duplicate theorem/lemma declaration name "${name}" (${count} declarations)`)
+  }
+
+  return { declarations, errors }
+}
+
+/** Declaration list from the hardened scan (errors are reported by analyzeLeanDeclarations). */
+export function parseLeanDeclarations(source: string): LeanDeclaration[] {
+  return analyzeLeanDeclarations(source).declarations
 }
 
 /**
  * Fail-closed binding check: the attempt's declaration name must be the
  * expected one (or the only theorem/lemma when no name is recorded) and its
- * type must equal the approved node statement after whitespace normalization.
- * A `disprove`/`disproved` node must declare the negation instead.
+ * type must match the approved node statement. Ambiguous scans (strings,
+ * quotations, namespaces, private/protected, duplicate names, more than one
+ * candidate) are rejected; there is no "first match".
  */
 export function bindVerifiedDeclaration(
   source: string,
   expected: DeclarationBindingExpectation,
 ): DeclarationBindingResult {
-  const declarations = parseLeanDeclarations(source)
+  const scan = analyzeLeanDeclarations(source)
+  if (scan.errors.length > 0) {
+    return { ok: false, findings: scan.errors }
+  }
+  const declarations = scan.declarations
   const expectedName = stripGuillemets(clean(expected.declaration ?? "", 128).trim())
   const statement = normalizeLeanStatement(expected.statement)
   const findings: string[] = []
@@ -935,8 +1215,12 @@ export function bindVerifiedDeclaration(
 
   let declaration: LeanDeclaration | undefined
   if (expectedName) {
-    declaration = declarations.find((d) => stripGuillemets(d.name) === expectedName)
-    if (!declaration) {
+    const matches = declarations.filter((d) => stripGuillemets(d.name) === expectedName)
+    if (matches.length > 1) {
+      findings.push(`verified attempt declares ${matches.length} theorem/lemmas named "${expectedName}"; ambiguous binding is refused`)
+    } else if (matches.length === 1) {
+      declaration = matches[0]
+    } else {
       const found = declarations.map((d) => d.name).join(", ")
       findings.push(
         `verified attempt does not declare expected theorem/lemma "${expectedName}" (found: ${found || "none"})`,
@@ -951,26 +1235,10 @@ export function bindVerifiedDeclaration(
   }
 
   if (declaration && statement) {
-    const actual = declaration.normalizedType
-    if (expected.disproof) {
-      const shown = statement
-      const candidates = new Set(
-        [
-          `Not (${shown})`,
-          `¬(${shown})`,
-          `¬ (${shown})`,
-          `¬${shown}`,
-          `Not ${shown}`,
-        ].map((s) => normalizeLeanStatement(s)),
-      )
-      if (!candidates.has(actual)) {
-        findings.push(
-          `declared type "${clean(actual, 240)}" is not the required negation of the approved statement "${clean(shown, 240)}"`,
-        )
-      }
-    } else if (actual !== statement) {
+    if (!leanStatementMatches(declaration.normalizedType, statement, expected.disproof === true)) {
+      const kind = expected.disproof ? "is not the required negation of" : "does not match"
       findings.push(
-        `declared type "${clean(actual, 240)}" does not match approved node statement "${clean(statement, 240)}"`,
+        `declared type "${clean(declaration.normalizedType, 240)}" ${kind} approved node statement "${clean(statement, 240)}"`,
       )
     }
   }
@@ -993,32 +1261,41 @@ export interface AxiomDependencyCheck {
 }
 
 /**
- * Parse Lean's `#print axioms` output and reject anything outside the standard
- * axioms plus the caller's allowlist. `sorryAx` is never allowed, even if a
- * caller tries to allowlist it.
+ * Reject source that can print a spoofed `#print axioms` report before the
+ * appended probe. This is a heuristic: it catches `#` commands, `logInfo`,
+ * `dbg_trace`, `trace`, `run_cmd`, `println`/`eprintln`, `IO.`, and trace
+ * options. It does not prove that no user-defined macro can print, so the line
+ * parser below also anchors reports to the exact declaration name and requires
+ * exactly one report.
  */
-export function parseLeanAxiomOutput(output: unknown, allowedAxioms: string[] = []): AxiomDependencyCheck {
-  const text = String(output ?? "")
-  const findings: string[] = []
-  let dependencies: string[] = []
-
-  const depends = text.match(/depends on axioms:\s*\[([\s\S]*?)\]/i)
-  if (depends) {
-    dependencies = depends[1]
-      .split(",")
-      .map((d) => stripGuillemets(d.trim()))
-      .filter(Boolean)
-  } else if (/does not depend on any axioms/i.test(text)) {
-    dependencies = []
-  } else {
-    return {
-      recognized: false,
-      dependencies: [],
-      unauthorized: [],
-      findings: ["could not determine transitive axiom dependencies from Lean output (failing closed)"],
-    }
+export function detectAxiomProbeHijacks(source: string): string[] {
+  const masked = maskLeanDeclarationsSource(source)
+  if (masked.error || masked.text === undefined) {
+    return [`refused: cannot scan attempt for probe-hijacking commands: ${masked.error ?? "unknown"}`]
   }
+  const code = masked.text
+  const tokens = new Set<string>()
+  for (const m of code.matchAll(/(^|[^\w])#\s*([A-Za-z_][A-Za-z0-9_']*)/g)) tokens.add(`#${m[2]}`)
+  for (const m of code.matchAll(/\b(logInfo|dbg_trace|trace|run_cmd|run_elab|run_tac|println|eprintln)\b/g)) tokens.add(m[1])
+  if (/\bIO\s*\./.test(code)) tokens.add("IO.")
+  if (/\bset_option\s+trace\b/.test(code)) tokens.add("set_option trace")
+  if (tokens.size === 0) return []
+  return [
+    `refused: attempt contains probe-hijacking command(s) ${[...tokens].join(", ")}; remove them and re-verify`,
+  ]
+}
 
+export interface AxiomDependencyEvaluation {
+  dependencies: string[]
+  unauthorized: string[]
+  findings: string[]
+}
+
+/** Classify a dependency list against the standard axioms + caller allowlist. */
+export function evaluateAxiomDependencies(
+  dependencies: string[],
+  allowedAxioms: string[] = [],
+): AxiomDependencyEvaluation {
   const allowed = new Set<string>(STANDARD_LEAN_AXIOMS)
   for (const a of allowedAxioms) {
     const name = stripGuillemets(String(a ?? "").trim())
@@ -1027,17 +1304,81 @@ export function parseLeanAxiomOutput(output: unknown, allowedAxioms: string[] = 
 
   const unauthorized: string[] = []
   for (const dep of dependencies) {
-    const name = stripGuillemets(dep)
+    const name = stripGuillemets(String(dep ?? "").trim())
     if (!name) continue
     if (name === "sorryAx" || !allowed.has(name)) unauthorized.push(name)
   }
 
-  const uniqueDeps = [...new Set(dependencies)]
+  const uniqueDeps = [...new Set(dependencies.map((d) => stripGuillemets(String(d ?? "").trim())).filter(Boolean))]
   const uniqueUnauthorized = [...new Set(unauthorized)]
-  if (uniqueUnauthorized.length > 0) {
-    findings.push(`unauthorized transitive axiom dependency: ${uniqueUnauthorized.join(", ")}`)
+  const findings =
+    uniqueUnauthorized.length > 0
+      ? [`unauthorized transitive axiom dependency: ${uniqueUnauthorized.join(", ")}`]
+      : []
+  return { dependencies: uniqueDeps, unauthorized: uniqueUnauthorized, findings }
+}
+
+/**
+ * Parse Lean's `#print axioms` output and reject anything outside the standard
+ * axioms plus the caller's allowlist. Only complete lines of the form
+ * `'<decl>' depends on axioms: [ ... ]` or `'<decl>' does not depend on any
+ * axioms` count. Exactly one report must exist, and it must name `declaration`.
+ * `sorryAx` is never allowed, even if a caller tries to allowlist it.
+ */
+export function parseLeanAxiomOutput(
+  output: unknown,
+  allowedAxioms: string[] = [],
+  declarationName?: string,
+): AxiomDependencyCheck {
+  const expected = stripGuillemets(String(declarationName ?? "").trim())
+  if (!expected) {
+    return {
+      recognized: false,
+      dependencies: [],
+      unauthorized: [],
+      findings: ["refused: declaration name is required to parse axiom probe output (failing closed)"],
+    }
   }
-  return { recognized: true, dependencies: uniqueDeps, unauthorized: uniqueUnauthorized, findings }
+
+  const text = String(output ?? "").replace(/\r\n?/g, "\n")
+  const reports: Array<{ name: string; dependencies: string[] | null }> = []
+  const reportRe =
+    /^[ \t]*'([^'\r\n]+)'[ \t]+(?:depends on axioms:[ \t]*\[([^\]\r\n]*)\]|does not depend on any axioms)[ \t]*$/gim
+  for (const m of text.matchAll(reportRe)) {
+    reports.push({
+      name: stripGuillemets(m[1].trim()),
+      dependencies: m[2] === undefined ? null : m[2].split(",").map((d) => stripGuillemets(d.trim())).filter(Boolean),
+    })
+  }
+
+  const findings: string[] = []
+  const foreign = reports.filter((r) => r.name !== expected)
+  if (foreign.length > 0) {
+    findings.push(
+      `refused: axiom probe output contains a report for a different declaration (${foreign.map((r) => `"${r.name}"`).join(", ")})`,
+    )
+  }
+  const matches = reports.filter((r) => r.name === expected)
+  if (matches.length === 0) {
+    findings.push(
+      `could not find exactly one '#print axioms ${expected}' report in Lean output (failing closed)`,
+    )
+  } else if (matches.length > 1) {
+    findings.push(
+      `refused: axiom probe output contains ${matches.length} reports for "${expected}"; a spoofed or duplicated report cannot be trusted`,
+    )
+  }
+  if (foreign.length > 0 || matches.length !== 1) {
+    return { recognized: false, dependencies: [], unauthorized: [], findings }
+  }
+
+  const evaluated = evaluateAxiomDependencies(matches[0].dependencies ?? [], allowedAxioms)
+  return {
+    recognized: true,
+    dependencies: evaluated.dependencies,
+    unauthorized: evaluated.unauthorized,
+    findings: [...findings, ...evaluated.findings],
+  }
 }
 
 export interface LeanAxiomProbeOptions {
@@ -1092,6 +1433,17 @@ export function checkLeanAxiomDependencies(options: LeanAxiomProbeOptions): Lean
       stdout: "",
       stderr: "",
       error: read.error,
+    }
+  }
+
+  const hijacks = detectAxiomProbeHijacks(read.text)
+  if (hijacks.length > 0) {
+    return {
+      executed: false,
+      check: { ...empty, findings: hijacks },
+      stdout: "",
+      stderr: "",
+      error: hijacks[0],
     }
   }
 
@@ -1165,7 +1517,7 @@ export function checkLeanAxiomDependencies(options: LeanAxiomProbeOptions): Lean
     } catch {}
   }
 
-  const check = parseLeanAxiomOutput(`${stdout}\n${stderr}`, options.allowedAxioms ?? [])
+  const check = parseLeanAxiomOutput(`${stdout}\n${stderr}`, options.allowedAxioms ?? [], declaration)
   if (error) check.findings.unshift(error)
   return {
     executed: executed && check.recognized,
@@ -1893,6 +2245,29 @@ export function mutateLemmaNode(
   }
 
   // update
+  const wasVerified = node.status === "proved" || node.status === "disproved"
+  let nextStatement: string | undefined
+  if (typeof params.statement === "string") {
+    nextStatement = cleanBlock(params.statement, 2000)
+  }
+  let nextDeclaration: string | null | undefined
+  if (typeof params.declaration === "string") {
+    const decl = params.declaration.trim()
+    if (!decl) {
+      nextDeclaration = null
+    } else if (!isSafeLeanDeclarationName(decl)) {
+      return { error: `refused: invalid declaration "${clean(params.declaration, 80)}" (must be a Lean theorem/lemma name)` }
+    } else {
+      nextDeclaration = clean(decl, 128)
+    }
+  }
+  const statementChanged = nextStatement !== undefined && nextStatement !== node.statement
+  const declarationChanged = nextDeclaration !== undefined && (nextDeclaration ?? null) !== (node.declaration ?? null)
+  if (wasVerified && (statementChanged || declarationChanged)) {
+    return {
+      error: `refused: cannot change statement/declaration on a ${node.status} node; reset it to "formal" first and re-verify`,
+    }
+  }
   if (params.status !== undefined) {
     const nextStatus = clean(params.status, 32)
     if (!VALID_NODE_STATUSES.has(nextStatus)) {
@@ -1906,19 +2281,8 @@ export function mutateLemmaNode(
     }
     node.status = nextStatus as LemmaNodeRecord["status"]
   }
-  if (typeof params.statement === "string") {
-    node.statement = cleanBlock(params.statement, 2000)
-  }
-  if (typeof params.declaration === "string") {
-    const decl = params.declaration.trim()
-    if (!decl) {
-      node.declaration = null
-    } else if (!isSafeLeanDeclarationName(decl)) {
-      return { error: `refused: invalid declaration "${clean(params.declaration, 80)}" (must be a Lean theorem/lemma name)` }
-    } else {
-      node.declaration = clean(decl, 128)
-    }
-  }
+  if (nextStatement !== undefined) node.statement = nextStatement
+  if (nextDeclaration !== undefined) node.declaration = nextDeclaration
   node.updatedAt = now
   manifest.nodes = nodes
   manifest.updatedAt = now
@@ -1951,20 +2315,41 @@ export interface StampedLemmaVerifyReport extends LeanVerifyResult {
 function expectedDeclarationForNode(
   runDir: string,
   node: LemmaNodeRecord,
-): { declaration: string | null; statement: string } {
+): { declaration: string | null; statement: string; error?: string } {
   const recorded = node.declaration ? stripGuillemets(clean(node.declaration, 128).trim()) : ""
   const statement = cleanBlock(node.statement ?? "", 2000).trim()
   if (recorded) return { declaration: recorded, statement }
 
   const probSafe = ensureSafeSubpath(runDir, "lemma/problem.lean")
-  if (probSafe.error || !probSafe.path) return { declaration: null, statement }
+  if (probSafe.error || !probSafe.path) {
+    return { declaration: null, statement, error: "cannot bind declaration: node has no declaration and lemma/problem.lean is unavailable" }
+  }
   const probRead = readBoundedRegular(probSafe.path)
-  if (probRead.error || probRead.text === undefined) return { declaration: null, statement }
-  const declarations = parseLeanDeclarations(probRead.text)
-  if (declarations.length !== 1) return { declaration: null, statement }
+  if (probRead.error || probRead.text === undefined) {
+    return {
+      declaration: null,
+      statement,
+      error: `cannot bind declaration: node has no declaration and lemma/problem.lean is unreadable (${probRead.error ?? "unknown"})`,
+    }
+  }
+  const scan = analyzeLeanDeclarations(probRead.text)
+  if (scan.errors.length > 0) {
+    return {
+      declaration: null,
+      statement,
+      error: `cannot infer expected declaration from lemma/problem.lean: ${scan.errors[0]}`,
+    }
+  }
+  if (scan.declarations.length !== 1) {
+    return {
+      declaration: null,
+      statement,
+      error: `cannot infer expected declaration: lemma/problem.lean declares ${scan.declarations.length} theorem/lemmas; record declaration on the node`,
+    }
+  }
   return {
-    declaration: stripGuillemets(declarations[0].name),
-    statement: statement || declarations[0].type,
+    declaration: stripGuillemets(scan.declarations[0].name),
+    statement: statement || scan.declarations[0].type,
   }
 }
 
@@ -2034,11 +2419,13 @@ export function verifyLemmaNodeAttempt(
   // the PASS branch can mark the node proved/disproved.
   if (report.status === "PASS") {
     const expected = expectedDeclarationForNode(runDir, node)
-    const binding = bindVerifiedDeclaration(attemptRead.text, {
-      declaration: expected.declaration,
-      statement: expected.statement,
-      disproof: node.status === "disprove" || node.status === "disproved",
-    })
+    const binding: DeclarationBindingResult = expected.error
+      ? { ok: false, findings: [expected.error] }
+      : bindVerifiedDeclaration(attemptRead.text, {
+          declaration: expected.declaration,
+          statement: expected.statement,
+          disproof: node.status === "disprove" || node.status === "disproved",
+        })
     if (!binding.ok || !binding.declaration) {
       report.status = "FAIL"
       report.findings.push(...binding.findings)
@@ -2249,18 +2636,64 @@ export function evaluateLemmaFinalEvidence(runDir: string): LemmaFinalEvidence {
       reasons.push(
         `lemma node ${id}: invalid/missing stamped verification (status=${verifyStatus}, executed=${executed}, exitCode=${exitCode}, sorry=${hasSorry}, admit=${hasAdmit}, axiom=${hasUnauthorizedAxiom})`,
       )
-    } else if (vReport.attemptHash && vReport.attemptFile) {
-      const attSafe = ensureSafeSubpath(runDir, vReport.attemptFile)
-      if (attSafe.error || !attSafe.path) {
-        reasons.push(`lemma node ${id}: ${attSafe.error ?? "unsafe attemptFile"}`)
+    } else {
+      // The stamped report is only valid for the node metadata it was produced
+      // against. A later statement/declaration edit (or a replaced report) must
+      // invalidate final evidence rather than silently reusing the old PASS.
+      const expected = expectedDeclarationForNode(runDir, n)
+      const reportDeclaration = typeof vReport.declaration === "string" ? stripGuillemets(vReport.declaration.trim()) : ""
+      const reportType = typeof vReport.declarationType === "string" ? vReport.declarationType : ""
+      if (expected.error) {
+        reasons.push(`lemma node ${id}: ${expected.error}`)
+      }
+      if (!reportDeclaration) {
+        reasons.push(`lemma node ${id}: stamped verification does not record the bound declaration`)
+      } else if (expected.declaration && reportDeclaration !== expected.declaration) {
+        reasons.push(
+          `lemma node ${id}: stamped declaration "${reportDeclaration}" does not match node declaration "${expected.declaration}"`,
+        )
+      }
+      if (!reportType) {
+        reasons.push(`lemma node ${id}: stamped verification does not record the bound declaration type`)
+      } else if (expected.statement && !leanStatementMatches(reportType, expected.statement, nStatus === "disproved")) {
+        reasons.push(
+          `lemma node ${id}: stamped declaration type "${clean(reportType, 240)}" does not match node statement "${clean(expected.statement, 240)}"`,
+        )
+      }
+      if (!Array.isArray(vReport.axiomDependencies)) {
+        reasons.push(`lemma node ${id}: stamped verification does not record axiomDependencies`)
       } else {
-        const attRead = readBoundedRegular(attSafe.path)
-        if (attRead.error || attRead.text === undefined) {
-          reasons.push(`lemma node ${id}: ${attRead.error ?? "cannot read attemptFile"}`)
+        const evaluated = evaluateAxiomDependencies(
+          vReport.axiomDependencies.map(String),
+          Array.isArray(vReport.allowedAxioms) ? vReport.allowedAxioms.map(String) : [],
+        )
+        if (evaluated.unauthorized.length > 0) {
+          reasons.push(
+            `lemma node ${id}: stamped axiomDependencies contain unauthorized dependencies (${evaluated.unauthorized.join(", ")})`,
+          )
+        }
+      }
+      if (
+        !Array.isArray(vReport.unauthorizedAxioms) ||
+        vReport.unauthorizedAxioms.length > 0 ||
+        vReport.hasUnauthorizedAxiom === true
+      ) {
+        reasons.push(`lemma node ${id}: stamped verification records unauthorized or missing axiom data`)
+      }
+
+      if (vReport.attemptHash && vReport.attemptFile) {
+        const attSafe = ensureSafeSubpath(runDir, vReport.attemptFile)
+        if (attSafe.error || !attSafe.path) {
+          reasons.push(`lemma node ${id}: ${attSafe.error ?? "unsafe attemptFile"}`)
         } else {
-          const curAttHash = createHash("sha256").update(attRead.text, "utf8").digest("hex")
-          if (curAttHash !== vReport.attemptHash) {
-            reasons.push(`lemma node ${id}: attempt file ${vReport.attemptFile} modified since verification`)
+          const attRead = readBoundedRegular(attSafe.path)
+          if (attRead.error || attRead.text === undefined) {
+            reasons.push(`lemma node ${id}: ${attRead.error ?? "cannot read attemptFile"}`)
+          } else {
+            const curAttHash = createHash("sha256").update(attRead.text, "utf8").digest("hex")
+            if (curAttHash !== vReport.attemptHash) {
+              reasons.push(`lemma node ${id}: attempt file ${vReport.attemptFile} modified since verification`)
+            }
           }
         }
       }

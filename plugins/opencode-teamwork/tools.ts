@@ -1462,6 +1462,12 @@ async function createPlanRun(
   // The request record is verbatim, so refuse rather than truncate. The
   // length check runs before anything is written.
   const request = typeof input.request === "string" ? input.request : undefined
+  if (request !== undefined && !request.trim()) {
+    return {
+      ok: false,
+      content: "refused: request must be non-empty when supplied; omit it or pass the user's verbatim request. Nothing was written.",
+    }
+  }
   if (request !== undefined && request.length > REQUEST_MAX) {
     return {
       ok: false,
@@ -1799,8 +1805,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             inputs: Array.isArray(input?.inputs) ? input.inputs.map(String) : undefined,
             hasDocument: false,
           },
-          root,
-        )
+          root,        )
         let result: any
         if (doc.topology === "document-review") {
           result = {

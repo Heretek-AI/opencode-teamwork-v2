@@ -1,10 +1,13 @@
 import { registerTeamworkTools, registerTeamworkHooks } from "../plugins/opencode-teamwork/tools.ts"
 import {
+  analyzeLeanDeclarations,
   bindVerifiedDeclaration,
   checkLeanAxiomDependencies,
   classifyRoute,
+  detectAxiomProbeHijacks,
   detectLeanProofHoles,
   formatMissingToolchainRefusal,
+  leanStatementMatches,
   parseLeanAxiomOutput,
   parseLeanDeclarations,
   probeLemmaToolchain,
@@ -438,6 +441,20 @@ try {
     assert(badMode.content.includes(mode), `refusal must list ${mode}`)
   }
   assert(!existsSync(join(testDir, ".opencode", "teamwork", badModeRun)), "an invalid mode must write nothing")
+
+  // (c2) a supplied but blank request is refused before anything is written.
+  const blankRequestRun = "20261018-000000-blank-request"
+  for (const blank of ["", "   ", "\n\t  \n"]) {
+    const blankRes = await registeredTools.plan.execute({
+      sessionId: blankRequestRun,
+      topology: "iterative-coding",
+      skipInterview: true,
+      request: blank,
+      tasks: [{ id: "B1" }],
+    })
+    assert(blankRes.content.startsWith("refused: request must be non-empty"), `blank request must be refused: ${blankRes.content}`)
+  }
+  assert(!existsSync(join(testDir, ".opencode", "teamwork", blankRequestRun)), "a blank request must write nothing")
 
   // (d) legacy tolerance: omitting both inputs plans, defaults to development, no artifact.
   const defaultRun = "20261018-000000-request-default"
@@ -2005,7 +2022,7 @@ try {
   for (const p of POLICY) {
     assert.deepStrictEqual(enforced[p.id], p.deny, `${p.id}: code deny set drifted: ${JSON.stringify(enforced[p.id])}`)
   }
-  console.log("✓ READ_ONLY_ACTIONS matches the expected deny set for all 5 read-only agents")
+  console.log(`✓ READ_ONLY_ACTIONS matches the expected deny set for all ${POLICY.length} read-only agents`)
 
   // --- 8b: every agent whose code policy denies `edit` is documented in the
   // README read-only paragraph (parsed, not a duplicate hard-coded list).
@@ -2864,6 +2881,12 @@ try {
     const orchPlan = orchestrator.slice(orchestrator.indexOf("**Plan**"), orchestrator.indexOf("**Propose**"))
     assert(/\brequest\b/.test(orchPlan), "orchestrator Plan step must pass the verbatim `request` to teamwork_plan")
     assert(orchPlan.includes("ORIGINAL_REQUEST.md"), "orchestrator must state that request is recorded in ORIGINAL_REQUEST.md")
+
+    const indexSrc = readFileSync(join(repoRoot, "plugins/opencode-teamwork/index.ts"), "utf8")
+    const teamworkCommand = indexSrc.slice(indexSrc.indexOf('name: "teamwork"'), indexSrc.indexOf('name: "teamwork-craft"'))
+    assert(/teamwork_plan/.test(teamworkCommand), "the /teamwork template must mention teamwork_plan")
+    assert(/\brequest\b/.test(teamworkCommand), "the /teamwork template must tell Sentinel to pass the verbatim request")
+    assert(/ORIGINAL_REQUEST\.md/.test(teamworkCommand), "the /teamwork template must name ORIGINAL_REQUEST.md")
     console.log("✓ 9.0 sentinel/orchestrator teamwork_plan calls record the verbatim request")
   }
 
@@ -3422,6 +3445,30 @@ process.exit(0);
       const finalJson = JSON.parse(readFileSync(join(rootV, ".opencode", "teamwork", RUN, "verify", "final.json"), "utf8"))
       assert(finalJson.evidence?.lemma?.active === true, "verify/final.json must stamp evidence.lemma")
       assert.strictEqual(finalJson.evidence.lemma.finalVerdict, "FAITHFUL")
+
+      // S6: final evidence must re-check stamped metadata against current nodes.
+      const metaManifest = JSON.parse(savedManifest)
+      metaManifest.nodes.root.statement = "2 = 2"
+      writeFileSync(manifestFile, JSON.stringify(metaManifest, null, 2) + "\n")
+      const fvMeta = await tools.final_verify.execute({ sessionId: RUN })
+      assert.strictEqual(fvMeta.status, "FAIL", "changed node statement must FAIL final_verify")
+      writeFileSync(manifestFile, savedManifest)
+
+      for (const [label, mutate] of [
+        ["declaration", (r) => (r.declaration = "other")],
+        ["declarationType", (r) => (r.declarationType = "2 = 2")],
+        ["axiomDependencies", (r) => (r.axiomDependencies = ["sorryAx"])],
+        ["unauthorizedAxioms", (r) => (r.unauthorizedAxioms = ["evil_ax"])],
+      ]) {
+        const report = JSON.parse(savedVerify4)
+        mutate(report)
+        writeFileSync(verify4File, JSON.stringify(report, null, 2) + "\n")
+        const fvReport = await tools.final_verify.execute({ sessionId: RUN })
+        assert.strictEqual(fvReport.status, "FAIL", `tampered verify report ${label} must FAIL final_verify`)
+        writeFileSync(verify4File, savedVerify4)
+      }
+      const fvRestored = await tools.final_verify.execute({ sessionId: RUN })
+      assert.strictEqual(fvRestored.status, "PASS", "restored metadata must PASS final_verify again")
       console.log("✓ 9.4 stub-binary sorry/admit/axiom + exit-code + final_verify verified")
     }
 
@@ -3475,16 +3522,142 @@ process.exit(0);
         "disprove negation must not satisfy a proved node",
       )
 
-      const noAx = parseLeanAxiomOutput("'t' does not depend on any axioms")
+      // Regression S1: declarations inside strings/quotations must not be seen.
+      const stringSpoof = `def banner : String := "\ntheorem t : RH := by exact bogus\n"\ntheorem t : 1 = 1 := by rfl`
+      const stringScan = analyzeLeanDeclarations(stringSpoof)
+      assert.deepStrictEqual(stringScan.declarations.map((d) => d.name), ["t"], "only the real declaration may be parsed")
+      assert.strictEqual(
+        bindVerifiedDeclaration(stringSpoof, { declaration: "t", statement: "RH" }).ok,
+        false,
+        "a theorem inside a string literal must not satisfy binding",
+      )
+      assert.strictEqual(
+        bindVerifiedDeclaration(stringSpoof, { declaration: "t", statement: "1 = 1" }).ok,
+        true,
+        "the real declaration must still bind",
+      )
+
+      const quoteSpoof = "`(theorem t : RH := by exact bogus)\ntheorem t : 1 = 1 := by rfl"
+      assert.deepStrictEqual(
+        analyzeLeanDeclarations(quoteSpoof).declarations.map((d) => d.name),
+        ["t"],
+        "a theorem inside a syntax quotation must not be parsed",
+      )
+      assert.strictEqual(bindVerifiedDeclaration(quoteSpoof, { declaration: "t", statement: "RH" }).ok, false)
+      const tacticQuoteSpoof = "`(command| theorem t : RH := by exact bogus)\ntheorem t : 1 = 1 := by rfl"
+      assert.deepStrictEqual(
+        analyzeLeanDeclarations(tacticQuoteSpoof).declarations.map((d) => d.name),
+        ["t"],
+        "a category syntax quotation must not leak declarations",
+      )
+      assert.strictEqual(bindVerifiedDeclaration(tacticQuoteSpoof, { declaration: "t", statement: "RH" }).ok, false)
+      assert.strictEqual(
+        analyzeLeanDeclarations("`(theorem t : RH").errors.some((e) => e.includes("quotation")),
+        true,
+        "an undelimitable quotation must fail closed",
+      )
+
+      // Duplicate / namespace / private / protected declarations are ambiguous.
+      const duplicateDecls = "theorem t : 1 = 1 := by rfl\ntheorem t : 2 = 2 := by rfl"
+      const dupBind = bindVerifiedDeclaration(duplicateDecls, { declaration: "t", statement: "1 = 1" })
+      assert.strictEqual(dupBind.ok, false, "duplicate declaration names must be rejected")
+      assert(dupBind.findings.some((f) => f.includes("duplicate theorem/lemma")), dupBind.findings.join("; "))
+
+      for (const source of [
+        "namespace N\ntheorem t : 1 = 1 := by rfl\nend N",
+        "section S\ntheorem t : 1 = 1 := by rfl\nend S",
+        "private theorem t : 1 = 1 := by rfl",
+        "private\ntheorem t : 1 = 1 := by rfl",
+        "protected theorem t : 1 = 1 := by rfl",
+      ]) {
+        const res = bindVerifiedDeclaration(source, { declaration: "t", statement: "1 = 1" })
+        assert.strictEqual(res.ok, false, `ambiguous scoped declaration must fail closed: ${source}`)
+        assert(/namespace|section|private|protected/.test(res.findings.join(" ")), res.findings.join("; "))
+      }
+
+      // S8: negation spacing and binder/forall equivalence.
+      const spacedNot = bindVerifiedDeclaration("theorem notP : ¬ (1 = 2) := by omega", {
+        declaration: "notP",
+        statement: "1 = 2",
+        disproof: true,
+      })
+      assert.strictEqual(spacedNot.ok, true, `spaced negation must match: ${spacedNot.findings}`)
+      const binderDisproof = bindVerifiedDeclaration(
+        "theorem notAdd (n : Nat) : ¬ (n + 0 = n + 1) := by omega",
+        { declaration: "notAdd", statement: "(n : Nat) : n + 0 = n + 1", disproof: true },
+      )
+      assert.strictEqual(binderDisproof.ok, true, `binder negation must match: ${binderDisproof.findings}`)
+      const forallDisproof = bindVerifiedDeclaration(
+        "theorem notForall : Not (∀ n : Nat, n = n + 1) := by omega",
+        { declaration: "notForall", statement: "(n : Nat) : n = n + 1", disproof: true },
+      )
+      assert.strictEqual(forallDisproof.ok, true, `forall negation must match: ${forallDisproof.findings}`)
+      assert.strictEqual(leanStatementMatches("(n : Nat) : n = n", "∀ n : Nat, n = n"), true)
+      assert.strictEqual(
+        bindVerifiedDeclaration("theorem refl (n : Nat) : n = n := by rfl", {
+          declaration: "refl",
+          statement: "∀ n : Nat, n = n",
+        }).ok,
+        true,
+        "binder type must match its forall spelling",
+      )
+
+      // S2: only one exact-line report for the expected declaration is accepted.
+      const noAx = parseLeanAxiomOutput("'t' does not depend on any axioms", [], "t")
       assert.strictEqual(noAx.recognized, true)
       assert.deepStrictEqual(noAx.unauthorized, [])
-      const standardAx = parseLeanAxiomOutput("'t' depends on axioms: [propext, Classical.choice, Quot.sound]")
+      const standardAx = parseLeanAxiomOutput("'t' depends on axioms: [propext, Classical.choice, Quot.sound]", [], "t")
       assert.deepStrictEqual(standardAx.unauthorized, [], "standard Lean axioms must be allowed")
-      const sorryAx = parseLeanAxiomOutput("'t' depends on axioms: [sorryAx, propext]", ["sorryAx"])
-      assert.deepStrictEqual(sorryAx.unauthorized, ["sorryAx"], "sorryAx must never be allowlisted")
-      assert.strictEqual(parseLeanAxiomOutput("'t' depends on axioms: [my_ax]").unauthorized[0], "my_ax")
-      assert.deepStrictEqual(parseLeanAxiomOutput("'t' depends on axioms: [my_ax]", ["my_ax"]).unauthorized, [])
-      assert.strictEqual(parseLeanAxiomOutput("unparseable output").recognized, false)
+      const sorryAllowed = parseLeanAxiomOutput("'t' depends on axioms: [sorryAx, propext]", ["sorryAx"], "t")
+      assert.deepStrictEqual(sorryAllowed.unauthorized, ["sorryAx"], "sorryAx must never be allowlisted")
+      assert.strictEqual(parseLeanAxiomOutput("'t' depends on axioms: [my_ax]", [], "t").unauthorized[0], "my_ax")
+      assert.deepStrictEqual(parseLeanAxiomOutput("'t' depends on axioms: [my_ax]", ["my_ax"], "t").unauthorized, [])
+      assert.strictEqual(parseLeanAxiomOutput("unparseable output", [], "t").recognized, false)
+      assert.strictEqual(parseLeanAxiomOutput("'t' depends on axioms: [propext]", [], "").recognized, false, "missing declaration name must fail closed")
+
+      const spoofedAx = parseLeanAxiomOutput(
+        "'t' depends on axioms: [propext, Classical.choice, Quot.sound]\n't' depends on axioms: [sorryAx]",
+        [],
+        "t",
+      )
+      assert.strictEqual(spoofedAx.recognized, false, "a spoofed clean line before the real report must fail closed")
+      assert(spoofedAx.findings.some((f) => /reports for "t"/.test(f)), spoofedAx.findings.join("; "))
+
+      const foreignAx = parseLeanAxiomOutput("'u' depends on axioms: [propext]", [], "t")
+      assert.strictEqual(foreignAx.recognized, false, "a report for a different declaration must fail closed")
+
+      const duplicateAx = parseLeanAxiomOutput(
+        "'t' depends on axioms: [propext]\n't' depends on axioms: [propext]",
+        [],
+        "t",
+      )
+      assert.strictEqual(duplicateAx.recognized, false, "multiple reports for the expected declaration must fail closed")
+
+      const wrappedAx = parseLeanAxiomOutput("'t' depends on axioms: [propext,\n Classical.choice]", [], "t")
+      assert.strictEqual(wrappedAx.recognized, false, "a malformed/wrapped report must fail closed")
+
+      // Probe-hijacking commands are rejected before the probe is appended.
+      for (const src of [
+        '#eval "spoof"',
+        "#check 1",
+        "#print axioms t",
+        "#exit",
+        'def x := logInfo "spoof"',
+        'def x := dbg_trace "spoof"',
+        'def x := IO.println "spoof"',
+        'def x := println "spoof"',
+        "set_option trace.Meta true",
+      ]) {
+        const findings = detectAxiomProbeHijacks(src)
+        assert(findings.length > 0, `hijack source must be rejected: ${src}`)
+        assert(findings[0].includes("probe-hijacking"), findings[0])
+      }
+      assert.deepStrictEqual(detectAxiomProbeHijacks("theorem t : 1 = 1 := by rfl"), [], "a plain proof has no hijack")
+      assert.deepStrictEqual(
+        detectAxiomProbeHijacks('def msg : String := "#eval spoof"'),
+        [],
+        "hijack text inside a string literal must not trigger",
+      )
 
       // Toolchain absent: the axiom probe must fail closed, never PASS.
       const axTmpDir = mkdtempSync(join(lemmaTestDir, "axiom-notool-"))
@@ -3518,6 +3691,46 @@ process.exit(0);
         await tools.lemma_node.execute({ sessionId: RUN, action: "create", lemmaId: "root", declaration: "t", statement: "1 = 1" })
       }
 
+      // The problem.lean fallback must be unique; ambiguous problems fail closed.
+      const RUN_FALLBACK = "20261018-000000-lemma-fallback"
+      await tools.plan.execute({
+        sessionId: RUN_FALLBACK,
+        topology: "proof",
+        lemmaMode: true,
+        skipInterview: true,
+        tasks: [{ id: "L1", agent: "team/proof-worker" }],
+      })
+      await tools.lemma_formalize.execute({ sessionId: RUN_FALLBACK, action: "draft", leanCode: "theorem t : 1 = 1 := by sorry" })
+      await tools.lemma_formalize.execute({ sessionId: RUN_FALLBACK, action: "review_pre", verdict: "APPROVE", notes: "ok" })
+      await tools.lemma_node.execute({ sessionId: RUN_FALLBACK, action: "create", lemmaId: "root", statement: "1 = 1" })
+      await tools.lemma_node.execute({ sessionId: RUN_FALLBACK, action: "attempt", lemmaId: "root", leanCode: "theorem t : 1 = 1 := by rfl" })
+      const vFallback = await tools.lemma_verify.execute({ sessionId: RUN_FALLBACK, lemmaId: "root" })
+      assert.strictEqual(vFallback.report.status, "PASS", `unique problem.lean fallback must bind: ${JSON.stringify(vFallback.report)}`)
+      assert.strictEqual(vFallback.report.declaration, "t")
+
+      const RUN_AMBIG = "20261018-000000-lemma-ambiguous-problem"
+      await tools.plan.execute({
+        sessionId: RUN_AMBIG,
+        topology: "proof",
+        lemmaMode: true,
+        skipInterview: true,
+        tasks: [{ id: "L1", agent: "team/proof-worker" }],
+      })
+      await tools.lemma_formalize.execute({
+        sessionId: RUN_AMBIG,
+        action: "draft",
+        leanCode: "theorem a : 1 = 1 := by sorry\ntheorem b : 1 = 1 := by sorry",
+      })
+      await tools.lemma_formalize.execute({ sessionId: RUN_AMBIG, action: "review_pre", verdict: "APPROVE", notes: "ok" })
+      await tools.lemma_node.execute({ sessionId: RUN_AMBIG, action: "create", lemmaId: "root", statement: "1 = 1" })
+      await tools.lemma_node.execute({ sessionId: RUN_AMBIG, action: "attempt", lemmaId: "root", leanCode: "theorem a : 1 = 1 := by rfl" })
+      const vAmbiguous = await tools.lemma_verify.execute({ sessionId: RUN_AMBIG, lemmaId: "root" })
+      assert.strictEqual(vAmbiguous.report.status, "FAIL", "ambiguous problem.lean must fail closed")
+      assert(
+        vAmbiguous.report.findings.some((f) => f.includes("declares 2 theorem/lemmas")),
+        `ambiguous fallback finding missing: ${JSON.stringify(vAmbiguous.report.findings)}`,
+      )
+
       const RUN = "20261018-000000-lemma-binding"
       await setupRun(RUN)
       await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 1, leanCode: "theorem other : 1 = 1 := by rfl" })
@@ -3543,6 +3756,31 @@ process.exit(0);
       assert.deepStrictEqual(vWhitespace.report.unauthorizedAxioms, [])
       assert(vWhitespace.node.status === "proved", "bound declaration must mark the node proved")
 
+      // S6: metadata is immutable after a PASS; require an explicit reset first.
+      const mutateStatement = await tools.lemma_node.execute({
+        sessionId: RUN,
+        action: "update",
+        lemmaId: "root",
+        statement: "2 = 2",
+      })
+      assert(mutateStatement.content.startsWith("refused:"), `statement mutation after PASS must be refused: ${mutateStatement.content}`)
+      assert(/reset it to "formal"/i.test(mutateStatement.content), "refusal must explain the explicit reset")
+      const mutateDeclaration = await tools.lemma_node.execute({
+        sessionId: RUN,
+        action: "update",
+        lemmaId: "root",
+        declaration: "other",
+      })
+      assert(mutateDeclaration.content.startsWith("refused:"), `declaration mutation after PASS must be refused: ${mutateDeclaration.content}`)
+      const sameMetadata = await tools.lemma_node.execute({
+        sessionId: RUN,
+        action: "update",
+        lemmaId: "root",
+        statement: "1 = 1",
+        declaration: "t",
+      })
+      assert(!sameMetadata.content.startsWith("refused:"), `rewriting identical metadata must stay allowed: ${sameMetadata.content}`)
+
       await tools.lemma_node.execute({ sessionId: RUN, action: "attempt", lemmaId: "root", round: 4, leanCode: "-- AXIOM_SORRY_DEP\ntheorem t : 1 = 1 := by rfl" })
       const vTransitiveSorry = await tools.lemma_verify.execute({ sessionId: RUN, lemmaId: "root", round: 4 })
       assert.strictEqual(vTransitiveSorry.report.status, "FAIL", "transitive sorryAx must FAIL even with a clean source text")
@@ -3567,6 +3805,23 @@ process.exit(0);
       assert.strictEqual(vAllowedAx.report.status, "PASS", `allowlisted transitive axiom must PASS: ${JSON.stringify(vAllowedAx.report)}`)
       assert(vAllowedAx.report.axiomDependencies.includes("my_custom_ax"))
       assert.deepStrictEqual(vAllowedAx.report.unauthorizedAxioms, [])
+
+      // S2 E2E: a printing command in the attempt must stop the probe.
+      const RUN_HIJACK = "20261018-000000-lemma-hijack"
+      await setupRun(RUN_HIJACK, 1)
+      await tools.lemma_node.execute({
+        sessionId: RUN_HIJACK,
+        action: "attempt",
+        lemmaId: "root",
+        round: 1,
+        leanCode: '#eval "spoof"\ntheorem t : 1 = 1 := by rfl',
+      })
+      const vHijack = await tools.lemma_verify.execute({ sessionId: RUN_HIJACK, lemmaId: "root", round: 1 })
+      assert.strictEqual(vHijack.report.status, "FAIL", "probe-hijacking command must FAIL")
+      assert(
+        vHijack.report.findings.some((f) => f.includes("probe-hijacking")),
+        `hijack finding missing: ${JSON.stringify(vHijack.report.findings)}`,
+      )
 
       console.log("✓ 9.4b declaration binding + transitive axiom dependencies verified")
     }
