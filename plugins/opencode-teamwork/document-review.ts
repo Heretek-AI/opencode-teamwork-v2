@@ -213,58 +213,341 @@ function inferFormat(formatHint: unknown, label = "", contentType = ""): string 
   return ext || "md"
 }
 
-function splitInstructionAndInlineDoc(request: string): { instructionText: string; hasInlineDoc: boolean } {
-  let hasInlineDoc = false
-  let working = request
+interface TextSpan {
+  start: number
+  end: number
+}
+
+interface LineInfo {
+  text: string
+  start: number
+  end: number
+}
+
+const MD_HEADING_LINE_RE = /^[ \t]*#{1,3}\s+\S/
+const LATEX_STRUCT_LINE_RE =
+  /^[ \t]*\\(?:(?:documentclass|documentstyle|usepackage|RequirePackage)(?:\[[^\]]*\])?\{|(?:title|author|date|maketitle|newcommand|renewcommand|newtheorem|DeclareMathOperator)\b|(?:part|chapter|section|subsection)\*?\{|begin\{(?:document|abstract|theorem|lemma|proposition|corollary|definition|proof|remark)\})/
+const YAML_FM_OPEN_RE = /^---\s*$/
+const YAML_FM_CLOSE_RE = /^(?:---|\.\.\.)\s*$/
+const YAML_FM_KEY_RE = /^[A-Za-z_][A-Za-z0-9_.-]*\s*:/
+
+const STRUCT_PARA_RE =
+  /^[ \t]*(?:#{1,6}\s+\S|\\(?:part|chapter|section|subsection|begin|end|documentclass|documentstyle|usepackage|RequirePackage|title|author|date|maketitle|item)\b|```|~~~|---|\.\.\.|>\s|\|)/m
+const EXPLICIT_ASSISTANT_RE =
+  /\b(?:please|can\s+you|could\s+you|would\s+you|will\s+you|help\s+me|tell\s+me|let\s+me\s+know|i\s+(?:want|need)\s+you\s+to)\b/i
+const QUESTION_ABOUT_DOC_RE =
+  /\b(?:this\s+(?:paper|document|doc|draft|spec|rfc|manuscript|preprint|proof|theorem|lemma|section)|the\s+above)\b[^?!]*\?\s*$/i
+const IMPERATIVE_START_RE =
+  /^(?:(?:now|then|also|finally|next)[,:\s]+)?(?:review|critique|assess|evaluate|audit|referee|peer[- ]?review|analy[sz]e|summari[sz]e|check|inspect|explain|prove|disprove|solve|answer|verify|formali[sz]e|fix|debug|diagnose|troubleshoot|implement|refactor|write|build|add|edit|update|test|make)\b/i
+const BODY_NARRATION_RE =
+  /^(?:in\s+(?:section|chapter|part|appendix|table|figure|this\s+(?:paper|section|article|note|draft|work|study))\b|(?:here|below|above|finally|overall),?\s+we\b|we\s+(?:review|analy[sz]e|evaluate|summari[sz]e|prove|show|present|conclude|observe|find|note|discuss|describe|propose|report|compare|demonstrate)\b)/i
+
+function isTrailingUserInstruction(paraText: string): boolean {
+  const trimmed = paraText.trim()
+  if (!trimmed) return false
+  if (STRUCT_PARA_RE.test(trimmed)) return false
+  if (EXPLICIT_ASSISTANT_RE.test(trimmed)) return true
+  if (BODY_NARRATION_RE.test(trimmed)) return false
+  return IMPERATIVE_START_RE.test(trimmed) || QUESTION_ABOUT_DOC_RE.test(trimmed)
+}
+
+function getLineInfos(text: string): LineInfo[] {
+  const lines: LineInfo[] = []
+  const re = /([^\r\n]*)(\r?\n|$)/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    if (m[0].length === 0 && m.index === text.length) break
+    lines.push({ text: m[1], start: m.index, end: m.index + m[1].length })
+    if (m[2].length === 0) break
+  }
+  return lines
+}
+
+function findYamlFrontmatterStart(lines: LineInfo[], beforeLine: number): number {
+  for (let i = 0; i < beforeLine; i++) {
+    if (!YAML_FM_OPEN_RE.test(lines[i].text)) continue
+    let hasKey = false
+    let valid = true
+    for (let j = i + 1; j < beforeLine; j++) {
+      const ln = lines[j].text
+      if (YAML_FM_CLOSE_RE.test(ln)) {
+        if (valid && hasKey) return i
+        break
+      }
+      const trimmed = ln.trim()
+      if (!trimmed || trimmed.startsWith("#")) continue
+      if (YAML_FM_KEY_RE.test(trimmed)) {
+        hasKey = true
+      } else if (/^\s+\S/.test(ln) || /^-\s+/.test(trimmed)) {
+        // YAML multiline value or sequence item
+      } else {
+        valid = false
+        break
+      }
+    }
+  }
+  return -1
+}
+
+function overlapsAny(spans: TextSpan[], start: number, end: number): boolean {
+  return spans.some((s) => start < s.end && end > s.start)
+}
+
+function mergeSpans(spans: TextSpan[]): TextSpan[] {
+  if (spans.length <= 1) return [...spans]
+  const sorted = [...spans].sort((a, b) => a.start - b.start)
+  const merged: TextSpan[] = [{ ...sorted[0] }]
+  for (let i = 1; i < sorted.length; i++) {
+    const prev = merged[merged.length - 1]
+    const cur = sorted[i]
+    if (cur.start <= prev.end) {
+      prev.end = Math.max(prev.end, cur.end)
+    } else {
+      merged.push({ ...cur })
+    }
+  }
+  return merged
+}
+
+function maskSpansPreservingLines(text: string, spans: TextSpan[]): string {
+  if (spans.length === 0) return text
+  const chars = text.split("")
+  for (const sp of spans) {
+    for (let k = sp.start; k < sp.end; k++) {
+      if (chars[k] !== "\n" && chars[k] !== "\r") chars[k] = " "
+    }
+  }
+  return chars.join("")
+}
+
+function splitInstructionAndInlineDoc(request: string): {
+  leadingInstruction: string
+  inlineDoc: string
+  trailingInstruction: string
+  instructionText: string
+  hasInlineDoc: boolean
+} {
+  const spans: TextSpan[] = []
+  let hasExplicitDocTag = false
 
   // 1. <<<DOCUMENT ... >>>
-  const docTagMatches = [...working.matchAll(/<<<DOCUMENT\b[\s\S]*?>>>/gi)]
-  if (docTagMatches.some((m) => m[0].replace(/<<<DOCUMENT|>>>/gi, "").trim().length >= 20)) {
-    hasInlineDoc = true
-    working = working.replace(/<<<DOCUMENT\b[\s\S]*?>>>/gi, " ")
+  for (const m of request.matchAll(/<<<DOCUMENT\b([\s\S]*?)>>>/gi)) {
+    if (m.index !== undefined && m[1].trim().length >= 20) {
+      hasExplicitDocTag = true
+      spans.push({ start: m.index, end: m.index + m[0].length })
+    }
   }
 
-  // 2. Fenced code/document block >= 120 chars
-  const fenceMatches = [...working.matchAll(/```[^\n]*\r?\n([\s\S]*?)```/g)]
-  if (fenceMatches.some((m) => m[1].trim().length >= 120)) {
-    hasInlineDoc = true
-    working = working.replace(/```[^\n]*\r?\n[\s\S]*?```/g, " ")
-  }
-
-  // 3. Multi-line structured document >= 240 chars with headings or LaTeX structure
-  if (!hasInlineDoc && working.length >= 240) {
-    const lines = working.split(/\r?\n/)
-    const hasHeading = /^#{1,3}\s+\S/m.test(working)
-    const hasLatexDoc = /\\(?:part|chapter|section|subsection)\*?\{|\\begin\{(?:theorem|lemma|abstract|document)\}/.test(working)
-    if (lines.length >= 3 && (hasHeading || hasLatexDoc)) {
-      hasInlineDoc = true
-      // Keep the leading non-heading instruction lines before the first heading/section
-      const firstStructIdx = working.search(/(?:^|\n)(?:#{1,3}\s+\S|\\(?:part|chapter|section|subsection)\*?\{|\\begin\{(?:theorem|lemma|abstract|document)\})/)
-      if (firstStructIdx > 0) {
-        working = working.slice(0, firstStructIdx)
-      } else {
-        // Inline doc starts at line 0: preserve trailing non-structural instruction
-        // lines/paragraph (e.g., "\n\nPlease critique this paper.") or text after \end{document}.
-        const endDocMatch = [...working.matchAll(/\\end\{document\}/gi)].pop()
-        if (endDocMatch && endDocMatch.index !== undefined) {
-          working = working.slice(endDocMatch.index + endDocMatch[0].length).trim()
-        } else {
-          const paras = working
-            .split(/\r?\n\s*\r?\n/)
-            .map((p) => p.trim())
-            .filter(Boolean)
-          const lastPara = paras.length >= 2 ? paras[paras.length - 1] : ""
-          const isStructPara =
-            /^(?:#{1,3}\s+\S|\\(?:part|chapter|section|subsection)\*?\{|\\(?:begin|end)\{(?:theorem|lemma|abstract|document)\})/m.test(
-              lastPara,
-            )
-          working = lastPara && !isStructPara ? lastPara : ""
+  // 2. Fenced code/document block >= 120 chars (fence-length-aware line scan + inline fallback)
+  const rawLines = getLineInfos(request)
+  let i = 0
+  while (i < rawLines.length) {
+    const openMatch = /^[ \t]*(`{3,}|~{3,})(.*)$/.exec(rawLines[i].text)
+    const fenceChar = openMatch ? openMatch[1][0] : ""
+    const validInfo = openMatch ? fenceChar !== "`" || !openMatch[2].includes("`") : false
+    if (openMatch && validInfo && !overlapsAny(spans, rawLines[i].start, rawLines[i].end)) {
+      const fenceLen = openMatch[1].length
+      const closeRe = new RegExp(`^[ \\t]*${fenceChar === "`" ? "`" : "~"}{${fenceLen},}[ \\t]*$`)
+      let closeIdx = -1
+      for (let j = i + 1; j < rawLines.length; j++) {
+        if (closeRe.test(rawLines[j].text)) {
+          closeIdx = j
+          break
         }
+      }
+      if (closeIdx !== -1) {
+        const bodyStart = rawLines[i].end
+        const bodyEnd = rawLines[closeIdx].start
+        if (request.slice(bodyStart, bodyEnd).trim().length >= 120) {
+          const spanStart = rawLines[i].start
+          const spanEnd = rawLines[closeIdx].end
+          if (!overlapsAny(spans, spanStart, spanEnd)) {
+            spans.push({ start: spanStart, end: spanEnd })
+          }
+        }
+        i = closeIdx + 1
+        continue
+      }
+    }
+    i++
+  }
+  for (const m of request.matchAll(/```[^\n]*\r?\n([\s\S]*?)```/g)) {
+    if (m.index !== undefined && m[1].trim().length >= 120) {
+      const s = m.index
+      const e = m.index + m[0].length
+      if (!overlapsAny(spans, s, e)) {
+        spans.push({ start: s, end: e })
       }
     }
   }
 
-  return { instructionText: working, hasInlineDoc }
+  // 3. Multi-line structured document >= 240 chars (on original or fence-masked text when no <<<DOCUMENT>>>)
+  const masked = hasExplicitDocTag ? "" : maskSpansPreservingLines(request, spans)
+  if (!hasExplicitDocTag && masked.replace(/[ \t]+/g, " ").trim().length >= 240) {
+    const lines = getLineInfos(masked)
+    if (lines.length >= 3) {
+      const firstMdIdx = lines.findIndex((ln) => MD_HEADING_LINE_RE.test(ln.text))
+      const firstLatexIdx = lines.findIndex((ln) => LATEX_STRUCT_LINE_RE.test(ln.text))
+
+      if (firstMdIdx !== -1 || firstLatexIdx !== -1) {
+        let mdStartLine = firstMdIdx
+        if (firstMdIdx !== -1) {
+          const fmStart = findYamlFrontmatterStart(lines, firstMdIdx)
+          if (fmStart !== -1) mdStartLine = fmStart
+        }
+        let latexStartLine = firstLatexIdx
+        if (firstLatexIdx !== -1) {
+          while (latexStartLine > 0 && /^[ \t]*%/.test(lines[latexStartLine - 1].text)) {
+            latexStartLine--
+          }
+        }
+        const startLine =
+          mdStartLine !== -1 && latexStartLine !== -1
+            ? Math.min(mdStartLine, latexStartLine)
+            : mdStartLine !== -1
+              ? mdStartLine
+              : latexStartLine
+        const docStart = lines[startLine].start
+
+        const endDocMatches = [...masked.matchAll(/\\end\{document\}/gi)].filter(
+          (m) => m.index !== undefined && m.index >= docStart,
+        )
+        let docEnd = request.length
+        if (endDocMatches.length > 0) {
+          const lastEnd = endDocMatches[endDocMatches.length - 1]
+          if (lastEnd.index !== undefined) {
+            docEnd = lastEnd.index + lastEnd[0].length
+          }
+        } else {
+          const paras: { start: number; end: number; text: string }[] = []
+          let pStartIdx = -1
+          for (let k = startLine; k < rawLines.length; k++) {
+            const nonBlank = rawLines[k].text.trim().length > 0
+            if (nonBlank && pStartIdx === -1) {
+              pStartIdx = k
+            } else if (!nonBlank && pStartIdx !== -1) {
+              const sOff = rawLines[pStartIdx].start
+              const eOff = rawLines[k - 1].end
+              paras.push({ start: sOff, end: eOff, text: request.slice(sOff, eOff) })
+              pStartIdx = -1
+            }
+          }
+          if (pStartIdx !== -1) {
+            const sOff = rawLines[pStartIdx].start
+            const eOff = rawLines[rawLines.length - 1].end
+            paras.push({ start: sOff, end: eOff, text: request.slice(sOff, eOff) })
+          }
+
+          let keepCount = paras.length
+          let peeled = 0
+          while (keepCount >= 2 && peeled < 2 && isTrailingUserInstruction(paras[keepCount - 1].text)) {
+            const candidateEnd = paras[keepCount - 2].end
+            const remainingMasked = masked.slice(docStart, candidateEnd)
+            const remLines = remainingMasked.split(/\r?\n/)
+            const stillStructured = remLines.some((l) => MD_HEADING_LINE_RE.test(l) || LATEX_STRUCT_LINE_RE.test(l))
+            if (!stillStructured) break
+            keepCount--
+            peeled++
+          }
+          if (keepCount < paras.length) {
+            docEnd = paras[keepCount - 1].end
+          }
+        }
+
+        spans.push({ start: docStart, end: docEnd })
+      }
+    }
+  }
+
+  if (spans.length === 0) {
+    return {
+      leadingInstruction: request,
+      inlineDoc: "",
+      trailingInstruction: "",
+      instructionText: request,
+      hasInlineDoc: false,
+    }
+  }
+
+  const merged = mergeSpans(spans)
+  const outerParts: string[] = []
+  const docParts: string[] = []
+  let cursor = 0
+  for (const sp of merged) {
+    outerParts.push(request.slice(cursor, sp.start))
+    docParts.push(request.slice(sp.start, sp.end))
+    cursor = sp.end
+  }
+  outerParts.push(request.slice(cursor))
+
+  const leadingInstruction = outerParts[0].trim()
+  const trailingInstruction = outerParts[outerParts.length - 1].trim()
+  const inlineDoc = docParts.join("\n\n")
+  const instructionText = outerParts.map((p) => p.trim()).filter(Boolean).join("\n\n")
+
+  return { leadingInstruction, inlineDoc, trailingInstruction, instructionText, hasInlineDoc: true }
+}
+
+const DOC_NOUN_PHRASE =
+  "(?:(?:this|the|that|these|my|our|attached|supplied|provided|following|above)\\s+){0,2}" +
+  "(?:(?!(?:bugs?|defects?|issues?|errors?|faults?|glitches?|crash(?:es)?|failures?|regressions?|exceptions?|leaks?|bottlenecks?)\\b)[a-z0-9_-]+\\s+){0,2}" +
+  "(?:papers?|documents?|docs?|preprints?|manuscripts?|rfcs?|drafts?|spec(?:ification)?s?|design\\s+docs?|proposals?|whitepapers?|reports?|theses|thesis|articles?)"
+
+const STRONG_CRITIQUE_RE = new RegExp(
+  `\\b(?:review|critique|assess|evaluate|audit|referee|peer[- ]?review|summari[sz]e|what\\s+does\\s+${DOC_NOUN_PHRASE}\\s+say)\\b`,
+  "i",
+)
+
+const DOC_TARGETED_ANALYZE_CHECK_RE = new RegExp(
+  `\\b(?:analy[sz]e|check)\\s+(?:of\\s+)?(?:__DOC_REF__|${DOC_NOUN_PHRASE})\\b`,
+  "i",
+)
+
+const DEFECT_HEAD_NOUN_BODY =
+  "bugs?|defects?|issues?|errors?|faults?|glitches?|crash(?:es)?|failures?|outages?|panics?|hangs?|freezes?|deadlocks?|timeouts?|regressions?|exceptions?|stack\\s*traces?|tracebacks?|core\\s*dumps?|leaks?|bottlenecks?|slowdowns?|spikes?|contentions?|race\\s+conditions?|races?"
+const NON_MODIFIER_GUARD =
+  "(?!(?:for|in|of|on|to|with|about|from|into|by|and|or|covering|regarding|concerning|paper|document|doc|preprint|manuscript|rfc|draft|spec|specification|article|report)\\b)"
+const DEFECT_ANALYSIS_RE = new RegExp(
+  `\\b(?:analy[sz]e|investigate|trace|inspect|examine|profile|fix|resolve)\\s+(?:(?:the|this|that|these|those|a|an|some|any|my|our|your|their|several|multiple|recent|intermittent|recurring|new|existing)\\s+)?(?:${NON_MODIFIER_GUARD}[a-z0-9_-]+\\s+){0,3}(?:${DEFECT_HEAD_NOUN_BODY})\\b` +
+    `|\\b(?:analy[sz]e|investigate|trace|reproduce|root[- ]?cause)\\s+why\\b` +
+    `|\\breproduce\\s+(?:(?:the|this|that|these|those|a|an)\\s+)?(?:${NON_MODIFIER_GUARD}[a-z0-9_-]+\\s+){0,3}(?:${DEFECT_HEAD_NOUN_BODY}|behavior|problem)\\b`,
+  "i",
+)
+
+const DIAGNOSTIC_VERB_RE = /\b(debug|diagnose|troubleshoot|root[- ]?cause)\b/gi
+const TOPIC_INTRO_RE =
+  /(?:^|\s)(?:covering|about|regarding|concerning|discussing|explaining|documenting|describing|detailing|outlining|mentioning)\s+(?:(?:the|a|an|its|their|our|these|those|new|all)\s+)*$/i
+const HOW_TO_RE = /\bhow\s+to\s+(?:[a-z-]+\s*(?:,\s*(?:and\s+|or\s+)?|\s+(?:and|or)\s+))*$/i
+const DEBUG_ATTR_NOUN_RE =
+  /^\s+(?:(?:and|or)\s+(?:[a-z0-9_-]+\s+)?)?(?:flags?|modes?|options?|outputs?|logs?|logging|levels?|info(?:rmation)?|symbols?|builds?|configs?|configurations?|settings?|commands?|menus?|panels?|endpoints?|headers?|tools?|tooling|features?|workflows?|guides?|sections?|chapters?|docs?|documentation|assertions?|statements?|prints?|messages?|coverage)\b/i
+
+function hasDebuggingOrDiagnosticIntent(intentText: string): boolean {
+  if (DEFECT_ANALYSIS_RE.test(intentText)) return true
+  DIAGNOSTIC_VERB_RE.lastIndex = 0
+  let m: RegExpExecArray | null
+  while ((m = DIAGNOSTIC_VERB_RE.exec(intentText)) !== null) {
+    const idx = m.index
+    const word = m[1].toLowerCase()
+    const rawPrefix = intentText.slice(0, idx)
+    const hardBoundary = Math.max(
+      rawPrefix.lastIndexOf("."),
+      rawPrefix.lastIndexOf(";"),
+      rawPrefix.lastIndexOf("!"),
+      rawPrefix.lastIndexOf("\n"),
+      rawPrefix.lastIndexOf("("),
+    )
+    const commaBoundary = Math.max(hardBoundary, rawPrefix.lastIndexOf(","))
+    const beforeHard = rawPrefix.slice(hardBoundary + 1)
+    const beforeComma = rawPrefix.slice(commaBoundary + 1)
+    const after = intentText.slice(idx + m[0].length)
+    const isTopicIntro = TOPIC_INTRO_RE.test(beforeComma) || HOW_TO_RE.test(beforeHard)
+    const isAttrDebug =
+      word === "debug" &&
+      (DEBUG_ATTR_NOUN_RE.test(after) ||
+        (/\b(?:on|about|for)\s+$/i.test(beforeComma) && /^\s*(?:[.,;!?)]|$)/.test(after)))
+    if (!isTopicIntro && !isAttrDebug) return true
+  }
+  return false
 }
 
 export function classifyRoute(rawInput: RouteClassifyInput | string, root: string): RouteClassification {
@@ -292,46 +575,53 @@ export function classifyRoute(rawInput: RouteClassifyInput | string, root: strin
   URL_TOKEN_RE.lastIndex = 0
 
   let hasExplicitRequestDocPath = false
-  for (const rawTok of instructionText.split(/\s+/)) {
-    const tok = trimToken(rawTok)
-    if (!tok || /^https?:\/\//i.test(tok)) continue
+  const isSuppliedDocToken = (tok: string): boolean => {
+    if (!tok) return false
+    if (/^https?:\/\//i.test(tok)) return true
     const hasExplicitPrefix =
       tok.startsWith("/") ||
       tok.startsWith("~/") ||
       tok.startsWith("file://") ||
       tok.startsWith("./") ||
       tok.includes("/")
-    if (!hasExplicitPrefix || !DOC_EXT_RE.test(tok)) continue
-    if (!checkPaths) {
-      hasExplicitRequestDocPath = true
-      break
-    }
-    if (isContainedRegularFile(root, tok).ok) {
-      hasExplicitRequestDocPath = true
-      break
-    }
+    if (!hasExplicitPrefix || !DOC_EXT_RE.test(tok)) return false
+    return !checkPaths || isContainedRegularFile(root, tok).ok
   }
+
+  const intentText = instructionText.replace(/\S+/g, (rawTok) => {
+    const tok = trimToken(rawTok)
+    if (!isSuppliedDocToken(tok)) return rawTok
+    if (!/^https?:\/\//i.test(tok)) hasExplicitRequestDocPath = true
+    return rawTok.replace(tok, "__DOC_REF__")
+  })
 
   const hasSuppliedDocument = hasExplicitDocObj || hasDocInputs || hasRequestUrl || hasExplicitRequestDocPath || hasInlineDoc
 
   // Negative Trigger Guard A: PR / pull request / diff / patch / code review
   const rejectedAsPrOrCodeReview =
     /\b(?:review\s+(?:this|the|my|our|a)?\s*(?:pr|pull\s+request|diff|patch|commit|commits|codebase|code)|pr\s*#?\d+|pull\s+request\s*#?\d+|code\s+review|reviewing\s+(?:this|the)\s+(?:pr|diff|patch|code))\b/i.test(
-      instructionText,
+      intentText,
     )
 
-  // Negative Trigger Guard B: primary deliverable is implementing, fixing/analyzing/debugging a bug, or solving/proving a problem
+  // Negative Trigger Guard B: primary deliverable is implementing, debugging/diagnosing a failure, or solving/proving a problem
+  const hasImplementOrEditIntent =
+    /\b(?:implement|refactor|write\s+(?:a\s+|the\s+)?(?:function|module|script|test|code|patch|class|cli)|build\s+(?:a|the)|add\s+(?:a|the)\s+(?:feature|flag|endpoint|test|option|command)|make\s+tests\s+pass|edit\s+(?:the\s+)?(?:file|code)|update\s+(?:the\s+)?(?:code|docs|readme)|fix\s+(?:this|that|it)\b)\b/i.test(
+      intentText,
+    )
+  const hasMathOrSolveIntent =
+    /\b(?:solve\s+(?:problem|exercise|question|equation|this|the\s+problem)|answer\s+(?:problem|question|exercise)|prove\s+(?:theorem|lemma|conjecture|proposition|corollary|that\b|the\s+following|it\b)|disprove|find\s+(?:a\s+)?(?:proof|solution|counterexample)\s+(?:for|of|to))\b/i.test(
+      intentText,
+    )
   const rejectedAsImplementOrSolve =
-    /\b(?:implement|fix\s+(?:the\s+|this\s+|a\s+)?bug|fix\s+this|(?:analy[sz]e|investigate|debug|diagnose|troubleshoot|trace|reproduce)\s+(?:the\s+|this\s+|a\s+|an\s+)?(?:bug|issue|error|crash|failure|regression|exception|defect)|debug|diagnose|troubleshoot|refactor|write\s+(?:a\s+|the\s+)?(?:function|module|script|test|code|patch|class|cli)|build\s+(?:a|the)|add\s+(?:a|the)\s+(?:feature|flag|endpoint|test|option|command)|make\s+tests\s+pass|edit\s+(?:the\s+)?(?:file|code)|update\s+(?:the\s+)?(?:code|docs|readme)|solve\s+(?:problem|exercise|question|equation|this|the\s+problem)|answer\s+(?:problem|question|exercise)|prove\s+(?:theorem|lemma|conjecture|proposition|corollary|that\b|the\s+following|it\b)|disprove|find\s+(?:a\s+)?(?:proof|solution|counterexample)\s+(?:for|of|to))\b/i.test(
-      instructionText,
-    )
+    hasImplementOrEditIntent || hasMathOrSolveIntent || hasDebuggingOrDiagnosticIntent(intentText)
 
-  // Positive critique/assessment intent
+  // Positive critique/assessment intent (Tier 1 strong critique verbs + Tier 2 document-targeted analyze/check)
   const hasCritiqueIntent =
-    (hasExplicitDocObj && instructionText.trim().length === 0) ||
-    /\b(?:review|critique|assess|evaluate|audit|referee|peer[- ]?review|analy[sz]e|summari[sz]e|what\s+does\s+(?:this|the)\s+(?:paper|document|doc|preprint|manuscript|rfc|draft)\s+say|check\s+(?:this|the)\s+(?:paper|document|doc|preprint|manuscript|rfc|draft|design\s+doc))\b/i.test(
-      instructionText,
-    )
+    (hasExplicitDocObj &&
+      (instructionText.trim().length === 0 ||
+        /^(?:please\s+)?(?:analy[sz]e|check)(?:\s+(?:this|it))?[.!?]?$/i.test(instructionText.trim()))) ||
+    STRONG_CRITIQUE_RE.test(intentText) ||
+    DOC_TARGETED_ANALYZE_CHECK_RE.test(intentText)
 
   // Priority 2+: other route signals evaluated on full instruction (or request if not inline doc)
   const routeEvalText = hasInlineDoc ? instructionText : request
