@@ -13,8 +13,8 @@ an effect or setup function. (cause: SchemaError(Expected object at ["default"])
 ```
 
 This repo is the ported, V2-native version: the original 10 agents plus a
-security auditor, document segment reviewer, formalization reviewer, and
-tournament referee (14 total) and 7 slash commands,
+security auditor, document segment reviewer, formalization reviewer,
+tournament referee, and independent victory auditor (15 total) and 7 slash commands,
 rewritten for the V2 plugin + agent APIs. Verified against **OpenCode `v2.0.26`**.
 
 ## What changed (V1 → V2)
@@ -36,7 +36,7 @@ plugins/opencode-teamwork/tools.ts           # engine tools + hooks (V2 API)
 plugins/opencode-teamwork/document-review.ts # Document Review route classifier, PDF/MD ingestion, RSA bounds
 plugins/opencode-teamwork/lemma.ts           # LEMMA (Lean 4) probe, classifier, verifier
 plugins/opencode-teamwork/tournament.ts      # bounded massive-proof tournament & opt-in router
-agents/team/*.md                  # 14 team agents (markdown, V2 frontmatter)
+agents/team/*.md                  # 15 team agents (markdown, V2 frontmatter)
 docs/ARTIFACTS.md                 # canonical artifact layout, topologies, schemas
 lib/team.mjs                      # installer core (config dir, model map, agent files)
 lib/picker.mjs                    # interactive model picker (`opencode models`)
@@ -74,7 +74,8 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 | `teamwork_next` | evaluates DAG dependencies, lifecycle states, and ready tasks |
 | `teamwork_task_update` | deterministic task state machine transitions (`pending` → `worker_active` → `worker_done` → `verifier_active` → `verified_pass` / `verified_fail` / `blocked`) |
 | `teamwork_security_audit` | mandatory pre-merge security gate (`verify/security-audit.json`) |
-| `teamwork_final_verify` | compute the final verdict from the task reports + security audit (plus `lemma/` artifacts when in LEMMA mode), stamp it, write `verify/final.json` |
+| `teamwork_victory_audit` | record the independent `team/victory-auditor` acceptance verdict, bound to the current `ORIGINAL_REQUEST.md` hash (`verify/victory.json`) |
+| `teamwork_final_verify` | compute the final verdict from the task reports + security audit + victory audit (plus `lemma/` artifacts when in LEMMA mode), stamp it, write `verify/final.json` |
 | `teamwork_lemma_probe` | read-only probe for `lean`, `lake`, and the LEAP CLI (`leap`; legacy `leap-tools` accepted) on `PATH` |
 | `teamwork_lemma_formalize` | LEMMA Phase 0 `problem_draft.lean` / `review_pre` → `problem.lean` and `review_final` faithfulness gate |
 | `teamwork_lemma_node` | bounded lemma decomposition tree (`create`, `update`, `blueprint`, `attempt`) |
@@ -84,14 +85,15 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 Hooks: `permission.evaluate` enforces the per-agent read-only policy **in code**
 (not just in their prompts). The read-only agents (`team/verifier`,
 `team/falsifier`, `team/scout`, `team/security-auditor`,
-`team/segment-reviewer`, `team/formalization-reviewer`, `team/referee`) all
-deny the `edit` tool, so none of them can write through it. `shell` is still
-available to the verifier, scout and security auditor, and it can modify files;
-the falsifier, segment reviewer, formalization reviewer, and referee also have
-`shell` denied, and the segment, formalization, and referee roles deny
-`webfetch` and `subagent` as well (the verifier and security auditor deny
-`webfetch`). In short: no writes through `edit` for all seven, and no `shell`
-writes for the falsifier, segment reviewer, formalization reviewer, or referee.
+`team/segment-reviewer`, `team/formalization-reviewer`, `team/referee`,
+`team/victory-auditor`) all deny the `edit` tool, so none of them can write
+through it. `shell` is still available to the verifier, scout, security auditor
+and victory auditor, and it can modify files; the falsifier, segment reviewer,
+formalization reviewer, and referee also have `shell` denied, and the segment,
+formalization, referee, and victory-auditor roles deny `webfetch` and
+`subagent` as well (the verifier and security auditor deny `webfetch`). In
+short: no writes through `edit` for all eight, and no `shell` writes for the
+falsifier, segment reviewer, formalization reviewer, or referee.
 The hook also enforces network constraints
 (`constraints.network: denied`), and `session.context` injects the active run's
 state + recent pitfalls into every team agent's system prompt.
@@ -106,6 +108,7 @@ topologies, and the JSON schemas (`spec.json`, `plan.dag.json`, `state.json`,
 
 - `verified_pass` requires a legal lifecycle transition and PASS evidence (an inline PASS verdict or a `PASS` per-task report).
 - A run completes only with a `PASS` `verify/final.json` stamped by `teamwork_final_verify`; an unstamped report needs the recorded `allowUnstamped` bypass.
+- That PASS also needs a `verify/victory.json` from the independent `team/victory-auditor` reporting `VICTORY CONFIRMED` for every requirement and the current `ORIGINAL_REQUEST.md` hash, unless the plan explicitly recorded `victoryAudit: "skip"` (then `final_verify` records `victory: "SKIPPED (explicit)"`).
 - The security audit fails on integrity-rule violations for the run's mode, and that blocks the merge.
 - Planning refuses to start when blocking inputs are missing or unreachable unless `allowMissingInputs` is recorded.
 - Legacy topology aliases are normalised on write; an unknown topology is refused before anything is written.
@@ -220,7 +223,7 @@ defaults without touching files that already exist.
 1. Install the plugin: `opencode plugin add @heretek-ai/opencode-teamwork-v2`.
 
 2. Assign models and install the agents. `init` writes
-   `~/.config/opencode/teamwork.json`, installs all 14 agents and registers the
+   `~/.config/opencode/teamwork.json`, installs all 15 agents and registers the
    plugin; `models` rewrites only the model map and the agents' `model:` lines.
    Both are safe to re-run.
 
@@ -371,7 +374,7 @@ built-ins.
 
 ## Agents
 
-The 14 shipped agents are installed as markdown files under `~/.config/opencode/agents/team/`. Specialised roles are added strictly alongside the route that exercises them (never a 49-file flat roster or unused roles):
+The 15 shipped agents are installed as markdown files under `~/.config/opencode/agents/team/`. Specialised roles are added strictly alongside the route that exercises them (never a 49-file flat roster or unused roles):
 
 | Agent | File | Default Model | Consuming Route / Topology | Code-Enforced Deny Set (`READ_ONLY_ACTIONS`) | Purpose |
 | --- | --- | --- | --- | --- | --- |
@@ -388,7 +391,8 @@ The 14 shipped agents are installed as markdown files under `~/.config/opencode/
 | `team/security-auditor` | `security-auditor.md` | `deepseek/deepseek-v4-pro` | All routes (`READY_FOR_SECURITY_AUDIT`, `teamwork_security_audit`) | `edit`, `webfetch`, `subagent` (`shell` available, can modify files) | Mandatory pre-merge security and integrity-mode auditor |
 | `team/segment-reviewer` | `segment-reviewer.md` | `deepseek/deepseek-flash` | `document-review` (`teamwork_document_triage` / `teamwork_document_record`) | `edit`, `shell`, `webfetch`, `subagent` | Strictly read-only RSA tree (`[4,2,1]`) analyst/aggregator/adjudicator for one document segment |
 | `team/formalization-reviewer` | `formalization-reviewer.md` | `deepseek/deepseek-v4-pro` | `proof` with `lemmaMode: true` (`teamwork_lemma_formalize`) | `edit`, `shell`, `webfetch`, `subagent` | Strictly read-only Lean 4 formalization faithfulness reviewer (`APPROVE` / `FAITHFUL`) |
-| `team/referee` | `referee.md` | `deepseek/deepseek-v4-pro` | `massive-proof` (`teamwork_tournament` `score` & `audit`) | `edit`, `shell`, `webfetch`, `subagent` | Strictly read-only tournament referee, deterministic candidate scorer, and victory auditor |
+| `team/referee` | `referee.md` | `deepseek/deepseek-v4-pro` | `massive-proof` (`teamwork_tournament` `score` & `audit`) | `edit`, `shell`, `webfetch`, `subagent` | Strictly read-only tournament referee, deterministic candidate scorer, and tournament victory auditor |
+| `team/victory-auditor` | `victory-auditor.md` | `deepseek/deepseek-v4-pro` | Every run (`victoryAudit: "required"`, before completion) | `edit`, `subagent`, `webfetch` (`shell` available, can modify files) | Independent fresh-session final acceptance auditor against `ORIGINAL_REQUEST.md` + `requirements.json`; records `VICTORY CONFIRMED`/`VICTORY REJECTED` via `teamwork_victory_audit` |
 
 Model assignments live in each agent's frontmatter (`model:`); see
 [Model assignment](#model-assignment) for how to set them.

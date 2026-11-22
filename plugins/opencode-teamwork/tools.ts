@@ -98,6 +98,20 @@ import {
   validateTournamentConfig,
 } from "./tournament.ts"
 import type { BudgetEstimate, TournamentConfig, TournamentManifest } from "./tournament.ts"
+import {
+  VICTORY_AUDITOR_AGENT,
+  callerRequirementsFile,
+  deriveRequirementsFromRequest,
+  describeVictoryGate,
+  evaluateVictoryGate,
+  normalizeVictoryAuditMode,
+  persistRequirementsBaseline,
+  readRequirementsBaseline,
+  recordVictoryAudit,
+  resolveVictoryAuditMode,
+  validateRequirementsBaseline,
+} from "./victory.ts"
+import type { RequirementsFile, VictoryAuditMode } from "./victory.ts"
 
 // ---------------------------------------------------------------------------
 // OpenCode native cost tracking
@@ -919,6 +933,9 @@ const READ_ONLY_ACTIONS: Record<string, Set<string>> = {
   "team/segment-reviewer": new Set(["edit", "shell", "subagent", "webfetch"]),
   "team/formalization-reviewer": new Set(["edit", "shell", "subagent", "webfetch"]),
   "team/referee": new Set(["edit", "shell", "subagent", "webfetch"]),
+  // The victory auditor needs shell to run the project's tests independently;
+  // it must not edit, delegate, or fetch anything.
+  "team/victory-auditor": new Set(["edit", "subagent", "webfetch"]),
 }
 
 const pad = (n: number) => String(n).padStart(2, "0")
@@ -1286,6 +1303,7 @@ async function appendEvent(
       | "run_created"
       | "task_transition"
       | "security_audit"
+      | "victory_audit"
       | "final_verification"
       | "final_verification_bypass"
       | "preflight"
@@ -1651,6 +1669,38 @@ async function createPlanRun(
       content: `refused: request is ${request.length} chars, over the ${REQUEST_MAX}-char limit; it must be recorded verbatim. Shorten it or start the run from a shorter routed request. Nothing was written.`,
     }
   }
+  // Requirements baseline + victory-audit mode. Both are validated before any
+  // write: an invalid id / duplicate refuses the whole plan with nothing on disk.
+  let requirementsBaseline: RequirementsFile | undefined
+  if (input.requirements !== undefined) {
+    const reqCheck = validateRequirementsBaseline(input.requirements)
+    if (!reqCheck.ok) return { ok: false, content: `${reqCheck.error}; nothing was written.` }
+    if (reqCheck.items.length > 0) requirementsBaseline = callerRequirementsFile(reqCheck.items)
+  }
+  if (!requirementsBaseline) requirementsBaseline = readRequirementsBaseline(run)
+  if (!requirementsBaseline && request !== undefined) requirementsBaseline = deriveRequirementsFromRequest(request)
+  let victoryAuditMode: VictoryAuditMode
+  let victoryAuditSource: "caller" | "default" = "default"
+  if (input.victoryAudit !== undefined && input.victoryAudit !== null) {
+    const requestedMode = normalizeVictoryAuditMode(input.victoryAudit)
+    if (!requestedMode) {
+      return {
+        ok: false,
+        content: "refused: victoryAudit must be \"required\" or \"skip\"; nothing was written.",
+      }
+    }
+    victoryAuditMode = requestedMode
+    victoryAuditSource = "caller"
+  } else {
+    victoryAuditMode = requirementsBaseline ? "required" : "skip"
+  }
+  if (victoryAuditMode === "required" && !requirementsBaseline) {
+    return {
+      ok: false,
+      content:
+        "refused: victoryAudit: \"required\" needs a requirements baseline; pass request or requirements, or record victoryAudit: \"skip\" explicitly. Nothing was written.",
+    }
+  }
   // SEC-1: task ids become keys of state/costs maps and path/branch segments.
   // Refuse the whole plan (before anything is written) on any unsafe id.
   for (const t of input.tasks || []) {
@@ -1819,6 +1869,13 @@ async function createPlanRun(
     const refused = writeOriginalRequest(run, request, integrityMode, sessionId)
     if (refused) return { ok: false, content: refused }
   }
+  if (requirementsBaseline) {
+    const refused = persistRequirementsBaseline(run, requirementsBaseline)
+    if (refused) return { ok: false, content: refused }
+  }
+  // A victory audit is required unless the plan explicitly records a skip.
+  // Record the mode in BOTH plan.dag.json and state.json so a later re-plan or
+  // hand edit cannot silently drop the gate.
   const tasks = (input.tasks || []).map((t: any) => ({
     id: clean(t.id, 64),
     dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.map((d: any) => clean(d, 64)) : [],
@@ -1833,6 +1890,9 @@ async function createPlanRun(
     sessionId,
     topology,
     integrityMode,
+    victoryAudit: victoryAuditMode,
+    victoryAuditSource,
+    ...(requirementsBaseline ? { requirementsSource: requirementsBaseline.source, requirementsCount: requirementsBaseline.items.length } : {}),
     preflight,
     ...(isLemma ? { lemmaMode: true, route: "lemma", lemmaBounds } : rawRoute ? { route: rawRoute } : {}),
     ...(validatedTournamentConfig && tournamentEstimate
@@ -1846,6 +1906,7 @@ async function createPlanRun(
       version: 1,
       sessionId,
       integrityMode,
+      victoryAudit: victoryAuditMode,
       ...(isLemma ? { lemmaMode: true, route: "lemma" } : {}),
       phase: "DISPATCH",
       tasks: nullMap(Object.fromEntries(tasks.map((t: any) => [t.id, { status: "pending", round: 0 }]))),
@@ -1856,8 +1917,9 @@ async function createPlanRun(
     // the caller chose (defaults to development when omitted).
     const stateFile = join(run, "state.json")
     const state = readJson<any>(stateFile, undefined)
-    if (state && (state.integrityMode !== integrityMode || (isLemma && !state.lemmaMode))) {
+    if (state && (state.integrityMode !== integrityMode || state.victoryAudit !== victoryAuditMode || (isLemma && !state.lemmaMode))) {
       state.integrityMode = integrityMode
+      state.victoryAudit = victoryAuditMode
       if (isLemma) {
         state.lemmaMode = true
         state.route = "lemma"
@@ -1965,7 +2027,7 @@ async function createPlanRun(
     tasks,
     topology,
     integrityMode,
-    content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\n${preflightLine}\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${preflight.bypassed ? `\n⚠ Input preflight bypassed (allowMissingInputs: true): ${preflight.status}.` : ""}${creditWarning}`,
+    content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\n${preflightLine}\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.\nVictory audit: ${victoryAuditMode}${victoryAuditSource === "caller" ? " (explicit)" : ""}${requirementsBaseline ? `; requirements baseline ${requirementsBaseline.items.length} item(s) from ${requirementsBaseline.source} (requirements.json)` : "; no requirements baseline"}.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${preflight.bypassed ? `\n⚠ Input preflight bypassed (allowMissingInputs: true): ${preflight.status}.` : ""}${creditWarning}`,
   }
 }
 
@@ -1989,6 +2051,20 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           routingReason: { type: "string", description: "Optional. Why this topology was chosen; persisted in plan.dag.json when provided." },
           request: { type: "string", description: "The verbatim text this run was routed on (max 20000 chars); recorded once in ORIGINAL_REQUEST.md. Sentinel must always pass this for LEMMA and general runs; a second plan into the same run with a non-empty request file is refused." },
           integrityMode: { type: "string", description: "development | demo | benchmark. Default development. Recorded in ORIGINAL_REQUEST.md, state.json and plan.dag.json; the security auditor and final gate read it from ORIGINAL_REQUEST.md." },
+          requirements: {
+            type: "array",
+            description: "Optional requirements baseline (max 50). Ids are safe tokens; text is non-empty and <= 2,000 chars. Duplicates are refused. Persisted to <run>/requirements.json and checked item-by-item by the independent victory audit.",
+            items: {
+              type: "object",
+              properties: { id: { type: "string" }, text: { type: "string" } },
+              required: ["id", "text"],
+              additionalProperties: false,
+            },
+          },
+          victoryAudit: {
+            type: "string",
+            description: "required | skip. Default required when a request or requirements baseline exists. A skip is recorded in plan.dag.json/state.json and final_verify then records \"SKIPPED (explicit)\".",
+          },
           budgetUsd: { type: "number", description: "Run budget in USD. When using opencode/ models + opencode_console, derive this from credits (full or partial, per the user's choice)." },
           budgetSource: { type: "string", description: "Where the budget came from: credits | default | manual." },
           requireSpec: { type: "boolean", description: "Default true. When true, the run must have a non-empty prompt_draft.md (the approved spec) before the plan is written; see skipInterview for the explicit bypass." },
@@ -4040,6 +4116,30 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
 
+          // Independent victory audit gate: even a stamped PASS (or an explicit
+          // legacy unstamped bypass) cannot complete the run without a confirmed
+          // verdict bound to the current ORIGINAL_REQUEST.md, unless the plan
+          // explicitly recorded victoryAudit: "skip".
+          const nextVictoryMode = resolveVictoryAuditMode(plan, state, run)
+          const nextVictoryGate =
+            nextVictoryMode.mode === "required" ? evaluateVictoryGate(run, "required") : evaluateVictoryGate(run, "skip")
+          if (!nextVictoryGate.ok) {
+            if (state.phase !== "FINAL_VERIFICATION") {
+              state.phase = "FINAL_VERIFICATION"
+              writeJson(join(run, "state.json"), state)
+            }
+            const rejected = nextVictoryGate.status === "REJECTED"
+            return {
+              content: `${rejected ? "BLOCKED_BY_VICTORY_AUDIT" : "READY_FOR_VICTORY_AUDIT"}: ${describeVictoryGate(nextVictoryGate)}\nDispatch a fresh team/victory-auditor against ORIGINAL_REQUEST.md and requirements.json, then have it call teamwork_victory_audit with VICTORY CONFIRMED or VICTORY REJECTED. Only after CONFIRMED (or an explicit plan victoryAudit: "skip") may the run report ALL_PASSED.\n${integrityModeNote}`,
+              status: rejected ? "BLOCKED_BY_VICTORY_AUDIT" : "READY_FOR_VICTORY_AUDIT",
+              finalReport: finalFile,
+              passedCount: passedTasks.length,
+              integrityMode: integrity.mode,
+              victory: nextVictoryGate.status,
+              reasons: nextVictoryGate.reasons,
+            }
+          }
+
           if (plan?.topology === "document-review" && docManifest) {
             if (docManifest.extractionStatus === "needs_ingestor") {
               return {
@@ -4105,17 +4205,19 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               finalReport: finalFile,
               stamped: false,
               unstampedBypass: true,
+              victory: nextVictoryGate.status,
             }
           }
 
           return {
-            content: `ALL_TASKS_PASSED: All ${taskDefs.size} tasks have passed verification, security audit PASSED, and final verification PASSED. Ready to merge Sentinel base worktree to user branch and present final artifact.\n${integrityModeNote}`,
+            content: `ALL_TASKS_PASSED: All ${taskDefs.size} tasks have passed verification, security audit PASSED, final verification PASSED, and the victory audit is ${nextVictoryGate.status}. Ready to merge Sentinel base worktree to user branch and present final artifact.\n${integrityModeNote}`,
             status: "ALL_PASSED",
             integrityMode: integrity.mode,
             passedCount: passedTasks.length,
             securityAuditPassed: true,
             finalReport: finalFile,
             stamped: true,
+            victory: nextVictoryGate.status,
           }
         }
 
@@ -4551,9 +4653,85 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     })
 
     editor.add({
+      name: "victory_audit",
+      description:
+        "Record the independent final acceptance verdict from team/victory-auditor. The auditor compares the delivered artifacts and tests against ORIGINAL_REQUEST.md and requirements.json. Only a trusted session whose agent is team/victory-auditor may call it (a caller-supplied label cannot self-authorize). Writes verify/victory.json; a CONFIRMED verdict is write-once.",
+      input: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string", description: "Teamwork session id (defaults to the active run)." },
+          verdict: { type: "string", description: "VICTORY CONFIRMED | VICTORY REJECTED" },
+          requirements: {
+            type: "array",
+            description: "One result for every id in requirements.json, exactly once. met requires non-empty evidence.",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string" },
+                met: { type: "boolean" },
+                evidence: { type: "string" },
+              },
+              required: ["id", "met", "evidence"],
+              additionalProperties: false,
+            },
+          },
+          findings: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional. Up to 50 concrete gaps found during the audit.",
+          },
+          summary: { type: "string", description: "Optional. The auditor's prose (max 2000 chars)." },
+        },
+        required: ["verdict", "requirements"],
+        additionalProperties: false,
+      },
+      execute: async (input: any, context: any) => {
+        const resolved = resolveRun(root, input?.sessionId)
+        if (resolved.error) return { content: resolved.error }
+        const run = resolved.run as string
+        const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+        // Authorization follows the trusted session identity only. There is no
+        // `agent` input: a caller cannot label itself the victory auditor.
+        const caller = callSession ? await deriveCallerAgent(ctx, run, callSession) : undefined
+        if (!caller || caller.agent !== VICTORY_AUDITOR_AGENT) {
+          return {
+            content: `refused: victory_audit must be called by ${VICTORY_AUDITOR_AGENT} (trusted session agent: ${caller?.agent ? clean(caller.agent, 64) : "unknown"}); nothing was written`,
+          }
+        }
+        if (!callSession) {
+          return { content: "refused: victory_audit needs a trusted session identity; nothing was written" }
+        }
+        const result = recordVictoryAudit(run, basename(run), {
+          verdict: input.verdict,
+          requirements: input.requirements,
+          findings: input.findings,
+          summary: input.summary,
+          auditorSessionId: callSession,
+        })
+        if (!result.ok) return { content: result.error }
+        const state = readJson<any>(join(run, "state.json"), undefined)
+        await appendEvent(run, {
+          event: "victory_audit",
+          sessionId: basename(run),
+          taskId: null,
+          to: result.verdict.verdict,
+          round: 0,
+          agent: VICTORY_AUDITOR_AGENT,
+          agentSource: "session",
+          phase: state?.phase ?? null,
+        })
+        return {
+          content: `VICTORY AUDIT RECORDED: ${result.verdict.verdict} (${result.verdict.requirements.length} requirement(s)).\nArtifact: ${join(run, "verify", "victory.json")}`,
+          verdict: result.verdict,
+          artifact: join(run, "verify", "victory.json"),
+        }
+      },
+    })
+
+    editor.add({
       name: "final_verify",
       description:
-        "Compute and stamp the run's final verdict from artifacts. PASS requires every task to be verified_pass, every verify/report-<taskId>.json to be PASS, and verify/security-audit.json to be PASS. Writes verify/final.json atomically and appends a final_verification event. The verdict is computed from evidence and cannot be overridden by input.",
+        "Compute and stamp the run's final verdict from artifacts. PASS requires every task to be verified_pass, every verify/report-<taskId>.json to be PASS, verify/security-audit.json to be PASS, and (unless the plan explicitly skipped it) a CONFIRMED independent victory audit bound to the current ORIGINAL_REQUEST.md. Writes verify/final.json atomically and appends a final_verification event. The verdict is computed from evidence and cannot be overridden by input.",
       input: {
         type: "object",
         properties: {
@@ -4840,6 +5018,13 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
 
+          // Independent victory audit: required unless the plan explicitly opted
+          // out. The verdict binds to the current ORIGINAL_REQUEST.md hash, so a
+          // deleted/edited request or a stale audit cannot complete a run.
+          const victoryMode = resolveVictoryAuditMode(plan, state, run).mode
+          const victoryGate = evaluateVictoryGate(run, victoryMode)
+          if (!victoryGate.ok) reasons.push(...victoryGate.reasons)
+
           // A supplied failReason can only make the verdict fail, never pass it.
           const failReason = typeof input?.failReason === "string" ? clean(input.failReason, 500).trim() : ""
           if (failReason) reasons.push(failReason)
@@ -4863,16 +5048,33 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               }))
             : []
 
+          const victoryRecord = victoryGate.skipped
+            ? "SKIPPED (explicit)"
+            : victoryGate.ok
+              ? "CONFIRMED"
+              : "FAILED"
           refuseSymlink(finalFile)
           writeJson(finalFile, {
             status,
             generatedBy: { agent: caller?.agent ?? null, session: callSession || basename(run) },
             generatedAt: new Date().toISOString(),
             integrityMode: integrity.mode,
+            victory: victoryRecord,
             evidence: {
               tasks,
               securityAudit,
               allTasksVerifiedPass,
+              victory: victoryGate.skipped
+                ? { mode: "skip", status: victoryGate.status, reasons: [] }
+                : victoryGate.ok
+                  ? {
+                      mode: "required",
+                      status: victoryGate.status,
+                      auditor: victoryGate.verdict.auditor,
+                      auditorSessionId: victoryGate.verdict.auditorSessionId,
+                      requestHash: victoryGate.verdict.requestHash,
+                    }
+                  : { mode: "required", status: victoryGate.status, reasons: victoryGate.reasons },
               ...(documentReviewEvidence ? { documentReview: documentReviewEvidence } : {}),
               ...(lemmaEvidence ? { lemma: lemmaEvidence } : {}),
               ...(tournamentEvidence ? { tournament: tournamentEvidence } : {}),
@@ -4897,7 +5099,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             integrity.source === "artifact"
               ? `Integrity mode: ${integrity.mode} (from ORIGINAL_REQUEST.md).`
               : `Integrity mode: ${integrity.mode} (default applied; no ORIGINAL_REQUEST.md for this run).`
-          const evidenceLine = `Evidence: ${tasks.length} task(s), allTasksVerifiedPass=${allTasksVerifiedPass}, security audit ${securityAudit.status}.`
+          const evidenceLine = `Evidence: ${tasks.length} task(s), allTasksVerifiedPass=${allTasksVerifiedPass}, security audit ${securityAudit.status}, ${describeVictoryGate(victoryGate)}`
 
           if (status === "FAIL") {
             return {
@@ -4905,15 +5107,17 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               status: "FAIL",
               finalReport: finalFile,
               integrityMode: integrity.mode,
+              victory: victoryRecord,
               reasons: cappedReasons,
             }
           }
 
           return {
-            content: `FINAL VERIFICATION PASSED: every task is verified_pass, every task report is PASS, and the security audit is PASS.\n${evidenceLine}\n${integrityModeNote}\nArtifact: ${finalFile}`,
+            content: `FINAL VERIFICATION PASSED: every task is verified_pass, every task report is PASS, the security audit is PASS, and the victory audit is ${victoryRecord}.\n${evidenceLine}\n${integrityModeNote}\nArtifact: ${finalFile}`,
             status: "PASS",
             finalReport: finalFile,
             integrityMode: integrity.mode,
+            victory: victoryRecord,
           }
         })
       },

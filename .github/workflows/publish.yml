@@ -48,7 +48,7 @@ jobs:
           const p = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/pack.json", "utf8"));
           const paths = p[0].files.map((f) => f.path);
           const bad = paths.filter((x) => x === "docs/re" || x.startsWith("docs/re/"));
-          const need = ["docs/ARTIFACTS.md", "docs/GUARDRAILS.md", "plugins/opencode-teamwork/index.ts"];
+          const need = ["docs/ARTIFACTS.md", "docs/GUARDRAILS.md", "plugins/opencode-teamwork/index.ts", "plugins/opencode-teamwork/victory.ts", "agents/team/victory-auditor.md"];
           const miss = need.filter((n) => !paths.includes(n));
           console.log(`packed files: ${paths.length}`);
           if (bad.length) console.error("forbidden docs/re paths:\n" + bad.join("\n"));
