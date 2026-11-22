@@ -2453,15 +2453,17 @@ try {
       "YAML frontmatter Markdown doc with trailing critique must route to document-review",
     )
 
-    // Topic-mention & masked-path positive document-review cases (Challenger 2 / Reviewer 2)
+    // Topic-mention & masked-path positive document-review cases (Challenger 2 / Reviewer 2 / Challenger 3)
     mkdirSync(join(docRoot, "docs"), { recursive: true })
     writeFileSync(join(docRoot, "docs", "spec.md"), "# Spec\nSpecification details.\n")
     writeFileSync(join(docRoot, "docs", "cli.md"), "# CLI\nDebug flags reference.\n")
     writeFileSync(join(docRoot, "docs", "debug-guide.md"), "# Debug Guide\nHow to use debug flags.\n")
+    writeFileSync(join(docRoot, "docs", "runbook.md"), "# Runbook\nHow to debug, diagnose, and troubleshoot crashes.\n")
     for (const topicReq of [
       "review this paper for bugs in the proof docs/spec.md",
       "review docs/cli.md covering debug flags",
       "review docs/debug-guide.md",
+      "review docs/runbook.md covering how to debug, diagnose, and troubleshoot crashes",
     ]) {
       const topicRes = await tools.route.execute({ request: topicReq })
       assert.strictEqual(
@@ -2533,6 +2535,36 @@ try {
         "# Introduction\n" +
           "C".repeat(240) +
           "\n\nIn Section 3 we review prior benchmarks and analyze the throughput results.",
+        "distributed-coding",
+      ],
+      [
+        "# Introduction\n" +
+          "C".repeat(240) +
+          "\n\nIn Section 3 we review prior benchmarks and analyze the results. Please see Appendix A for details.",
+        "distributed-coding",
+      ],
+      ["review docs/spec.md and check the bugs in src/foo.md", "distributed-coding"],
+      ["review docs/spec.md and fix src/foo.md", "distributed-coding"],
+      ["review docs/spec.md and edit src/foo.md", "distributed-coding"],
+      ["review docs/spec.md and update src/foo.md", "distributed-coding"],
+      ["review docs/spec.md and write tests for src/foo.md", "distributed-coding"],
+      ["review docs/runbook.md covering how to debug, and debug src/foo.md", "distributed-coding"],
+      [
+        "Please review this implementation:\n\n```ts\n" +
+          "export function parseHeader(buf: Uint8Array): string {\n" +
+          "  return new TextDecoder().decode(buf.subarray(0, 16))\n" +
+          "}\n" +
+          "export function helper(x: number) { return x * 2 }\n" +
+          "```",
+        "distributed-coding",
+      ],
+      [
+        "Review this function for bugs:\n\n```ts\n" +
+          "export function parseHeader(buf: Uint8Array): string {\n" +
+          "  return new TextDecoder().decode(buf.subarray(0, 16))\n" +
+          "}\n" +
+          "export function helper(x: number) { return x * 2 }\n" +
+          "```",
         "distributed-coding",
       ],
     ]
