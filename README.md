@@ -67,11 +67,15 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 | `teamwork_security_audit` | mandatory pre-merge security gate (`verify/security-audit.json`) |
 | `teamwork_worktree` | out-of-repo git worktree provisioning, diff, merge, resolve & cleanup |
 
-Hooks: `permission.evaluate` enforces the read-only guarantee for the verifier,
-falsifier, scout and security auditor **in code** (not just in their prompts),
-enforces network constraints (`constraints.network: denied`), and
-`session.context` injects the active run's state + recent pitfalls into every team
-agent's system prompt.
+Hooks: `permission.evaluate` enforces the per-agent read-only policy **in code**
+(not just in their prompts). The read-only agents (`team/verifier`,
+`team/falsifier`, `team/scout`, `team/security-auditor`) all deny the `edit`
+tool, so none of them can write through it. `shell` is still available to the
+verifier, scout and security auditor, and it can modify files; the falsifier
+also has `shell` denied. In short: no writes through `edit` for all four, no
+`shell` writes for the falsifier. The hook also enforces network constraints
+(`constraints.network: denied`), and `session.context` injects the active run's
+state + recent pitfalls into every team agent's system prompt.
 
 All run artifacts live under `.opencode/teamwork/<session-id>/`; see
 [`docs/ARTIFACTS.md`](docs/ARTIFACTS.md) for the layout, the canonical
@@ -330,7 +334,7 @@ Model assignments live in each agent's frontmatter (`model:`); see
 - **Security:** the guardrail model (path containment, server-derived session
   ids, read-only enforcement, sanitised context injection, non-destructive
   installers) is documented in [`docs/GUARDRAILS.md`](docs/GUARDRAILS.md). The
-  `team/security-auditor` agent audits a repo read-only with a clean context.
+  `team/security-auditor` agent audits a repo with a clean context.
 - Docs: <https://opencode.ai/v2/docs/build/plugins>
 
 ## License & attribution

@@ -1,5 +1,5 @@
 ---
-description: "Verifier — the forcing function. Receives a worker's branch + spec.json, runs the verification plan, returns verification_report.json with PASS/FAIL + checks + evidence."
+description: "Verifier — the forcing function. Receives a worker's branch + spec.json, runs the verification plan, returns verification_report.json with PASS/FAIL + checks + evidence. `edit`, `webfetch` and `subagent` are denied in code; `shell` is available and can modify files."
 mode: all
 model: deepseek/deepseek-v4-pro
 color: "#f59e0b"

@@ -197,6 +197,20 @@ await check("HTML: healthy fixture builds without error", () => {
   assert.strictEqual(healthyData.tasks.length, 2)
 })
 
+await check("HTML: a mixed legacy (no seq) and new (seq + agentSource) log exports cleanly", () => {
+  // Export derives timing and actors but renders no event-level summary; lines
+  // with the new optional fields must be read without changing the result.
+  const mixed = EVENTS.map((e, i) => (i % 2 === 0 ? e : { ...e, seq: i + 1, agentSource: "session" }))
+  const data = buildExportData(makeRun({ events: mixed }), SESSION)
+  assert.strictEqual(data.error, null, `buildExportData must succeed, got: ${data.error}`)
+  assert.strictEqual(data.timing, "events")
+  const html = renderExport(data, { format: "html" })
+  const md = renderExport(data, { format: "markdown" })
+  assert(html.startsWith("<!DOCTYPE"), "mixed events must still render HTML")
+  assert(md.startsWith("# Teamwork run report"), "mixed events must still render Markdown")
+  assert.strictEqual(data.tasks.length, 2)
+})
+
 await check("HTML: output starts with a <!DOCTYPE> declaration", () => {
   const html = renderExport(healthyData, { format: "html" })
   assert(html.startsWith("<!DOCTYPE"), `must start with <!DOCTYPE, got: ${JSON.stringify(html.slice(0, 40))}`)

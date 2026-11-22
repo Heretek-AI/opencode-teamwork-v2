@@ -15,7 +15,22 @@
 // No OpenCode imports: tool definitions are plain objects, so the loader never
 // has to resolve node_modules for this package.
 
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync, appendFileSync, renameSync, rmSync } from "node:fs"
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+  appendFileSync,
+  renameSync,
+  rmSync,
+  openSync,
+  readSync,
+  fstatSync,
+  closeSync,
+} from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { homedir } from "node:os"
 import { execFileSync } from "node:child_process"
@@ -355,22 +370,27 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
  * Best-effort actor lookup for the calling session. Fail-open: never throws and
  * never blocks longer than 2s. Order: the client's session.get agent, then the
  * agent recorded for that session in snapshots.json (same source as
- * bySession[*].agent). Returns undefined when neither is available.
+ * bySession[*].agent). Returns the actor with its provenance (`session` for both
+ * sources), or undefined when neither is available.
  */
-async function deriveCallerAgent(ctx: any, run: string, sessionID: string | undefined): Promise<string | undefined> {
+async function deriveCallerAgent(
+  ctx: any,
+  run: string,
+  sessionID: string | undefined,
+): Promise<{ agent: string; source: "session" } | undefined> {
   if (!sessionID) return undefined
   try {
     if (typeof ctx?.session?.get === "function") {
       const info: any = await withTimeout(Promise.resolve(ctx.session.get({ sessionID })), 2000)
       const a = typeof info?.agent === "string" ? clean(info.agent, 64).trim() : ""
-      if (a) return a
+      if (a) return { agent: a, source: "session" }
     }
   } catch {}
   try {
     const a = readSnapshots(join(run, "snapshots.json"))?.bySession?.[sessionID]?.agent
     if (typeof a === "string") {
       const c = clean(a, 64).trim()
-      if (c) return c
+      if (c) return { agent: c, source: "session" }
     }
   } catch {}
   return undefined
@@ -509,6 +529,76 @@ const TOPOLOGY_ALIASES: Record<string, string> = {
 function normalizeTopology(value: unknown): string | undefined {
   const v = clean(value, 64)
   return TOPOLOGY_ALIASES[v] ?? (TOPOLOGIES.includes(v) ? v : undefined)
+}
+
+// Integrity modes (docs/ARTIFACTS.md). Chosen when the run is routed, recorded
+// once in ORIGINAL_REQUEST.md, and read back from that artifact by the audit and
+// final-verification gates. `development` is the default for legacy runs.
+const INTEGRITY_MODES = ["development", "demo", "benchmark"] as const
+type IntegrityMode = (typeof INTEGRITY_MODES)[number]
+const DEFAULT_INTEGRITY_MODE: IntegrityMode = "development"
+const REQUEST_MAX = 20000
+
+/** Normalise an integrity mode; undefined when it is not one of the three. */
+function normalizeIntegrityMode(value: unknown): IntegrityMode | undefined {
+  const v = String(value ?? "").trim()
+  return (INTEGRITY_MODES as readonly string[]).includes(v) ? (v as IntegrityMode) : undefined
+}
+
+/**
+ * Read the integrity mode from `<run>/ORIGINAL_REQUEST.md`. That artifact is the
+ * only source of truth at audit/final-verification time; legacy runs have none,
+ * so they default to `development`.
+ */
+function readIntegrityMode(run: string): { mode: IntegrityMode; source: "artifact" | "default" } {
+  const file = join(run, "ORIGINAL_REQUEST.md")
+  try {
+    if (existsSync(file)) {
+      const text = readFileSync(file, "utf8")
+      // Only the metadata block counts: a "- Integrity mode:" line inside the
+      // verbatim request body must never override the header.
+      const splitAt = text.indexOf("\n## Request")
+      const header = splitAt === -1 ? text : text.slice(0, splitAt)
+      const m = header.match(/^- Integrity mode:[ \t]*(\S+)[ \t]*$/m)
+      const mode = m && normalizeIntegrityMode(m[1])
+      if (mode) return { mode, source: "artifact" }
+    }
+  } catch {}
+  return { mode: DEFAULT_INTEGRITY_MODE, source: "default" }
+}
+
+/**
+ * Write `<run>/ORIGINAL_REQUEST.md` exactly once, before any plan files.
+ * `request` is preserved byte-for-byte (no reflow, no trimming). Returns an
+ * actionable error string on refusal; the caller must then write nothing else.
+ * The open with `wx` makes "once" true even across two concurrent planners.
+ */
+function writeOriginalRequest(run: string, request: string, mode: IntegrityMode, sessionId: string): string | undefined {
+  const file = join(run, "ORIGINAL_REQUEST.md")
+  try {
+    refuseSymlink(file)
+  } catch (err: any) {
+    return `refused: ${clean(err?.message, 160)}; nothing else was written`
+  }
+  let existing = ""
+  try {
+    if (existsSync(file)) existing = readFileSync(file, "utf8")
+  } catch {
+    return `refused: cannot read ${file}; refusing to overwrite a request that may already be recorded`
+  }
+  if (existing.trim()) {
+    return `refused: ${file} already records this run's request and is write-once.\nUse a new session (a new teamwork_plan sessionId) for a different request. Nothing was written.`
+  }
+  const body = `# Original Request\n\n- Integrity mode: ${mode}\n- Recorded: ${new Date().toISOString()}\n- Session: ${sessionId}\n\n## Request\n\n${request}`
+  try {
+    writeFileSync(file, body.endsWith("\n") ? body : body + "\n", { flag: "wx" })
+  } catch (err: any) {
+    if (err?.code === "EEXIST") {
+      return `refused: ${file} already records this run's request and is write-once.\nUse a new session (a new teamwork_plan sessionId) for a different request. Nothing was written.`
+    }
+    return `refused: could not record ${file} (${clean(err?.message, 120)}); nothing else was written`
+  }
+  return undefined
 }
 
 /**
@@ -728,10 +818,63 @@ function touch(file: string, content: string) {
 }
 
 /**
+ * Next sequence number for one `<run>/events.jsonl`: a single number space per
+ * file, starting at 1. Called inside the append lock, so no two appends can
+ * race for the same value. The tail (last 8 KiB) is read rather than the whole
+ * file: the last non-empty line's `seq` + 1 is the answer in the common case.
+ * A legacy line without `seq`, or a malformed / truncated tail, falls back to
+ * counting non-empty lines (correctness over micro-optimisation: a legacy log
+ * still gets a value above every line already present, and nothing is lost).
+ */
+function nextEventSeq(file: string): number {
+  let tail = ""
+  try {
+    const fd = openSync(file, "r")
+    try {
+      const size = fstatSync(fd).size
+      const len = Math.min(size, 8192)
+      const buf = Buffer.alloc(len)
+      let read = 0
+      while (read < len) {
+        const n = readSync(fd, buf, read, len - read, size - len + read)
+        if (n === 0) break
+        read += n
+      }
+      tail = buf.subarray(0, read).toString("utf8")
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return 1 // absent events.jsonl: this is the first event
+  }
+  const lines = tail.split("\n")
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const l = lines[i].trim()
+    if (!l) continue
+    try {
+      const seq = (JSON.parse(l) as any)?.seq
+      if (Number.isInteger(seq) && seq > 0) return seq + 1
+    } catch {}
+    break // last line is legacy or corrupt: count lines instead
+  }
+  try {
+    let count = 0
+    for (const l of readFileSync(file, "utf8").split("\n")) if (l.trim()) count++
+    return count + 1
+  } catch {
+    return 1
+  }
+}
+
+/**
  * Append one lifecycle event to `<run>/events.jsonl` (append-only, one JSON
  * object per line). Fail-open: any error is swallowed so the DAG engine never
  * depends on the event log. Every string field is sanitised with clean() so no
  * value can inject a second physical line.
+ *
+ * `seq` is assigned here, inside the same lock as the append, and is monotonic
+ * per file. `agentSource` records where the actor came from and is emitted only
+ * when `agent` is non-null.
  */
 async function appendEvent(
   run: string,
@@ -743,6 +886,8 @@ async function appendEvent(
     to: string
     round?: number
     agent?: string | null
+    /** Provenance of `agent`: explicit input, session lookup, or plan declaration. */
+    agentSource?: "explicit" | "session" | "plan"
     branch?: string | null
     worktree?: string | null
     phase?: string | null
@@ -757,20 +902,28 @@ async function appendEvent(
     await withFileLock(eventsFile, () => {
       refuseSymlink(eventsFile)
       const opt = (v: unknown, max: number) => (v === null || v === undefined || v === "" ? null : clean(v, max))
+      const agent = opt(ev.agent, 64)
+      const source =
+        agent && (ev.agentSource === "explicit" || ev.agentSource === "session" || ev.agentSource === "plan")
+          ? ev.agentSource
+          : null
       const line = JSON.stringify({
         ts: new Date().toISOString(),
+        seq: nextEventSeq(eventsFile),
         event: ev.event,
         sessionId: clean(ev.sessionId, 64),
         taskId: opt(ev.taskId, 64),
         from: opt(ev.from, 32),
         to: clean(ev.to, 32),
         round: Number(ev.round) || 0,
-        agent: opt(ev.agent, 64),
+        agent,
+        ...(source ? { agentSource: source } : {}),
         branch: opt(ev.branch, 120),
         worktree: opt(ev.worktree, 200),
         phase: opt(ev.phase, 32),
-        // Only run_created carries the spec-gate decision; other event lines stay
-        // byte-identical to their previous 11-field shape.
+        // Only run_created carries the spec-gate decision. Every line now also
+        // carries seq (and agentSource when an actor exists); legacy lines on
+        // disk keep their old shape and remain valid.
         ...(ev.specGate
           ? { specGate: clean(ev.specGate, 16), ...(ev.specPath ? { specPath: clean(ev.specPath, 200) } : {}) }
           : {}),
@@ -853,6 +1006,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           sessionId: { type: "string", description: "Reuse an existing session id; omit to create one." },
           topology: { type: "string", description: "small-focused | iterative-coding | distributed-coding | proof | massive-proof | document-review. Legacy aliases accepted and normalised: large-swarm → distributed-coding, doc-review → document-review, long-proof → proof, massive-proof-swarm → massive-proof." },
           routingReason: { type: "string", description: "Optional. Why this topology was chosen; persisted in plan.dag.json when provided." },
+          request: { type: "string", description: "Optional. The verbatim text this run was routed on (max 20000 chars); recorded once in ORIGINAL_REQUEST.md. A second plan into the same run with a non-empty request file is refused." },
+          integrityMode: { type: "string", description: "development | demo | benchmark. Default development. Recorded in ORIGINAL_REQUEST.md, state.json and plan.dag.json; the security auditor and final gate read it from ORIGINAL_REQUEST.md." },
           budgetUsd: { type: "number", description: "Run budget in USD. When using opencode/ models + opencode_console, derive this from credits (full or partial, per the user's choice)." },
           budgetSource: { type: "string", description: "Where the budget came from: credits | default | manual." },
           requireSpec: { type: "boolean", description: "Default true. When true, the run must have a non-empty prompt_draft.md (the approved spec) before the plan is written; see skipInterview for the explicit bypass." },
@@ -889,6 +1044,25 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             content: `refused: invalid topology "${clean(input.topology, 32)}" (accepted: ${TOPOLOGIES.join(", ")}; aliases: ${Object.keys(TOPOLOGY_ALIASES).join(", ")})`,
           }
         }
+        // Refuse an unknown integrity mode before anything is written. The mode
+        // is the run's integrity contract, so a typo must never be persisted.
+        const integrityMode =
+          input.integrityMode === undefined || input.integrityMode === null
+            ? DEFAULT_INTEGRITY_MODE
+            : normalizeIntegrityMode(input.integrityMode)
+        if (!integrityMode) {
+          return {
+            content: `refused: invalid integrityMode "${clean(input.integrityMode, 32)}" (accepted: ${INTEGRITY_MODES.join(", ")}; default: ${DEFAULT_INTEGRITY_MODE})`,
+          }
+        }
+        // The request record is verbatim, so refuse rather than truncate. The
+        // length check runs before anything is written.
+        const request = typeof input.request === "string" ? input.request : undefined
+        if (request !== undefined && request.length > REQUEST_MAX) {
+          return {
+            content: `refused: request is ${request.length} chars, over the ${REQUEST_MAX}-char limit; it must be recorded verbatim. Shorten it or start the run from a shorter routed request. Nothing was written.`,
+          }
+        }
         // SEC-1: task ids become keys of state/costs maps and path/branch segments.
         // Refuse the whole plan (before anything is written) on any unsafe id.
         for (const t of input.tasks || []) {
@@ -896,6 +1070,20 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const i = ids.findIndex((id: unknown) => typeof id !== "string" || !isSafeTaskId(id))
           if (i !== -1) {
             return { content: `refused: invalid task id "${clean(ids[i], 32)}" (must be a single segment matching ${TASK_ID})` }
+          }
+        }
+        // ORIGINAL_REQUEST.md is write-once. Check before the spec gate so a
+        // second request is refused for the right reason and writes nothing.
+        const originalRequestFile = join(run, "ORIGINAL_REQUEST.md")
+        if (request !== undefined) {
+          try {
+            if (existsSync(originalRequestFile) && readFileSync(originalRequestFile, "utf8").trim()) {
+              return {
+                content: `refused: ${originalRequestFile} already records this run's request and is write-once.\nUse a new session (a new teamwork_plan sessionId) for a different request. Nothing was written.`,
+              }
+            }
+          } catch {
+            return { content: `refused: cannot read ${originalRequestFile}; refusing to overwrite a request that may already be recorded. Nothing was written.` }
           }
         }
         // 3.4: a run starts from an approved spec (`<run>/prompt_draft.md`). The
@@ -917,6 +1105,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
         }
         mkdirSync(run, { recursive: true })
+        // The request record goes first: it is the artifact the auditor and the
+        // final gate read the integrity mode from.
+        if (request !== undefined) {
+          const refused = writeOriginalRequest(run, request, integrityMode, sessionId)
+          if (refused) return { content: refused }
+        }
         const tasks = (input.tasks || []).map((t: any) => ({
           id: clean(t.id, 64),
           dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.map((d: any) => clean(d, 64)) : [],
@@ -930,6 +1124,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         writeJson(join(run, "plan.dag.json"), {
           sessionId,
           topology,
+          integrityMode,
           tasks,
           ...(routingReason ? { routingReason } : {}),
         })
@@ -937,10 +1132,21 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           writeJson(join(run, "state.json"), {
             version: 1,
             sessionId,
+            integrityMode,
             phase: "DISPATCH",
             tasks: nullMap(Object.fromEntries(tasks.map((t: any) => [t.id, { status: "pending", round: 0 }]))),
             updatedAt: new Date().toISOString(),
           })
+        } else {
+          // A re-plan keeps the run's checkpoint but must still carry the mode
+          // the caller chose (defaults to development when omitted).
+          const stateFile = join(run, "state.json")
+          const state = readJson<any>(stateFile, undefined)
+          if (state && state.integrityMode !== integrityMode) {
+            state.integrityMode = integrityMode
+            state.updatedAt = new Date().toISOString()
+            writeJson(stateFile, state)
+          }
         }
         // Use ?? (nullish coalescing) so budgetUsd: 0 is respected as "no budget"
         const budget = input.budgetUsd ?? 20
@@ -1005,7 +1211,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           creditWarning = "\n⚠ opencode/ models + opencode_console connected — run teamwork_budget and derive budgetUsd from credits before dispatching."
         }
         return {
-          content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${creditWarning}`,
+          content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${creditWarning}`,
         }
       },
     })
@@ -1359,6 +1565,14 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (passedTasks.length === taskDefs.size) {
           const auditFile = join(run, "verify", "security-audit.json")
           const audit = existsSync(auditFile) ? readJson<any>(auditFile, undefined) : undefined
+          // The final gate reports the run's integrity mode, read from the same
+          // artifact the auditor uses (legacy runs default to development). It is
+          // disclosed, never enforced here: enforcement stays with the auditor.
+          const integrity = readIntegrityMode(run)
+          const integrityModeNote =
+            integrity.source === "artifact"
+              ? `Integrity mode: ${integrity.mode} (from ORIGINAL_REQUEST.md).`
+              : `Integrity mode: ${integrity.mode} (default; no ORIGINAL_REQUEST.md for this run).`
 
           if (!audit || audit.status !== "PASS") {
             const auditFailed = audit && audit.status === "FAIL"
@@ -1397,8 +1611,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               writeJson(join(run, "state.json"), state)
             }
             return {
-              content: `READY_FOR_FINAL_VERIFICATION: All ${taskDefs.size} tasks passed verification and security audit PASSED, but there is no usable final verification report at ${finalFile} (missing, unreadable, or malformed).\nRun an independent final verification of the whole run and write verify/final.json with "status": "PASS" or "FAIL" before merging.`,
+              content: `READY_FOR_FINAL_VERIFICATION: All ${taskDefs.size} tasks passed verification and security audit PASSED, but there is no usable final verification report at ${finalFile} (missing, unreadable, or malformed).\nRun an independent final verification of the whole run and write verify/final.json with "status": "PASS" or "FAIL" before merging.\n${integrityModeNote}`,
               status: "READY_FOR_FINAL_VERIFICATION",
+              integrityMode: integrity.mode,
               finalReport: finalFile,
               passedCount: passedTasks.length,
             }
@@ -1406,8 +1621,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
           if (finalReport.status !== "PASS") {
             return {
-              content: `BLOCKED_BY_FINAL_VERIFICATION: Final verification did not pass the run (status ${clean(finalReport.status, 32)}).\nAddress the findings in ${finalFile} and re-run the final verification; merge stays blocked until verify/final.json reports PASS.`,
+              content: `BLOCKED_BY_FINAL_VERIFICATION: Final verification did not pass the run (status ${clean(finalReport.status, 32)}).\nAddress the findings in ${finalFile} and re-run the final verification; merge stays blocked until verify/final.json reports PASS.\n${integrityModeNote}`,
               status: "BLOCKED_BY_FINAL_VERIFICATION",
+              integrityMode: integrity.mode,
               finalReport: finalFile,
               passedCount: passedTasks.length,
             }
@@ -1419,8 +1635,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
 
           return {
-            content: `ALL_TASKS_PASSED: All ${taskDefs.size} tasks have passed verification, security audit PASSED, and final verification PASSED. Ready to merge Sentinel base worktree to user branch and present final artifact.`,
+            content: `ALL_TASKS_PASSED: All ${taskDefs.size} tasks have passed verification, security audit PASSED, and final verification PASSED. Ready to merge Sentinel base worktree to user branch and present final artifact.\n${integrityModeNote}`,
             status: "ALL_PASSED",
+            integrityMode: integrity.mode,
             passedCount: passedTasks.length,
             securityAuditPassed: true,
             finalReport: finalFile,
@@ -1659,9 +1876,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // Actor precedence (best-effort, fail-open): explicit input.agent, then the
           // calling session's agent, then the plan-declared agent. clean() runs in appendEvent too.
           const explicitAgent = typeof input.agent === "string" ? clean(input.agent, 64).trim() : ""
-          const callerAgent = explicitAgent ? undefined : await deriveCallerAgent(ctx, run, callSession)
+          const caller = explicitAgent ? undefined : await deriveCallerAgent(ctx, run, callSession)
           const planAgent = def?.agent ? clean(def.agent, 64) : undefined
-          const recordedAgent = explicitAgent || callerAgent || planAgent || null
+          const recordedAgent = explicitAgent || caller?.agent || planAgent || null
+          const agentSource = explicitAgent ? "explicit" : caller?.agent ? "session" : planAgent ? "plan" : undefined
 
           // Log what actually landed in state.json (post-normalisation, post-coercion).
           await appendEvent(run, {
@@ -1672,6 +1890,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             to: status,
             round,
             agent: recordedAgent,
+            agentSource,
             branch: input.branch ?? current.branch ?? null,
             worktree: input.worktree ?? current.worktree ?? null,
             phase: state.phase ?? null,
@@ -1722,6 +1941,13 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const verifyDir = join(run, "verify")
         mkdirSync(verifyDir, { recursive: true })
         const auditFile = join(verifyDir, "security-audit.json")
+        // The auditor works from the recorded request, not from its caller: the
+        // mode is read from ORIGINAL_REQUEST.md (legacy runs default to development).
+        const integrity = readIntegrityMode(run)
+        const integrityModeNote =
+          integrity.source === "artifact"
+            ? `Integrity mode: ${integrity.mode} (from ORIGINAL_REQUEST.md).`
+            : `Integrity mode: ${integrity.mode} (default applied; no ORIGINAL_REQUEST.md for this run).`
 
         const findings = Array.isArray(input.findings) ? input.findings : []
         const counts = {
@@ -1738,6 +1964,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
         const report = {
           sessionId: basename(run),
+          integrityMode: integrity.mode,
           status,
           timestamp: new Date().toISOString(),
           severityCounts: counts,
@@ -1778,15 +2005,17 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
         if (status === "FAIL") {
           return {
-            content: `SECURITY AUDIT FAILED: ${counts.critical} Critical, ${counts.high} High, ${counts.medium} Medium findings. Final merge is BLOCKED until remediated.\nReport saved to: ${auditFile}`,
+            content: `SECURITY AUDIT FAILED: ${counts.critical} Critical, ${counts.high} High, ${counts.medium} Medium findings. Final merge is BLOCKED until remediated.\n${integrityModeNote}\nReport saved to: ${auditFile}`,
             status: "FAIL",
+            integrityMode: integrity.mode,
             reportPath: auditFile,
           }
         }
 
         return {
-          content: `SECURITY AUDIT PASSED: ${findings.length} findings (${counts.medium} Medium, ${counts.low} Low, 0 High/Critical). Final merge is APPROVED.\nReport saved to: ${auditFile}`,
+          content: `SECURITY AUDIT PASSED: ${findings.length} findings (${counts.medium} Medium, ${counts.low} Low, 0 High/Critical). Final merge is APPROVED.\n${integrityModeNote}\nReport saved to: ${auditFile}`,
           status: "PASS",
+          integrityMode: integrity.mode,
           reportPath: auditFile,
         }
       },

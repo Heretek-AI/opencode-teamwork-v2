@@ -17,7 +17,7 @@ remove the sharpest edges.
 | --- | --- | --- |
 | **Session-id allowlist** `^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$` + containment assert | `plugins/opencode-teamwork/tools.ts` (`resolveRun`) | Path traversal / arbitrary file write or append via `sessionId` in any `teamwork_*` tool. |
 | **Server-derived session id** — `teamwork_plan` generates and returns the id; prompts must use it, never a value read from a file | `tools.ts` + `agents/team/sentinel.md` | Command injection through a malicious `prompt_draft.md` session id interpolated into `git worktree` shell lines. |
-| **Read-only enforcement (per-agent deny list)** | `tools.ts` `registerTeamworkHooks` → `permission.hook("evaluate")` | Verifier/falsifier/scout/security-auditor editing, or escalating via `subagent`/`task`. Fail-closed: a hook that cannot register fails plugin load. |
+| **Read-only enforcement (per-agent deny list)** | `tools.ts` `registerTeamworkHooks` → `permission.hook("evaluate")` | `edit` for the verifier, falsifier, scout and security auditor, so none can write through the `edit` tool; plus `shell` for the falsifier, `webfetch` for the verifier and security auditor, and `subagent` for all four. `shell` remains available to the verifier, scout and security auditor and **can modify files**, so only the falsifier is left without a shell write path. Fail-closed: a hook that cannot register fails plugin load. |
 | **Sanitised run-state injection** — only whitelisted/enumerated fields, newlines stripped, id from the directory name | `tools.ts` `describeRun` → `session.hook("context")` | Stored prompt injection from an untrusted `state.json` into a system prompt. |
 | **Non-destructive installer** — `refresh` defaults to false; `--refresh` opts in with backup | `lib/team.mjs` `installAgents` | Silent overwrite of a user's edited agent prompts. |
 | **Non-destructive config edits** — refuse symlinks, never rewrite commented (JSONC) configs | `lib/team.mjs` `registerPlugin` | Comment loss / value corruption / symlink write-through when editing `opencode.json(c)`. |
@@ -28,7 +28,8 @@ remove the sharpest edges.
 - **No worktree/cwd confinement in code.** Worker/verifier prompts *say* "don't
   edit outside your worktree," but with `resource: "*"` nothing enforces it.
   `git worktree` isolation is prompt-level. (Mitigated only by the permission
-  hook for read-only agents.)
+  hook: for the verifier, scout and security auditor it denies `edit` but not
+  `shell`, which can write anywhere; the falsifier also has `shell` denied.)
 - **`constraints.network` / `constraints.sandbox`** in `docs/ARTIFACTS.md` are
   descriptive; they are not enforced. "Network: denied" is honor-system.
 - **Plugin tools are not agent-scoped.** The permission layer does not mediate
@@ -41,7 +42,7 @@ remove the sharpest edges.
 
 ## Running an audit
 
-Use the `team/security-auditor` agent (read-only, clean context) or a fresh
-subagent. It is also wired into the prompt linter's expectations; the guardrail
-invariants (session-id validation present, no stale references) are checked in
-CI by `scripts/lint-prompts.mjs`.
+Use the `team/security-auditor` agent (clean context; `edit` denied, `shell`
+available) or a fresh subagent. It is also wired into the prompt linter's
+expectations; the guardrail invariants (session-id validation present, no stale
+references) are checked in CI by `scripts/lint-prompts.mjs`.

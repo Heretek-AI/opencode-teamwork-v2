@@ -11,6 +11,7 @@ Every run writes under one root:
 ```
 .opencode/teamwork/<session-id>/
 ├── prompt_draft.md          # spec (from the crafter, or inlined by the sentinel); required by teamwork_plan unless bypassed
+├── ORIGINAL_REQUEST.md      # verbatim routed request + integrity mode (write-once; absent on legacy runs)
 ├── plan.dag.json            # task DAG
 ├── state.json               # resumable coordinator state
 ├── costs.json               # coordinator-maintained budget tracker
@@ -50,7 +51,55 @@ Legacy aliases — accept them, normalize on write:
 `large-swarm` → `distributed-coding`, `doc-review` → `document-review`,
 `long-proof` → `proof`, `massive-proof-swarm` → `massive-proof`.
 
+## Integrity modes
+
+Every run is routed with one integrity mode. It is recorded in
+`ORIGINAL_REQUEST.md`, copied to `state.json` and `plan.dag.json`, and read back
+by the security auditor and the final-verification gate from
+`ORIGINAL_REQUEST.md` (never from the caller). The orchestrator records and
+reports it; enforcement stays with the auditor.
+
+| Mode | Meaning |
+| --- | --- |
+| `development` | Default. Reuse, libraries and frameworks are allowed; only fabricated outputs and facade implementations are ruled out. |
+| `demo` | Also forbids copying core logic from open source, delegating core work to external tools, and reading test sources to reverse-engineer expected behaviour. |
+| `benchmark` | A fully independent from-scratch implementation using the language standard library only. |
+
+`development` is the default: `teamwork_plan` applies it when `integrityMode` is
+omitted, and the auditor and final gate apply it to legacy runs with no
+`ORIGINAL_REQUEST.md`. Any other value is refused before anything is written.
+
 ## Schemas
+
+### `ORIGINAL_REQUEST.md` — verbatim routed request (write-once)
+
+`teamwork_plan` writes this file once, **before** `plan.dag.json` and
+`state.json`, when its optional `request` input is provided. It is the artifact
+the auditor reads the integrity mode from, and the path to hand any auditor that
+checks the work against the original request.
+
+- **Write-once.** If the file already exists with non-empty content, a second
+  plan into the same run is refused ("write-once ... use a new session") and
+  writes nothing else.
+- **Verbatim.** The request text is preserved exactly — no reflow, no trimming
+  of interior whitespace — and capped at 20,000 characters. A longer request is
+  refused, never silently truncated.
+- **Legacy tolerance.** When `request` is omitted, no file is created; the run
+  still plans and the mode defaults to `development`.
+
+Format:
+
+~~~markdown
+# Original Request
+
+- Integrity mode: demo
+- Recorded: 2026-01-12T10:15:00.000Z
+- Session: 20260112-101500-a1b2
+
+## Request
+
+<verbatim request>
+~~~
 
 ### `spec.json` — one per dispatched worker (written by the sentinel)
 
@@ -82,6 +131,7 @@ Legacy aliases — accept them, normalize on write:
 {
   "sessionId": "20260112-101500-a1b2",
   "topology": "distributed-coding",
+  "integrityMode": "development",
   "tasks": [
     {
       "id": "R1-impl",
@@ -102,6 +152,7 @@ Legacy aliases — accept them, normalize on write:
 {
   "version": 1,
   "sessionId": "20260112-101500-a1b2",
+  "integrityMode": "development",
   "phase": "LOAD_SPEC|WORKTREE_INIT|DAG_BUILD|DISPATCH|SECURITY_AUDIT|FINAL_VERIFICATION|MERGE|PRESENT_PARTIAL|DONE",
   "tasks": {
     "R1-impl": {
@@ -191,6 +242,17 @@ The plugin provides deterministic orchestration tools for the Sentinel coordinat
 | `skipInterview` | boolean | `false` | Explicit bypass: plan without an approved prompt. Recorded as `specGate: "bypassed"`, and the tool result says so. |
 
 With no spec and neither override, the call is refused with an actionable message naming the expected path, `/teamwork-craft`, and `skipInterview: true`. A whitespace-only `prompt_draft.md` counts as no spec.
+
+**Request record & integrity mode (`teamwork_plan`).** Two additive, optional inputs:
+
+| Input | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `request` | string | omitted | The verbatim text the run was routed on (≤20,000 chars). Recorded once in `ORIGINAL_REQUEST.md` before any plan file; omitting it creates no artifact. |
+| `integrityMode` | `development \| demo \| benchmark` | `development` | Recorded in `ORIGINAL_REQUEST.md`, `state.json` and `plan.dag.json`. Any other value refuses the plan before anything is written. |
+
+The request record is a separate artifact from the approved spec: it does not
+satisfy the spec gate, and the spec gate does not replace it. `teamwork_security_audit`
+and the final-verification gate read the mode back from `ORIGINAL_REQUEST.md`.
 
 ### `costs.json`
 
@@ -307,9 +369,15 @@ Append-only log of run lifecycle events. Each event is one JSON object on its ow
 line, terminated by `\n`. Lines are only ever appended; nothing rewrites earlier
 lines.
 
-Every line has these 11 fields, always present (`null` where not applicable):
+Every new line has these 12 fields, always present (`null` where not applicable),
+plus `agentSource` when an actor exists:
 
 - `ts` (string): ISO 8601 time the event was written
+- `seq` (integer): position in this file's event sequence, starting at `1` and
+  increasing by one with every append. The value is assigned inside the same
+  `withFileLock` as the append, so concurrent appends cannot duplicate it.
+  **Optional on legacy lines**: logs written before `seq` existed have no
+  `seq`, and they remain valid.
 - `event` (string): `run_created`, `task_transition`, or `security_audit`
 - `sessionId` (string): Run session id (≤64 chars)
 - `taskId` (string or null): Task id (≤64 chars); `null` for run-level events
@@ -317,6 +385,12 @@ Every line has these 11 fields, always present (`null` where not applicable):
 - `to` (string): New task status, or `PASS`/`FAIL` for `security_audit` (≤32 chars)
 - `round` (integer): Task round; `0` when not applicable
 - `agent` (string or null): Actor that performed the transition (≤64 chars). **Caller-reported (self-reported)**, see the **Actor** paragraph below.
+- `agentSource` (string, optional): Provenance of `agent` — `"explicit"` (the
+  `agent` input on `teamwork_task_update`), `"session"` (the calling session's
+  agent, from the session tree or `snapshots.json`), or `"plan"` (the agent
+  declared for the task in `plan.dag.json`). Emitted **only** when `agent` is
+  non-null; `run_created` and `security_audit` carry no actor, so they omit it.
+  Legacy lines also omit it.
 - `branch` (string or null): Task branch (≤120 chars)
 - `worktree` (string or null): Task worktree path (≤200 chars)
 - `phase` (string or null): Run phase after the event (≤32 chars)
@@ -328,45 +402,49 @@ The three event kinds:
   It additionally carries the spec-gate decision: `specGate`
   (`"satisfied" | "bypassed" | "not_required"`) and, only when satisfied,
   `specPath` (the `prompt_draft.md` path, ≤200 chars). These two fields appear
-  **only** on `run_created`; every other event keeps the 11 fields above.
+  **only** on `run_created`; every other event keeps the fields above.
   `specGate` and `specPath` also go through `clean()`. The timeline view parses
   events field by field and does not surface `specGate` (it is visible in
   `events.jsonl` itself).
 - `task_transition`: written by `teamwork_task_update` after `state.json` is saved.
   `from` is the previous status and `to` the status that landed. `round`, `branch`,
-  `worktree` and `phase` are the values after the transition.
+  `worktree` and `phase` are the values after the transition. `agentSource`
+  appears when an actor was resolved.
 - `security_audit`: written by `teamwork_security_audit`. `to` is `"PASS"` or
   `"FAIL"`, and `phase` is the run phase. `taskId`, `from`, `branch`, `worktree` and
-  `agent` are `null`, and `round` is `0`.
+  `agent` are `null`, `round` is `0`, and `agentSource` is omitted.
 
 Example (one `task_transition` line, wrapped here for readability):
 
 ```json
-{"ts":"2026-01-12T10:15:00.000Z","event":"task_transition","sessionId":"20260112-101500-a1b2",
+{"ts":"2026-01-12T10:15:00.000Z","seq":12,"event":"task_transition","sessionId":"20260112-101500-a1b2",
  "taskId":"R1-impl","from":"worker_active","to":"worker_done","round":1,
- "agent":"team/worker","branch":"teamwork/20260112-101500-a1b2-R1-impl",
+ "agent":"team/worker","agentSource":"explicit","branch":"teamwork/20260112-101500-a1b2-R1-impl",
  "worktree":"../.teamwork-worktrees/20260112-101500-a1b2/R1-impl","phase":"DISPATCH"}
 ```
 
 **Actor (`agent`) — caller-reported, not verified.** On `task_transition` the field
 records the actor, resolved in this order: (1) the explicit `agent` input to
 `teamwork_task_update`, (2) the calling session's agent, read from the session
-tree, (3) the agent declared for the task in `plan.dag.json`. The sentinel passes
-`agent: "team/worker"` on `worker_done` and `agent: "team/verifier"` on
-`verified_pass` / `verified_fail`. The value is self-reported: the engine does not
-check that the named agent actually performed the transition. No engine decision
-reads it; the timeline view only displays it. Treat it as a label, not as evidence
-of who acted.
+tree, (3) the agent declared for the task in `plan.dag.json`. `agentSource`
+records which of those three produced the value (`explicit`, `session`, `plan`).
+The sentinel passes `agent: "team/worker"` on `worker_done` and
+`agent: "team/verifier"` on `verified_pass` / `verified_fail`. The value is
+self-reported: the engine does not check that the named agent actually performed
+the transition. No engine decision reads it; the timeline view only displays it.
+Treat it as a label, not as evidence of who acted.
 
 **Sanitising.** The caller-supplied and file-derived string fields (`sessionId`,
 `taskId`, `from`, `to`, `agent`, `branch`, `worktree`, `phase`) are passed through
 `clean()` and truncated to the limit above. `ts` is generated by the engine
-(`new Date().toISOString()`) and `event` is a code-supplied literal, so neither goes
-through `clean()`. `clean()` replaces C0 control characters, DEL, C1 controls
-(U+0080–U+009F, including U+0085), and U+2028/U+2029 with spaces. A value can
-therefore never add a second physical line. It is a line-safety and display
-sanitiser, not a complete defence against hostile text, and it does not guard
-against prototype-key collisions (see Bucket names above).
+(`new Date().toISOString()`), `seq` is assigned by the engine, `event` is a
+code-supplied literal, and `agentSource` is only emitted for one of the three
+fixed values above, so none of those goes through `clean()`. `clean()` replaces
+C0 control characters, DEL, C1 controls (U+0080–U+009F, including U+0085), and
+U+2028/U+2029 with spaces. A value can therefore never add a second physical
+line. It is a line-safety and display sanitiser, not a complete defence against
+hostile text, and it does not guard against prototype-key collisions (see Bucket
+names above).
 
 **Locking and symlinks.** Each append runs inside a per-file, in-process lock
 (`withFileLock` keyed on the `events.jsonl` path). A symlinked
@@ -403,6 +481,7 @@ to derived mode, with start and duration unknown.
 ```json
 {
   "sessionId": "20260112-101500-a1b2",
+  "integrityMode": "development",
   "status": "PASS|FAIL",
   "timestamp": "ISO8601",
   "severityCounts": { "critical": 0, "high": 0, "medium": 1, "low": 2 },
@@ -417,6 +496,12 @@ to derived mode, with start and duration unknown.
   ]
 }
 ```
+
+`integrityMode` is read at audit time from `ORIGINAL_REQUEST.md` and recorded
+here; legacy runs with no request artifact record `development` and the tool
+result says the default was applied. The mode is disclosed, not enforced, by
+`teamwork_next`'s final-verification gate, whose responses carry the same
+`integrityMode` field.
 
 If `critical` > 0 or `high` > 0, `status` is forced to `FAIL` and `teamwork_next` blocks final merge (`BLOCKED_BY_SECURITY`).
 

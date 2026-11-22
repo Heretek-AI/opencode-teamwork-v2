@@ -147,7 +147,7 @@ function taskOf(timeline, taskId) {
 }
 
 const TASK_KEYS = [
-  "taskId", "status", "rounds", "passedAtRound", "agent", "branch", "startedAt", "endedAt",
+  "taskId", "status", "rounds", "passedAtRound", "agent", "agentSource", "branch", "seq", "startedAt", "endedAt",
   "durationMs", "approx", "costUsd", "tokens", "note",
 ]
 const TIMELINE_KEYS = [
@@ -212,6 +212,36 @@ await check("events mode: beta (blocked) has exact duration, no pass round, appr
   assert.strictEqual(b.passedAtRound, null)
   assert.strictEqual(b.agent, "team/worker")
   assert.strictEqual(b.approx, false)
+})
+
+await check("events mode: mixed legacy (no seq) and new (seq + agentSource) lines render together", () => {
+  // alpha's first transition carries seq 2 and agentSource; beta's lines are legacy.
+  const mixed = [
+    { ...EVENTS[0] },
+    { ...EVENTS[1], seq: 2, agentSource: "session" },
+    { ...EVENTS[2] },
+    { ...EVENTS[3], seq: 4, agentSource: "explicit" },
+    { ...EVENTS[4], seq: 5, agentSource: "explicit" },
+    { ...EVENTS[5], seq: 6, agentSource: "session" },
+    { ...EVENTS[6] },
+    { ...EVENTS[7], seq: 8, agentSource: "explicit" },
+    { ...EVENTS[8], seq: 9, agentSource: "explicit" },
+  ]
+  const t = buildTimeline(makeRun({ events: mixed }), SESSION)
+  assert.strictEqual(t.mode, "events")
+  const alpha = taskOf(t, "alpha")
+  assert.strictEqual(alpha.seq, 2, "the new line must expose its sequence")
+  assert.strictEqual(alpha.agentSource, "session", "agentSource must sit alongside the actor")
+  const beta = taskOf(t, "beta")
+  assert.strictEqual(beta.seq, null, "legacy lines have no sequence")
+  assert.strictEqual(beta.agentSource, null, "legacy lines have no agentSource")
+  const text = renderTimeline(t, { color: false }).join("\n")
+  assert(text.includes("seq: 2"), "the rendered timeline must show the new sequence")
+  assert(text.includes("worker: team/worker (session)"), "the rendered actor must show its source")
+  assert(
+    text.includes("    worker: team/worker  branch: teamwork/tl-beta"),
+    "a legacy task line must render exactly as before",
+  )
 })
 
 await check("events mode: totals are exact", () => {
@@ -466,7 +496,7 @@ await check("frozen shape: buildTimeline key sets are exactly the R2 contract, l
     for (const task of t.tasks) {
       assert.deepStrictEqual(
         Object.keys(task).sort(),
-        ["agent", "approx", "branch", "costUsd", "durationMs", "endedAt", "note", "passedAtRound", "rounds", "startedAt", "status", "taskId", "tokens"],
+        ["agent", "agentSource", "approx", "branch", "costUsd", "durationMs", "endedAt", "note", "passedAtRound", "rounds", "seq", "startedAt", "status", "taskId", "tokens"],
         `task keys for ${task.taskId}`,
       )
     }

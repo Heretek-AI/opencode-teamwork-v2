@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.7] - 2026-11-21
+
+### Added
+
+- `teamwork_plan` accepts optional `request`, `integrityMode` and `routingReason`; `request` is recorded verbatim and only once in `ORIGINAL_REQUEST.md`, and `integrityMode` (`development` default, `demo`, `benchmark`) is validated and persisted in `state.json` and `plan.dag.json`.
+- `ORIGINAL_REQUEST.md` is the single source for the recorded request and mode; `teamwork_security_audit` and the final-verification gate read it from that artifact rather than from the caller.
+- `events.jsonl` lines now carry a monotonic `seq` and an `agentSource` (`explicit`, `session`, `plan`) when an actor exists; `teamwork timeline` surfaces both, and logs without them stay valid.
+- `teamwork_plan` spec gate: planning is refused without a non-empty `prompt_draft.md` unless `requireSpec: false` or `skipInterview: true`, and the decision is recorded as `specGate` in the `run_created` event.
+- `teamwork_plan` rejects unknown topologies, normalises the four legacy aliases on write, and persists `routingReason` in `plan.dag.json` when supplied.
+- Per-task `feedbackLog` accumulates each verification round (capped at 20 entries), injects the still-unresolved entries into `teamwork_next`, and clears on `verified_pass`.
+- `teamwork_next` requires a PASS `verify/final.json` before reporting `ALL_PASSED`, returning `READY_FOR_FINAL_VERIFICATION` or `BLOCKED_BY_FINAL_VERIFICATION` instead.
+
+### Changed
+
+- Read-only policy documentation now states the exact guarantee: all four read-only agents deny `edit`, verifier, scout and security-auditor keep `shell` (which can modify files), the falsifier also denies `shell`, and a drift test enforces it.
+- Legacy topology aliases are normalised on write instead of being stored as supplied.
+
+### Fixed
+
+- `teamwork_status`, `teamwork_resume` and `describeRun` count `verified_pass` as passed, so completed tasks no longer show as outstanding.
+- `teamwork_task_update` enforces a transition graph and requires PASS evidence (inline verdict or `verify/report-<task>.json`), so `verified_pass` can no longer be set by a bare status update.
+- `scripts/lint-prompts.mjs` scopes topology parsing to its own section and asserts exactly the six canonical topology names.
+- `scripts/test-cost.mjs` discovers a real session or skips explicitly instead of depending on a hardcoded session id.
+
 ## [0.5.6] - 2026-10-18
 
 ### Added

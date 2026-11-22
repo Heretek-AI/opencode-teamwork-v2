@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { execFileSync } from "node:child_process"
+import { fileURLToPath } from "node:url"
 import assert from "node:assert"
 
 const testDir = mkdtempSync(join(tmpdir(), "teamwork-engine-test-"))
@@ -181,6 +182,7 @@ try {
   assert.strictEqual(nextRes.status, "READY_FOR_FINAL_VERIFICATION", "Missing final.json must block ALL_PASSED")
   assert.strictEqual(nextRes.finalReport, finalFile, "Response must name the final report path")
   assert.strictEqual(nextRes.passedCount, 2)
+  assert.strictEqual(nextRes.integrityMode, "development", "a run with no request artifact defaults the gate to development")
   let phase = JSON.parse(readFileSync(mainStateFile, "utf8")).phase
   assert.strictEqual(phase, "FINAL_VERIFICATION", "Phase must advance to FINAL_VERIFICATION")
 
@@ -191,12 +193,14 @@ try {
   assert.strictEqual(nextRes.status, "BLOCKED_BY_FINAL_VERIFICATION", "A FAIL final report must block the run")
   assert.notStrictEqual(nextRes.status, "ALL_PASSED")
   assert.strictEqual(nextRes.finalReport, finalFile)
+  assert.strictEqual(nextRes.integrityMode, "development", "BLOCKED_BY_FINAL_VERIFICATION must disclose the default mode")
 
   // (c) Only a PASS final report completes the run.
   writeFileSync(finalFile, JSON.stringify({ status: "PASS", summary: "independent final check passed" }) + "\n")
   nextRes = await registeredTools.next.execute({ sessionId: "20261018-000000-test" })
   assert.strictEqual(nextRes.status, "ALL_PASSED", "A PASS final report is required for ALL_PASSED")
   assert.strictEqual(nextRes.finalReport, finalFile, "ALL_PASSED must include the final report path")
+  assert.strictEqual(nextRes.integrityMode, "development", "ALL_PASSED must disclose the default mode")
   phase = JSON.parse(readFileSync(mainStateFile, "utf8")).phase
   assert.strictEqual(phase, "MERGE", "Phase must advance to MERGE only after final PASS")
 
@@ -331,8 +335,8 @@ try {
   assert.strictEqual(specCreated.specPath, runFile(testDir, specRun, "prompt_draft.md"), "a satisfied gate must record the spec path")
   assert.deepStrictEqual(
     Object.keys(specCreated),
-    ["ts", "event", "sessionId", "taskId", "from", "to", "round", "agent", "branch", "worktree", "phase", "specGate", "specPath"],
-    "existing run_created fields must keep their order; the gate fields are appended",
+    ["ts", "seq", "event", "sessionId", "taskId", "from", "to", "round", "agent", "branch", "worktree", "phase", "specGate", "specPath"],
+    "existing run_created fields must keep their order (seq after ts); the gate fields are appended",
   )
 
   // (d) requireSpec: false -> succeeds without a spec and is recorded as such.
@@ -345,6 +349,141 @@ try {
   assert(!Object.hasOwn(optOutCreated, "specPath"), "not_required must not record a specPath")
 
   console.log("✓ plan refuses without a spec (writing nothing), records satisfied/bypassed/not_required")
+
+  // ==========================================
+  // Part 1c-bis: request artifact and integrity modes
+  // ==========================================
+  console.log("Testing ORIGINAL_REQUEST.md and integrity modes...")
+
+  const requestFileOf = (id) => runFile(testDir, id, "ORIGINAL_REQUEST.md")
+
+  // (a) request + benchmark: verbatim artifact first, mode persisted everywhere.
+  const reqRun = "20261018-000000-request-bench"
+  const requestText = "Build the thing.\n\nKeep   these spaces\tand this tab.\n\n  indented line"
+  const reqRes = await registeredTools.plan.execute({
+    sessionId: reqRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: requestText,
+    integrityMode: "benchmark",
+    tasks: [{ id: "R1" }],
+  })
+  assert(reqRes.content.startsWith("Planned"), `request plan must succeed: ${reqRes.content}`)
+  assert(reqRes.content.includes("benchmark"), "the plan result must name the integrity mode")
+  const reqMd = readFileSync(requestFileOf(reqRun), "utf8")
+  assert(reqMd.startsWith("# Original Request\n\n- Integrity mode: benchmark\n- Recorded: "), `artifact header must be exact: ${reqMd.slice(0, 80)}`)
+  assert(/- Recorded: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/.test(reqMd), "Recorded must be ISO8601 UTC")
+  assert(reqMd.includes(`- Session: ${reqRun}`), "artifact must name the run session")
+  assert(reqMd.includes(`## Request\n\n${requestText}`), "request text must be preserved verbatim (interior whitespace intact)")
+  assert.strictEqual(JSON.parse(readFileSync(planFileOf(reqRun), "utf8")).integrityMode, "benchmark", "plan.dag.json must carry integrityMode")
+  assert.strictEqual(JSON.parse(readFileSync(stateFileOf(reqRun), "utf8")).integrityMode, "benchmark", "state.json must carry integrityMode")
+
+  // (b) a second plan into the same run is refused and writes nothing else.
+  const planBefore = readFileSync(planFileOf(reqRun), "utf8")
+  const stateBefore = readFileSync(stateFileOf(reqRun), "utf8")
+  const secondReq = await registeredTools.plan.execute({
+    sessionId: reqRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: "a different request",
+    integrityMode: "benchmark",
+    tasks: [{ id: "R2" }],
+  })
+  assert(secondReq.content.startsWith("refused:"), `a second request must be refused: ${secondReq.content}`)
+  assert(/write-once/i.test(secondReq.content), "refusal must explain the write-once rule")
+  assert(/new session/i.test(secondReq.content), "refusal must point at a new session")
+  assert.strictEqual(readFileSync(requestFileOf(reqRun), "utf8"), reqMd, "the recorded request must be unchanged")
+  assert.strictEqual(readFileSync(planFileOf(reqRun), "utf8"), planBefore, "a refused request must not rewrite plan.dag.json")
+  assert.strictEqual(readFileSync(stateFileOf(reqRun), "utf8"), stateBefore, "a refused request must not rewrite state.json")
+
+  // (c) an invalid mode is refused before anything is written.
+  const badModeRun = "20261018-000000-badmode"
+  const badMode = await registeredTools.plan.execute({
+    sessionId: badModeRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: "do it",
+    integrityMode: "production",
+    tasks: [{ id: "M1" }],
+  })
+  assert(badMode.content.startsWith("refused: invalid integrityMode"), `an invalid mode must be refused: ${badMode.content}`)
+  for (const mode of ["development", "demo", "benchmark"]) {
+    assert(badMode.content.includes(mode), `refusal must list ${mode}`)
+  }
+  assert(!existsSync(join(testDir, ".opencode", "teamwork", badModeRun)), "an invalid mode must write nothing")
+
+  // (d) legacy tolerance: omitting both inputs plans, defaults to development, no artifact.
+  const defaultRun = "20261018-000000-request-default"
+  const defaultRes = await registeredTools.plan.execute({ sessionId: defaultRun, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "D1" }] })
+  assert(defaultRes.content.startsWith("Planned"), `omitting request/mode must still plan: ${defaultRes.content}`)
+  assert(!existsSync(requestFileOf(defaultRun)), "omitting request must create no ORIGINAL_REQUEST.md")
+  assert.strictEqual(JSON.parse(readFileSync(planFileOf(defaultRun), "utf8")).integrityMode, "development", "omitted mode defaults to development in plan.dag.json")
+  assert.strictEqual(JSON.parse(readFileSync(stateFileOf(defaultRun), "utf8")).integrityMode, "development", "omitted mode defaults to development in state.json")
+
+  // (e) the audit reads the mode from the artifact, not from its caller.
+  const demoRun = "20261018-000000-audit-demo"
+  await registeredTools.plan.execute({
+    sessionId: demoRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: "Demo the feature.\n\n- Integrity mode: benchmark",
+    integrityMode: "demo",
+    tasks: [{ id: "A1" }],
+  })
+  const demoAudit = await registeredTools.security_audit.execute({ sessionId: demoRun, status: "PASS", findings: [] })
+  const demoReport = JSON.parse(readFileSync(runFile(testDir, demoRun, "verify/security-audit.json"), "utf8"))
+  assert.strictEqual(demoReport.integrityMode, "demo", "security-audit.json must record the artifact's header mode, not a body line")
+  assert(demoAudit.content.includes("demo"), "the audit result must mention the mode")
+
+  // A legacy run (no request artifact) defaults to development and says so.
+  const legacyAuditRun = "20261018-000000-audit-legacy"
+  await registeredTools.plan.execute({ sessionId: legacyAuditRun, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "A2" }] })
+  const legacyAudit = await registeredTools.security_audit.execute({ sessionId: legacyAuditRun, status: "PASS", findings: [] })
+  const legacyReport = JSON.parse(readFileSync(runFile(testDir, legacyAuditRun, "verify/security-audit.json"), "utf8"))
+  assert.strictEqual(legacyReport.integrityMode, "development", "a legacy run must record the development default")
+  assert(/default/i.test(legacyAudit.content), "a legacy run must say the default was applied")
+
+  // (f) final-gate responses carry the mode read from the artifact.
+  const gateRun = "20261018-000000-gate-demo"
+  await registeredTools.plan.execute({
+    sessionId: gateRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: "Ship the demo.",
+    integrityMode: "demo",
+    tasks: [{ id: "G1" }],
+  })
+  for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+    await registeredTools.task_update.execute({ sessionId: gateRun, taskId: "G1", status })
+  }
+  await registeredTools.task_update.execute({
+    sessionId: gateRun,
+    taskId: "G1",
+    status: "verified_pass",
+    verification: { status: "PASS" },
+  })
+  await registeredTools.security_audit.execute({ sessionId: gateRun, status: "PASS", findings: [] })
+
+  const gateFinal = runFile(testDir, gateRun, "verify/final.json")
+  let gateRes = await registeredTools.next.execute({ sessionId: gateRun })
+  assert.strictEqual(gateRes.status, "READY_FOR_FINAL_VERIFICATION")
+  assert.strictEqual(gateRes.integrityMode, "demo", "READY_FOR_FINAL_VERIFICATION must carry integrityMode")
+  assert(gateRes.content.includes("Integrity mode: demo"), `READY message must mention the mode: ${gateRes.content}`)
+
+  mkdirSync(dirname(gateFinal), { recursive: true })
+  writeFileSync(gateFinal, JSON.stringify({ status: "FAIL", summary: "not yet" }) + "\n")
+  gateRes = await registeredTools.next.execute({ sessionId: gateRun })
+  assert.strictEqual(gateRes.status, "BLOCKED_BY_FINAL_VERIFICATION")
+  assert.strictEqual(gateRes.integrityMode, "demo", "BLOCKED_BY_FINAL_VERIFICATION must carry integrityMode")
+  assert(gateRes.content.includes("Integrity mode: demo"), `BLOCKED message must mention the mode: ${gateRes.content}`)
+
+  writeFileSync(gateFinal, JSON.stringify({ status: "PASS", summary: "ok" }) + "\n")
+  gateRes = await registeredTools.next.execute({ sessionId: gateRun })
+  assert.strictEqual(gateRes.status, "ALL_PASSED")
+  assert.strictEqual(gateRes.integrityMode, "demo", "ALL_PASSED must carry integrityMode")
+  assert(gateRes.content.includes("Integrity mode: demo"), `ALL_PASSED message must mention the mode: ${gateRes.content}`)
+
+  console.log("✓ request recorded verbatim once, modes validated/persisted, audit & final gate read the artifact")
 
   // ==========================================
   // Part 1d: Transition graph + evidence for verified_pass
@@ -697,7 +836,7 @@ try {
 
 
   /** A fresh project root with the real tools registered and a run planned by the root session. */
-  async function attrFixture(runId, planAgent = "team/worker", taskIds = ["alpha"]) {
+  async function attrFixture(runId, planAgent = "team/worker", taskIds = ["alpha"], sessionAgent = undefined) {
     const root = mkdtempSync(join(testDir, "attr-"))
     const tools = {}
     await registerTeamworkTools(
@@ -712,7 +851,7 @@ try {
             })
           },
         },
-        session: { get: async () => undefined },
+        session: { get: async () => (sessionAgent ? { agent: sessionAgent } : undefined) },
       },
       root,
     )
@@ -832,6 +971,9 @@ try {
     assert.strictEqual(wa.agent, "team/worker", "explicit team/worker must be the recorded actor")
     assert.strictEqual(wd.agent, "team/worker")
     assert.strictEqual(va.agent, "team/verifier", "explicit team/verifier must be the recorded actor")
+    assert.strictEqual(wa.agentSource, "explicit", "an input.agent actor must be labelled explicit")
+    assert.strictEqual(wd.agentSource, "explicit")
+    assert.strictEqual(va.agentSource, "explicit")
     console.log("✓ explicit agent (team/worker and team/verifier) is recorded as the actor in events.jsonl")
   }
 
@@ -842,10 +984,56 @@ try {
     await f.tools.task_update.execute({ sessionId: RUN, taskId: "alpha", status: "worker_active" })
     const last = readEvents(f.root, RUN).at(-1)
     assert.strictEqual(last.agent, "team/worker", "plan-declared agent must be the fallback actor")
+    assert.strictEqual(last.agentSource, "plan", "a plan-declared actor must be labelled plan")
     console.log("✓ plan-declared agent is the fallback actor when none is supplied")
   }
 
-  // --- 6g: a garbage agent with control characters cannot inject a second JSONL line.
+  // --- 6f(2): the calling session's agent wins over the plan and is labelled session.
+  {
+    const RUN = "20261018-000000-session"
+    const f = await attrFixture(RUN, "team/worker", ["alpha"], "team/scout")
+    await f.tools.task_update.execute({ sessionId: RUN, taskId: "alpha", status: "worker_active" }, { sessionID: ROOT_SES })
+    const last = readEvents(f.root, RUN).at(-1)
+    assert.strictEqual(last.agent, "team/scout", "the session agent must beat the plan-declared agent")
+    assert.strictEqual(last.agentSource, "session", "a session-resolved actor must be labelled session")
+    console.log("✓ session-resolved agent is recorded with agentSource=session")
+  }
+
+  // --- 6g: seq is one monotonic number space per events.jsonl, starting at 1.
+  {
+    const RUN = "20261018-000000-seq"
+    const f = await attrFixture(RUN)
+    rmSync(runFile(f.root, RUN, "events.jsonl"))
+    await f.tools.task_update.execute({ sessionId: RUN, taskId: "alpha", status: "worker_active", agent: "team/worker" })
+    await f.tools.task_update.execute({ sessionId: RUN, taskId: "alpha", status: "worker_done", agent: "team/worker" })
+    const events = readEvents(f.root, RUN)
+    assert.deepStrictEqual(
+      events.map((e) => [e.event, e.seq]),
+      [["task_transition", 1], ["task_transition", 2]],
+      "two consecutive appends must get seq 1 and 2",
+    )
+    console.log("✓ consecutive task_transition lines get seq 1 and 2")
+  }
+
+  // --- 6h: a legacy events.jsonl without seq still appends the correct next value.
+  {
+    const RUN = "20261018-000000-legacy-seq"
+    const f = await attrFixture(RUN)
+    const file = runFile(f.root, RUN, "events.jsonl")
+    const legacy = [
+      { ts: "2026-10-18T10:00:00.000Z", event: "run_created", sessionId: RUN, taskId: null, from: null, to: "pending", round: 0, agent: null, branch: null, worktree: null, phase: "DAG_BUILD" },
+      { ts: "2026-10-18T10:00:01.000Z", event: "task_transition", sessionId: RUN, taskId: "alpha", from: "pending", to: "worker_active", round: 1, agent: null, branch: null, worktree: null, phase: "DISPATCH" },
+    ]
+    writeFileSync(file, legacy.map((e) => JSON.stringify(e)).join("\n") + "\n")
+    await f.tools.task_update.execute({ sessionId: RUN, taskId: "alpha", status: "worker_active", agent: "team/worker" })
+    const events = readEvents(f.root, RUN)
+    assert.strictEqual(events.length, 3, "the append must leave the two legacy lines and add one")
+    assert(!("seq" in events[0]) && !("seq" in events[1]), "legacy lines must be left untouched")
+    assert.strictEqual(events[2].seq, 3, "the appended line must continue after the two legacy lines")
+    console.log("✓ a legacy events.jsonl without seq appends the correct next seq")
+  }
+
+  // --- 6i: a garbage agent with control characters cannot inject a second JSONL line.
   {
     const RUN = "20261018-000000-inject"
     const f = await attrFixture(RUN)
@@ -1176,4 +1364,88 @@ try {
     }
     rmSync(testDir7, { recursive: true, force: true })
   }
+}
+
+// ==========================================
+// Part 8: read-only policy drift
+// ==========================================
+{
+  console.log("Testing read-only policy drift...")
+  const repoRoot = fileURLToPath(new URL("..", import.meta.url))
+
+  // Source of truth for this test: each agent's code-enforced deny set. The
+  // shell caveat is derived from the deny set, never restated, so the table
+  // cannot disagree with itself.
+  const POLICY = [
+    { id: "team/verifier", deny: ["edit", "subagent", "webfetch"] },
+    { id: "team/falsifier", deny: ["edit", "shell", "subagent"] },
+    { id: "team/scout", deny: ["edit", "subagent"] },
+    { id: "team/security-auditor", deny: ["edit", "subagent", "webfetch"] },
+  ].map((p) => ({ ...p, deny: [...p.deny].sort() }))
+
+  // --- 8a: READ_ONLY_ACTIONS holds exactly the documented deny sets.
+  const toolsSrc = readFileSync(join(repoRoot, "plugins/opencode-teamwork/tools.ts"), "utf8")
+  const table = toolsSrc.match(/const READ_ONLY_ACTIONS[^=]*=\s*\{([\s\S]*?)\n\}/)
+  assert(table, "READ_ONLY_ACTIONS table must exist in tools.ts")
+  const enforced = {}
+  for (const m of table[1].matchAll(/"([^"]+)":\s*new Set\(\[([^\]]*)\]\)/g)) {
+    enforced[m[1]] = [...m[2].matchAll(/"([^"]+)"/g)].map((a) => a[1]).sort()
+  }
+  assert.deepStrictEqual(
+    Object.keys(enforced).sort(),
+    POLICY.map((p) => p.id).sort(),
+    "READ_ONLY_ACTIONS must list exactly the agents covered by this test",
+  )
+  for (const p of POLICY) {
+    assert.deepStrictEqual(enforced[p.id], p.deny, `${p.id}: code deny set drifted: ${JSON.stringify(enforced[p.id])}`)
+  }
+  console.log("✓ READ_ONLY_ACTIONS matches the expected deny set for all four read-only agents")
+
+  // --- 8b: every agent whose code policy denies `edit` is documented in the
+  // README read-only paragraph (parsed, not a duplicate hard-coded list).
+  const readme = readFileSync(join(repoRoot, "README.md"), "utf8")
+  const start = readme.indexOf("per-agent read-only policy")
+  assert(start >= 0, "README must state the per-agent read-only policy")
+  const end = readme.indexOf("\n\n", start)
+  const paragraph = readme.slice(start, end === -1 ? undefined : end)
+  const documented = [...new Set([...paragraph.matchAll(/`(team\/[a-z-]+)`/g)].map((m) => m[1]))].sort()
+  const editDeniers = POLICY.filter((p) => p.deny.includes("edit")).map((p) => p.id).sort()
+  assert.deepStrictEqual(documented, editDeniers, "README must document exactly the edit-denying agents as read-only")
+  assert(/can modify files/i.test(paragraph), "README must state that shell can modify files")
+  assert(
+    /falsifier[^.]*shell|shell[^.]*falsifier/i.test(paragraph),
+    "README must state that the falsifier's deny set includes shell",
+  )
+  console.log("✓ README documents every edit-denying team agent, plus the shell caveat and the falsifier exception")
+
+  // --- 8c: each agent description matches its own deny set.
+  for (const p of POLICY) {
+    const name = p.id.replace(/^team\//, "")
+    const src = readFileSync(join(repoRoot, "agents/team", `${name}.md`), "utf8")
+    const fm = src.match(/^---\r?\n([\s\S]*?)\r?\n---/)
+    assert(fm, `${p.id}: frontmatter must exist`)
+    const desc = fm[1].match(/^description:\s*"([^"]*)"/m)
+    assert(desc, `${p.id}: quoted description must exist`)
+    const text = desc[1]
+    if (p.deny.includes("shell")) {
+      assert(
+        !/shell[^.]*can modify files/i.test(text),
+        `${p.id}: description must not carry the shell caveat (its deny set includes shell): ${text}`,
+      )
+      assert(/shell[^.]*denied|denied[^.]*shell/i.test(text), `${p.id}: description must say shell is denied: ${text}`)
+    } else {
+      assert(
+        /shell[^.]*can modify files/i.test(text),
+        `${p.id}: description must warn that shell is available and can modify files: ${text}`,
+      )
+    }
+  }
+  console.log("✓ each read-only agent description matches its own deny set (shell caveat only where shell is allowed)")
+
+  // --- 8d: GUARDRAILS states the same guarantee.
+  const guardrails = readFileSync(join(repoRoot, "docs/GUARDRAILS.md"), "utf8")
+  const row = guardrails.split("\n").find((line) => line.includes("Read-only enforcement"))
+  assert(row, "GUARDRAILS must keep the read-only enforcement row")
+  assert(/shell/i.test(row) && /can modify files/i.test(row), "GUARDRAILS read-only row must state the shell caveat")
+  console.log("✓ GUARDRAILS read-only row states the edit-only guarantee and the shell caveat")
 }

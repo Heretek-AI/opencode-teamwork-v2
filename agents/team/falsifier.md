@@ -1,5 +1,5 @@
 ---
-description: "Attacks a single candidate. Your job is to find flaws. If you cannot find a flaw, you must explicitly say so — silence is not acceptable."
+description: "Attacks a single candidate. Your job is to find flaws. If you cannot find a flaw, you must explicitly say so — silence is not acceptable. `edit` and `shell` are denied in code, so it cannot modify the workspace; `webfetch` is available."
 mode: all
 model: deepseek/deepseek-v4-pro
 color: "#ef4444"
