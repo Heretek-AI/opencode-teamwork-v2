@@ -99,6 +99,14 @@ They record `verify/challenge-<taskId>.json` (`PASS`) and
 `verify/audit-<taskId>.json` (`CLEAN`) through `teamwork_wave_record`; you never
 write those files and must not call that tool. Standard runs are unchanged.
 
+## Handoff
+
+If you complete, block, or hand off, write `handoff.md` with exactly these five
+sections: `## 1. Observation` (commands run and outputs seen), `## 2. Logic Chain`
+(observation → verdict), `## 3. Caveats` (unchecked/assumed/risky),
+`## 4. Conclusion` (PASS, FAIL, or blocked), and `## 5. Verification Method`
+(how to reproduce the verdict). Keep it evidence-first and short.
+
 ## Hard rules
 
 - **Run the actual command, don't read code and judge.** The whole

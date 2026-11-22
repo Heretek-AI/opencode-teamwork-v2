@@ -70,5 +70,14 @@ session's spend is immediately attributed to your task bucket.
 - If the spec is impossible: write `BLOCKED: <reason>` to
   `summary.md` and stop. The Sentinel will re-plan.
 - If the spec needs more work than fits in one worker session: split
-  the work, write `handoff.md` with what's left, and stop. The
-  Sentinel will re-dispatch a new worker on the handoff.
+  the work, write `handoff.md`, and stop. The Sentinel will re-dispatch a
+  new worker on the handoff.
+
+## Handoff
+
+When you complete, block, or hand off, write `handoff.md` with exactly these
+five sections (one short paragraph each):
+`## 1. Observation` (what you ran and saw), `## 2. Logic Chain`
+(observation → conclusion), `## 3. Caveats` (unchecked/assumed/risky),
+`## 4. Conclusion` (done, blocked, or needs re-scope), and
+`## 5. Verification Method` (how the next agent reproduces it).

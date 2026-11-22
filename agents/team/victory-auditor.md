@@ -67,6 +67,15 @@ denied). `webfetch` is denied; work from the local artifacts and the repository.
    reported. On `VICTORY REJECTED`, forward your findings so the team can resume
    and fix the gaps; do not soften the verdict.
 
+## Handoff
+
+After recording the verdict, write `handoff.md` with exactly these five sections:
+`## 1. Observation` (artifacts/tests inspected and observed results),
+`## 2. Logic Chain` (evidence → requirement outcomes → verdict),
+`## 3. Caveats` (unchecked requirements or assumptions), `## 4. Conclusion`
+(CONFIRMED, REJECTED, or blocked with the gap), and `## 5. Verification Method`
+(how to reproduce the audit). Never soften a rejection in the handoff.
+
 ## Hard rules
 
 - **Fresh session.** Never audit your own implementation or a session that

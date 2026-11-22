@@ -139,6 +139,38 @@ for (const file of ["sentinel.md", "crafter.md"]) {
 if (!existsSync(join(root, "docs", "GUARDRAILS.md"))) errors.push("docs/GUARDRAILS.md is missing")
 if (!agents.includes("security-auditor.md")) errors.push("agents/team/security-auditor.md is missing")
 
+// Continuity protocol: handoffs use five fixed sections, and the shared run
+// briefing's section names are documented. Both are contract text, so drift
+// here is a silent loss of continuity for the next agent.
+const HANDOFF_SECTIONS = [
+  "1. Observation",
+  "2. Logic Chain",
+  "3. Caveats",
+  "4. Conclusion",
+  "5. Verification Method",
+]
+const HANDOFF_AGENTS = ["worker.md", "verifier.md", "falsifier.md", "security-auditor.md", "victory-auditor.md"]
+for (const file of HANDOFF_AGENTS) {
+  const path = join(agentsDir, file)
+  if (!existsSync(path)) {
+    errors.push(`agents/team/${file} is missing`)
+    continue
+  }
+  const text = read(path)
+  const missing = HANDOFF_SECTIONS.filter((section) => !text.includes(section))
+  if (missing.length) fail(path, `handoff.md missing sections: ${missing.join(", ")}`)
+}
+const briefingSections = ["## Mission", "## Identity", "## Key Constraints", "## Project Status", "## Artifact Index", "## Succession"]
+if (existsSync(artifactsFile)) {
+  const md = read(artifactsFile)
+  const missingHandoff = HANDOFF_SECTIONS.filter((section) => !md.includes(section))
+  if (missingHandoff.length) fail(artifactsFile, `handoff.md contract missing sections: ${missingHandoff.join(", ")}`)
+  if (!/handoff\.md/.test(md)) fail(artifactsFile, "handoff.md contract is not documented")
+  const missingBriefing = briefingSections.filter((section) => !md.includes(section))
+  if (missingBriefing.length) fail(artifactsFile, `BRIEFING.md contract missing sections: ${missingBriefing.join(", ")}`)
+  if (!/BRIEFING\.md/.test(md)) fail(artifactsFile, "BRIEFING.md is not documented")
+}
+
 const toolsFile = join(root, "plugins", "opencode-teamwork", "tools.ts")
 if (existsSync(toolsFile)) {
   const t = read(toolsFile)

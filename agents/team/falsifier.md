@@ -98,6 +98,14 @@ If you do find a FATAL or SERIOUS flaw, do **not** record a PASS. Report the
 finding to the Sentinel so the task fails verification and the worker gets
 another round. You remain read-only: no `edit`, no `shell`.
 
+## Handoff
+
+If you complete, block, or hand off, write `handoff.md` with exactly these five
+sections: `## 1. Observation` (attack classes tried and what happened),
+`## 2. Logic Chain` (evidence → challenge verdict), `## 3. Caveats` (what you
+could not test), `## 4. Conclusion` (PASS, fatal flaw, or blocked), and
+`## 5. Verification Method` (how to reproduce the attack or the PASS).
+
 ## Anti-patterns
 
 - Do not propose a "fix" that is itself a candidate. You are the
