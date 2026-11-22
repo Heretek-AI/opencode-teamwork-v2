@@ -96,8 +96,20 @@ import {
   tournamentConfigsEqual,
   tournamentDir,
   validateTournamentConfig,
+  writeSafeRunFile,
 } from "./tournament.ts"
 import type { BudgetEstimate, TournamentConfig, TournamentManifest } from "./tournament.ts"
+import {
+  DEFAULT_VERIFICATION_MODE,
+  evaluateStrictGate,
+  normalizeVerificationMode,
+  normalizeWaveKind,
+  recordVerificationWave,
+  renderGateStatus,
+  resolveVerificationMode,
+  WAVE_AGENTS,
+} from "./strict.ts"
+import type { VerificationMode } from "./strict.ts"
 import {
   VICTORY_AUDITOR_AGENT,
   callerRequirementsFile,
@@ -1304,6 +1316,7 @@ async function appendEvent(
       | "task_transition"
       | "security_audit"
       | "victory_audit"
+      | "verification_wave"
       | "final_verification"
       | "final_verification_bypass"
       | "preflight"
@@ -1654,6 +1667,63 @@ async function createPlanRun(
       content: `refused: invalid integrityMode "${clean(input.integrityMode, 32)}" (accepted: ${INTEGRITY_MODES.join(", ")}; default: ${DEFAULT_INTEGRITY_MODE})`,
     }
   }
+  // Verification mode: standard (default, unchanged) or strict (one falsifier
+  // challenge + one security-auditor audit per task). It is part of the run's
+  // contract, so an invalid value refuses before anything is written and a
+  // re-plan may keep or repeat the persisted mode but never change it.
+  const requestedVerification =
+    input.verification === undefined || input.verification === null
+      ? undefined
+      : normalizeVerificationMode(input.verification)
+  if (input.verification !== undefined && input.verification !== null && !requestedVerification) {
+    return {
+      ok: false,
+      content: `refused: invalid verification "${clean(input.verification, 32)}" (accepted: standard | strict; default: ${DEFAULT_VERIFICATION_MODE}); nothing was written.`,
+    }
+  }
+  let persistedVerification: VerificationMode | undefined
+  if (existsSync(run)) {
+    const planRes = readBoundedRunJson<any>(run, join(run, "plan.dag.json"), MAX_MANIFEST_BYTES)
+    if (planRes.status === "error") {
+      return { ok: false, content: `${planRes.error}; nothing was written.` }
+    }
+    const stateRes = readBoundedRunJson<any>(run, join(run, "state.json"), MAX_MANIFEST_BYTES)
+    if (stateRes.status === "error") {
+      return { ok: false, content: `${stateRes.error}; nothing was written.` }
+    }
+    const fromPlanRaw = planRes.status === "ok" ? planRes.value?.verification : undefined
+    const fromStateRaw = stateRes.status === "ok" ? stateRes.value?.verification : undefined
+    const fromPlan =
+      fromPlanRaw === undefined || fromPlanRaw === null ? undefined : normalizeVerificationMode(fromPlanRaw)
+    const fromState =
+      fromStateRaw === undefined || fromStateRaw === null ? undefined : normalizeVerificationMode(fromStateRaw)
+    if (
+      (fromPlanRaw !== undefined && fromPlanRaw !== null && !fromPlan) ||
+      (fromStateRaw !== undefined && fromStateRaw !== null && !fromState)
+    ) {
+      return {
+        ok: false,
+        content:
+          "refused: plan.dag.json or state.json records an invalid verification mode; repair the run or start a new session. Nothing was written.",
+      }
+    }
+    if (fromPlan && fromState && fromPlan !== fromState) {
+      return {
+        ok: false,
+        content:
+          "refused: plan.dag.json and state.json disagree about verification; repair the run or start a new session. Nothing was written.",
+      }
+    }
+    persistedVerification = fromPlan ?? fromState
+  }
+  if (persistedVerification && requestedVerification && persistedVerification !== requestedVerification) {
+    return {
+      ok: false,
+      content: `refused: verification is already persisted as "${persistedVerification}" for this run and cannot be changed by a re-plan; omit it to keep the mode or start a new session. Nothing was written.`,
+    }
+  }
+  const verificationMode: VerificationMode =
+    persistedVerification ?? requestedVerification ?? DEFAULT_VERIFICATION_MODE
   // The request record is verbatim, so refuse rather than truncate. The
   // length check runs before anything is written.
   const request = typeof input.request === "string" ? input.request : undefined
@@ -1890,6 +1960,7 @@ async function createPlanRun(
     sessionId,
     topology,
     integrityMode,
+    verification: verificationMode,
     victoryAudit: victoryAuditMode,
     victoryAuditSource,
     ...(requirementsBaseline ? { requirementsSource: requirementsBaseline.source, requirementsCount: requirementsBaseline.items.length } : {}),
@@ -1906,6 +1977,7 @@ async function createPlanRun(
       version: 1,
       sessionId,
       integrityMode,
+      verification: verificationMode,
       victoryAudit: victoryAuditMode,
       ...(isLemma ? { lemmaMode: true, route: "lemma" } : {}),
       phase: "DISPATCH",
@@ -1917,8 +1989,15 @@ async function createPlanRun(
     // the caller chose (defaults to development when omitted).
     const stateFile = join(run, "state.json")
     const state = readJson<any>(stateFile, undefined)
-    if (state && (state.integrityMode !== integrityMode || state.victoryAudit !== victoryAuditMode || (isLemma && !state.lemmaMode))) {
+    if (
+      state &&
+      (state.integrityMode !== integrityMode ||
+        state.verification !== verificationMode ||
+        state.victoryAudit !== victoryAuditMode ||
+        (isLemma && !state.lemmaMode))
+    ) {
       state.integrityMode = integrityMode
+      state.verification = verificationMode
       state.victoryAudit = victoryAuditMode
       if (isLemma) {
         state.lemmaMode = true
@@ -2027,7 +2106,7 @@ async function createPlanRun(
     tasks,
     topology,
     integrityMode,
-    content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\n${preflightLine}\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.\nVictory audit: ${victoryAuditMode}${victoryAuditSource === "caller" ? " (explicit)" : ""}${requirementsBaseline ? `; requirements baseline ${requirementsBaseline.items.length} item(s) from ${requirementsBaseline.source} (requirements.json)` : "; no requirements baseline"}.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${preflight.bypassed ? `\n⚠ Input preflight bypassed (allowMissingInputs: true): ${preflight.status}.` : ""}${creditWarning}`,
+    content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\n${preflightLine}\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.\nVerification: ${verificationMode}${verificationMode === "strict" ? " (one falsifier challenge + one security-auditor audit per task)" : ""}.\nVictory audit: ${victoryAuditMode}${victoryAuditSource === "caller" ? " (explicit)" : ""}${requirementsBaseline ? `; requirements baseline ${requirementsBaseline.items.length} item(s) from ${requirementsBaseline.source} (requirements.json)` : "; no requirements baseline"}.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${preflight.bypassed ? `\n⚠ Input preflight bypassed (allowMissingInputs: true): ${preflight.status}.` : ""}${creditWarning}`,
   }
 }
 
@@ -2051,6 +2130,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           routingReason: { type: "string", description: "Optional. Why this topology was chosen; persisted in plan.dag.json when provided." },
           request: { type: "string", description: "The verbatim text this run was routed on (max 20000 chars); recorded once in ORIGINAL_REQUEST.md. Sentinel must always pass this for LEMMA and general runs; a second plan into the same run with a non-empty request file is refused." },
           integrityMode: { type: "string", description: "development | demo | benchmark. Default development. Recorded in ORIGINAL_REQUEST.md, state.json and plan.dag.json; the security auditor and final gate read it from ORIGINAL_REQUEST.md." },
+          verification: {
+            type: "string",
+            description:
+              "standard | strict. Default standard (unchanged verifier-only completion). Strict adds exactly one team/falsifier challenge and one team/security-auditor audit per task; both must be recorded with teamwork_wave_record before final verification can PASS. Persisted in plan.dag.json and state.json; a re-plan may not change it.",
+          },
           requirements: {
             type: "array",
             description: "Optional requirements baseline (max 50). Ids are safe tokens; text is non-empty and <= 2,000 chars. Duplicates are refused. Persisted to <run>/requirements.json and checked item-by-item by the independent victory audit.",
@@ -3687,7 +3771,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     editor.add({
       name: "next",
       description:
-        "Determine the next actionable tasks in the DAG based on dependencies and current lifecycle states. Returns tasks ready for worker dispatch, tasks ready for verifier dispatch, in-progress tasks, or signals completion/deadlock.",
+        "Determine the next actionable tasks in the DAG based on dependencies and current lifecycle states. Returns tasks ready for worker dispatch, tasks ready for verifier dispatch, in-progress tasks, or signals completion/deadlock. In strict mode it returns NEEDS_STRICT_WAVE (or BLOCKED_BY_STRICT_WAVE) until every task has its falsifier challenge and security-auditor audit, and never ALL_PASSED before them.",
       input: {
         type: "object",
         properties: {
@@ -4064,6 +4148,39 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               status: "READY_FOR_SECURITY_AUDIT",
               agent: "team/security-auditor",
               passedCount: passedTasks.length,
+            }
+          }
+
+          // Strict mode: the security audit above is the run-level pre-merge
+          // gate. Strict additionally needs one falsifier challenge and one
+          // security-auditor audit per task, recorded after its verifier PASS.
+          // Never complete (or pretend final verification is ready) without them.
+          const verification = resolveVerificationMode(plan, state)
+          if (verification.mode === "strict") {
+            const strictTasks = [...taskDefs.keys()]
+              .filter((id) => isSafeTaskId(id))
+              .map((id) => ({ id, status: String(taskStates[id]?.status ?? "pending") }))
+            const strictGate = evaluateStrictGate(run, strictTasks, "strict")
+            if (!strictGate.ok) {
+              const status =
+                strictGate.status === "MISSING" ? "NEEDS_STRICT_WAVE" : "BLOCKED_BY_STRICT_WAVE"
+              const pairs = strictGate.missing.map((m) => `${m.taskId}:${m.kind}`)
+              return {
+                content: `${status}: strict verification is incomplete. ${
+                  pairs.length
+                    ? `Missing strict verdict(s): ${pairs.join(", ")}.`
+                    : "Every strict verdict is present but at least one is not PASS/CLEAN."
+                }\nDispatch team/falsifier and team/security-auditor in parallel for each ready task; each must call teamwork_wave_record (challenge=PASS, audit=CLEAN). Then run teamwork_final_verify.\n${strictGate.reasons.map((r) => `  - ${r}`).join("\n")}`,
+                status,
+                strictWave: {
+                  status: strictGate.status,
+                  missing: strictGate.missing,
+                  reasons: strictGate.reasons,
+                },
+                missing: strictGate.missing,
+                reasons: strictGate.reasons,
+                passedCount: passedTasks.length,
+              }
             }
           }
 
@@ -4729,9 +4846,79 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     })
 
     editor.add({
+      name: "wave_record",
+      description:
+        "Record one strict-verification verdict. Only team/falsifier may record kind=challenge (verdict PASS) and only team/security-auditor may record kind=audit (verdict CLEAN); the caller identity is derived from the trusted session and cannot be supplied as an input. Requires the task to exist and its verify/report-<taskId>.json to be PASS, writes verify/challenge-<taskId>.json or verify/audit-<taskId>.json atomically, appends a verification_wave event, and is write-once.",
+      input: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string" },
+          taskId: { type: "string", description: "The task ID defined in plan.dag.json." },
+          kind: { type: "string", description: "challenge | audit." },
+          verdict: { type: "string", description: "challenge: PASS; audit: CLEAN. Any other value is refused." },
+          notes: { type: "string", description: "Optional adversarial notes (max 1000 chars, sanitized)." },
+          evidence: { type: "string", description: "Optional evidence pointer (max 2000 chars, sanitized)." },
+        },
+        required: ["sessionId", "taskId", "kind", "verdict"],
+        additionalProperties: false,
+      },
+      execute: async (input: any, context: any) => {
+        const resolved = resolveRun(root, input?.sessionId)
+        if (resolved.error) return { content: resolved.error }
+        const run = resolved.run as string
+        const kind = normalizeWaveKind(input?.kind)
+        if (!kind) {
+          return {
+            content: `refused: invalid strict-wave kind "${clean(input?.kind, 32)}" (expected challenge | audit); nothing was written`,
+          }
+        }
+        // Authorization follows the trusted session identity only. There is no
+        // `agent` input: a caller cannot label itself the falsifier or auditor.
+        const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+        const caller = callSession ? await deriveCallerAgent(ctx, run, callSession) : undefined
+        const expectedAgent = WAVE_AGENTS[kind]
+        if (!caller || caller.agent !== expectedAgent) {
+          return {
+            content: `refused: a ${kind} verdict must be recorded by ${expectedAgent} (trusted session agent: ${caller?.agent ? clean(caller.agent, 64) : "unknown"}); nothing was written`,
+          }
+        }
+        if (!callSession) {
+          return { content: "refused: wave_record needs a trusted session identity; nothing was written" }
+        }
+        const result = recordVerificationWave(run, basename(run), {
+          taskId: input?.taskId,
+          kind,
+          verdict: input?.verdict,
+          notes: input?.notes,
+          evidence: input?.evidence,
+          agent: caller.agent,
+          agentSessionId: callSession,
+        })
+        if (!result.ok) return { content: result.error }
+        const state = readJson<any>(join(run, "state.json"), undefined)
+        await appendEvent(run, {
+          event: "verification_wave",
+          sessionId: basename(run),
+          taskId: result.verdict.taskId,
+          to: result.verdict.verdict,
+          round: 0,
+          agent: expectedAgent,
+          agentSource: "session",
+          phase: state?.phase ?? null,
+          note: `${kind}: ${result.verdict.verdict}`,
+        })
+        return {
+          content: `STRICT WAVE RECORDED: ${kind}=${result.verdict.verdict} for ${result.verdict.taskId} by ${expectedAgent}.\nArtifact: ${result.artifact}`,
+          verdict: result.verdict,
+          artifact: result.artifact,
+        }
+      },
+    })
+
+    editor.add({
       name: "final_verify",
       description:
-        "Compute and stamp the run's final verdict from artifacts. PASS requires every task to be verified_pass, every verify/report-<taskId>.json to be PASS, verify/security-audit.json to be PASS, and (unless the plan explicitly skipped it) a CONFIRMED independent victory audit bound to the current ORIGINAL_REQUEST.md. Writes verify/final.json atomically and appends a final_verification event. The verdict is computed from evidence and cannot be overridden by input.",
+        "Compute and stamp the run's final verdict from artifacts. PASS requires every task to be verified_pass, every verify/report-<taskId>.json to be PASS, verify/security-audit.json to be PASS, and (unless the plan explicitly skipped it) a CONFIRMED independent victory audit bound to the current ORIGINAL_REQUEST.md. In strict mode it also requires verify/challenge-<taskId>.json (team/falsifier, PASS) and verify/audit-<taskId>.json (team/security-auditor, CLEAN) for every task, and writes GATE_STATUS.md. Writes verify/final.json atomically and appends a final_verification event. The verdict is computed from evidence and cannot be overridden by input.",
       input: {
         type: "object",
         properties: {
@@ -4808,6 +4995,17 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             if (t.reportStatus !== "PASS") reasons.push(`task ${t.id}: report ${t.reportStatus}`)
           }
           if (securityAudit.status !== "PASS") reasons.push(`security audit: ${securityAudit.status}`)
+
+          // Opt-in strict wave: recompute the per-task challenge/audit evidence.
+          // A missing or non-PASS/CLEAN verdict is a named FAIL reason. Standard
+          // mode is a no-op, so its verdict and artifacts are unchanged.
+          const verificationMode = resolveVerificationMode(plan, state).mode
+          const strictGate = evaluateStrictGate(
+            run,
+            tasks.filter((t) => t.report !== null).map((t) => ({ id: t.id, status: t.status })),
+            verificationMode,
+          )
+          if (!strictGate.skipped) reasons.push(...strictGate.reasons)
 
           let documentReviewEvidence:
             | { checked: boolean; segmentReportsComplete: boolean; finalReportPresent: boolean }
@@ -5037,8 +5235,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (context?.signal?.aborted && !reasons.includes("request aborted via AbortSignal")) {
             reasons.push("request aborted via AbortSignal")
           }
-          const status = reasons.length === 0 ? "PASS" : "FAIL"
-          const cappedReasons = reasons.slice(0, 100)
+          let status: "PASS" | "FAIL" = reasons.length === 0 ? "PASS" : "FAIL"
+          let cappedReasons = reasons.slice(0, 100)
           const summary = typeof input?.summary === "string" ? clean(input.summary, 2000).trim() : ""
           const findings = Array.isArray(input?.findings)
             ? input.findings.slice(0, 50).map((f: any) => ({
@@ -5047,6 +5245,41 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 fix: clean(f?.fix, 500),
               }))
             : []
+
+          // Strict mode writes a sanitized GATE_STATUS.md table. A failure to
+          // write the required artifact is itself a FAIL reason, so a symlinked
+          // or unwritable path can never leave a PASS without its evidence.
+          if (!strictGate.skipped) {
+            const gateFile = join(run, "GATE_STATUS.md")
+            try {
+              writeSafeRunFile(
+                run,
+                gateFile,
+                renderGateStatus({
+                  sessionId: basename(run),
+                  finalStatus: status,
+                  gate: strictGate,
+                  reasons: cappedReasons,
+                }),
+              )
+            } catch (err: any) {
+              reasons.push(`strict gate: could not write GATE_STATUS.md (${clean(err?.message, 120)})`)
+              status = "FAIL"
+              cappedReasons = reasons.slice(0, 100)
+              try {
+                writeSafeRunFile(
+                  run,
+                  gateFile,
+                  renderGateStatus({
+                    sessionId: basename(run),
+                    finalStatus: "FAIL",
+                    gate: strictGate,
+                    reasons: cappedReasons,
+                  }),
+                )
+              } catch {}
+            }
+          }
 
           const victoryRecord = victoryGate.skipped
             ? "SKIPPED (explicit)"
@@ -5078,6 +5311,33 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               ...(documentReviewEvidence ? { documentReview: documentReviewEvidence } : {}),
               ...(lemmaEvidence ? { lemma: lemmaEvidence } : {}),
               ...(tournamentEvidence ? { tournament: tournamentEvidence } : {}),
+              ...(verificationMode === "strict"
+                ? {
+                    strict: {
+                      mode: "strict",
+                      status: strictGate.status,
+                      missing: strictGate.missing,
+                      reasons: strictGate.reasons,
+                      tasks: strictGate.tasks.map((t) => ({
+                        id: t.id,
+                        report: `verify/report-${t.id}.json`,
+                        reportStatus: t.reportStatus,
+                        challenge: {
+                          path: t.challenge.path,
+                          status: t.challenge.verdict,
+                          agent: t.challenge.agent,
+                          ok: t.challenge.ok,
+                        },
+                        audit: {
+                          path: t.audit.path,
+                          status: t.audit.verdict,
+                          agent: t.audit.agent,
+                          ok: t.audit.ok,
+                        },
+                      })),
+                    },
+                  }
+                : {}),
             },
             reasons: cappedReasons,
             ...(summary ? { summary } : {}),
@@ -5099,25 +5359,27 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             integrity.source === "artifact"
               ? `Integrity mode: ${integrity.mode} (from ORIGINAL_REQUEST.md).`
               : `Integrity mode: ${integrity.mode} (default applied; no ORIGINAL_REQUEST.md for this run).`
-          const evidenceLine = `Evidence: ${tasks.length} task(s), allTasksVerifiedPass=${allTasksVerifiedPass}, security audit ${securityAudit.status}, ${describeVictoryGate(victoryGate)}`
+          const evidenceLine = `Evidence: ${tasks.length} task(s), allTasksVerifiedPass=${allTasksVerifiedPass}, security audit ${securityAudit.status}, ${verificationMode === "strict" ? `strict wave ${strictGate.status}, ` : ""}${describeVictoryGate(victoryGate)}`
 
           if (status === "FAIL") {
             return {
-              content: `FINAL VERIFICATION FAILED: ${reasons.length} unmet condition(s). Final merge is BLOCKED.\nReasons:\n${cappedReasons.map((r) => `  - ${r}`).join("\n")}\n${evidenceLine}\n${integrityModeNote}\nArtifact: ${finalFile}`,
+              content: `FINAL VERIFICATION FAILED: ${reasons.length} unmet condition(s). Final merge is BLOCKED.\nReasons:\n${cappedReasons.map((r) => `  - ${r}`).join("\n")}\n${evidenceLine}\n${integrityModeNote}\nArtifact: ${finalFile}${verificationMode === "strict" ? `\nGate status: ${join(run, "GATE_STATUS.md")}` : ""}`,
               status: "FAIL",
               finalReport: finalFile,
               integrityMode: integrity.mode,
               victory: victoryRecord,
+              ...(verificationMode === "strict" ? { strictGate: strictGate.status, strictMissing: strictGate.missing } : {}),
               reasons: cappedReasons,
             }
           }
 
           return {
-            content: `FINAL VERIFICATION PASSED: every task is verified_pass, every task report is PASS, the security audit is PASS, and the victory audit is ${victoryRecord}.\n${evidenceLine}\n${integrityModeNote}\nArtifact: ${finalFile}`,
+            content: `FINAL VERIFICATION PASSED: every task is verified_pass, every task report is PASS, the security audit is PASS, ${verificationMode === "strict" ? "the strict challenge/audit wave is PASS, " : ""}and the victory audit is ${victoryRecord}.\n${evidenceLine}\n${integrityModeNote}\nArtifact: ${finalFile}${verificationMode === "strict" ? `\nGate status: ${join(run, "GATE_STATUS.md")}` : ""}`,
             status: "PASS",
             finalReport: finalFile,
             integrityMode: integrity.mode,
             victory: victoryRecord,
+            ...(verificationMode === "strict" ? { strictGate: strictGate.status } : {}),
           }
         })
       },
