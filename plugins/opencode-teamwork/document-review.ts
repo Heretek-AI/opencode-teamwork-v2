@@ -509,6 +509,7 @@ const NON_MODIFIER_GUARD =
   "(?!(?:for|in|of|on|to|with|about|from|into|by|and|or|covering|regarding|concerning|paper|document|doc|preprint|manuscript|rfc|draft|spec|specification|article|report)\\b)"
 const DEFECT_ANALYSIS_RE = new RegExp(
   `\\b(?:analy[sz]e|check|investigate|trace|inspect|examine|profile|fix|resolve)\\s+(?:(?:the|this|that|these|those|a|an|some|any|my|our|your|their|several|multiple|recent|intermittent|recurring|new|existing)\\s+)?(?:${NON_MODIFIER_GUARD}[a-z0-9_-]+\\s+){0,3}(?:${DEFECT_HEAD_NOUN_BODY})\\b` +
+    `|\\btroubleshoot\\s+(?:(?:the|this|that|these|those|a|an)\\s+)?(?:${NON_MODIFIER_GUARD}[a-z0-9_-]+\\s+){0,3}(?:${DEFECT_HEAD_NOUN_BODY})\\s+(?:in|of|on|for)\\s+__DOC_REF__\\b` +
     `|\\b(?:analy[sz]e|investigate|trace|reproduce|root[- ]?cause)\\s+why\\b` +
     `|\\breproduce\\s+(?:(?:the|this|that|these|those|a|an)\\s+)?(?:${NON_MODIFIER_GUARD}[a-z0-9_-]+\\s+){0,3}(?:${DEFECT_HEAD_NOUN_BODY}|behavior|problem)\\b`,
   "i",
@@ -527,6 +528,10 @@ function isHowToTopicContinuation(beforeHard: string, word: string, after: strin
   const tail = m[1]
   // ", and " / ", or " with fewer than 2 commas is a clause boundary, not an Oxford-comma list continuation.
   if (/,\s*(?:and|or)\s+$/i.test(tail) && tail.split(",").length - 1 < 2) {
+    return false
+  }
+  // A second ", and/or " after an already-completed "and/or <item>, " inside the how-to list is a new clause boundary.
+  if (/(?:and|or)\s+[a-z-]+\s*,\s*(?:and|or)\s+$/i.test(tail)) {
     return false
   }
   // A diagnostic verb acting directly on a supplied document token or repeating an earlier verb in the list is imperative.
@@ -618,13 +623,13 @@ export function classifyRoute(rawInput: RouteClassifyInput | string, root: strin
 
   // Negative Trigger Guard A: PR / pull request / diff / patch / code review
   const rejectedAsPrOrCodeReview =
-    /\b(?:review\s+(?:this|the|my|our|a)?\s*(?:pr|pull\s+request|diff|patch|commit|commits|codebase|code|implementation|function|method|class|module|script|snippet)|pr\s*#?\d+|pull\s+request\s*#?\d+|code\s+review|reviewing\s+(?:this|the)\s+(?:pr|diff|patch|code|implementation|function|method|class|module|script|snippet))\b/i.test(
+    /\b(?:(?:review|critique|audit|evaluate|assess)\s+(?:this|the|my|our|a)?\s*(?:pr|pull\s+request|diff|patch|commit|commits|codebase|code|implementation|function|method|class|module|script|snippet|component)|pr\s*#?\d+|pull\s+request\s*#?\d+|code\s+review|(?:reviewing|critiquing|auditing|evaluating|assessing)\s+(?:this|the|my|our|a)\s+(?:pr|pull\s+request|diff|patch|commit|commits|codebase|code|implementation|function|method|class|module|script|snippet|component))\b/i.test(
       intentText,
     )
 
   // Negative Trigger Guard B: primary deliverable is implementing, debugging/diagnosing a failure, or solving/proving a problem
   const hasImplementOrEditIntent =
-    /\b(?:implement|refactor|write\s+(?:a\s+|the\s+)?(?:function|module|script|tests?|code|patch|class|cli)|build\s+(?:a|the)|add\s+(?:a|the)\s+(?:feature|flag|endpoint|test|option|command)|make\s+tests\s+pass|edit\s+(?:the\s+)?(?:file|code)|update\s+(?:the\s+)?(?:code|docs|readme)|fix\s+(?:this|that|it)\b|(?:edit|update|fix)\s+(?:the\s+|this\s+|that\s+)?__DOC_REF__)\b/i.test(
+    /\b(?:implement|refactor|write\s+(?:(?:a|an|the|some|more|new|unit|integration|e2e|regression|smoke|failing|automated)\s+){0,3}(?:function|module|script|tests?|code|patch|class|cli)|build\s+(?:a|the)|add\s+(?:a|the)\s+(?:feature|flag|endpoint|test|option|command)|make\s+tests\s+pass|edit\s+(?:the\s+)?(?:file|code)|update\s+(?:the\s+)?(?:code|docs|readme)|fix\s+(?:this|that|it)\b|(?:edit|update|fix|modify|patch|rewrite)\s+(?:the\s+|this\s+|that\s+)?__DOC_REF__\b|(?:fix|edit|update|patch|modify|rewrite)\s+(?:the\s+|this\s+|a\s+|an\s+)?[a-z0-9_-]+\s+(?:in|of|on)\s+__DOC_REF__\b)\b/i.test(
       intentText,
     )
   const hasMathOrSolveIntent =

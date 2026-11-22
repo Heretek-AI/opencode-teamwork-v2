@@ -2464,6 +2464,7 @@ try {
       "review docs/cli.md covering debug flags",
       "review docs/debug-guide.md",
       "review docs/runbook.md covering how to debug, diagnose, and troubleshoot crashes",
+      "review docs/spec.md covering class invariants",
     ]) {
       const topicRes = await tools.route.execute({ request: topicReq })
       assert.strictEqual(
@@ -2565,6 +2566,60 @@ try {
           "}\n" +
           "export function helper(x: number) { return x * 2 }\n" +
           "```",
+        "distributed-coding",
+      ],
+      ["review docs/spec.md and write unit tests for src/foo.md", "distributed-coding"],
+      ["review docs/spec.md and write integration tests for src/foo.md", "distributed-coding"],
+      ["review docs/spec.md and write new tests for src/foo.md", "distributed-coding"],
+      [
+        "Audit this implementation:\n\n```ts\n" +
+          "export function parseHeader(buf: Uint8Array): string {\n" +
+          "  return new TextDecoder().decode(buf.subarray(0, 16))\n" +
+          "}\n" +
+          "export function helper(x: number) { return x * 2 }\n" +
+          "```",
+        "distributed-coding",
+      ],
+      [
+        "Critique this function:\n\n```ts\n" +
+          "export function parseHeader(buf: Uint8Array): string {\n" +
+          "  return new TextDecoder().decode(buf.subarray(0, 16))\n" +
+          "}\n" +
+          "export function helper(x: number) { return x * 2 }\n" +
+          "```",
+        "distributed-coding",
+      ],
+      [
+        "Evaluate this code:\n\n```ts\n" +
+          "export function parseHeader(buf: Uint8Array): string {\n" +
+          "  return new TextDecoder().decode(buf.subarray(0, 16))\n" +
+          "}\n" +
+          "export function helper(x: number) { return x * 2 }\n" +
+          "```",
+        "distributed-coding",
+      ],
+      [
+        "Assess this snippet:\n\n```ts\n" +
+          "export function parseHeader(buf: Uint8Array): string {\n" +
+          "  return new TextDecoder().decode(buf.subarray(0, 16))\n" +
+          "}\n" +
+          "export function helper(x: number) { return x * 2 }\n" +
+          "```",
+        "distributed-coding",
+      ],
+      [
+        "Review this component:\n\n```tsx\n" +
+          "export function UserCard({ name, role }: { name: string; role: string }) {\n" +
+          '  return <div className="card"><strong>{name}</strong><span>{role}</span></div>\n' +
+          "}\n" +
+          "```",
+        "distributed-coding",
+      ],
+      ["review docs/spec.md and modify src/foo.md", "distributed-coding"],
+      ["review docs/spec.md and patch src/foo.md", "distributed-coding"],
+      ["review docs/spec.md and fix the typo in src/foo.md", "distributed-coding"],
+      [
+        "review docs/runbook.md covering how to build, test, and debug, and troubleshoot the crash in src/foo.md",
         "distributed-coding",
       ],
     ]
