@@ -1,4 +1,4 @@
-// opencode-teamwork — V2 port
+// @heretek-ai/opencode-teamwork-v2 — V2 port
 //
 // Original package: opencode-teamwork@0.2.1 (V1 plugin API)
 // Ported to the OpenCode V2 plugin API (see https://opencode.ai/v2/docs/build/plugins).

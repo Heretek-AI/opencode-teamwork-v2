@@ -1,4 +1,4 @@
-// opencode-teamwork-v2 — postinstall hook
+// @heretek-ai/opencode-teamwork-v2 — postinstall hook
 //
 // Installs the 11 `team/*` agent markdown files into the OpenCode config
 // directory and asks the user which model each agent should use.

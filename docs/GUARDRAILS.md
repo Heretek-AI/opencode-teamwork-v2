@@ -1,6 +1,6 @@
 # Guardrails
 
-The security model for `opencode-teamwork-v2`, and how each control is enforced
+The security model for `@heretek-ai/opencode-teamwork-v2`, and how each control is enforced
 (in code, not just in a prompt).
 
 ## Threat model

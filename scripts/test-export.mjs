@@ -1,4 +1,4 @@
-// opencode-teamwork-v2 — run export test suite
+// @heretek-ai/opencode-teamwork-v2 — run export test suite
 //
 // Hermetic, zero-dependency coverage for `lib/export.mjs` and the
 // `opencode-teamwork export` CLI. Every fixture is a synthetic run directory

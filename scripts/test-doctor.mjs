@@ -1,4 +1,4 @@
-// opencode-teamwork-v2 — doctor diagnostics test suite
+// @heretek-ai/opencode-teamwork-v2 — doctor diagnostics test suite
 //
 // Hermetic, zero-dependency coverage for `lib/doctor.mjs` and the
 // `opencode-teamwork doctor` CLI. Every fixture lives in its own temp dir and

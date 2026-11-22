@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// opencode-teamwork-v2 — installer CLI
+// @heretek-ai/opencode-teamwork-v2 — installer CLI
 //
 //   opencode-teamwork init      pick models + install agents + register plugin
 //   opencode-teamwork models    pick models + reinstall agents (no config edit)
@@ -37,7 +37,7 @@ function safeEcho(value, max = 64) {
   return shown.length > max ? `${shown.slice(0, max)}...` : shown
 }
 
-const HELP = `opencode-teamwork-v2
+const HELP = `@heretek-ai/opencode-teamwork-v2
 
 Usage: opencode-teamwork <command> [options]
 
@@ -512,6 +512,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(`opencode-teamwork-v2: ${error?.message || error}`)
+  console.error(`@heretek-ai/opencode-teamwork-v2: ${error?.message || error}`)
   process.exitCode = 1
 })

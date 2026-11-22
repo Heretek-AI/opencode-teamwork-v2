@@ -1,5 +1,5 @@
 {
-  "name": "opencode-teamwork-v2",
+  "name": "@heretek-ai/opencode-teamwork-v2",
   "version": "0.5.9",
   "description": "Antigravity-style multi-agent orchestration for OpenCode V2 — 11 agents, 7 commands, interactive model assignment on install.",
   "keywords": [
@@ -15,11 +15,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sorcnr/opencode-teamwork-v2.git"
+    "url": "git+https://github.com/Heretek-AI/opencode-teamwork-v2.git"
   },
-  "homepage": "https://github.com/sorcnr/opencode-teamwork-v2#readme",
+  "homepage": "https://github.com/Heretek-AI/opencode-teamwork-v2#readme",
   "bugs": {
-    "url": "https://github.com/sorcnr/opencode-teamwork-v2/issues"
+    "url": "https://github.com/Heretek-AI/opencode-teamwork-v2/issues"
   },
   "type": "module",
   "exports": {

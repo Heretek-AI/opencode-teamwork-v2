@@ -109,7 +109,7 @@ current status, then present what you have — do not try to "finish quickly."
 ## Cost & model selection
 
 Each role's model lives in that agent's markdown frontmatter (`model:`).
-Users change them with `npx opencode-teamwork-v2 init`, which records the
+Users change them with `npx @heretek-ai/opencode-teamwork-v2 init`, which records the
 mapping in `~/.config/opencode/teamwork.json`. You MUST respect those
 overrides. If a role is unset, fall back to the orchestrator's model.
 

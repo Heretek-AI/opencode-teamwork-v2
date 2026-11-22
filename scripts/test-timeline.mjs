@@ -1,4 +1,4 @@
-// opencode-teamwork-v2 — lifecycle timeline test suite
+// @heretek-ai/opencode-teamwork-v2 — lifecycle timeline test suite
 //
 // Hermetic, zero-dependency coverage for `lib/timeline.mjs` and the
 // `opencode-teamwork timeline` CLI. Every fixture is a synthetic run directory

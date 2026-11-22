@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Prompt/agent linter for opencode-teamwork-v2.
+// Prompt/agent linter for @heretek-ai/opencode-teamwork-v2.
 //
 // Guards the invariants we keep breaking by hand:
 //   * one canonical artifact root (.opencode/teamwork/<session-id>/)

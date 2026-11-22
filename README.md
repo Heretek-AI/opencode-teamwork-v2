@@ -1,4 +1,4 @@
-# opencode-teamwork-v2
+# @heretek-ai/opencode-teamwork-v2
 
 An **OpenCode V2 port** of [`opencode-teamwork`](https://github.com/aditya0si/OpenCode-Team) —
 Antigravity-style multi-agent orchestration for OpenCode.
@@ -29,7 +29,7 @@ rewritten for the V2 plugin + agent APIs. Verified against **OpenCode `v2.0.26`*
 ## Layout
 
 ```
-package.json                      # npm manifest (name: opencode-teamwork-v2)
+package.json                      # npm manifest (name: @heretek-ai/opencode-teamwork-v2)
 index → plugins/opencode-teamwork/index.ts   # V2 plugin, registers the 7 commands
 plugins/opencode-teamwork/tools.ts           # engine tools + hooks (V2 API)
 agents/team/*.md                  # 11 team agents (markdown, V2 frontmatter)
@@ -106,33 +106,33 @@ topologies, and the JSON schemas (`spec.json`, `plan.dag.json`, `state.json`,
 ### From GitHub (no npm account needed)
 
 ```sh
-opencode plugin add github:sorcnr/opencode-teamwork-v2
+opencode plugin add github:Heretek-AI/opencode-teamwork-v2
 
 # then choose a model for each agent:
-npx github:sorcnr/opencode-teamwork-v2 init
+npx github:Heretek-AI/opencode-teamwork-v2 init
 ```
 
 If `npx github:…` is unavailable, run the bundled CLI straight from the install
 directory:
 
 ```sh
-node ~/.config/opencode/node_modules/opencode-teamwork-v2/bin/opencode-teamwork.mjs init
+node ~/.config/opencode/node_modules/@heretek-ai/opencode-teamwork-v2/bin/opencode-teamwork.mjs init
 ```
 
 ### From npm
 
 ```sh
-opencode plugin add opencode-teamwork-v2
+opencode plugin add @heretek-ai/opencode-teamwork-v2
 
-npx opencode-teamwork-v2 init      # pick models, install agents, register plugin
-npx opencode-teamwork-v2 models    # pick models only (never edits opencode.json)
-npx opencode-teamwork-v2 status    # show what is installed and mapped
-npx opencode-teamwork-v2 doctor    # diagnose environment health (or --json)
-npx opencode-teamwork-v2 runs      # list active/past runs and spent budgets
-npx opencode-teamwork-v2 inspect   # inspect latest run DAG, tasks, and audit
-npx opencode-teamwork-v2 timeline  # chronological run timeline, task durations & cost
-npx opencode-teamwork-v2 export    # export a run report (HTML by default, or --markdown)
-npx opencode-teamwork-v2 prune     # prune completed git worktrees
+npx @heretek-ai/opencode-teamwork-v2 init      # pick models, install agents, register plugin
+npx @heretek-ai/opencode-teamwork-v2 models    # pick models only (never edits opencode.json)
+npx @heretek-ai/opencode-teamwork-v2 status    # show what is installed and mapped
+npx @heretek-ai/opencode-teamwork-v2 doctor    # diagnose environment health (or --json)
+npx @heretek-ai/opencode-teamwork-v2 runs      # list active/past runs and spent budgets
+npx @heretek-ai/opencode-teamwork-v2 inspect   # inspect latest run DAG, tasks, and audit
+npx @heretek-ai/opencode-teamwork-v2 timeline  # chronological run timeline, task durations & cost
+npx @heretek-ai/opencode-teamwork-v2 export    # export a run report (HTML by default, or --markdown)
+npx @heretek-ai/opencode-teamwork-v2 prune     # prune completed git worktrees
 ```
 
 `opencode-teamwork` and `opencode-teamwork-v2` are aliases for the same CLI. If
@@ -144,14 +144,14 @@ Agent prompt files are left untouched by default. To also adopt updated prompt
 bodies (keeps your model choices, backs up the old files):
 
 ```sh
-npx opencode-teamwork-v2 install --refresh
+npx @heretek-ai/opencode-teamwork-v2 install --refresh
 ```
 
 Non-interactive / scripted use:
 
 ```sh
-npx opencode-teamwork-v2 install --all anthropic/claude-sonnet-4-5
-npx opencode-teamwork-v2 install --model sentinel=deepseek/deepseek-v4-pro \
+npx @heretek-ai/opencode-teamwork-v2 install --all anthropic/claude-sonnet-4-5
+npx @heretek-ai/opencode-teamwork-v2 install --model sentinel=deepseek/deepseek-v4-pro \
                                  --model scout=deepseek/deepseek-flash
 ```
 
@@ -200,7 +200,7 @@ defaults without touching files that already exist.
 
 ## First run (5 minutes)
 
-1. Install the plugin: `opencode plugin add opencode-teamwork-v2`.
+1. Install the plugin: `opencode plugin add @heretek-ai/opencode-teamwork-v2`.
 
 2. Assign models and install the agents. `init` writes
    `~/.config/opencode/teamwork.json`, installs all 11 agents and registers the
@@ -208,8 +208,8 @@ defaults without touching files that already exist.
    Both are safe to re-run.
 
    ```sh
-   npx opencode-teamwork-v2 init
-   npx opencode-teamwork-v2 models
+   npx @heretek-ai/opencode-teamwork-v2 init
+   npx @heretek-ai/opencode-teamwork-v2 models
    ```
 
 3. In your project, run `/teamwork-craft`. The 9-step interview writes the
@@ -227,9 +227,9 @@ defaults without touching files that already exist.
 6. Inspect it afterwards from the project root:
 
    ```sh
-   npx opencode-teamwork-v2 status     # install + model map
-   npx opencode-teamwork-v2 timeline   # per-task timing, rounds, spend
-   npx opencode-teamwork-v2 export     # HTML report (-m for Markdown)
+   npx @heretek-ai/opencode-teamwork-v2 status     # install + model map
+   npx @heretek-ai/opencode-teamwork-v2 timeline   # per-task timing, rounds, spend
+   npx @heretek-ai/opencode-teamwork-v2 export     # HTML report (-m for Markdown)
    ```
 
 ## Run reports (`export`)
@@ -238,7 +238,7 @@ defaults without touching files that already exist.
 It only reads the run directory; it never changes run state.
 
 ```sh
-npx opencode-teamwork-v2 export [<session-id>] [--session <id>] [--html | -m|--markdown] [-o <file>|-o -]
+npx @heretek-ai/opencode-teamwork-v2 export [<session-id>] [--session <id>] [--html | -m|--markdown] [-o <file>|-o -]
 ```
 
 - **Session id:** pass it positionally (`export <session-id>`) or with
@@ -299,7 +299,7 @@ publishing to npm is what makes the package available to `bun add`, OpenCode, an
 npm alike. Two ways to ship:
 
 **A. GitHub only (no npm account).** Nothing to publish — users install the git
-spec directly (`opencode plugin add github:sorcnr/opencode-teamwork-v2`). Just
+spec directly (`opencode plugin add github:Heretek-AI/opencode-teamwork-v2`). Just
 tag releases:
 
 ```sh
@@ -323,7 +323,7 @@ using **npm Trusted Publishing** (OIDC, no long-lived token). One-time setup:
 1. Create the package with a first manual publish (`npm publish`, token above) —
    package settings only exist once the package exists.
 2. On npmjs.com: **Package → Settings → Trusted Publisher → GitHub Actions**
-   with user `sorcnr`, repo `opencode-teamwork-v2`, workflow `publish.yml`,
+   with user `Heretek-AI`, repo `opencode-teamwork-v2`, workflow `publish.yml`,
    and `npm publish` allowed.
 3. Release afterwards by tagging:
 
