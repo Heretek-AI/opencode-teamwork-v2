@@ -66,6 +66,18 @@ jobs:
           use-github-cache: "false"
           lake-package-directory: ${{ runner.temp }}/lean-core
 
+      # A restored ~/.elan cache can contain the toolchain without a configured
+      # default (lean-action with auto-config:false does not set one), which
+      # makes `lean --version` fail with "no default toolchain configured".
+      # Pin it explicitly so cold and warm cache runs behave the same.
+      - name: Configure elan default toolchain
+        run: |
+          export PATH="$HOME/.elan/bin:$PATH"
+          elan toolchain install leanprover/lean4:stable
+          elan default leanprover/lean4:stable
+          lean --version
+          lake --version
+
       # The `leap-tools` PyPI package does not exist. Build the pinned git
       # revision (and its wheels) first, then install binary-only so no
       # source build or index resolution happens at install time.
