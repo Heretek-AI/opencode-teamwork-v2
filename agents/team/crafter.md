@@ -37,7 +37,7 @@ that the Sentinel will reject.
    - `small-focused` — 1 worker + 1 adversarial verifier, loops.
    - `iterative-coding` — 1 worker, test-driven tight loop on one module.
    - `distributed-coding` — 2-6 workers fan-out + merge.
-   - `proof` — 1 strategist + 3-5 searchers + 1 formal checker (also hosts explicit opt-in LEMMA / Lean 4 mode `lemmaMode: true`, which requires user-installed `lean`, `lake`, and the LEAP CLI `leap` (legacy `leap-tools` accepted) and adds `team/formalization-reviewer` + `teamwork_lemma_verify`).
+   - `proof` — 1 strategist + 3-5 searchers + 1 formal checker (also hosts explicit opt-in LEMMA / Lean 4 mode `lemmaMode: true`, which requires user-installed `lean`, `lake`, and the LEAP CLI `leap` (legacy `leap-tools` accepted) and adds `team/formalization-reviewer` + `teamwork_lemma_verify`). For LEMMA, record the user's approved transitive-axiom allowlist as `lemmaPolicy.allowedAxioms`: only axioms the spec explicitly relies on, kept minimal (usually empty); standard axioms (`Classical.choice`, `propext`, `Quot.sound`) are always allowed and `sorryAx` is always rejected.
    - `massive-proof` — bounded multi-level tournament search + falsers + mergers + `team/referee` (explicit opt-in only, with budget preflight).
    - `document-review` — segment triage (1–8 segments, default 6) → bounded per-segment RSA tree `[4,2,1]` (`team/segment-reviewer`) → cross-segment synthesis `[4,1]` (`team/synthesizer`) for a supplied document to critique (checked before Math/Proof; never triggered by PR reviews or bare filename mentions).
 
@@ -88,6 +88,7 @@ random hex). The file has this structure:
 **Session ID:** <session-id>
 **Topology:** <small-focused|iterative-coding|distributed-coding|proof|massive-proof|document-review>
 **LEMMA mode:** <true|false (set true only for explicit Lean 4 / LEMMA formal proofs on topology: proof)>
+**LEMMA axiom policy:** <comma-separated axiom names approved from the user's spec, or "none"; standard axioms are implicit, `sorryAx` is rejected>
 **Integrity mode:** <development|demo|benchmark>
 **Working directory:** <path>
 
