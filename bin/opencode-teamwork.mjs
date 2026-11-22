@@ -7,7 +7,7 @@
 //   opencode-teamwork status    show what is currently configured
 //   opencode-teamwork help
 
-import { existsSync, lstatSync, readFileSync, realpathSync, writeFileSync } from "node:fs"
+import { closeSync, existsSync, lstatSync, openSync, readFileSync, realpathSync, writeFileSync, constants as fsConstants } from "node:fs"
 import { tmpdir } from "node:os"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import {
@@ -416,17 +416,31 @@ function exportCommand(options) {
     target = resolved.path
   }
 
+  // O_NOFOLLOW refuses a symlinked final component at open time (ELOOP), while
+  // a regular file is still allowed to be truncated and replaced. The fd is the
+  // authority, so there is no lstat-then-write race.
+  let fd = null
   try {
-    if (lstatSync(target, { throwIfNoEntry: false })?.isSymbolicLink()) {
-      console.error(`Refusing to write ${safeEcho(target, 200)}: target is a symlink`)
-      process.exitCode = 1
-      return
-    }
-    writeFileSync(target, doc, { encoding: "utf8", flag: "w" })
+    fd = openSync(
+      target,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | (fsConstants.O_NOFOLLOW ?? 0),
+      0o666,
+    )
+    writeFileSync(fd, doc, { encoding: "utf8" })
   } catch (err) {
-    console.error(`Could not write ${safeEcho(target, 200)}: ${safeEcho(err?.code || err?.message, 120)}`)
+    if (err && (err.code === "ELOOP" || err.code === "EMLINK")) {
+      console.error(`Refusing to write ${safeEcho(target, 200)}: target is a symlink`)
+    } else {
+      console.error(`Could not write ${safeEcho(target, 200)}: ${safeEcho(err?.code || err?.message, 120)}`)
+    }
     process.exitCode = 1
     return
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd)
+      } catch {}
+    }
   }
   console.log(target)
 }

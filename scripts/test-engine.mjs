@@ -18,8 +18,30 @@ import {
 } from "../plugins/opencode-teamwork/lemma.ts"
 import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
-import { currentModels, readRawModelMap, writeModelMap, installAgents, DEFAULT_MODELS } from "../lib/team.mjs"
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, readFileSync, chmodSync, symlinkSync, linkSync, lstatSync, statSync } from "node:fs"
+import {
+  currentModels,
+  readRawModelMap,
+  writeModelMap,
+  installAgents,
+  ensureAgents,
+  registerPlugin,
+  writeReferenceFile,
+  DEFAULT_MODELS,
+} from "../lib/team.mjs"
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { createServer } from "node:http"
@@ -5374,5 +5396,137 @@ process.exit(0);
     )
     assert(/REFUSED|SKIP/.test(describeFifoRun.stdout || ""), `describeRun FIFO child must report REFUSED or SKIP: ${describeFifoRun.stdout || ""}`)
     console.log("✓ describeRun refuses symlinked state/pitfalls and does not hang on FIFOs")
+  }
+
+  // --- 10.7 lib/team.mjs install/registration writes are atomic and no-follow.
+  {
+    const teamAgents = Object.keys(DEFAULT_MODELS).length
+    const root = mkdtempSync(join(tmpdir(), "teamwork-install-"))
+    try {
+      // create: O_CREAT|O_EXCL, no temp files left behind
+      const configDir = join(root, "config")
+      const first = installAgents({ configDir })
+      assert.strictEqual(first.created.length, teamAgents, `all ${teamAgents} agents must be created`)
+      assert.deepStrictEqual(first.missing, [], "no source agents may be missing")
+      assert.deepStrictEqual(first.updated, [], "a first install updates nothing")
+      const targetDir = join(configDir, "agents", "team")
+      const sentinel = join(targetDir, "sentinel.md")
+      assert(existsSync(sentinel), "sentinel.md must be installed")
+      assert(readFileSync(sentinel, "utf8").includes(`model: ${DEFAULT_MODELS["team/sentinel"]}`), "default model must be injected")
+      assert(!readdirSync(targetDir).some((name) => name.endsWith(".tmp")), "no temp files may be left behind")
+
+      // idempotent re-run: unchanged, no backup
+      const second = installAgents({ configDir })
+      assert.strictEqual(second.unchanged.length, teamAgents, "a second identical install must be unchanged")
+      assert.strictEqual(second.backupDir, undefined, "an unchanged install must not create backups")
+
+      // update: backup holds the previous content and the mode is preserved
+      writeFileSync(sentinel, readFileSync(sentinel, "utf8") + "\nLOCAL EDIT\n")
+      chmodSync(sentinel, 0o640)
+      const beforeUpdate = readFileSync(sentinel, "utf8")
+      const updated = installAgents({ configDir, models: { "team/sentinel": "custom/new-model" } })
+      assert.deepStrictEqual(updated.updated, ["sentinel.md"], "only sentinel.md must be updated")
+      assert(updated.backupDir, "an update must report a backup dir")
+      assert.strictEqual(readFileSync(join(updated.backupDir, "sentinel.md"), "utf8"), beforeUpdate, "the backup must hold the pre-update content")
+      assert(readFileSync(sentinel, "utf8").includes("model: custom/new-model"), "the requested model must be injected")
+      assert.strictEqual(statSync(sentinel).mode & 0o777, 0o640, "the existing file mode must be preserved")
+
+      // refresh: adopt the shipped body, keep the chosen model, back up local edits
+      const refreshDir = join(root, "refresh-config")
+      installAgents({ configDir: refreshDir })
+      const scout = join(refreshDir, "agents", "team", "scout.md")
+      writeFileSync(scout, readFileSync(scout, "utf8") + "\nLOCAL SCOUT EDIT\n")
+      const refreshed = installAgents({ configDir: refreshDir, refresh: true, models: { "team/scout": "custom/scout" } })
+      assert(refreshed.updated.includes("scout.md"), "refresh must update scout.md")
+      const refreshedText = readFileSync(scout, "utf8")
+      assert(!refreshedText.includes("LOCAL SCOUT EDIT"), "refresh must replace the local body")
+      assert(refreshedText.includes("model: custom/scout"), "refresh must keep the chosen model line")
+      assert(readFileSync(join(refreshed.backupDir, "scout.md"), "utf8").includes("LOCAL SCOUT EDIT"), "refresh must back up the local edit")
+
+      // dry run: reports created but writes nothing at all
+      const dryDir = join(root, "dry-config")
+      const dry = installAgents({ configDir: dryDir, dryRun: true })
+      assert.strictEqual(dry.created.length, teamAgents, "dry run must still report every would-be creation")
+      assert(!existsSync(dryDir), "dry run must not create the config dir")
+
+      // symlinked target: skipped, never followed or replaced
+      const symDir = join(root, "sym-config")
+      mkdirSync(join(symDir, "agents", "team"), { recursive: true })
+      const outside = join(root, "outside-agent.md")
+      writeFileSync(outside, "OUTSIDE AGENT\n")
+      symlinkSync(outside, join(symDir, "agents", "team", "sentinel.md"))
+      const sym = installAgents({ configDir: symDir })
+      assert(sym.skipped.includes("sentinel.md"), "a symlinked target must be reported as skipped")
+      assert(!sym.created.includes("sentinel.md"), "a symlinked target must not be created")
+      assert.strictEqual(readFileSync(outside, "utf8"), "OUTSIDE AGENT\n", "a symlinked target must not be written through")
+      assert(lstatSync(join(symDir, "agents", "team", "sentinel.md")).isSymbolicLink(), "the symlink must be left in place")
+
+      // ensureAgents: create-only, no follow, idempotent
+      const ensureDir = join(root, "ensure-config")
+      const ensured = ensureAgents({ configDir: ensureDir })
+      assert.strictEqual(ensured.length, teamAgents, "ensureAgents must create every missing agent")
+      assert.deepStrictEqual(ensureAgents({ configDir: ensureDir }), [], "ensureAgents must create nothing on a second run")
+      const ensureSymDir = join(root, "ensure-sym-config")
+      mkdirSync(join(ensureSymDir, "agents", "team"), { recursive: true })
+      const ensureOutside = join(root, "outside-ensure.md")
+      writeFileSync(ensureOutside, "OUTSIDE ENSURE\n")
+      symlinkSync(ensureOutside, join(ensureSymDir, "agents", "team", "sentinel.md"))
+      const ensureSym = ensureAgents({ configDir: ensureSymDir })
+      assert(!ensureSym.includes("sentinel.md"), "ensureAgents must skip a symlinked target")
+      assert.strictEqual(readFileSync(ensureOutside, "utf8"), "OUTSIDE ENSURE\n", "ensureAgents must not write through a symlink")
+
+      // registration: create, idempotence, backup, mode, dry run, symlink, JSONC
+      const regDir = join(root, "reg-config")
+      const reg = registerPlugin({ configDir: regDir })
+      assert.strictEqual(reg.status, "added", "a first registration must add the plugin")
+      const regFile = join(regDir, "opencode.json")
+      assert(readFileSync(regFile, "utf8").includes("@heretek-ai/opencode-teamwork-v2"), "opencode.json must name the plugin")
+      assert.strictEqual(registerPlugin({ configDir: regDir }).status, "already", "a second registration must be a no-op")
+
+      const existingDir = join(root, "reg-existing")
+      mkdirSync(existingDir, { recursive: true })
+      const existingFile = join(existingDir, "opencode.json")
+      writeFileSync(existingFile, '{"plugins":["other-plugin"]}\n')
+      chmodSync(existingFile, 0o640)
+      const beforeReg = readFileSync(existingFile, "utf8")
+      assert.strictEqual(registerPlugin({ configDir: existingDir }).status, "added", "an existing config must get the plugin")
+      assert(readFileSync(existingFile, "utf8").includes("other-plugin"), "existing plugins must be preserved")
+      const backups = readdirSync(existingDir).filter((name) => name.startsWith("opencode.json.bak."))
+      assert.strictEqual(backups.length, 1, "exactly one config backup must be written")
+      assert.strictEqual(readFileSync(join(existingDir, backups[0]), "utf8"), beforeReg, "the config backup must hold the old content")
+      assert.strictEqual(statSync(existingFile).mode & 0o777, 0o640, "the config mode must be preserved")
+
+      const regDry = join(root, "reg-dry")
+      assert.strictEqual(registerPlugin({ configDir: regDry, dryRun: true }).status, "added", "dry run must report added")
+      assert(!existsSync(join(regDry, "opencode.json")), "dry run must not write the config")
+
+      const regSym = join(root, "reg-sym")
+      mkdirSync(regSym, { recursive: true })
+      const regOutside = join(root, "outside-opencode.json")
+      writeFileSync(regOutside, '{"plugins":[]}\n')
+      symlinkSync(regOutside, join(regSym, "opencode.json"))
+      assert.strictEqual(registerPlugin({ configDir: regSym }).status, "symlink", "a symlinked config must be refused")
+      assert.strictEqual(readFileSync(regOutside, "utf8"), '{"plugins":[]}\n', "a symlinked config must not be written through")
+
+      const jsoncDir = join(root, "reg-jsonc")
+      mkdirSync(jsoncDir, { recursive: true })
+      const jsoncFile = join(jsoncDir, "opencode.jsonc")
+      writeFileSync(jsoncFile, '{\n  // keep me\n  "plugins": []\n}\n')
+      const jsoncBefore = readFileSync(jsoncFile, "utf8")
+      assert.strictEqual(registerPlugin({ configDir: jsoncDir }).status, "commented", "JSONC must not be rewritten")
+      assert.strictEqual(readFileSync(jsoncFile, "utf8"), jsoncBefore, "JSONC comments must survive")
+
+      // reference file: overwrite refuses a symlinked dest, keep-if-present is honoured
+      const refDir = join(root, "ref-config")
+      mkdirSync(join(refDir, "teamwork"), { recursive: true })
+      const refOutside = join(root, "outside-artifacts.md")
+      writeFileSync(refOutside, "ORIGINAL ARTIFACTS\n")
+      symlinkSync(refOutside, join(refDir, "teamwork", "ARTIFACTS.md"))
+      assert.strictEqual(writeReferenceFile({ configDir: refDir, overwrite: true }), false, "a symlinked ARTIFACTS dest must be refused")
+      assert.strictEqual(readFileSync(refOutside, "utf8"), "ORIGINAL ARTIFACTS\n", "a symlinked ARTIFACTS dest must not be written through")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+    console.log("✓ install/refresh/registration writes are atomic, create-only where required, and no-follow")
   }
 }
