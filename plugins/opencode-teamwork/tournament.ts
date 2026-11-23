@@ -11,16 +11,9 @@
 //   * Null-prototype dictionaries (`nullMap`) preventing prototype collisions
 //   * Control-character / line-separator stripping (`clean`, `cleanBlock`)
 
-import {
-  lstatSync,
-  mkdirSync,
-  realpathSync,
-  renameSync,
-  writeFileSync,
-} from "node:fs"
+import { lstatSync, realpathSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
-import { randomBytes } from "node:crypto"
-import { readRegularBounded, readWithinBounded } from "./safe-fs.mjs"
+import { readRegularBounded, readWithinBounded, writeFileAtomicWithin } from "./safe-fs.mjs"
 import type { SafeFsRead } from "./safe-fs.mjs"
 
 export const TOURNAMENT_LIMITS = {
@@ -405,39 +398,17 @@ export function readBoundedRunJson<T = any>(
 }
 
 export function writeSafeRunFile(run: string, targetPath: string, content: string): void {
+  // Keep the path-level policy and its exact error text: `ensureSafeRunSubpath`
+  // refuses symlinks/escapes before any syscall and is the documented contract
+  // for this writer.
   const check = ensureSafeRunSubpath(run, targetPath)
   if (!check.ok) throw new Error(check.error)
-  const file = check.path
-  const dir = dirname(file)
-  if (resolve(dir) !== resolve(run)) {
-    const dirCheck = ensureSafeRunSubpath(run, dir)
-    if (!dirCheck.ok) throw new Error(dirCheck.error)
-  }
-  mkdirSync(dir, { recursive: true })
-  // Never reuse a predictable temp path: a symlink/hard link planted at
-  // `<file>.tmp` would make writeFileSync follow it and overwrite a victim.
-  // A fresh random suffix plus O_CREAT|O_EXCL (`wx`, which also refuses an
-  // existing symlink) keeps the write inside a brand-new inode; the rename then
-  // replaces the destination entry itself, never a target it points at.
-  //
-  // Write-path residual (ADR 0004): this validation is by path, before the
-  // create/rename. An intermediate directory swapped for a symlink after the
-  // checks can still redirect the write; mkdir/rename have no fd-relative
-  // primitive in Node core, so only the read path has the /proc/self/fd check.
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const tmp = `${file}.${randomBytes(6).toString("hex")}.tmp`
-    const tmpCheck = ensureSafeRunSubpath(run, tmp)
-    if (!tmpCheck.ok) throw new Error(tmpCheck.error)
-    try {
-      writeFileSync(tmpCheck.path, content, { encoding: "utf8", flag: "wx" })
-    } catch (err: any) {
-      if (err?.code === "EEXIST") continue
-      throw err
-    }
-    renameSync(tmpCheck.path, file)
-    return
-  }
-  throw new Error(`refused: could not create a unique temp file for "${basename(file)}"`)
+  // ADR 0010: the write itself is pinned. The destination's parent directory is
+  // opened once and every create/mkdir/rename/lstat is expressed relative to
+  // that descriptor, so an intermediate directory swapped for a symlink after
+  // the path check cannot redirect the bytes. Missing parent segments are
+  // created one validated segment at a time (no recursive mkdir by path).
+  writeFileAtomicWithin(run, relative(resolve(run), check.path), content)
 }
 
 export function writeSafeRunJson(run: string, targetPath: string, value: unknown): void {

@@ -22,7 +22,7 @@ import { basename, join } from "node:path"
 import { sha256Hex } from "./auth.ts"
 import type { AuthContext, AuthEnvelope, AuthFailure } from "./auth.ts"
 import { clean, isSafeTaskId, readBoundedRunFile, writeSafeRunFile } from "./tournament.ts"
-import { withCrossProcessLock } from "./locks.ts"
+import { withPinnedCrossProcessLock } from "./locks.ts"
 
 /** Domain separator for the signed handoff index payload. */
 export const HANDOFF_AUTH_KIND = "teamwork.handoff"
@@ -569,7 +569,7 @@ export function writeHandoffSync(run: string, opts: WriteHandoffOptions): Writte
  * works, and re-recording upgrades that pair on any later call.
  */
 export async function writeHandoff(run: string, opts: WriteHandoffOptions): Promise<WrittenHandoff> {
-  return withCrossProcessLock(join(run, handoffIndexRelativePath()), async () => {
+  return withPinnedCrossProcessLock(run, handoffIndexRelativePath(), async () => {
     const prepared = prepareHandoff(run, opts)
     let entry = prepared.entry
     if (opts.auth) {

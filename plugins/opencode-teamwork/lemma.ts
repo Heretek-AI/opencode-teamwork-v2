@@ -8,9 +8,7 @@ import {
   constants as fsConstants,
   existsSync,
   lstatSync,
-  mkdirSync,
   realpathSync,
-  renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -18,7 +16,14 @@ import {
 import { execFileSync, spawnSync } from "node:child_process"
 import { createHash, randomBytes } from "node:crypto"
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path"
-import { readRegularBounded, readWithinBounded } from "./safe-fs.mjs"
+import {
+  createDirWithin,
+  readRegularBounded,
+  readWithinBounded,
+  unlinkWithin,
+  writeFileAtomicWithin,
+  writeOnceWithin,
+} from "./safe-fs.mjs"
 
 export const MAX_LEMMA_DEPTH = 3
 export const MAX_LEMMA_WIDTH = 4
@@ -234,16 +239,17 @@ function readSafeSubpath(
 }
 
 function writeTextAtomicSafe(runDir: string, relPath: string, content: string): { path?: string; error?: string } {
+  // Keep the path policy and its exact error text, then perform the write with
+  // the pinned-fd primitive (ADR 0010). The parent directory is opened once and
+  // the temp/create/rename/lstat never walk a path that a swap can divert.
   const safe = ensureSafeSubpath(runDir, relPath)
   if (safe.error || !safe.path) return { error: safe.error || "refused: unsafe path" }
-  const target = safe.path
-  refuseSymlink(target)
-  mkdirSync(dirname(target), { recursive: true })
-  const tmp = target + ".tmp"
-  refuseSymlink(tmp)
-  writeFileSync(tmp, content, "utf8")
-  renameSync(tmp, target)
-  return { path: target }
+  try {
+    writeFileAtomicWithin(runDir, relPath, content)
+  } catch (err: any) {
+    return { error: clean(err?.message || "write failed", 200) }
+  }
+  return { path: safe.path }
 }
 
 function writeJsonAtomicSafe(runDir: string, relPath: string, value: unknown): { path?: string; error?: string } {
@@ -1413,6 +1419,8 @@ export function parseLeanAxiomOutput(
 export interface LeanAxiomProbeOptions {
   filePath: string
   declaration: string
+  /** Run root when `filePath` is a run artifact: pins the probe create/unlink. */
+  runDir?: string
   cwd?: string
   mode?: "lean" | "lake-env-lean" | "lake-build"
   env?: NodeJS.ProcessEnv
@@ -1500,8 +1508,16 @@ export function checkLeanAxiomDependencies(options: LeanAxiomProbeOptions): Lean
     `.lemma-axioms-${process.pid}-${randomBytes(8).toString("hex")}.lean`,
   )
   const probeSource = `${read.text.endsWith("\n") ? read.text : read.text + "\n"}#print axioms ${declaration}\n`
+  const probeRel =
+    options.runDir && !relative(resolve(options.runDir), probePath).startsWith("..")
+      ? relative(resolve(options.runDir), probePath)
+      : ""
+  const pinnedProbe = probeRel !== "" && !isAbsolute(probeRel) && options.runDir !== undefined
   try {
-    writeFileSync(probePath, probeSource, { encoding: "utf8", flag: "wx" })
+    // ADR 0010: inside a run, create the throwaway probe through the pinned
+    // parent descriptor, so a swapped intermediate directory cannot redirect it.
+    if (pinnedProbe) writeOnceWithin(options.runDir as string, probeRel, probeSource)
+    else writeFileSync(probePath, probeSource, { encoding: "utf8", flag: "wx" })
   } catch (err: any) {
     return {
       executed: false,
@@ -1542,7 +1558,8 @@ export function checkLeanAxiomDependencies(options: LeanAxiomProbeOptions): Lean
     }
   } finally {
     try {
-      unlinkSync(probePath)
+      if (pinnedProbe) unlinkWithin(options.runDir as string, probeRel)
+      else unlinkSync(probePath)
     } catch {}
   }
 
@@ -2383,6 +2400,8 @@ export function mutateLemmaNode(
     }
     manifest.updatedAt = now
 
+    // Pre-create the node directory at node-add (attack-surface reduction).
+    createDirWithin(runDir, `lemma/nodes/${lemmaId}`)
     const wNode = writeJsonAtomicSafe(runDir, `lemma/nodes/${lemmaId}/state.json`, node)
     if (wNode.error) return { error: wNode.error }
     if (parentId !== null) {
@@ -2649,6 +2668,7 @@ export function verifyLemmaNodeAttempt(
       report.declarationType = binding.declaration.normalizedType
       const axioms = checkLeanAxiomDependencies({
         filePath: attemptSafe.path,
+        runDir,
         declaration,
         cwd: params.cwd ?? dirname(attemptSafe.path),
         mode: params.mode ?? "lean",

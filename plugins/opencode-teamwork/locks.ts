@@ -30,6 +30,7 @@
 // Zero runtime dependencies. Erasable TypeScript only.
 
 import {
+  closeSync,
   linkSync,
   lstatSync,
   mkdirSync,
@@ -40,8 +41,11 @@ import {
   writeFileSync,
 } from "node:fs"
 import { hostname } from "node:os"
-import { dirname, isAbsolute, join } from "node:path"
+import { basename, dirname, isAbsolute, join } from "node:path"
 import { randomBytes, randomInt } from "node:crypto"
+import { assertSingleSegment, pinParent } from "./safe-fs.mjs"
+
+const PROC_SELF_FD = "/proc/self/fd"
 
 const fileLocks = new Map<string, Promise<unknown>>()
 
@@ -74,6 +78,13 @@ export interface CrossProcessLockOptions {
   isProcessAlive?: (pid: number) => boolean
   /** Test seam: pretend this filesystem has no hard links. */
   disableHardlinks?: boolean
+  /**
+   * Internal: the lock path is already `/proc/self/fd/<dirfd>/<name>` from a
+   * pinned run directory. Skips the path-level directory checks (which would see
+   * the procfs fd entry as a symlink) because the parent was validated by
+   * `pinParent` and cannot be diverted by an intermediate swap.
+   */
+  pinned?: boolean
   /** Optional diagnostic sink (also recorded in the bounded module ring). */
   onDiagnostic?: (diagnostic: LockDiagnostic) => void
 }
@@ -482,6 +493,49 @@ export async function withCrossProcessLock<T>(
   return withFileLock(lockPath, () => acquireAndRun(lockPath, fn, options))
 }
 
+/**
+ * Cross-process lock for `run/relTargetPath` whose lock file is created inside
+ * the already-pinned parent directory (ADR 0010). The in-process queue key is a
+ * stable `realpath + relative path` string (not the procfs descriptor path,
+ * which changes on every call), while every on-disk lock operation uses
+ * `/proc/self/fd/<dirfd>/<name>`. An intermediate directory swapped for a
+ * symlink therefore cannot divert the lock create, link, rename or unlink.
+ *
+ * The directory descriptor is held for the whole acquire/run/release sequence
+ * and closed in `finally`; it is never closed while the lock is being used.
+ */
+export async function withPinnedCrossProcessLock<T>(
+  run: string,
+  relTargetPath: string,
+  fn: () => Promise<T> | T,
+  options: CrossProcessLockOptions = {},
+): Promise<T> {
+  const pin = pinParent(run, relTargetPath, { create: true })
+  if (pin.status !== "ok") {
+    // A brand-new run root does not exist yet (teamwork_plan/teamwork_tournament
+    // create it at the first write). Run-root creation is the documented
+    // path-based residual, so this one pre-creation lock keeps the previous
+    // path-based behavior; every later lock pins the now-existing directory.
+    if (pin.reason === "run-missing") {
+      const lockPath = crossProcessLockPath(join(run, relTargetPath))
+      return withFileLock(lockPath, () => acquireAndRun(lockPath, fn, options))
+    }
+    throw new Error(pin.message)
+  }
+  const dirFd = pin.dirFd
+  try {
+    const lockName = `${basename(relTargetPath)}.lock`
+    assertSingleSegment(lockName)
+    const lockPath = `${PROC_SELF_FD}/${dirFd}/${lockName}`
+    const key = `pinned|${pin.real}|${pin.relPath}`
+    return await withFileLock(key, () => acquireAndRun(lockPath, fn, { ...options, pinned: true }))
+  } finally {
+    try {
+      closeSync(dirFd)
+    } catch {}
+  }
+}
+
 async function acquireAndRun<T>(
   lockPath: string,
   fn: () => Promise<T> | T,
@@ -508,10 +562,12 @@ async function acquireLock(lockPath: string, options: CrossProcessLockOptions): 
   const deadline = now() + timeoutMs
   let attempt = 0
 
-  mkdirSync(dirname(lockPath), { recursive: true })
+  if (options.pinned !== true) {
+    mkdirSync(dirname(lockPath), { recursive: true })
+  }
 
   while (true) {
-    assertLockPathSafe(lockPath)
+    if (options.pinned !== true) assertLockPathSafe(lockPath)
     const owner: LockOwner = { pid, host, at: new Date(now()).toISOString(), nonce }
     if (tryCreateLock(lockPath, owner, options) === "created") return nonce
 
