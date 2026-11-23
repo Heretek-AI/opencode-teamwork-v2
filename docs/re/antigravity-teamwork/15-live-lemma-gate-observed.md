@@ -1,6 +1,6 @@
 # Live LEMMA Run — the Blocking Pre-flight Gate Observed (`MISSING`)
 
-**Status: OBSERVED — one LEMMA-route attempt reached its blocking pre-flight audit, received the verdict `MISSING`, relayed the prerequisites notice and stopped before any Lean work. The process then hit its 10-minute print ceiling and exited `3`.** Recorded on **2026-11-23** against the installed Antigravity CLI **1.5.14**, the same binary analysed throughout this corpus (`00-artifact-identity.md`). This is the first runtime record in the set of the **LEMMA** route and of the **`teamwork_dependency` gate actually firing**. It is deliberately narrow: **one** run, one verdict, no route agent. It does not exercise the LEMMA pipeline, the `READY` path, or install mode.
+**Status: OBSERVED — one LEMMA-route attempt reached its blocking pre-flight audit, received the verdict `MISSING`, relayed the prerequisites notice and stopped before any Lean work. The process then hit its 10-minute print ceiling and exited `3`.** Recorded on **2026-11-23** against the installed Antigravity CLI **1.5.15** (binary SHA-256 `7b004d26…41fa2d`, 273,879,752 bytes). [OBSERVED — `agy --version`; the run's server log, `~/.gemini/antigravity-cli/log/cli-20261123_073544.log:3`, `Language server version: 1.5.15`] This is **not** the 1.5.14 build the static documents `00`–`06` and `09` analyse; see [`PROVENANCE.md`](PROVENANCE.md) *live axis vs static axis*. The **control probe** recorded at `12:32:36Z`, three minutes earlier, ran on the previous **1.5.14** binary and is a **cross-version** control, not this run's identity (§8.3). This is the first runtime record in the set of the **LEMMA** route and of the **`teamwork_dependency` gate actually firing**. It is deliberately narrow: **one** run, one verdict, no route agent. It does not exercise the LEMMA pipeline, the `READY` path, or install mode.
 
 The run is the reference sample for five things the corpus previously held only statically:
 
@@ -28,8 +28,10 @@ Three transcripts are cited: the **parent** (`<appDataDir>/brain/c9bb22c0-05b0-4
 
 | Field | Value | Label |
 |---|---|---|
-| CLI | `agy` 1.5.14 | OBSERVED — `<capture>/probe.meta` line 2; binary SHA-256 `37873b80…97d8c94` on line 3 |
-| Host | Linux x86-64 (`fc46` kernel), UTC−05:00 local | OBSERVED — `<capture>/probe.meta` line 4 |
+| CLI | `agy` **1.5.15** | OBSERVED — `agy --version` (current install); the run's server log `~/.gemini/antigravity-cli/log/cli-20261123_073544.log:3` reads `Language server version: 1.5.15` |
+| Binary | SHA-256 `7b004d26c3fdea25a7c9d456de4bfaccef4be1e4cc7fd6db628859c5c941fa2d`, 273,879,752 bytes | OBSERVED — `sha256sum /home/john/.local/bin/agy`; `stat -c %s` |
+| Control probe (separate, earlier) | `agy` **1.5.14**, SHA-256 `37873b80…97d8c94` | OBSERVED — `<capture>/probe.meta` lines 2–3, written `2026-11-23T12:32:36Z`. This is a **cross-version** control on the previous binary, **not** the LEMMA run's identity (§8.3) |
+| Host | Linux x86-64 (`fc46` kernel), UTC−05:00 local | OBSERVED — `<capture>/probe.meta` line 4; unchanged across the upgrade, and the run's server log timestamps are UTC−05:00 |
 | Top-level conversation | `c9bb22c0-05b0-4674-a348-1c06fdf7ed91` | OBSERVED — `<capture>/lemma.stream.jsonl` `init`; parent transcript |
 | Top-level model | `gemini-4-argon-medium` | OBSERVED — parent transcript step 1 `model` |
 | Teamwork coordinator / sentinel | `9461e3b4-2958-43d9-80fd-685a850fc4af` | OBSERVED — stream `init`, subagent-created event, `<state>` path |
@@ -45,6 +47,8 @@ Three transcripts are cited: the **parent** (`<appDataDir>/brain/c9bb22c0-05b0-4
 | Gate verdict | `MISSING` | OBSERVED — `<state>/dependency_preflight/handoff.md` §4; auditor message; sentinel briefing |
 
 The run used the coordinator id as the state-root name under `scratch/teamwork/`, the **primary** root form recorded in `11-runtime-artifacts.md` §2.1 and observed again in `12` §6 (the `brain/<coordinator>/scratch/` form was not used here).
+
+**Cross-version comparability.** The sentinel prompt slice this run obeyed is **byte-identical** in 1.5.14 and 1.5.15: 36,482 bytes, SHA-256 `3e8c347eb2db6059ef9f010873062c41bc7d95fd640746674b4caddd0fabf4c1`, at 1-based offset 113,241,709 in 1.5.14 and 113,300,479 in 1.5.15. So the prompt-level behaviour recorded here is comparable to the static 1.5.14 corpus; only the surrounding statics (builtin tree, literal offsets) moved. [OBSERVED — byte comparison of the two binaries, §9; offset arithmetic in `prompts/sentinel-routing.md`]
 
 ---
 
@@ -94,7 +98,7 @@ All times UTC. Transcript timestamps are the client's; file mtimes are the host'
 
 | Time | Event | Evidence | Label |
 |---|---|---|---|
-| 12:32:36 | Control-probe metadata written (CLI 1.5.14, binary hash, host) | `<capture>/probe.meta` | OBSERVED |
+| 12:32:36 | Control-probe metadata written (CLI **1.5.14**, binary hash, host — the previous binary, three minutes before the 1.5.15 upgrade) | `<capture>/probe.meta`; `cli-20261123_073238.log:3` (`1.5.14`) | OBSERVED |
 | 12:32:36 → +167.6 s | Control probe returns `PONG` (settings override; §8.3) | `<capture>/probe.stream.jsonl`, `probe.exit` | OBSERVED |
 | 12:35:55 | Top-level user input recorded | parent transcript step 0 | OBSERVED |
 | 12:38:39 | Top-level planner calls `invoke_subagent` (`TypeName: teamwork`, role "Teamwork Coordinator") | parent transcript step 1 | OBSERVED |
@@ -328,11 +332,11 @@ The `duration_seconds: 172.6` is inconsistent with the 600 s ceiling and the 600
 
 - The top-level conversation records `gemini-4-argon-medium`; the sentinel records `gemini-4-hydrogen-tiered-high`. [OBSERVED — parent step 1; sentinel steps 1/5/7/10]
 - The error names an **individual** quota. Its countdown is `127h44m31s` ≈ 5 d 7 h 44 m, far longer than the 429 windows `07` §3.5 recorded (`34m52s`, `6m57s`). That this long countdown is a different quota class from the 5-hour window is INFERRED. [OBSERVED text and duration]
-- From capture time **2026-11-23T12:45Z**, `+127h44m31s` lands at **2026-11-28T20:29Z**. The CLI does not log when its countdown started, so the reset instant is `INFERRED` arithmetic, not an observed server timestamp. [OBSERVED arithmetic]
+- From the instant the countdown was emitted, **2026-11-23T12:38:48Z** (the run's request/step-1 timestamp; the 429 instant itself is not separately logged), `+127h44m31s` lands on **2026-11-28T20:23:19Z**: `12:38:48Z + 5d 07h 44m 31s = 2026-11-28T20:23:19Z`. The interview run independently lands on the same instant: `15:54:23.9Z + 124h28m56s = 2026-11-28T20:23:19.9Z`. The two countdowns therefore converge on **`2026-11-28T20:23:19Z`** (shared with `16` §8.3). An earlier draft used the capture mtime `12:45:55Z` and reported `20:29Z`; that anchor is ~7 min late, because the quota sentence is written at the print timeout rather than when the 429 fired. The CLI does not log the countdown start, so both the 12:38:48Z anchor and the reset instant are `INFERRED` arithmetic, not an observed server timestamp; the convergence of two independent countdowns is the evidence. [OBSERVED texts; arithmetic INFERRED]
 
 ### 8.3 The control probe, and what it does and does not prove
 
-Earlier in the same window, a one-line probe returned `PONG`:
+Earlier in the same window, a one-line probe returned `PONG`. It ran on the **previous 1.5.14 binary** and is therefore a **cross-version control**: it shows the account could complete a model call minutes before the upgrade, not that the 1.5.15 build behaves identically.
 
 ```sh
 agy -p='Reply with exactly: PONG' --settings '{"model":"gemini-3.8-flash-low"}'
@@ -343,6 +347,7 @@ agy -p='Reply with exactly: PONG' --settings '{"model":"gemini-3.8-flash-low"}'
 | Probe exited `0` and returned `PONG` | `<capture>/probe.exit` (`EXIT=0`); `probe.stream.jsonl` final `result` (`status: "SUCCESS"`, `response: "PONG\n"`) | OBSERVED |
 | Probe took 167.6 s | `probe.stream.jsonl` final `result.duration_seconds` | OBSERVED |
 | Probe ran before the LEMMA run | `probe.meta` 12:32:36Z; probe stream mtime 12:35:37Z; LEMMA user input 12:35:55Z | OBSERVED |
+| Probe binary | **1.5.14** (`cli-20261123_073238.log:3`), the pre-upgrade build; the LEMMA run is **1.5.15** (`cli-20261123_073544.log:3`) | OBSERVED — **cross-version control** |
 | The probe's argv included the settings override | supplied by the capture owner; **no argv record is stored** in `<capture>/probe.*` | UNKNOWN from the capture alone |
 | `gemini-3.8-flash-low` answered | the stream records **no model field**; only `PONG` and success | INFERRED from the invocation, not observed in the stream |
 
@@ -369,6 +374,13 @@ Every quoted artifact is reproduced, redacted, in [`live/2026-11-23-lemma-gate/`
 capture=/tmp/opencode/re-0.9
 state=<appDataDir>/scratch/teamwork/9461e3b4-2958-43d9-80fd-685a850fc4af/.agents/teamwork
 ws=/tmp/opencode/re-0.9/lemma-ws
+
+# version identity (the run is 1.5.15; the probe is 1.5.14)
+agy --version                                   # 1.5.15
+sha256sum /home/john/.local/bin/agy             # 7b004d26…41fa2d
+sed -n '3p' ~/.gemini/antigravity-cli/log/cli-20261123_073544.log   # 1.5.15
+sed -n '3p' ~/.gemini/antigravity-cli/log/cli-20261123_073238.log   # 1.5.14 (control probe)
+cat "$capture/probe.meta"                       # 1.5.14 control probe, 12:32:36Z
 
 # run outcome
 cat "$capture/lemma.exit"                 # EXIT=3

@@ -1,6 +1,6 @@
 # Live Task-Interview Gate in Print Mode — the Interviewer Dispatch and Its Draft
 
-**Status: OBSERVED — two print-mode conversations entered the task-interview gate without `[skip-interview]`. The coordinator (`teamwork`) relayed the preparation notice and spawned `teamwork_interviewer`; one interviewer wrote `interviewer/prompt_draft.md` with seven `[OPEN: …]` gaps. No approval, no `ORIGINAL_REQUEST.md`, no route decision and no orchestrator folder exist in either conversation.** Recorded on **2026-11-23** against the installed Antigravity CLI **1.5.14**, the same binary analysed throughout this corpus (`00-artifact-identity.md`). The redacted evidence bundle is [`live/2026-11-23-interview-print/`](live/2026-11-23-interview-print/).
+**Status: OBSERVED — two print-mode conversations entered the task-interview gate without `[skip-interview]`. The coordinator (`teamwork`) relayed the preparation notice and spawned `teamwork_interviewer`; one interviewer wrote `interviewer/prompt_draft.md` with seven `[OPEN: …]` gaps. No approval, no `ORIGINAL_REQUEST.md`, no route decision and no orchestrator folder exist in either conversation.** Recorded on **2026-11-23** against the installed Antigravity CLI **1.5.15** (binary SHA-256 `7b004d26…41fa2d`, 273,879,752 bytes). [OBSERVED — `agy --version`; server logs `cli-20261123_104212.log`, `_105147.log`, `_105431.log`, `_110054.log` each read `Language server version: 1.5.15`] This is **not** the 1.5.14 build the static documents analyse; see [`PROVENANCE.md`](PROVENANCE.md) *live axis vs static axis*. The **control probe** at `12:32:36Z` ran on the previous **1.5.14** binary and is cited only as a **cross-version** control. The redacted evidence bundle is [`live/2026-11-23-interview-print/`](live/2026-11-23-interview-print/).
 
 This is the first runtime record in the set of the **interview gate itself**. `12`, `13` and `15` all used `[skip-interview]`, so none of them exercised it; `11` inferred the gate's artifact shape from `prompt_draft.md` files in **prior** state roots. What this run adds is the gate's runtime behaviour, not its completion:
 
@@ -30,9 +30,10 @@ The transcripts cited are the **parent** (`<appDataDir>/brain/<top-level>/.syste
 
 | Field | Default-model run | flash-low run | Label |
 |---|---|---|---|
-| CLI | `agy` 1.5.14 | same | OBSERVED — `<capture>/probe.meta` line 2 |
-| Binary | `37873b80…97d8c94` | same | OBSERVED — `probe.meta` line 3; `00` hash |
-| Host | Linux x86-64, UTC−05:00 local | same | OBSERVED — `probe.meta` line 4 |
+| CLI | `agy` **1.5.15** | same | OBSERVED — `agy --version`; server logs `cli-20261123_104212.log:3`, `_105147.log:3`, `_105431.log:3`, `_110054.log:3` = `Language server version: 1.5.15` |
+| Binary | `7b004d26…41fa2d` (273,879,752 B) | same | OBSERVED — `sha256sum` / `stat` on `/home/john/.local/bin/agy` |
+| Control probe (separate, earlier) | `agy` **1.5.14**, `37873b80…97d8c94` | — | OBSERVED — `<capture>/probe.meta`; **cross-version control**, not these runs' identity (§8.2) |
+| Host | Linux x86-64, UTC−05:00 local | same | OBSERVED — `<capture>/probe.meta` line 4; server-log timestamps are UTC−05:00 |
 | Top-level conversation | `84b1064f-61b5-4c8b-8561-a4f037299bb2` | `62ca5ebf-e58b-459b-b264-ac48451582dd` | OBSERVED — `<capture>/interview*.stream.jsonl` `init` |
 | Top-level model | `gemini-4-argon-medium` | `gemini-4-neon-high` (selected as `gemini-3.8-flash-low`) | OBSERVED — parent transcripts step 1/3/5 `model`; log alias line quoted in §8.2 |
 | Workspace | `<workspace-default>`, empty | `<workspace-flash>`, empty | OBSERVED — `init.init.cwd`; `ls -la` |
@@ -46,6 +47,8 @@ The transcripts cited are the **parent** (`<appDataDir>/brain/<top-level>/.syste
 | Resume outcome | `ERROR`, 429 individual quota | `ERROR`, `print_timeout` at 6m0s | OBSERVED — §7, §8 |
 
 The top-level turn ends in `SUCCESS` in both conversations. The gate neither completed nor failed; the turn ended with the notice and the process exited. That distinction matters: a `SUCCESS` envelope here means the caller turn was delivered, not that the interview was answered.
+
+**Cross-version comparability.** Both conversations ran on **1.5.15**, but the sentinel prompt text they obeyed is **byte-identical** to the 1.5.14 corpus: 36,482 bytes, SHA-256 `3e8c347eb2db6059ef9f010873062c41bc7d95fd640746674b4caddd0fabf4c1`, at 1-based offset 113,241,709 (1.5.14) and 113,300,479 (1.5.15). The behavioural evidence for the gate therefore remains comparable across the version fork; only the surrounding statics moved. [OBSERVED — byte comparison, `prompts/sentinel-routing.md`]
 
 ---
 
@@ -392,7 +395,7 @@ model alias "gemini-3.8-flash-low" resolved to "Gemini 4 Neon (High)"
 | The default top-level turn worked, then its resume was refused | `interview.stream.jsonl` `SUCCESS`; `interview2.*` 429 | OBSERVED |
 | Subagents ran on `gemini-4-hydrogen-tiered-high` in **both** conversations | coordinator transcripts; flash interviewer step 2 | OBSERVED |
 | The override reached the top-level model, not the teamwork agents | alias resolved for the parent; coordinators record the hydrogen tier in both runs | OBSERVED |
-| A `PONG` probe on flash-low succeeded earlier in the same account | `probe.stream.jsonl` `SUCCESS`, `probe.exit` `EXIT=0`; `probe.meta` 12:32:36Z; log alias line in `cli-20261123_073238.log:88` | OBSERVED (probe and alias); probe's argv UNKNOWN |
+| A `PONG` probe on flash-low succeeded earlier in the same account | `probe.stream.jsonl` `SUCCESS`, `probe.exit` `EXIT=0`; `probe.meta` 12:32:36Z; log alias line in `cli-20261123_073238.log:88` | OBSERVED (probe and alias); the probe ran on the **1.5.14** control binary, a **cross-version** control; probe's argv UNKNOWN |
 
 ### 8.3 Same reset instant as the earlier LEMMA 429
 
@@ -456,6 +459,14 @@ Every quoted artifact is reproduced, redacted, in [`live/2026-11-23-interview-pr
 capture=/tmp/opencode/re-0.9
 state_default=<appDataDir>/brain/a004d6df-2a76-4a73-87a6-c4832e82cdcf/scratch/.agents/teamwork
 state_flash=<appDataDir>/scratch/teamwork/cf78cfbd-cdcc-453a-a94b-71e2d22d6954/.agents/teamwork
+
+# version identity (both runs 1.5.15; the probe is 1.5.14)
+agy --version                                                     # 1.5.15
+sha256sum /home/john/.local/bin/agy                               # 7b004d26…41fa2d
+for f in cli-20261123_104212.log cli-20261123_105147.log \
+         cli-20261123_105431.log cli-20261123_110054.log; do
+  sed -n '3p' ~/.gemini/antigravity-cli/log/$f; done              # all 1.5.15
+cat "$capture/probe.meta"                                         # 1.5.14 control probe
 
 # gate entry and blocking
 grep -o '\[OPEN:' "$state_flash/interviewer/prompt_draft.md" | wc -l   # 7

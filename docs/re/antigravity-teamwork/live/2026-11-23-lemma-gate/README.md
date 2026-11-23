@@ -6,7 +6,7 @@ Redacted copies of the state documents cited by [`../../15-live-lemma-gate-obser
 
 | Item | Value |
 |---|---|
-| CLI | Antigravity Linux CLI `1.5.14` (binary `37873b80…97d8c94`) |
+| CLI | Antigravity Linux CLI `1.5.15` (binary `7b004d26…41fa2d`, 273,879,752 B) — the run's server log `cli-20261123_073544.log:3`; the `12:32:36Z` control probe was `1.5.14` (`37873b80…97d8c94`), a cross-version control |
 | Capture | `2026-11-23`, 12:32:36Z–12:45:59Z |
 | Top-level conversation | `<top-level>` |
 | Coordinator / sentinel | `<coordinator>` |

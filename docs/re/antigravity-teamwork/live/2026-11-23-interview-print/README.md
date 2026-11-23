@@ -6,7 +6,7 @@ Redacted copies of the documents cited by [`../../16-live-interview-gate-print-m
 
 | Item | Value |
 |---|---|
-| CLI | Antigravity Linux CLI `1.5.14` (binary `37873b80…97d8c94`) |
+| CLI | Antigravity Linux CLI `1.5.15` (binary `7b004d26…41fa2d`, 273,879,752 B) — server logs `cli-20261123_104212.log`, `_105147.log`, `_105431.log`, `_110054.log`; the `12:32:36Z` probe was `1.5.14`, a cross-version control |
 | Capture | `2026-11-23`, 15:42:23Z–16:07:05Z |
 | Request | `/teamwork Use the SWE Light route for this small, quick, single-file task: create gate.txt containing exactly: gate. Then stop.` |
 | Top-level, default model | `<top-level-default>` on `gemini-4-argon-medium` |

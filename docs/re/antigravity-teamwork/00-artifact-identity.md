@@ -8,7 +8,7 @@ This document set records the identity, provenance, and static-analysis findings
 |---|---|---:|---|
 | Source archive [OBSERVED] | `/home/john/Downloads/cli_linux_x64.tar.gz` | 101,195,950 | `d58386322d2073e96b33f7cc32b4e9ae2db6228f58440369725967b2de48c7b5` |
 | Archive member [OBSERVED] | `antigravity` (ELF, mode 0755, uid/gid root:root, mtime 2026-11-21 01:24) — exactly one member | unknown (member size not separately measured; archive contains exactly one member) [UNKNOWN] | unknown (member hash not separately computed) [UNKNOWN] |
-| Extracted binary, read-only working copy [OBSERVED] | `/tmp/opencode/antigravity-re/antigravity` | 273,240,776 | `37873b8062391b6202a3d3199ec012abc9e53aab720d26cd65699441497d8c94` |
+| Extracted binary, read-only working copy [OBSERVED] | `/tmp/opencode/antigravity-re/antigravity` — the 1.5.14 static binary. The path no longer exists on the host; re-extract from `~/Downloads/cli_linux_x64.tar.gz` (see `PROVENANCE.md`) | 273,240,776 | `37873b8062391b6202a3d3199ec012abc9e53aab720d26cd65699441497d8c94` |
 | String dump (generated) [OBSERVED] | `/tmp/opencode/antigravity-re/` (`strings -a -n 5` dump) | 45,893,848 | unknown (generated artifact; hash not recorded) [UNKNOWN] |
 
 ## Build Identity [OBSERVED]
