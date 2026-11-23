@@ -146,7 +146,16 @@ import {
 import { contentSha256Hex, isApprovalNonce } from "./approval-format.mjs"
 import type { RequirementsFile, VictoryAuditMode } from "./victory.ts"
 import { readAgentBriefingExcerpt, readBriefingExcerpt, refreshAgentBriefing, refreshRunBriefing } from "./briefing.ts"
-import { writeHandoff, resolveHandoffScope, handoffAgentSlug, evaluateHandoffGateChecked, normalizeHandoffMode, resolveHandoffMode } from "./handoff.ts"
+import {
+  writeHandoff,
+  resolveHandoffScope,
+  handoffAgentSlug,
+  evaluateHandoffGateChecked,
+  normalizeHandoffMode,
+  resolveHandoffMode,
+  assignedWorkerAgent,
+  readWorkerHandoffBinding,
+} from "./handoff.ts"
 import type { HandoffGate, HandoffMode, HandoffTaskRef } from "./handoff.ts"
 import { withCrossProcessLock, withFileLock, withPinnedCrossProcessLock, recentLockDiagnostics } from "./locks.ts"
 import {
@@ -8220,7 +8229,25 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 if (!isSafeTaskId(id)) continue
                 const raw = readBoundedRunFile(run, join(run, `verify/report-${id}.json`), MAX_RUN_FILE_BYTES)
                 const current = raw.status === "ok" ? sha256Hex(raw.text) : null
-                if (current !== digest) drift.push(`report ${id} changed since final verification`)
+                if (current !== digest) {
+                  drift.push(`report ${id} changed since final verification`)
+                  continue
+                }
+                // The report also binds the worker handoff; a re-recorded
+                // handoff invalidates a stamped PASS without changing the report.
+                if (raw.status === "ok" && resolveHandoffMode(plan, state).mode === "required") {
+                  let parsed: any
+                  try {
+                    parsed = JSON.parse(raw.text)
+                  } catch {}
+                  const bound = parsed?.workerHandoff
+                  if (bound && typeof bound === "object" && typeof bound.agent === "string") {
+                    const live = readWorkerHandoffBinding(run, id, bound.agent)
+                    if (live.reason || !live.binding || live.binding.path !== bound.path || live.binding.sha256 !== bound.sha256) {
+                      drift.push(`worker handoff for report ${id} changed since final verification`)
+                    }
+                  }
+                }
               }
             }
             const recordedAudit = finalReport.evidence?.auditDigest
@@ -8346,6 +8373,20 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               state.phase = "FINAL_VERIFICATION"
               await setRunPhase(run, "FINAL_VERIFICATION")
               await refreshBriefingSafe(run)
+            }
+            // A recorded verdict that no longer matches the evidence it saw is
+            // drift, not a missing audit: name it AUTH_STALE and force re-record.
+            if (nextVictoryGate.status === "AUTH_STALE") {
+              return {
+                content: `BLOCKED_BY_AUTH: [AUTH_STALE] the recorded victory audit is stale: ${nextVictoryGate.reasons.join("; ")}. Re-run teamwork_victory_audit against the current evidence.\n${integrityModeNote}`,
+                status: "AUTH_STALE",
+                auth: "AUTH_STALE",
+                finalReport: finalFile,
+                passedCount: passedTasks.length,
+                integrityMode: integrity.mode,
+                victory: nextVictoryGate.status,
+                reasons: nextVictoryGate.reasons,
+              }
             }
             const rejected = nextVictoryGate.status === "REJECTED"
             return {
@@ -10187,6 +10228,27 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           input?.checkpoint && typeof input.checkpoint === "object" && typeof input.checkpoint.headSha === "string"
             ? clean(input.checkpoint.headSha, 64).trim()
             : ""
+        // 0.12.0: bind the report to the worker handoff that preceded it. The
+        // binding is resolved from the handoff index on disk, never from input.
+        const handoffMode = resolveHandoffMode(plan, state).mode
+        const assignedWorker = assignedWorkerAgent(run, taskId)
+        const workerHandoffResult = assignedWorker
+          ? readWorkerHandoffBinding(run, taskId, assignedWorker)
+          : { reason: `task ${taskId} has no assigned worker role that can record a handoff` }
+        if (status === "PASS" && handoffMode === "required") {
+          if (workerHandoffResult.reason) {
+            return {
+              status: "REPORT_HANDOFF_STALE",
+              content: `refused: [REPORT_HANDOFF_STALE] ${workerHandoffResult.reason}; nothing was written. Re-record the worker handoff (teamwork_handoff) for ${taskId}, then re-run the verifier report.`,
+            }
+          }
+          if (!workerHandoffResult.binding) {
+            return {
+              status: "REPORT_HANDOFF_MISSING",
+              content: `refused: [REPORT_HANDOFF_MISSING] task "${taskId}" has requireHandoffs: "required" but no ${assignedWorker} handoff is recorded in handoffs/index.json; nothing was written. Have the worker call teamwork_handoff before the verifier reports.`,
+            }
+          }
+        }
         await renewClaimFor(run, taskId, authz.sessionID, ctx, "report")
         const report: any = {
           taskId,
@@ -10203,6 +10265,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           round: currentRound,
           fence: currentFence,
           branch: reportBranch,
+          ...(workerHandoffResult.binding ? { workerHandoff: workerHandoffResult.binding } : {}),
           ...(observedBase ? { baseSha: observedBase } : {}),
           ...(observedHead ? { headSha: observedHead } : {}),
           ...(observedDiffHash ? { diffHash: observedDiffHash } : {}),
@@ -10355,12 +10418,14 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // Evidence comes from disk only; no input can supply or alter it.
           const tasks: Array<{ id: string; status: string; report: string | null; reportStatus: string }> = []
           const reportDigests: Record<string, string | null> = Object.create(null)
+          const reportValues: Record<string, any> = Object.create(null)
           const authReasons: string[] = []
           const contentIntegrityReasons: string[] = []
           for (const id of ids) {
             const safe = isSafeTaskId(id)
             const reportRel = safe ? `verify/report-${id}.json` : null
             const report = reportRel ? readJson<any>(run, join(run, reportRel), undefined) : undefined
+            if (report) reportValues[id] = report
             const rawStatus = taskStates[id]?.status
             tasks.push({
               id: clean(id, 64),
@@ -10477,6 +10542,41 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             manifestCheck.signed ? manifestCheck.manifest : undefined,
           )
           if (!handoffGate.skipped) reasons.push(...handoffGate.reasons)
+
+          // 0.12.0: re-check every PASS report's worker-handoff binding against
+          // the current index and body hash. A re-recorded worker handoff makes
+          // the old report stale.
+          if (resolveHandoffMode(plan, state).mode === "required") {
+            for (const t of tasks) {
+              if (t.reportStatus !== "PASS") continue
+              const recorded = reportValues[t.id]?.workerHandoff
+              if (!recorded || typeof recorded !== "object" || typeof recorded.agent !== "string") {
+                reasons.push(
+                  `[REPORT_HANDOFF_MISSING] task ${t.id}: PASS report has no workerHandoff binding but requireHandoffs is "required"; re-record the report through teamwork_report after the worker handoff`,
+                )
+                continue
+              }
+              const current = readWorkerHandoffBinding(run, t.id, recorded.agent)
+              if (current.reason) {
+                reasons.push(`[REPORT_HANDOFF_STALE] task ${t.id}: ${current.reason}`)
+                continue
+              }
+              if (!current.binding) {
+                reasons.push(
+                  `[REPORT_HANDOFF_STALE] task ${t.id}: the worker handoff (${clean(recorded.agent, 64)}) bound into the report is no longer in handoffs/index.json`,
+                )
+                continue
+              }
+              if (
+                current.binding.path !== recorded.path ||
+                current.binding.sha256 !== recorded.sha256
+              ) {
+                reasons.push(
+                  `[REPORT_HANDOFF_STALE] task ${t.id}: ${current.binding.path} changed since the verifier report was recorded; the report is not bound to the current worker handoff`,
+                )
+              }
+            }
+          }
 
           let documentReviewEvidence:
             | { checked: boolean; segmentReportsComplete: boolean; finalReportPresent: boolean }

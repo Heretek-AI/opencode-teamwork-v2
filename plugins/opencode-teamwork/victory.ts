@@ -20,6 +20,7 @@ import { basename, join } from "node:path"
 import {
   clean,
   cleanBlock,
+  isSafeTaskId,
   readBoundedRunFile,
   readBoundedRunJson,
   writeSafeRunJson,
@@ -42,6 +43,11 @@ export const VICTORY_SKIP_REASON_MAX = 500
 const MAX_REQUIREMENTS_BYTES = 256 * 1024
 const MAX_VICTORY_BYTES = 512 * 1024
 const MAX_REQUEST_BYTES = 1024 * 1024
+const MAX_REPORT_BYTES = 1024 * 1024
+const MAX_PLAN_BYTES = 8 * 1024 * 1024
+const MAX_STATE_BYTES = 8 * 1024 * 1024
+const MAX_AUDIT_BYTES = 1024 * 1024
+const MAX_FINAL_BYTES = 1024 * 1024
 
 export type VictoryAuditMode = "required" | "skip"
 
@@ -62,6 +68,20 @@ export interface VictoryRequirementResult {
   evidence: string
 }
 
+/**
+ * Digests of the artifacts an audit actually reviewed, computed from disk by
+ * `recordVictoryAudit`. A verdict that does not match the current files is
+ * stale: the audit is bound to the exact bytes it saw, never to caller input.
+ */
+export interface VictoryEvidenceDigests {
+  /** sha256 of each `verify/report-<taskId>.json` present at audit time. */
+  reports: Record<string, string>
+  /** sha256 of `verify/security-audit.json`, or null when absent. */
+  securityAudit: string | null
+  /** sha256 of `verify/final.json` when one existed at audit time. */
+  final: string | null
+}
+
 export interface VictoryVerdictFile {
   version: 1
   sessionId: string
@@ -71,6 +91,8 @@ export interface VictoryVerdictFile {
   requestHash: string | null
   /** sha256 of the canonical requirements.json baseline this verdict reviewed. */
   requirementsHash?: string | null
+  /** Digests of the evidence this verdict reviewed (0.12.0, never caller input). */
+  evidenceDigests?: VictoryEvidenceDigests
   requirements: VictoryRequirementResult[]
   findings: string[]
   summary: string
@@ -300,6 +322,59 @@ export function currentRequirementsHash(run: string): string | null {
   return requirementsBaselineHash(readRequirementsBaseline(run))
 }
 
+/** Every task id that can own a verifier report: plan first, state as fallback. */
+function evidenceTaskIds(run: string): string[] {
+  const ids = new Set<string>()
+  const plan = readBoundedRunJson<any>(run, join(run, "plan.dag.json"), MAX_PLAN_BYTES)
+  if (plan.status === "ok" && Array.isArray(plan.value?.tasks)) {
+    for (const task of plan.value.tasks) {
+      if (typeof task?.id === "string" && isSafeTaskId(task.id)) ids.add(task.id)
+    }
+  }
+  const state = readBoundedRunJson<any>(run, join(run, "state.json"), MAX_STATE_BYTES)
+  if (state.status === "ok" && state.value?.tasks && typeof state.value.tasks === "object") {
+    for (const id of Object.keys(state.value.tasks)) {
+      if (isSafeTaskId(id)) ids.add(id)
+    }
+  }
+  return [...ids]
+}
+
+function runFileDigest(run: string, relPath: string, maxBytes: number): string | null {
+  const res = readBoundedRunFile(run, join(run, relPath), maxBytes)
+  return res.status === "ok" ? sha256Hex(res.text) : null
+}
+
+/**
+ * Compute the digest set of the evidence on disk. Used at record time to bind
+ * the verdict, and by the gate to detect an artifact edited afterwards. The
+ * caller never supplies any part of this value.
+ */
+export function evidenceDigestsFromDisk(run: string): VictoryEvidenceDigests {
+  // Null-prototype map: a task id such as `constructor` is an ordinary key.
+  const reports: Record<string, string> = Object.create(null)
+  for (const id of evidenceTaskIds(run)) {
+    const digest = runFileDigest(run, `verify/report-${id}.json`, MAX_REPORT_BYTES)
+    if (digest !== null) reports[id] = digest
+  }
+  // A `final.json` is bound only when it is a PASS verdict the audit could have
+  // reviewed. The normal order is audit → final_verify, and a pre-audit FAIL
+  // must not make the later PASS verdict permanently stale.
+  const finalRaw = readBoundedRunFile(run, join(run, "verify/final.json"), MAX_FINAL_BYTES)
+  let finalDigest: string | null = null
+  if (finalRaw.status === "ok") {
+    try {
+      if (JSON.parse(finalRaw.text)?.status === "PASS") finalDigest = sha256Hex(finalRaw.text)
+    } catch {}
+  }
+  return {
+    reports,
+    securityAudit: runFileDigest(run, "verify/security-audit.json", MAX_AUDIT_BYTES),
+    final: finalDigest,
+  }
+}
+
+
 /** Read the existing verdict, or undefined when absent/unreadable. */
 export function readVictoryVerdict(run: string): VictoryVerdictFile | undefined {
   const res = readBoundedRunJson<any>(run, join(run, "verify", "victory.json"), MAX_VICTORY_BYTES)
@@ -388,6 +463,17 @@ export async function recordVictoryAudit(
     }
   }
 
+  // Bind the verdict to what is actually on disk right now. The caller cannot
+  // supply these digests, so a later edit to a report/audit/final is detectable.
+  const evidenceDigests = evidenceDigestsFromDisk(run)
+  if (verdictKind === VICTORY_CONFIRMED && Object.keys(evidenceDigests.reports).length === 0) {
+    return {
+      ok: false,
+      error:
+        "refused: cannot record VICTORY CONFIRMED with evidenceDigests.reports empty (no verifier report was on disk for this run; nothing was written)",
+    }
+  }
+
   const existing = readVictoryVerdict(run)
   if (existing?.verdict === VICTORY_CONFIRMED) {
     return {
@@ -412,6 +498,7 @@ export async function recordVictoryAudit(
     auditorSessionId: input.auditorSessionId,
     requestHash,
     requirementsHash: requirementsBaselineHash(baseline),
+    evidenceDigests,
     requirements: results,
     findings,
     summary,
@@ -523,6 +610,66 @@ function evaluateVictoryCore(
       )
     }
   }
+
+  // The verdict is bound to the exact evidence bytes it reviewed. Recompute
+  // from disk: any drift means the audit no longer describes this run.
+  const recordedDigests = (victory as any).evidenceDigests
+  if (recordedDigests === undefined || recordedDigests === null) {
+    authCode = "AUTH_STALE"
+    reasons.push(
+      "[AUTH_STALE] victory audit: legacy verdict has no evidenceDigests, so it is not bound to the reports it claims to have reviewed; record a new audit",
+    )
+  } else if (typeof recordedDigests !== "object" || Array.isArray(recordedDigests)) {
+    authCode = "AUTH_STALE"
+    reasons.push("[AUTH_STALE] victory audit: evidenceDigests is malformed")
+  } else {
+    const current = evidenceDigestsFromDisk(run)
+    const recordedReports =
+      recordedDigests.reports && typeof recordedDigests.reports === "object" && !Array.isArray(recordedDigests.reports)
+        ? recordedDigests.reports
+        : null
+    if (!recordedReports) {
+      authCode = "AUTH_STALE"
+      reasons.push("[AUTH_STALE] victory audit: evidenceDigests.reports is missing or malformed")
+    } else {
+      for (const [id, digest] of Object.entries(recordedReports)) {
+        if (!isSafeTaskId(id)) {
+          authCode = "AUTH_STALE"
+          reasons.push(`[AUTH_STALE] victory audit: evidenceDigests names an invalid task id "${clean(id, 40)}"`)
+          continue
+        }
+        if (current.reports[id] !== digest) {
+          authCode = "AUTH_STALE"
+          reasons.push(
+            `[AUTH_STALE] victory audit: report ${id} changed since the audit reviewed it (drift in verify/report-${id}.json)`,
+          )
+        }
+      }
+      for (const id of Object.keys(current.reports)) {
+        if (!Object.prototype.hasOwnProperty.call(recordedReports, id)) {
+          authCode = "AUTH_STALE"
+          reasons.push(`[AUTH_STALE] victory audit: report ${id} was never reviewed by this audit (drift)`)
+        }
+      }
+    }
+    const recordedAudit = (recordedDigests as any).securityAudit ?? null
+    if (recordedAudit !== current.securityAudit) {
+      authCode = "AUTH_STALE"
+      reasons.push(
+        recordedAudit === null
+          ? "[AUTH_STALE] victory audit: security-audit.json appeared after the audit reviewed the run"
+          : "[AUTH_STALE] victory audit: security-audit.json changed since the audit reviewed it",
+      )
+    }
+    // `final.json` is normally written after the audit, so a recorded null is
+    // expected; once the audit recorded a digest it must keep matching.
+    const recordedFinal = (recordedDigests as any).final ?? null
+    if (recordedFinal !== null && recordedFinal !== current.final) {
+      authCode = "AUTH_STALE"
+      reasons.push("[AUTH_STALE] victory audit: verify/final.json changed since the audit reviewed it")
+    }
+  }
+
   if (victory.verdict !== VICTORY_CONFIRMED && victory.verdict !== VICTORY_REJECTED) {
     reasons.push(`victory audit: invalid verdict "${clean(victory.verdict, 40)}"`)
   } else if (victory.verdict === VICTORY_REJECTED) {

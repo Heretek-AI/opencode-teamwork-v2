@@ -21,7 +21,7 @@ import { lstatSync, readdirSync } from "node:fs"
 import { basename, join } from "node:path"
 import { sha256Hex } from "./auth.ts"
 import type { AuthContext, AuthEnvelope, AuthFailure } from "./auth.ts"
-import { clean, isSafeTaskId, readBoundedRunFile, writeSafeRunFile } from "./tournament.ts"
+import { clean, isSafeTaskId, readBoundedRunFile, readBoundedRunJson, writeSafeRunFile } from "./tournament.ts"
 import { withPinnedCrossProcessLock } from "./locks.ts"
 
 /** Domain separator for the signed handoff index payload. */
@@ -73,7 +73,21 @@ export const TASK_SCOPED_HANDOFF_ROLES = [
 /** These roles record run-level handoffs and must omit `taskId`. */
 export const RUN_LEVEL_HANDOFF_ROLES = ["team/victory-auditor", "team/sentinel", "team/orchestrator"] as const
 
-export type HandoffCite = { path: string; sha256: string }
+export interface HandoffCite {
+  path: string
+  sha256: string
+}
+
+/**
+ * A verifier report's binding to the worker handoff that preceded it (0.12.0).
+ * Filled by `teamwork_report` from `handoffs/index.json`; never caller input.
+ */
+export interface WorkerHandoffBinding {
+  taskId: string
+  agent: string
+  path: string
+  sha256: string
+}
 
 export interface HandoffIndexEntry {
   taskId: string
@@ -261,11 +275,57 @@ export function handoffCiteRelativePath(agent: string, taskId?: string): string 
 }
 
 function collectCites(run: string, agent: string, taskId?: string): HandoffCite[] {
+  const cites: HandoffCite[] = []
   const rel = handoffCiteRelativePath(agent, taskId)
-  if (!rel) return []
-  const res = readBoundedRunFile(run, join(run, rel), 8 * 1024 * 1024)
-  if (res.status !== "ok") return []
-  return [{ path: rel, sha256: sha256Hex(res.text) }]
+  if (rel) {
+    const res = readBoundedRunFile(run, join(run, rel), 8 * 1024 * 1024)
+    if (res.status === "ok") cites.push({ path: rel, sha256: sha256Hex(res.text) })
+  }
+  return cites
+}
+
+const MAX_PLAN_BYTES = 8 * 1024 * 1024
+
+/**
+ * The agent the plan assigned to a task (`plan.dag.json`), defaulting to
+ * `team/worker` exactly like the continuity matrix. Undefined when the task is
+ * absent or the assigned role cannot write a task handoff.
+ */
+export function assignedWorkerAgent(run: string, taskId: string): string | undefined {
+  const plan = readBoundedRunJson<any>(run, join(run, "plan.dag.json"), MAX_PLAN_BYTES)
+  if (plan.status !== "ok" || !Array.isArray(plan.value?.tasks)) return undefined
+  const task = plan.value.tasks.find((t: any) => t?.id === taskId)
+  const assigned = typeof task?.agent === "string" && task.agent.trim() ? task.agent.trim() : "team/worker"
+  return handoffAgentSlug(assigned) ? assigned : undefined
+}
+
+/**
+ * Resolve the worker handoff a verifier report must bind, re-hashing the body.
+ * Returns `{}` when the pair has no index entry, and `{ reason }` when an entry
+ * exists but its file is missing, unreadable, or does not match the index hash.
+ */
+export function readWorkerHandoffBinding(
+  run: string,
+  taskId: string,
+  agent: string,
+): { binding?: WorkerHandoffBinding; reason?: string } {
+  let index: HandoffIndex
+  try {
+    index = readIndex(run)
+  } catch (err: any) {
+    return { reason: `handoffs/index.json is unreadable (${clean(err?.message ?? err, 160)})` }
+  }
+  const entry = index.entries.find((e) => e.taskId === taskId && e.agent === agent)
+  if (!entry) return {}
+  const res = readBoundedRunFile(run, join(run, entry.path), MAX_HANDOFF_MARKDOWN_READ)
+  if (res.status !== "ok") {
+    return { reason: `worker handoff ${entry.path} is missing or unreadable` }
+  }
+  const actual = sha256Hex(res.text)
+  if (actual !== entry.sha256) {
+    return { reason: `worker handoff ${entry.path} sha256 does not match handoffs/index.json` }
+  }
+  return { binding: { taskId, agent, path: entry.path, sha256: entry.sha256 } }
 }
 
 function isFiniteRound(value: unknown): number {

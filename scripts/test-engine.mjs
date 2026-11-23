@@ -20,10 +20,11 @@ import {
 } from "../plugins/opencode-teamwork/lemma.ts"
 import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
 import { renderGateStatus } from "../plugins/opencode-teamwork/strict.ts"
+import { evaluateVictoryGate } from "../plugins/opencode-teamwork/victory.ts"
 import { withCrossProcessLock, crossProcessLockPath, observeLockArtifact, quarantineStaleLock } from "../plugins/opencode-teamwork/locks.ts"
 import { assertSafeUrl, blockedAddressReason } from "../plugins/opencode-teamwork/url-guard.ts"
 import { refreshRunBriefing, MAX_BRIEFING_BYTES, refreshAgentBriefing, readAgentBriefingExcerpt, agentBriefingRelativePath, MAX_AGENT_BRIEFING_DIRS } from "../plugins/opencode-teamwork/briefing.ts"
-import { writeHandoff, MAX_HANDOFF_ENTRIES, MAX_HANDOFF_INDEX_BYTES, HANDOFF_SECTION_LABELS, evaluateHandoffGateChecked } from "../plugins/opencode-teamwork/handoff.ts"
+import { writeHandoff, MAX_HANDOFF_ENTRIES, MAX_HANDOFF_INDEX_BYTES, HANDOFF_SECTION_LABELS, evaluateHandoffGateChecked, readWorkerHandoffBinding } from "../plugins/opencode-teamwork/handoff.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import { signApprovalArtifact } from "../lib/approve.mjs"
 import { contentSha256Hex } from "../plugins/opencode-teamwork/approval-format.mjs"
@@ -275,10 +276,13 @@ async function recordHandoffFor(tools, runId, { agent = "team/worker", taskId, s
 
 // Seed the default matrix: assigned worker + verifier per task, one run-level
 // sentinel handoff. Strict pairs are added after their wave artifacts exist.
-async function seedHandoffMatrix(tools, runId, taskIds, { agents = {}, strict = false } = {}) {
+async function seedHandoffMatrix(tools, runId, taskIds, { agents = {}, strict = false, workers = true } = {}) {
   for (const taskId of taskIds) {
     const worker = agents[taskId] ?? "team/worker"
-    await recordHandoffFor(tools, runId, { agent: worker, taskId })
+    // 0.12.0: a verifier report binds the worker handoff recorded before it, so
+    // re-recording the worker later would stale the report. Callers that seed
+    // workers first pass workers: false.
+    if (workers) await recordHandoffFor(tools, runId, { agent: worker, taskId })
     await recordHandoffFor(tools, runId, { agent: "team/verifier", taskId })
     if (strict) {
       await recordHandoffFor(tools, runId, { agent: "team/falsifier", taskId })
@@ -336,12 +340,20 @@ function makeSeedVerifiedRun(tools, ctx, root) {
       },
       { sessionID: FIXTURE_ROOT_SESSION },
     )
+    // 0.12.0: record each assigned worker's handoff before its verifier
+    // report, because a PASS report binds the worker handoff by hash.
+    if (handoffs) {
+      for (const taskId of taskIds) {
+        await recordHandoffFor(tools, runId, { agent: "team/worker", taskId })
+      }
+    }
     for (const taskId of taskIds) {
       for (const status of ["worker_active", "worker_done", "verifier_active"]) {
         await tools.task_update.execute({ sessionId: runId, taskId, status })
       }
-      // 0.10.2: a signed run requires a verified PASS report, not the inline
-      // verification.status shortcut. Write it at the current round.
+      // 0.12.0: a signed run requires a verified PASS report, not the inline
+      // verification.status shortcut. Write it at the current round. The
+      // worker handoff must exist first: the report binds it by hash.
       const reportRes = await tools.report.execute(
         {
           sessionId: runId,
@@ -371,8 +383,9 @@ function makeSeedVerifiedRun(tools, ctx, root) {
     })
     if (handoffs) {
       // Strict falsifier/auditor pairs are recorded by the wave tests, after
-      // the challenge/audit artifacts they cite exist.
-      await seedHandoffMatrix(tools, runId, taskIds, { strict: false })
+      // the challenge/audit artifacts they cite exist. Workers were recorded
+      // before their reports; re-recording them would stale those reports.
+      await seedHandoffMatrix(tools, runId, taskIds, { strict: false, workers: false })
     }
     if (stampVictory && request !== undefined) await stampVictoryFor(tools, ctx, root, runId)
   }
@@ -1825,6 +1838,176 @@ try {
   console.log("✓ requirements baseline, trusted victory-auditor identity, write-once verdict, and completion gate verified")
 
   // ==========================================
+  // Part 1c-ter-evidence: 0.12.0 evidence binding
+  // ==========================================
+  console.log("Testing victory evidence binding...")
+
+  const evidenceVictoryFile = (runId) => join(testDir, ".opencode", "teamwork", runId, "verify", "victory.json")
+  const evidenceReportFile = (runId, taskId) => join(testDir, ".opencode", "teamwork", runId, "verify", `report-${taskId}.json`)
+  const evidenceAuditFile = (runId) => join(testDir, ".opencode", "teamwork", runId, "verify", "security-audit.json")
+
+  const bindRun = "20261018-000000-ev-victory"
+  await seedVerifiedRun(bindRun, ["E1"], { request: "Deliver the evidence-bound victory fixture." })
+  const bindVictory = JSON.parse(readFileSync(evidenceVictoryFile(bindRun), "utf8"))
+  assert(bindVictory.evidenceDigests, "a recorded verdict must carry evidenceDigests")
+  assert.deepStrictEqual(Object.keys(bindVictory.evidenceDigests.reports), ["E1"], "evidenceDigests must name each report task")
+  assert.strictEqual(
+    bindVictory.evidenceDigests.reports.E1,
+    sha256Hex(readFileSync(evidenceReportFile(bindRun, "E1"), "utf8")),
+    "the verdict must bind the exact report bytes it reviewed",
+  )
+  assert.strictEqual(
+    bindVictory.evidenceDigests.securityAudit,
+    sha256Hex(readFileSync(evidenceAuditFile(bindRun), "utf8")),
+    "the verdict must bind the security audit it reviewed",
+  )
+  assert.strictEqual(bindVictory.evidenceDigests.final, null, "no final.json exists when the audit is recorded")
+  const bindPass = await registeredTools.final_verify.execute({ sessionId: bindRun })
+  assert.strictEqual(bindPass.status, "PASS", `bound evidence must PASS: ${bindPass.content}`)
+
+  appendFileSync(evidenceReportFile(bindRun, "E1"), "\n")
+  const bindDirectGate = evaluateVictoryGate(join(testDir, ".opencode", "teamwork", bindRun), "required")
+  assert.strictEqual(bindDirectGate.ok, false, "a changed report must stale the verdict")
+  assert.strictEqual(bindDirectGate.status, "AUTH_STALE", `the gate must return AUTH_STALE: ${JSON.stringify(bindDirectGate)}`)
+  assert(
+    bindDirectGate.reasons.some((r) => r.includes("victory audit: report E1 changed")),
+    `the drift must name the report: ${JSON.stringify(bindDirectGate.reasons)}`,
+  )
+  const bindStaleNext = await registeredTools.next.execute({ sessionId: bindRun })
+  assert.strictEqual(bindStaleNext.status, "AUTH_STALE", `next must surface AUTH_STALE: ${bindStaleNext.content}`)
+  assert(bindStaleNext.reasons.some((r) => r.includes("AUTH_STALE")), "next must carry the drift reasons")
+  const bindStaleFinal = await registeredTools.final_verify.execute({ sessionId: bindRun })
+  assert.strictEqual(bindStaleFinal.status, "FAIL", "final_verify must FAIL on a changed report")
+  assert(
+    bindStaleFinal.reasons.some((r) => r.includes("AUTH_STALE") && r.includes("victory audit")),
+    `final_verify must name the stale victory binding: ${JSON.stringify(bindStaleFinal.reasons)}`,
+  )
+
+  // CONFIRMED with no report on disk is refused at record time.
+  const emptyEvidenceRun = "20261018-000000-ev-victory-empty"
+  await registeredTools.plan.execute(
+    {
+      sessionId: emptyEvidenceRun,
+      topology: "iterative-coding",
+      skipInterview: true,
+      request: "Deliver the empty-evidence fixture.",
+      tasks: [{ id: "E9" }],
+    },
+    { sessionID: FIXTURE_ROOT_SESSION },
+  )
+  const emptyReqs = JSON.parse(readFileSync(join(testDir, ".opencode", "teamwork", emptyEvidenceRun, "requirements.json"), "utf8"))
+  const emptyAuditorGet = mockCtx.session.get
+  mockCtx.session.get = async ({ sessionID: id }) =>
+    id === FIXTURE_ROOT_SESSION ? { agent: "team/sentinel" } : { agent: "team/victory-auditor", parentID: FIXTURE_ROOT_SESSION }
+  let emptyVictory
+  try {
+    emptyVictory = await registeredTools.victory_audit.execute(
+      {
+        sessionId: emptyEvidenceRun,
+        verdict: "VICTORY CONFIRMED",
+        requirements: emptyReqs.items.map((r) => ({ id: r.id, met: true, evidence: "fixture" })),
+      },
+      { sessionID: "ses_victory_auditor" },
+    )
+  } finally {
+    mockCtx.session.get = emptyAuditorGet
+  }
+  assert(
+    emptyVictory.content.includes("evidenceDigests.reports empty"),
+    `CONFIRMED must be refused with no reports: ${emptyVictory.content}`,
+  )
+  assert(!existsSync(evidenceVictoryFile(emptyEvidenceRun)), "an empty-evidence verdict must write nothing")
+
+  // A legacy verdict without evidenceDigests is stale, never silently current.
+  const legacyVerdictRun = "20261018-000000-ev-victory-legacy"
+  await seedVerifiedRun(legacyVerdictRun, ["E2"], {
+    request: "Deliver the legacy-verdict fixture.",
+    allowUnsignedLegacy: true,
+  })
+  const legacyPayload = JSON.parse(readFileSync(evidenceVictoryFile(legacyVerdictRun), "utf8"))
+  delete legacyPayload.evidenceDigests
+  writeFileSync(evidenceVictoryFile(legacyVerdictRun), JSON.stringify(legacyPayload, null, 2) + "\n")
+  const legacyGate = evaluateVictoryGate(join(testDir, ".opencode", "teamwork", legacyVerdictRun), "required")
+  assert.strictEqual(legacyGate.ok, false, "a legacy victory without digests must not pass")
+  assert.strictEqual(legacyGate.status, "AUTH_STALE", "a legacy victory must be AUTH_STALE")
+  assert(
+    legacyGate.reasons.some((r) => r.includes("legacy verdict has no evidenceDigests")),
+    `the legacy warning must be explicit: ${JSON.stringify(legacyGate.reasons)}`,
+  )
+
+  console.log("✓ victory binds the reports/audit it reviewed, refuses empty evidence, and flags legacy verdicts")
+
+  console.log("Testing report → worker-handoff binding...")
+
+  const reportBoundRun = "20261018-000000-ev-report"
+  await registeredTools.plan.execute(
+    {
+      sessionId: reportBoundRun,
+      topology: "iterative-coding",
+      skipInterview: true,
+      request: "Deliver the report-binding fixture.",
+      victoryAudit: "skip",
+      victorySkipReason: "fixture: report-binding test does not complete the victory gate",
+      tasks: [{ id: "R1" }],
+    },
+    { sessionID: FIXTURE_ROOT_SESSION },
+  )
+  for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+    await registeredTools.task_update.execute({ sessionId: reportBoundRun, taskId: "R1", status })
+  }
+  const missingBoundReport = await registeredTools.report.execute(
+    { sessionId: reportBoundRun, taskId: "R1", status: "PASS", summary: "No worker handoff yet." },
+    { sessionID: "ses_fixture_verifier" },
+  )
+  assert.strictEqual(missingBoundReport.status, "REPORT_HANDOFF_MISSING", "a PASS report without the worker handoff must be refused")
+  assert(missingBoundReport.content.startsWith("refused: [REPORT_HANDOFF_MISSING]"), missingBoundReport.content)
+  assert(!existsSync(evidenceReportFile(reportBoundRun, "R1")), "a refused report must write nothing")
+  assert.strictEqual(
+    JSON.parse(readFileSync(runFile(testDir, reportBoundRun, "state.json"), "utf8")).tasks.R1.status,
+    "verifier_active",
+    "a refused report must not advance the task",
+  )
+
+  const workerHandoffRes = await recordHandoffFor(registeredTools, reportBoundRun, { agent: "team/worker", taskId: "R1" })
+  const boundReportRes = await registeredTools.report.execute(
+    { sessionId: reportBoundRun, taskId: "R1", status: "PASS", summary: "Worker handoff exists." },
+    { sessionID: "ses_fixture_verifier" },
+  )
+  assert.strictEqual(boundReportRes.report?.status, "PASS", `a bound report must be written: ${boundReportRes.content}`)
+  assert.deepStrictEqual(
+    boundReportRes.report?.workerHandoff,
+    {
+      taskId: "R1",
+      agent: "team/worker",
+      path: "handoffs/R1-worker.md",
+      sha256: sha256Hex(readFileSync(join(testDir, ".opencode", "teamwork", reportBoundRun, "handoffs", "R1-worker.md"), "utf8")),
+    },
+    "the report must bind the worker handoff path and body hash from the index",
+  )
+  assert.strictEqual(boundReportRes.report?.workerHandoff?.sha256, workerHandoffRes.sha256, "the binding must use the recorded index hash")
+
+  // Re-recording the worker handoff changes its bytes, so the old report is stale.
+  await recordHandoffFor(registeredTools, reportBoundRun, { agent: "team/worker", taskId: "R1", conclusion: "Reworked narrative." })
+  const staleReportFinal = await registeredTools.final_verify.execute({ sessionId: reportBoundRun })
+  assert.strictEqual(staleReportFinal.status, "FAIL", "a re-recorded worker handoff must stale the report")
+  assert(
+    staleReportFinal.reasons.some((r) => r.includes("[REPORT_HANDOFF_STALE]") && r.includes("R1")),
+    `the stale binding must be named: ${JSON.stringify(staleReportFinal.reasons)}`,
+  )
+
+  const boundSeedRun = "20261018-000000-ev-report-pass"
+  await seedVerifiedRun(boundSeedRun, ["R2"], { request: "Deliver the bound-report PASS fixture." })
+  const boundSeedFinal = await registeredTools.final_verify.execute({ sessionId: boundSeedRun })
+  assert.strictEqual(boundSeedFinal.status, "PASS", `a consistent binding must PASS: ${boundSeedFinal.content}`)
+  const boundSeedReport = JSON.parse(readFileSync(evidenceReportFile(boundSeedRun, "R2"), "utf8"))
+  assert(
+    boundSeedReport.workerHandoff && /^[0-9a-f]{64}$/.test(boundSeedReport.workerHandoff.sha256),
+    "a fixture report must carry the worker handoff binding",
+  )
+
+  console.log("✓ report binds the worker handoff, refuses a missing one, and a re-recorded handoff stales the report")
+
+  // ==========================================
   // Part 1c-ter-strict: opt-in strict verification wave
   // ==========================================
   console.log("Testing opt-in strict verification wave...")
@@ -2105,11 +2288,9 @@ try {
   const reworkFirstFinal = await registeredTools.final_verify.execute({ sessionId: strictReworkRun })
   assert.strictEqual(reworkFirstFinal.status, "PASS", `the original report must pass: ${reworkFirstFinal.content}`)
 
-  await writeSignedFixture(testDir, strictReworkRun, "verify/report-RH1.json", {
-    taskId: "RH1",
-    status: "PASS",
+  await writePassReport(registeredTools, strictReworkRun, "RH1", {
+    summary: "Reworked behavior: the report was rewritten for the second round.",
     checks: [{ name: "reworked behavior", type: "programmatic", passed: true }],
-    timestamp: "2026-11-22T00:00:00.000Z",
   })
   const reworkedReportText = readFileSync(reportFileOf(strictReworkRun, "RH1"), "utf8")
   assert.notStrictEqual(reworkedReportText, originalReportText, "the fixture must actually change the report bytes")
@@ -2141,7 +2322,7 @@ try {
   const reworkSameHash = await recordWave(strictReworkRun, "RH1", "challenge", "PASS", "team/falsifier")
   assert(/write-once/.test(reworkSameHash.content), `re-recording the same report must be refused: ${reworkSameHash.content}`)
   await seedStrictHandoffs(registeredTools, strictReworkRun, ["RH1"])
-  await seedHandoffMatrix(registeredTools, strictReworkRun, ["RH1"])
+  await seedHandoffMatrix(registeredTools, strictReworkRun, ["RH1"], { workers: false })
   const reworkSecondFinal = await registeredTools.final_verify.execute({ sessionId: strictReworkRun })
   assert.strictEqual(reworkSecondFinal.status, "PASS", `the re-recorded wave must pass: ${reworkSecondFinal.content}`)
   const reworkFinalJson = JSON.parse(readFileSync(finalFileOf(strictReworkRun), "utf8"))
@@ -3930,6 +4111,13 @@ try {
         const res = await tools.task_update.execute({ sessionId, taskId, status })
         assert(!res.content.startsWith("Error:"), `task_update ${taskId}->${status} failed: ${res.content}`)
       }
+      // 0.12.0: a PASS report binds the assigned worker's handoff by hash, so
+      // record it before the report (the verifier/falsifier pairs come later).
+      const docPlan = JSON.parse(readFileSync(join(docRoot, ".opencode", "teamwork", sessionId, "plan.dag.json"), "utf8"))
+      const assigned = docPlan?.tasks?.find((t) => t?.id === taskId)?.agent ?? "team/worker"
+      await recordHandoffFor(tools, sessionId, { agent: assigned, taskId })
+      const docRunDir = join(docRoot, ".opencode", "teamwork", sessionId)
+      const docBinding = readWorkerHandoffBinding(docRunDir, taskId, assigned)
       await writeSignedFixture(docRoot, sessionId, `verify/report-${taskId}.json`, {
         taskId,
         verifierAgent: "team/verifier",
@@ -3937,6 +4125,7 @@ try {
         summary: `Segment ${taskId} reviewed against the rubric.`,
         checks: [{ name: "rubric", type: "rubric", passed: true }],
         fatalFindings: [],
+        ...(docBinding.binding ? { workerHandoff: docBinding.binding } : {}),
       })
       const pass = await tools.task_update.execute({
         sessionId,
@@ -4068,6 +4257,7 @@ try {
         "seg-03": "team/segment-reviewer",
         "doc-synthesis": "team/synthesizer",
       },
+      workers: false,
     })
     const fvPass = await tools.final_verify.execute({ sessionId: mdRun, summary: "Verified all segments." })
     assert.strictEqual(fvPass.status, "PASS", `final_verify must PASS: ${fvPass.content}`)
@@ -5134,7 +5324,7 @@ try {
       assert.strictEqual(finalObj.evidence.tournament.refereeAgent, "team/referee")
 
       const nextDone = await tools9.next.execute({ sessionId: sid })
-      assert.strictEqual(nextDone.status, "ALL_PASSED")
+      assert.strictEqual(nextDone.status, "ALL_PASSED", `tournament completion must reach ALL_PASSED: ${nextDone.content}`)
       assert.strictEqual(nextDone.stamped, true)
 
       // mF4f: a stamped PASS must not outlive the tournament evidence it rested on.
@@ -7285,7 +7475,7 @@ process.exit(0);
       refreshRunBriefing(run)
       text = readFileSync(briefingFile, "utf8")
       assert(
-        text.includes("- Victory: CONFIRMED (unverified envelope)"),
+        text.includes("- Victory: CONFIRMED (unverified envelope; stale or unbound evidence)"),
         `an unsigned victory must be labelled unverified: ${text}`,
       )
       assert(!text.includes("- Victory: CONFIRMED\n"), "an unsigned victory must not render as plain CONFIRMED")
@@ -7312,6 +7502,8 @@ process.exit(0);
     // Ordered transitions: each status is only reachable from the previous one.
     await tools.task_update.execute({ sessionId: sid, taskId: "T1", status: "worker_done" })
     await tools.task_update.execute({ sessionId: sid, taskId: "T1", status: "verifier_active" })
+    // 0.12.0: a PASS report binds the worker handoff that preceded it.
+    await recordHandoffFor(tools, sid, { agent: "team/worker", taskId: "T1" })
     await writePassReport(tools, sid, "T1", {
       checks: [{ name: "fixture", passed: true }],
     })
@@ -8841,8 +9033,11 @@ process.exit(0);
         const dir = runDirOf(runId)
         mkdirSync(join(dir, "verify"), { recursive: true })
         writeFileSync(join(dir, "verify", "report-T1.json"), JSON.stringify({ status: "PASS" }) + "\n")
-        await recordHandoffFor(authTools, runId, { agent: "team/worker", taskId: "T1" })
+        // Record the verifier entry before the worker entry so this auth fixture
+        // exercises index signatures, not the 0.12.0 verifier→worker citation
+        // (which would go stale when a test rewrites the worker body).
         await recordHandoffFor(authTools, runId, { agent: "team/verifier", taskId: "T1" })
+        await recordHandoffFor(authTools, runId, { agent: "team/worker", taskId: "T1" })
         await recordHandoffFor(authTools, runId, { agent: "team/sentinel" })
         return dir
       }
