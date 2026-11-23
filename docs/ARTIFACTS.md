@@ -472,7 +472,7 @@ Keep it short and evidence-first; never assert a PASS you did not observe.
 The plugin provides deterministic orchestration tools for the Sentinel coordinator:
 - `teamwork_plan`: Creates the run directory and writes `plan.dag.json`, `state.json` and `costs.json`. It is gated on a spec by default (`requireSpec`, see below). `skipInterview` is the explicit, recorded bypass. `verification` selects `standard` (default, unchanged) or `strict` (per-task falsifier challenge + security-auditor audit); it is persisted in both artifacts and a re-plan cannot change it.
 - `teamwork_route`: Deterministic read-only route classifier checking `document-review` FIRST (before Math/Proof) when a supplied document has critique intent while rejecting PR/code reviews, bare filenames without supplied docs, and problem-solving/coding tasks.
-- `teamwork_document_triage`: Validates bounds (`maxSegments <= 8`, `reviewTreeShape <= [4,2,1]`, `synthTreeShape <= [4,1]`), path containment (`realpathSync` + `O_NOFOLLOW`), URL/inline limits, and PDF headers **before** creating any directory, ingests and partitions the document into `seg-01`..`seg-0K` + `doc-synthesis`, and writes `document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}`.
+- `teamwork_document_triage`: Validates bounds (`maxSegments <= 8`, `reviewTreeShape <= [4,2,1]`, `synthTreeShape <= [4,1]`), path containment (`realpathSync` + `O_NOFOLLOW`), URL/inline limits, and PDF headers **before** creating any directory, ingests and partitions the document into `seg-01`..`seg-0K` + `doc-synthesis`, and writes `document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}`. A `document.url` is fetched only through the SSRF guard: http/https only, public addresses only, pinned DNS, no automatic redirects, 3 s timeout, 16 MiB cap (see “URL network policy” below).
 - `teamwork_document_record`: Persists bounded RSA node outputs (`level-<L>-node-<I>.json`), `unit-report.md`, `synthesis/candidate-<I>.md`, and `DOCUMENT_REVIEW_REPORT.md` with `SEGMENT_ID` allowlist, manifest bounds, symlink refusal, and `clean()`/`cleanBlock()` sanitisation.
 - `teamwork_next`: Evaluates the DAG dependencies against current task lifecycle statuses. Categorizes tasks into `readyForWorker`, `readyForVerifier`, `inProgress`, or terminal conditions (`ALL_TASKS_PASSED` / `DEADLOCK`). Completion additionally requires a stamped `verify/final.json` from `teamwork_final_verify` (unless the caller passes the recorded `allowUnstamped: true` legacy bypass) **and** a `CONFIRMED` `verify/victory.json` bound to the current `ORIGINAL_REQUEST.md`, unless the plan explicitly recorded `victoryAudit: "skip"`. On a signed run the final verdict, security audit, reports, victory verdict, and strict-wave verdicts must all verify against their `_auth` envelopes and digest-index entries; any evidence changed since `final_verify` returns `AUTH_STALE`. An unsigned legacy run returns `AUTH_LEGACY` until `allowUnsignedLegacy: true` is passed (recorded as an event). Before a confirmed verdict it returns `READY_FOR_VICTORY_AUDIT` (or `BLOCKED_BY_VICTORY_AUDIT` for a rejection). In strict mode it returns `NEEDS_STRICT_WAVE` / `BLOCKED_BY_STRICT_WAVE` first, listing the missing `taskId:kind` pairs, and never returns `ALL_PASSED` without both per-task verdicts.
 - `teamwork_task_update`: Enforces deterministic state transitions, tracks worker branch names and diff summaries, updates verifier metrics, and advances run `phase` to `MERGE` or `PRESENT_PARTIAL`.
@@ -523,11 +523,25 @@ The block list is deliberately **narrow**:
 
 Path checks report `READY` (with `file`/`dir`) when the path exists and
 `MISSING` otherwise. URL checks record `UNCHECKED` when `checkUrls` is false
-(the default); with `checkUrls: true` each URL gets one `HEAD` request with a
-3 s timeout and is `READY` on 2xx/3xx or `OUTAGE` on any other status, error or
-timeout. The overall status is `OUTAGE` if any check is an outage, else
+(the default); with `checkUrls: true` each URL is first validated by the SSRF
+guard (`url-guard.ts`), then gets one `HEAD` request with a 3 s timeout and is
+`READY` on 2xx/3xx or `OUTAGE` on any other status, error or timeout. A URL whose
+hostname resolves to loopback/private/link-local/metadata (or any other
+non-public address) is `OUTAGE` before a connection is made; a 3xx `Location` is
+validated too, so a redirect cannot point at a blocked address. Redirects are
+not followed. The overall status is `OUTAGE` if any check is an outage, else
 `MISSING` if any **blocking** item is missing, else `READY`. Advisory misses
 never change the overall status.
+
+**URL network policy.** Plugin URL ingress accepts only `http`/`https` and
+rejects embedded credentials. The guard resolves the hostname, rejects
+loopback, private, carrier-grade NAT, link-local (including
+`169.254.169.254`), unspecified, multicast, reserved, documentation, 6to4,
+Teredo, unique-local, and IPv4-mapped/compatible IPv6 addresses, and pins the
+connection to the validated address so a second DNS answer cannot rebind it.
+Response bodies are capped (16 MiB for document ingestion) and requests time
+out after 3 s. `OPENCODE_TEAMWORK_ALLOW_LOCALHOST=1` is an explicit
+test/development opt-in that permits loopback only; the default is deny.
 
 Three additive, optional plan inputs control the gate:
 
