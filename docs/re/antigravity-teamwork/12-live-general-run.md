@@ -1,6 +1,6 @@
 # Live General Run — One Completed Single-Cycle `/teamwork` Dispatch
 
-**Status: OBSERVED — one completed General-route run, timed out only after the gate passed.** Recorded on **2026-11-22** against the installed Antigravity CLI **1.5.14**, the same binary analysed throughout this corpus (`00-artifact-identity.md`). This document is the first runtime record in the set of a `/teamwork` invocation that **routed, decomposed, implemented, verified and gated a task end to end**. It is deliberately narrow: **one** run, one route, one milestone. It does not establish a default, a fixed gate, or a route-selection rule. The companion SWE Light run is [`13-live-swe-light-run.md`](13-live-swe-light-run.md); it selected a different route and a different gate mechanism, and was killed by a server restart before its loop closed.
+**Status: OBSERVED — one completed General-route run, timed out only after the gate passed.** Recorded on **2026-11-22** against the installed Antigravity CLI **1.5.14**, the same binary analysed throughout this corpus (`00-artifact-identity.md`). This document is the first runtime record in the set of a `/teamwork` invocation that **routed, decomposed, implemented, verified and gated a task end to end**. It is deliberately narrow: **one** run, one route, one milestone. It does not establish a default, a fixed gate, or a route-selection rule. The companion SWE Light runs are in [`13-live-swe-light-run.md`](13-live-swe-light-run.md): Run 1 was killed by a server restart before its loop closed; Run 2 completed the same loop and returned a prose `VICTORY CONFIRMED`.
 
 The run is the reference sample for four things the corpus previously held only statically or from prior state trees:
 
@@ -223,7 +223,7 @@ The prior completed run cited in `11` §5 (`5d42725e-45a3-490f-b291-e7137aedde94
 | Gate file | `orchestrator/GATE_STATUS.md` | `orchestrator/GATE_STATUS.md` |
 | Iterations | 1 | 1 |
 
-**The gate composition is not fixed.** Across these two samples it scales with scope/iteration: a single-cycle General run used the minimum independent set — **1 reviewer + 1 challenger + 1 auditor** — while the larger multi-milestone run doubled the reviewers and challengers. This is the correct statement to carry forward. It is **not** a rule, a default, or a universal template: two samples cannot establish how a LEMMA, Document Review, SWE Light or tournament gate composes, and the earlier 39-root sample showed gate files under `sub_orch_m<N>/` for milestone gates, which this run did not create. [OBSERVED composition; `INFERRED` that redundancy scales with scope; universality `UNKNOWN`]
+**The gate composition is not fixed.** Across these two samples it scales with scope/iteration: a single-cycle General run used the minimum independent set — **1 reviewer + 1 challenger + 1 auditor** — while the larger multi-milestone run doubled the reviewers and challengers. This is the correct statement to carry forward. It is **not** a rule, a default, or a universal template: two samples cannot establish how a LEMMA, Document Review or tournament gate composes; SWE Light is now observed to use a **loop rather than a row table** (`13` §4-§12), so it is not a third row count. The earlier 39-root sample showed gate files under `sub_orch_m<N>/` for milestone gates, which this run did not create. [OBSERVED composition; `INFERRED` that redundancy scales with scope; universality `UNKNOWN`]
 
 What is stable across both samples is the **rule shape**, not the row count:
 
@@ -422,25 +422,25 @@ The contrast is useful: the six-row/multi-milestone run completed its victory au
 | Succession | Threshold literal only | Rule and 6/32 counter observed; **not triggered** | `08` A20 (ADR 0003); this doc §8.4 |
 | Victory audit | One prior confirmed verdict | Gate PASS then **timeout before verdict**; prior run supplies the confirmed case | this doc §9 |
 
-The second live run adds a third data point and changes the framing: SWE Light writes no gate table at all, so the corpus must describe a **route-specific verification contract**, not only 4-row vs. 6-row counts. That is recorded in [`13`](13-live-swe-light-run.md) §9 and reflected in `11` §5.3 and `08` A9/A11.
+The SWE Light runs add a third and fourth data point and change the framing: the route writes no gate table at all, so the corpus must describe a **route-specific verification contract**, not only 4-row vs. 6-row counts. That is recorded in [`13`](13-live-swe-light-run.md) §9 and §12, and reflected in `11` §5.3 and `08` A9/A11.
 
 ### 10.1 Structured for the next run
 
-This document is the **first** entry in a two-run live series. The follow-up SWE Light run is recorded separately in [`13-live-swe-light-run.md`](13-live-swe-light-run.md); §11 below is a pointer, and the side-by-side comparison is `13` §9. Do not merge the two runs into one set of counts: the point of the series is the **difference** in route, gate mechanism and artifact set.
+This document is the **first** entry in a live series. The SWE Light runs are recorded separately in [`13-live-swe-light-run.md`](13-live-swe-light-run.md); §11 below is a pointer, and the side-by-side comparison is `13` §9 and §12.9. Do not merge the runs into one set of counts: the point of the series is the **difference** in route, gate mechanism and artifact set.
 
 ---
 
-## 11. Live SWE Light run — recorded in `13`
+## 11. Live SWE Light runs — recorded in `13`
 
-The SWE Light run began on the same binary and the same `[skip-interview]` request shape, selected `teamwork_swe`, wrote **no `GATE_STATUS.md`**, **no `PROJECT.md`** and **no handoffs**, and gated on a sequential `teamwork_implementer` → `teamwork_reviewer` loop. It was killed by a server restart in Round 2 before the loop closed or the victory auditor was dispatched.
+Both SWE Light runs began on the same binary and the same `[skip-interview]` request shape, selected `teamwork_swe`, wrote **no `GATE_STATUS.md`** and gated on a sequential `teamwork_implementer` → `teamwork_reviewer` loop. Run 1 was killed by a server restart in Round 2 before the loop closed; Run 2 completed the loop, passed a three-phase victory audit and returned a prose `VICTORY CONFIRMED`.
 
-Read [`13-live-swe-light-run.md`](13-live-swe-light-run.md) for the identity, timeline, missing-handoff caveat, termination analysis and the General-vs-SWE-Light comparison. This section is deliberately only a pointer so the General record above stays self-contained.
+Read [`13-live-swe-light-run.md`](13-live-swe-light-run.md) for both identities, timelines, the missing-handoff/sandbox caveat, termination analysis and the General-vs-SWE-Light comparison. This section is deliberately only a pointer so the General record above stays self-contained.
 
 ---
 
 ## 12. Limits
 
-- One General run. It does not show what a completed SWE Light loop (`13` stops mid-loop), Document Review, LEMMA, Math/Proof or a multi-milestone General run would write.
+- One General run. It does not show what Document Review, LEMMA, Math/Proof or a multi-milestone General run would write. The SWE Light runs are in `13`: Run 1 stopped mid-loop, Run 2 completed the loop and returned a prose verdict.
 - The top-level model and the teamwork models differ (§1.1); which tier the route or the harness selected is `UNKNOWN`.
 - The command's argv is reconstructed, not recorded (§2.1). The prompt length and each flag are observed; the exact flag order and quoting are `INFERRED`.
 - The `[skip-interview]` → no-interview causality is `INFERRED` from absence; there is no log line naming the token as the cause.
