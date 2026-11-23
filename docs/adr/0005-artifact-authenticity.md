@@ -130,6 +130,15 @@ Protected against a run-dir-only writer:
 5. **Transparency log / append-only remote witness** for the digest index,
    making storage tampering detectable after the fact.
 
+> **Phase B assessment (2026-11-22).** `docs/adr/0006-artifact-trust-isolation.md`
+> evaluates these options against the same-UID shell on the review host. It
+> finds that a bare separate-UID signer (option 2) is a signing oracle, that an
+> OS keychain is not a UID boundary, and that `ctx.permission.assert` is
+> auto-approvable. It recommends accepting and documenting the Phase A boundary
+> for Sprint 2.1, and records a human-presence gate or an independent verifier
+> as the missing primitive. This pointer does not change the Phase A decision
+> above.
+
 The Phase A HMAC envelope, canonical encoding, path binding, digest index, and
 manifest schema are deliberately compatible with Phase B: moving to Ed25519 or a
 helper process changes the key holder and MAC/signature algorithm, not the
