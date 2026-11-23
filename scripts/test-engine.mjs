@@ -2267,6 +2267,156 @@ try {
 
   console.log("✓ a verifier handoff cites worker + report; a changed worker handoff makes it stale")
 
+  console.log("Testing evidence contradiction detection...")
+
+  // 1. CONFIRMED victory while a task fails.
+  const contraVictoryRun = "20261018-000000-ev-contra-victory"
+  await seedVerifiedRun(contraVictoryRun, ["C1"], { request: "Deliver the contradictory-victory fixture." })
+  const contraStateFile = join(testDir, ".opencode", "teamwork", contraVictoryRun, "state.json")
+  const contraState = JSON.parse(readFileSync(contraStateFile, "utf8"))
+  contraState.tasks.C1.status = "verified_fail"
+  writeFileSync(contraStateFile, JSON.stringify(contraState, null, 2) + "\n")
+  const contraVictoryNext = await registeredTools.next.execute({ sessionId: contraVictoryRun })
+  assert.strictEqual(contraVictoryNext.status, "INCONSISTENT_EVIDENCE", `next must refuse the contradiction: ${contraVictoryNext.content}`)
+  assert.deepStrictEqual(contraVictoryNext.contradictions.map((c) => c.code), ["INCONSISTENT_VICTORY_TASK"])
+  const contraVictoryFinal = await registeredTools.final_verify.execute({ sessionId: contraVictoryRun })
+  assert.strictEqual(contraVictoryFinal.status, "FAIL")
+  assert(
+    contraVictoryFinal.reasons.some((r) => r.includes("[INCONSISTENT_VICTORY_TASK]")),
+    `final_verify must name the code: ${JSON.stringify(contraVictoryFinal.reasons)}`,
+  )
+
+  // 2. CLEAN audit while a High finding exists.
+  const contraAuditRun = "20261018-000000-ev-contra-audit"
+  await seedVerifiedRun(contraAuditRun, ["C2"], {
+    request: "Deliver the contradictory-audit fixture.",
+    victoryAudit: "skip",
+    victorySkipReason: "fixture: contradiction audit test skips victory",
+    stampVictory: false,
+  })
+  const contraAuditPayload = JSON.parse(readFileSync(evidenceAuditFile(contraAuditRun), "utf8"))
+  delete contraAuditPayload._auth
+  contraAuditPayload.status = "PASS"
+  contraAuditPayload.severityCounts = { ...(contraAuditPayload.severityCounts ?? {}), high: 1 }
+  contraAuditPayload.findings = [
+    { id: "SEC-9", severity: "High", location: "src/core.ts:9", description: "forged PASS with a High finding" },
+  ]
+  await writeSignedFixture(testDir, contraAuditRun, "verify/security-audit.json", contraAuditPayload)
+  const contraAuditNext = await registeredTools.next.execute({ sessionId: contraAuditRun })
+  assert.strictEqual(contraAuditNext.status, "INCONSISTENT_EVIDENCE", `next must refuse PASS+High: ${contraAuditNext.content}`)
+  assert(contraAuditNext.contradictions.some((c) => c.code === "INCONSISTENT_AUDIT_HIGH"))
+
+  // 4. A wave PASS bound to the current hash of a FAIL report.
+  const contraWaveRun = "20261018-000000-ev-contra-wave"
+  await seedVerifiedRun(contraWaveRun, ["C4"], {
+    request: "Deliver the contradictory-wave fixture.",
+    victoryAudit: "skip",
+    victorySkipReason: "fixture: contradiction wave test skips victory",
+    verification: "strict",
+    stampVictory: false,
+  })
+  await writeSignedFixture(testDir, contraWaveRun, "verify/report-C4.json", {
+    taskId: "C4",
+    status: "FAIL",
+    summary: "The behavior is absent.",
+    checks: [{ name: "behavior", type: "check", passed: false }],
+  })
+  const contraWaveReportText = readFileSync(evidenceReportFile(contraWaveRun, "C4"), "utf8")
+  await writeSignedFixture(testDir, contraWaveRun, "verify/security-audit.json", {
+    sessionId: contraWaveRun,
+    integrityMode: "development",
+    status: "PASS",
+    timestamp: new Date().toISOString(),
+    severityCounts: { critical: 0, high: 0, medium: 0, low: 0 },
+    summary: "",
+    findings: [],
+    integrityFindings: [],
+    integrityViolations: [],
+    ruleChecks: [{ rule: "fabricated_output", result: "clean" }],
+    reviewedDigests: (() => {
+      const digests = JSON.parse(readFileSync(evidenceAuditFile(contraWaveRun), "utf8")).reviewedDigests
+      return { reports: { C4: sha256Hex(contraWaveReportText) }, final: digests.final }
+    })(),
+  })
+  await writeSignedFixture(testDir, contraWaveRun, "verify/challenge-C4.json", {
+    version: 1,
+    sessionId: contraWaveRun,
+    taskId: "C4",
+    kind: "challenge",
+    verdict: "PASS",
+    agent: "team/falsifier",
+    agentSessionId: "ses_contra_wave",
+    reportHash: citeSha256(contraWaveReportText),
+    cites: [],
+    notes: "",
+    evidence: "",
+    generatedAt: new Date().toISOString(),
+  })
+  const contraWaveNext = await registeredTools.next.execute({ sessionId: contraWaveRun })
+  assert.strictEqual(contraWaveNext.status, "INCONSISTENT_EVIDENCE", `next must refuse a wave against FAIL: ${contraWaveNext.content}`)
+  assert(contraWaveNext.contradictions.some((c) => c.code === "INCONSISTENT_WAVE_REPORT"))
+
+  // 3. A PASS report whose recorded head no longer matches the verified branch.
+  const contraGitRoot = mkdtempSync(join(tmpdir(), "teamwork-evidence-git-"))
+  const git = (...args) => execFileSync(GIT_BIN, args, { cwd: contraGitRoot, encoding: "utf8" }).trim()
+  git("init", "-q")
+  git("config", "user.email", "fixture@example.com")
+  git("config", "user.name", "Fixture")
+  writeFileSync(join(contraGitRoot, "README.md"), "base\n")
+  git("add", "-A")
+  git("commit", "-qm", "base")
+  const gitTools = await makeToolsFor(contraGitRoot)
+  const contraBranchRun = "20261018-000000-ev-contra-branch"
+  await gitTools.plan.execute(
+    {
+      sessionId: contraBranchRun,
+      topology: "iterative-coding",
+      skipInterview: true,
+      victoryAudit: "skip",
+      victorySkipReason: "fixture: contradiction branch test skips victory",
+      requireHandoffs: "skip",
+      tasks: [{ id: "C3" }],
+    },
+    { sessionID: FIXTURE_ROOT_SESSION },
+  )
+  const contraBranch = `teamwork/${contraBranchRun}-C3`
+  git("checkout", "-qb", contraBranch)
+  for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+    await gitTools.task_update.execute({ sessionId: contraBranchRun, taskId: "C3", status }, { sessionID: FIXTURE_ROOT_SESSION })
+  }
+  const contraBranchReport = await gitTools.report.execute(
+    { sessionId: contraBranchRun, taskId: "C3", status: "PASS", summary: "Bound to the current head." },
+    { sessionID: "ses_fixture_verifier" },
+  )
+  assert.strictEqual(contraBranchReport.report?.status, "PASS", contraBranchReport.content)
+  assert(/^[0-9a-f]{40}$/.test(contraBranchReport.report?.headSha ?? ""), "the report must record the git head")
+  await gitTools.task_update.execute(
+    { sessionId: contraBranchRun, taskId: "C3", status: "verified_pass", verification: { status: "PASS" } },
+    { sessionID: FIXTURE_ROOT_SESSION },
+  )
+  await gitTools.security_audit.execute({ sessionId: contraBranchRun, status: "PASS", findings: [] }, { sessionID: "ses_fixture_security_auditor" })
+  writeFileSync(join(contraGitRoot, "README.md"), "base\nmoved\n")
+  git("add", "-A")
+  git("commit", "-qm", "move the branch after the report")
+  const contraBranchNext = await gitTools.next.execute({ sessionId: contraBranchRun })
+  assert.strictEqual(contraBranchNext.status, "INCONSISTENT_EVIDENCE", `next must refuse a moved branch: ${contraBranchNext.content}`)
+  assert(contraBranchNext.contradictions.some((c) => c.code === "INCONSISTENT_REPORT_BRANCH"))
+  const contraBranchFinal = await gitTools.final_verify.execute({ sessionId: contraBranchRun })
+  assert.strictEqual(contraBranchFinal.status, "FAIL")
+  assert(
+    contraBranchFinal.reasons.some((r) => r.includes("[INCONSISTENT_REPORT_BRANCH]")),
+    `final_verify must name the moved branch: ${JSON.stringify(contraBranchFinal.reasons)}`,
+  )
+  rmSync(contraGitRoot, { recursive: true, force: true })
+
+  // A consistent set still passes.
+  const contraCleanRun = "20261018-000000-ev-contra-clean"
+  await seedVerifiedRun(contraCleanRun, ["C5"], { request: "Deliver the consistent fixture." })
+  const contraCleanNext = await registeredTools.next.execute({ sessionId: contraCleanRun })
+  assert.notStrictEqual(contraCleanNext.status, "INCONSISTENT_EVIDENCE", `a consistent set must not be refused: ${contraCleanNext.content}`)
+
+  console.log("✓ contradiction codes name victory/task, report/branch, audit/High, and wave/FAIL conflicts; clean sets pass")
+
   // ==========================================
   // Part 1c-ter-strict: opt-in strict verification wave
   // ==========================================
