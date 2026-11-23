@@ -11,6 +11,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Release-tag provenance guard: `scripts/check-release-tag.mjs` fetches tags and
   refuses to publish a `v*` tag whose commit is not an ancestor of `origin/main`;
   `publish.yml` runs it before publish with full history/tags, only on tag pushes.
+- **Artifact authenticity (Phase A, ADR 0005).** `teamwork_plan` writes a signed `run.manifest.json` baseline (modes + request/requirements/plan/LEMMA-policy hashes). Verifier reports, security audit, strict-wave verdicts, victory verdict, and final verdict carry canonical-JSON HMAC-SHA256 `_auth` envelopes and a digest index in `ctx.storage` (`auth/run/<runId>/<relPath>`, key ring at `auth/key/ring`). `teamwork_report` is the trusted signed writer for `verify/report-<taskId>.json`. `teamwork_victory_audit`, `teamwork_wave_record`, and `teamwork_report` require the caller session to descend from the plan-time `rootSessionId`.
+- `OPENCODE_TEAMWORK_HMAC_KEY` (base64url 32 bytes) and `OPENCODE_TEAMWORK_HMAC_KEY_ID` for CI/offline runs.
 
 ### Changed
 
@@ -22,6 +24,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every `team/*` agent, not only worker/verifier, and is resolved from per-task
   `spec.json` as well as `prompt_draft.md`. `shell` network access remains
   honor-system.
+- `teamwork_final_verify`/`teamwork_next` verify signatures and the signed baseline: a forged/copied/edited artifact fails as `AUTH_MISSING`, `AUTH_INVALID`, `AUTH_UNKNOWN_KEY`, `AUTH_INDEX_MISSING`, or `AUTH_STALE`, and a `strict→standard`/`required→skip`/integrity-mode downgrade is refused. Unsigned legacy runs return `AUTH_LEGACY` until an explicit, recorded `allowUnsignedLegacy` bypass; `benchmark` refuses that bypass and `victoryAudit: "skip"`.
+- Standalone CLI readers label authenticity as `signed`/`unsigned`/`unknown` by envelope presence only; they cannot verify and do not claim to.
 
 ### Notes
 

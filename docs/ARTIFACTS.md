@@ -13,6 +13,7 @@ Every run writes under one root:
 ├── prompt_draft.md          # spec (from the crafter, or inlined by the sentinel); required by teamwork_plan unless bypassed
 ├── ORIGINAL_REQUEST.md      # verbatim routed request + integrity mode (write-once; absent on legacy runs)
 ├── requirements.json        # plan-time requirements baseline (caller or request-derived; absent when neither exists)
+├── run.manifest.json        # signed baseline: modes + request/requirements/plan/policy hashes (_auth)
 ├── plan.dag.json            # task DAG (+ preflight gate result + verification/victoryAudit modes)
 ├── preflight.json           # input-checks report (written by teamwork_preflight)
 ├── state.json               # resumable coordinator state
@@ -177,6 +178,84 @@ plan records `victoryAudit: "skip"` explicitly.
 - **Immutable once written.** A re-plan with a different baseline is refused;
   the same baseline is idempotent. This stops a confirmed verdict from being
   invalidated by editing the requirements afterwards.
+
+### `run.manifest.json` — signed completion baseline (ADR 0005)
+
+Written by `teamwork_plan` for a signed run (the default). It pins the run's
+modes and the hashes a later gate recomputes, so a control-plane downgrade is
+`AUTH_STALE` rather than accepted:
+
+```json
+{
+  "version": 1,
+  "sessionId": "20261122-120000-abcd",
+  "rootSessionId": "ses_...",
+  "integrityMode": "development|demo|benchmark",
+  "verification": "standard|strict",
+  "victoryAudit": "required|skip",
+  "requestHash": "sha256 | null",
+  "requirementsHash": "sha256 | null",
+  "planHash": "sha256",
+  "lemmaPolicyHash": "sha256 | null",
+  "runKeyId": "k_...",
+  "createdAt": "2026-11-22T12:00:00.000Z",
+  "_auth": {
+    "v": 1,
+    "alg": "hmac-sha256",
+    "keyId": "k_...",
+    "path": "run.manifest.json",
+    "digest": "sha256",
+    "mac": "sha256",
+    "at": "2026-11-22T12:00:00.000Z"
+  }
+}
+```
+
+- `rootSessionId` is the plan-time caller session. `teamwork_victory_audit`,
+  `teamwork_wave_record`, and `teamwork_report` require the caller session to
+  be a strict descendant of it (walked through `parentID`, bounded, fail closed).
+- `planHash` covers the semantic plan (topology, modes, route, LEMMA bounds,
+  tasks), not formatting or `routingReason`.
+- A re-plan must present the same modes and hashes. `final_verify`/`next`
+  return `AUTH_STALE` if `plan.dag.json`, `state.json`, `ORIGINAL_REQUEST.md`,
+  `requirements.json`, or the LEMMA policy diverges from the manifest.
+- **Legacy:** `allowUnsignedLegacy: true` at plan time creates/keeps an
+  unsigned run. Its completion gates return `AUTH_LEGACY` until the caller
+  explicitly passes `allowUnsignedLegacy: true`; that bypass is recorded as a
+  `legacy_unsigned_bypass` event. `benchmark` refuses the bypass and refuses
+  `victoryAudit: "skip"`.
+
+### `_auth` envelopes and the digest index (ADR 0005)
+
+Every signed control-plane artifact carries an `_auth` object in addition to its
+normal fields:
+
+| Field | Meaning |
+| --- | --- |
+| `v` | envelope version (`1`) |
+| `alg` | `hmac-sha256` |
+| `keyId` | key used (current or one of up to two previous keys) |
+| `path` | exact run-relative path; a copied envelope fails |
+| `digest` | sha256 of `canonicalJson(payload without _auth)` |
+| `mac` | HMAC-SHA256 over the envelope without `mac` |
+| `at` | ISO-8601 timestamp |
+
+The plugin also writes `ctx.storage` key `auth/run/<runId>/<relPath>` with the
+same `path`/`digest`/`keyId`/`mac`/`at`. A signed run fails closed when the
+index entry is missing (`AUTH_INDEX_MISSING`) or stale (`AUTH_STALE`); an old
+artifact is never auto-adopted. The key ring lives at `auth/key/ring`
+(`{version: 1, keys: [...]}`), current + up to two previous keys. A malformed
+ring is `AUTH_KEY_CORRUPT` and is never silently rotated. CI/offline can set
+`OPENCODE_TEAMWORK_HMAC_KEY` (base64url, 32 bytes) and
+`OPENCODE_TEAMWORK_HMAC_KEY_ID`.
+
+Failure vocabulary: `AUTH_UNAVAILABLE`, `AUTH_KEY_CORRUPT`, `AUTH_MISSING`,
+`AUTH_INVALID`, `AUTH_UNKNOWN_KEY`, `AUTH_INDEX_MISSING`, `AUTH_STALE`,
+`AUTH_LEGACY`.
+
+> **Boundary.** A same-UID shell with read access to `opencode.db` / the plugin
+> KV store can read the key. Phase A makes a run-dir-only forgery evident; it
+> does not isolate the key. See `docs/adr/0005-artifact-authenticity.md`.
 
 ### `spec.json` — one per dispatched worker (written by the sentinel)
 
@@ -395,11 +474,12 @@ The plugin provides deterministic orchestration tools for the Sentinel coordinat
 - `teamwork_route`: Deterministic read-only route classifier checking `document-review` FIRST (before Math/Proof) when a supplied document has critique intent while rejecting PR/code reviews, bare filenames without supplied docs, and problem-solving/coding tasks.
 - `teamwork_document_triage`: Validates bounds (`maxSegments <= 8`, `reviewTreeShape <= [4,2,1]`, `synthTreeShape <= [4,1]`), path containment (`realpathSync` + `O_NOFOLLOW`), URL/inline limits, and PDF headers **before** creating any directory, ingests and partitions the document into `seg-01`..`seg-0K` + `doc-synthesis`, and writes `document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}`.
 - `teamwork_document_record`: Persists bounded RSA node outputs (`level-<L>-node-<I>.json`), `unit-report.md`, `synthesis/candidate-<I>.md`, and `DOCUMENT_REVIEW_REPORT.md` with `SEGMENT_ID` allowlist, manifest bounds, symlink refusal, and `clean()`/`cleanBlock()` sanitisation.
-- `teamwork_next`: Evaluates the DAG dependencies against current task lifecycle statuses. Categorizes tasks into `readyForWorker`, `readyForVerifier`, `inProgress`, or terminal conditions (`ALL_TASKS_PASSED` / `DEADLOCK`). Completion additionally requires a stamped `verify/final.json` from `teamwork_final_verify` (unless the caller passes the recorded `allowUnstamped: true` legacy bypass) **and** a `CONFIRMED` `verify/victory.json` bound to the current `ORIGINAL_REQUEST.md`, unless the plan explicitly recorded `victoryAudit: "skip"`. Before a confirmed verdict it returns `READY_FOR_VICTORY_AUDIT` (or `BLOCKED_BY_VICTORY_AUDIT` for a rejection). In strict mode it returns `NEEDS_STRICT_WAVE` / `BLOCKED_BY_STRICT_WAVE` first, listing the missing `taskId:kind` pairs, and never returns `ALL_PASSED` without both per-task verdicts.
+- `teamwork_next`: Evaluates the DAG dependencies against current task lifecycle statuses. Categorizes tasks into `readyForWorker`, `readyForVerifier`, `inProgress`, or terminal conditions (`ALL_TASKS_PASSED` / `DEADLOCK`). Completion additionally requires a stamped `verify/final.json` from `teamwork_final_verify` (unless the caller passes the recorded `allowUnstamped: true` legacy bypass) **and** a `CONFIRMED` `verify/victory.json` bound to the current `ORIGINAL_REQUEST.md`, unless the plan explicitly recorded `victoryAudit: "skip"`. On a signed run the final verdict, security audit, reports, victory verdict, and strict-wave verdicts must all verify against their `_auth` envelopes and digest-index entries; any evidence changed since `final_verify` returns `AUTH_STALE`. An unsigned legacy run returns `AUTH_LEGACY` until `allowUnsignedLegacy: true` is passed (recorded as an event). Before a confirmed verdict it returns `READY_FOR_VICTORY_AUDIT` (or `BLOCKED_BY_VICTORY_AUDIT` for a rejection). In strict mode it returns `NEEDS_STRICT_WAVE` / `BLOCKED_BY_STRICT_WAVE` first, listing the missing `taskId:kind` pairs, and never returns `ALL_PASSED` without both per-task verdicts.
 - `teamwork_task_update`: Enforces deterministic state transitions, tracks worker branch names and diff summaries, updates verifier metrics, and advances run `phase` to `MERGE` or `PRESENT_PARTIAL`.
-- `teamwork_victory_audit`: Records the independent final acceptance verdict from `team/victory-auditor`. Only a trusted session whose agent resolves to `team/victory-auditor` may call it; there is no caller-supplied `agent` label. Every `requirements.json` id must appear exactly once, `met: true` needs non-empty evidence, and `VICTORY CONFIRMED` needs a current `ORIGINAL_REQUEST.md` (the verdict stores its sha256). Writes `verify/victory.json`; a confirmed verdict is write-once.
+- `teamwork_report`: Trusted writer for `verify/report-<taskId>.json`. Only a session whose trusted agent resolves to `team/verifier` and that descends from the run's `rootSessionId` may call it; the task must exist in `plan.dag.json`, and a `PASS` needs a summary or at least one check. The report is signed for a signed run; `final_verify` requires that signature. A wrong agent, missing task, or evidence-free PASS is refused.
+- `teamwork_victory_audit`: Records the independent final acceptance verdict from `team/victory-auditor`. Only a trusted session whose agent resolves to `team/victory-auditor` **and that descends from the run's `rootSessionId`** may call it; there is no caller-supplied `agent` label. Every `requirements.json` id must appear exactly once, `met: true` needs non-empty evidence, and `VICTORY CONFIRMED` needs a current `ORIGINAL_REQUEST.md` (the verdict stores its sha256 and the `requirementsHash`). Writes signed `verify/victory.json`; a confirmed verdict is write-once.
 - `teamwork_wave_record`: Strict mode only. Records one wave verdict: `kind: "challenge"` / `verdict: "PASS"` may only be written by a trusted session whose agent resolves to `team/falsifier`; `kind: "audit"` / `verdict: "CLEAN"` only by `team/security-auditor`. There is no caller-supplied `agent` label. It refuses a task absent from `plan.dag.json`, a missing/non-PASS `verify/report-<taskId>.json`, any other verdict, and a repeat recording for the same report hash. It stores the sha256 of the exact report bytes (the gate requires a match) and writes `verify/challenge-<taskId>.json` or `verify/audit-<taskId>.json` atomically, then appends a `verification_wave` event. A changed report is the only overwrite path (the previous verdict is stale).
-- `teamwork_final_verify`: Computes the run's final verdict from the artifacts on disk — every task must be `verified_pass`, every `verify/report-<taskId>.json` must be `PASS`, `verify/security-audit.json` must be `PASS`, the victory audit must be `CONFIRMED` (unless explicitly skipped), and when `document-review/manifest.json` exists, every segment's `unit-report.md` and `DOCUMENT_REVIEW_REPORT.md` must exist as non-empty regular files. In strict mode it also requires `verify/challenge-<taskId>.json` (`team/falsifier`, `PASS`) and `verify/audit-<taskId>.json` (`team/security-auditor`, `CLEAN`) for every task, then writes `GATE_STATUS.md`. It writes `verify/final.json` atomically and appends a `final_verification` event. The verdict is computed from evidence; no input can turn a failing run into `PASS` (a caller-supplied `failReason` can only force `FAIL`). See [`verify/final.json`](#verifyfinaljson-final-verification-verdict).
+- `teamwork_final_verify`: Computes the run's final verdict from the artifacts on disk — every task must be `verified_pass`, every `verify/report-<taskId>.json` must be `PASS`, `verify/security-audit.json` must be `PASS`, the victory audit must be `CONFIRMED` (unless explicitly skipped), and when `document-review/manifest.json` exists, every segment's `unit-report.md` and `DOCUMENT_REVIEW_REPORT.md` must exist as non-empty regular files. On a signed run each report, audit, wave verdict, and victory verdict must verify against `_auth` + the digest index, and the current plan/request/requirements/policy hashes must match `run.manifest.json` (`AUTH_STALE` on drift). In strict mode it also requires `verify/challenge-<taskId>.json` (`team/falsifier`, `PASS`) and `verify/audit-<taskId>.json` (`team/security-auditor`, `CLEAN`) for every task, then writes `GATE_STATUS.md`. It writes signed `verify/final.json` (including `requirementsHash`, per-report digests, and the audit digest) atomically and appends a `final_verification` event. The verdict is computed from evidence; no input can turn a failing run into `PASS` (a caller-supplied `failReason` can only force `FAIL`). An unsigned legacy run returns `AUTH_LEGACY` unless `allowUnsignedLegacy: true` is explicitly passed. See [`verify/final.json`](#verifyfinaljson-final-verification-verdict).
 - `teamwork_worktree`: Isolates git worktrees outside the project repo (`setup` for sentinel and worker), inspects branch diffs (`diff`), performs clean merges into `teamwork/base-$SESSION_ID` with automatic conflict abort (`merge`), and prunes worktrees (`cleanup`).
 - `teamwork_preflight`: Re-checks the inputs named by an existing run's `ORIGINAL_REQUEST.md` (plus optional `inputs`), writes `<run>/preflight.json`, and appends a `preflight` event. It never throws and never blocks; it reports.
 
@@ -621,8 +701,9 @@ plus `agentSource` when an actor exists:
   `withFileLock` as the append, so concurrent appends cannot duplicate it.
   **Optional on legacy lines**: logs written before `seq` existed have no
   `seq`, and they remain valid.
-- `event` (string): `run_created`, `task_transition`, `security_audit`,
-  `victory_audit`, `verification_wave`, `final_verification`, `final_verification_bypass`, or `preflight`
+- `event` (string): `run_created`, `task_transition`, `verifier_report`,
+  `security_audit`, `victory_audit`, `verification_wave`, `final_verification`,
+  `final_verification_bypass`, `legacy_unsigned_bypass`, or `preflight`
 - `sessionId` (string): Run session id (≤64 chars)
 - `taskId` (string or null): Task id (≤64 chars); `null` for run-level events
 - `from` (string or null): Previous task status (≤32 chars)
@@ -641,11 +722,12 @@ plus `agentSource` when an actor exists:
 - `phase` (string or null): Run phase after the event (≤32 chars)
 - `note` (string, optional): Why a bypass was taken, what input preflight
   found, or which strict-wave verdict was recorded (≤200 chars). Emitted on
-  `final_verification_bypass`, on `teamwork_preflight`'s `preflight` event, on
-  `verification_wave`, and on `run_created` when the input-preflight gate was
-  bypassed. Every other event omits it. Sanitised with `clean()`.
+  `final_verification_bypass`, `legacy_unsigned_bypass`, on
+  `teamwork_preflight`'s `preflight` event, on `verification_wave`, and on
+  `run_created` when the input-preflight gate was bypassed. Every other event
+  omits it. Sanitised with `clean()`.
 
-The eight event kinds:
+The event kinds:
 
 - `run_created`: written by `teamwork_plan` once the run is created. `taskId` and
   `from` are `null`, `to` is `"pending"`, `round` is `0`, `phase` is `"DAG_BUILD"`.
@@ -684,6 +766,9 @@ The eight event kinds:
   are `null`, `round` is `0`, and `phase` is the run phase. `agent` is the calling
   session's agent when it could be resolved (with `agentSource: "session"`);
   otherwise it is `null` and `agentSource` is omitted.
+- `verifier_report`: written by `teamwork_report` after the signed (or legacy
+  unsigned) `verify/report-<taskId>.json` is written. `to` is `PASS` or `FAIL`;
+  `agent` is `team/verifier` with `agentSource: "session"`.
 - `final_verification_bypass`: written by `teamwork_next` when it accepts an
   **unstamped** `verify/final.json` through the explicit `allowUnstamped: true`
   bypass. `to` is `"ALL_PASSED"`, `taskId` and `from` are `null`, `round` is
@@ -692,6 +777,10 @@ The eight event kinds:
   `agentSource: "session"`), otherwise `null`. It carries a `note` explaining
   that the verdict was not produced by `teamwork_final_verify`. A stamped
   verdict never emits this event.
+- `legacy_unsigned_bypass`: written by `teamwork_final_verify`/`teamwork_next`
+  when `allowUnsignedLegacy: true` lets an unsigned run proceed. `to` is
+  `final_verify` or `"ALL_PASSED"`; the `note` states that artifact `_auth`
+  envelopes were not verified.
 
 Example (one `task_transition` line, wrapped here for readability):
 
@@ -741,19 +830,29 @@ to derived mode, with start and duration unknown.
 ```json
 {
   "taskId": "R1-impl",
-  "verifierAgent": "team/verifier",
-  "verifierModel": "<model>",
-  "timestamp": "ISO8601",
   "status": "PASS",
+  "verifierAgent": "team/verifier",
+  "verifierSessionId": "ses_abc123",
+  "timestamp": "ISO8601",
+  "summary": "Rubric and programmatic checks passed.",
   "checks": [
     { "name": "...", "type": "programmatic|adversarial|rubric", "passed": true, "output": "..." }
   ],
   "feedbackForWorker": "...",
   "fatalFindings": [
     { "where": "file:line", "why": "...", "fix": "...", "reproduction": "..." }
-  ]
+  ],
+  "evidence": "npm test tail + src/api.ts:42",
+  "requirementsHash": "<sha256 of canonical requirements.json>",
+  "_auth": { "v": 1, "alg": "hmac-sha256", "keyId": "k_...", "path": "verify/report-R1-impl.json", "digest": "sha256", "mac": "sha256", "at": "ISO8601" }
 }
 ```
+
+`teamwork_report` is the trusted writer: the caller must be `team/verifier`,
+descend from the run's `rootSessionId`, and name a task that exists in
+`plan.dag.json`. A `PASS` needs a non-empty summary or at least one check. On a
+signed run the report is signed and indexed; `final_verify` requires that
+signature. A hand-written unsigned report is `AUTH_MISSING`.
 
 ### `verify/challenge-<taskId>.json` (strict challenge verdict)
 
@@ -769,7 +868,8 @@ to derived mode, with start and duration unknown.
   "reportHash": "<sha256 of verify/report-R1-impl.json>",
   "notes": "Tried empty input, overflow, TOCTOU; no fatal or serious flaw.",
   "evidence": "verify/report-R1-impl.json + src/api.ts:42",
-  "generatedAt": "ISO8601"
+  "generatedAt": "ISO8601",
+  "_auth": { "v": 1, "alg": "hmac-sha256", "keyId": "k_...", "path": "verify/challenge-R1-impl.json", "digest": "sha256", "mac": "sha256", "at": "ISO8601" }
 }
 ```
 
@@ -787,12 +887,14 @@ to derived mode, with start and duration unknown.
   "reportHash": "<sha256 of verify/report-R1-impl.json>",
   "notes": "No Critical/High findings; no forbidden integrity rule.",
   "evidence": "npm test tail + git diff base..task",
-  "generatedAt": "ISO8601"
+  "generatedAt": "ISO8601",
+  "_auth": { "v": 1, "alg": "hmac-sha256", "keyId": "k_...", "path": "verify/audit-R1-impl.json", "digest": "sha256", "mac": "sha256", "at": "ISO8601" }
 }
 ```
 
 Both are written only by `teamwork_wave_record`. There is no caller-supplied
-agent label: the tool derives the caller from the trusted session identity and
+agent label: the tool derives the caller from the trusted session identity,
+requires the caller session to descend from the run's `rootSessionId`, and
 accepts `challenge` only from `team/falsifier` and `audit` only from
 `team/security-auditor`. The task must exist in `plan.dag.json` and its
 `verify/report-<taskId>.json` must already be `PASS`. The allowed verdicts are
@@ -840,7 +942,8 @@ since it was recorded)` failure. `GATE_STATUS.md` renders either row as `FAIL`.
       "why": "uses a third-party parser",
       "forbiddenFrom": "benchmark"
     }
-  ]
+  ],
+  "_auth": { "v": 1, "alg": "hmac-sha256", "keyId": "k_...", "path": "verify/security-audit.json", "digest": "sha256", "mac": "sha256", "at": "ISO8601" }
 }
 ```
 
@@ -869,27 +972,31 @@ If `critical` > 0 or `high` > 0, `status` is forced to `FAIL` and `teamwork_next
   "auditor": "team/victory-auditor",
   "auditorSessionId": "ses_abc123",
   "requestHash": "<sha256 of ORIGINAL_REQUEST.md>",
+  "requirementsHash": "<sha256 of canonical requirements.json>",
   "requirements": [
     { "id": "R1", "met": true, "evidence": "npm test tail + src/api.ts:42" }
   ],
   "findings": ["Optional concrete gap"],
   "summary": "Independent acceptance audit prose.",
-  "generatedAt": "ISO8601"
+  "generatedAt": "ISO8601",
+  "_auth": { "v": 1, "alg": "hmac-sha256", "keyId": "k_...", "path": "verify/victory.json", "digest": "sha256", "mac": "sha256", "at": "ISO8601" }
 }
 ```
 
 Written only by `teamwork_victory_audit`, which derives the caller from the
-trusted session identity (a caller-supplied label cannot self-authorize). It
-validates that every `requirements.json` id appears exactly once, that
-`met: true` carries non-empty evidence, and that a `CONFIRMED` verdict has a
-current `ORIGINAL_REQUEST.md`; it then stores the request's sha256. A confirmed
-verdict is **write-once** (a later audit cannot overwrite it). On `REJECTED` the
-Sentinel forwards `findings` and resumes the team.
+trusted session identity (a caller-supplied label cannot self-authorize) and
+requires that session to descend from the run's `rootSessionId`. It validates
+that every `requirements.json` id appears exactly once, that `met: true` carries
+non-empty evidence, and that a `CONFIRMED` verdict has a current
+`ORIGINAL_REQUEST.md`; it then stores the request's sha256 and the current
+`requirementsHash`. A confirmed verdict is **write-once** (a later audit cannot
+overwrite it). On `REJECTED` the Sentinel forwards `findings` and resumes the
+team.
 
-The audit is an ordinary run artifact and therefore unauthenticated: a writer
-already inside the run directory could forge one. `teamwork_final_verify` and
-`teamwork_next` recompute the auditor label, requirement ids, and current
-request hash, which catches stale, mislabelled, or partially edited verdicts.
+On a signed run the verdict is signed and indexed. `final_verify`/`next` fail
+with `AUTH_MISSING` (no envelope), `AUTH_INVALID` (edited field), `AUTH_UNKNOWN_KEY`,
+`AUTH_INDEX_MISSING` (copied from another run), or `AUTH_STALE` (requirements
+baseline changed) rather than trusting it.
 
 ### `verify/final.json` (final verification verdict)
 
@@ -900,6 +1007,7 @@ request hash, which catches stale, mislabelled, or partially edited verdicts.
   "generatedAt": "ISO8601",
   "integrityMode": "development",
   "victory": "CONFIRMED|FAILED|SKIPPED (explicit)",
+  "requirementsHash": "<sha256 of canonical requirements.json>",
   "evidence": {
     "tasks": [
       {
@@ -911,7 +1019,9 @@ request hash, which catches stale, mislabelled, or partially edited verdicts.
     ],
     "securityAudit": { "path": "verify/security-audit.json", "status": "PASS" },
     "allTasksVerifiedPass": true,
-    "victory": { "mode": "required", "status": "CONFIRMED", "auditor": "team/victory-auditor", "requestHash": "..." },
+    "reportDigests": { "R1-impl": "<sha256 of report bytes>" },
+    "auditDigest": "<sha256 of security-audit.json bytes>",
+    "victory": { "mode": "required", "status": "CONFIRMED", "auditor": "team/victory-auditor", "requestHash": "...", "requirementsHash": "..." },
     "strict": {
       "mode": "strict",
       "status": "PASS",
@@ -932,11 +1042,15 @@ request hash, which catches stale, mislabelled, or partially edited verdicts.
   "summary": "Independent final check passed.",
   "findings": [
     { "where": "src/api.ts:42", "why": "...", "fix": "..." }
-  ]
+  ],
+  "_auth": { "v": 1, "alg": "hmac-sha256", "keyId": "k_...", "path": "verify/final.json", "digest": "sha256", "mac": "sha256", "at": "ISO8601" }
 }
 ```
 
-`teamwork_final_verify` writes this file atomically. `status` is `PASS` **only**
+`teamwork_final_verify` writes this file atomically. On a signed run the final
+verdict is signed and the evidence digests let `teamwork_next` detect a report
+or audit edited after the verdict (`AUTH_STALE`). An unsigned legacy run needs
+the explicit `allowUnsignedLegacy` bypass. `status` is `PASS` **only**
 when every task in `state.json` is `verified_pass`, every task report
 (`verify/report-<taskId>.json`, task ids validated with the same safe-id
 allowlist) reports `PASS`, `verify/security-audit.json` reports `PASS`, and the

@@ -62,7 +62,7 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 | --- | --- |
 | `teamwork_budget` | budget preflight: console credit derivation |
 | `teamwork_route` | priority-ordered route classifier (`document-review` first and before Math/Proof, then explicit Lean 4/LEMMA, then opt-in `massive-proof`; rejects PR/code reviews, bare filenames without a supplied doc, and theorem-solving requests) |
-| `teamwork_plan` | create the run dir + `plan.dag.json` / `state.json` / `costs.json` (with pre-`mkdir` tournament preflight) |
+| `teamwork_plan` | create the run dir + signed `run.manifest.json` / `plan.dag.json` / `state.json` / `costs.json` (with pre-`mkdir` tournament preflight) |
 | `teamwork_document_triage` | ingest/partition a supplied document into `seg-01`..`seg-0K` + `doc-synthesis` with pre-`mkdir` bounds & path containment checks |
 | `teamwork_document_record` | persist bounded RSA tree node outputs, `unit-report.md`, `candidate-<I>.md`, and `DOCUMENT_REVIEW_REPORT.md` |
 | `teamwork_tournament` | bounded `massive-proof` tournament state machine (`estimate`, `init`, `propose`, `falsify`, `merge`, `score`, `audit`, `cancel`, `status`) |
@@ -73,10 +73,11 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 | `teamwork_pitfall` | append to the pitfall registry (dynamically injected into workers) |
 | `teamwork_next` | evaluates DAG dependencies, lifecycle states, and ready tasks; strict runs stop at `NEEDS_STRICT_WAVE` until both wave verdicts exist |
 | `teamwork_task_update` | deterministic task state machine transitions (`pending` → `worker_active` → `worker_done` → `verifier_active` → `verified_pass` / `verified_fail` / `blocked`) |
-| `teamwork_security_audit` | mandatory pre-merge security gate (`verify/security-audit.json`) |
-| `teamwork_victory_audit` | record the independent `team/victory-auditor` acceptance verdict, bound to the current `ORIGINAL_REQUEST.md` hash (`verify/victory.json`) |
-| `teamwork_wave_record` | strict mode only: record one `team/falsifier` challenge (`PASS`) or `team/security-auditor` audit (`CLEAN`) per task (`verify/challenge-<task>.json` / `verify/audit-<task>.json`); trusted caller identity, sha256-bound to the verifier report (same-report write-once, changed-report replace) |
-| `teamwork_final_verify` | compute the final verdict from the task reports + security audit + victory audit (plus the strict wave when enabled, and `lemma/` artifacts when in LEMMA mode), stamp it, write `verify/final.json` |
+| `teamwork_report` | trusted writer for a signed `verify/report-<taskId>.json`: caller must be `team/verifier`, descend from the run root, and name an existing task; a `PASS` needs a summary or check |
+| `teamwork_security_audit` | mandatory pre-merge security gate (`verify/security-audit.json`; signed on a signed run) |
+| `teamwork_victory_audit` | record the independent `team/victory-auditor` acceptance verdict, bound to the current `ORIGINAL_REQUEST.md` and `requirements.json` hashes (`verify/victory.json`); caller must descend from the run root |
+| `teamwork_wave_record` | strict mode only: record one `team/falsifier` challenge (`PASS`) or `team/security-auditor` audit (`CLEAN`) per task (`verify/challenge-<task>.json` / `verify/audit-<task>.json`); trusted caller identity + session tree, sha256-bound to the verifier report (same-report write-once, changed-report replace) |
+| `teamwork_final_verify` | compute the final verdict from the task reports + security audit + victory audit (plus the strict wave when enabled, and `lemma/` artifacts when in LEMMA mode), verify the signed baseline, stamp it, write signed `verify/final.json` |
 | `teamwork_lemma_probe` | read-only probe for `lean`, `lake`, and the LEAP CLI (`leap`; legacy `leap-tools` accepted) on `PATH` |
 | `teamwork_lemma_formalize` | LEMMA Phase 0 `problem_draft.lean` / `review_pre` → `problem.lean` and `review_final` faithfulness gate |
 | `teamwork_lemma_node` | bounded lemma decomposition tree (`create`, `update`, `blueprint`, `attempt`) |
@@ -112,7 +113,9 @@ topologies, and the JSON schemas (`spec.json`, `plan.dag.json`, `state.json`,
 ### Completion guarantees
 
 - `verified_pass` requires a legal lifecycle transition and PASS evidence (an inline PASS verdict or a `PASS` per-task report).
-- A run completes only with a `PASS` `verify/final.json` stamped by `teamwork_final_verify`; an unstamped report needs the recorded `allowUnstamped` bypass.
+- A plan writes a signed `run.manifest.json` (the default). Verifier reports, security audit, strict-wave verdicts, victory verdict, and final verdict carry an HMAC `_auth` envelope and a `ctx.storage` digest-index entry. `final_verify`/`next` fail as `AUTH_MISSING`, `AUTH_INVALID`, `AUTH_UNKNOWN_KEY`, `AUTH_INDEX_MISSING`, or `AUTH_STALE` when an artifact is forged, copied, edited, or the signed plan/requirements/policy baseline drifts. See [`docs/adr/0005-artifact-authenticity.md`](docs/adr/0005-artifact-authenticity.md).
+- A run completes only with a `PASS` `verify/final.json` stamped by `teamwork_final_verify`; an unstamped report needs the recorded `allowUnstamped` bypass. An unsigned legacy run returns `AUTH_LEGACY` until the recorded `allowUnsignedLegacy` bypass is passed at the completion gate; `benchmark` refuses that bypass and `victoryAudit: "skip"`.
+- `teamwork_victory_audit`, `teamwork_wave_record`, and `teamwork_report` require the caller session to descend from the plan-time `rootSessionId`, so a top-level `opencode run --agent team/victory-auditor` cannot self-authorize.
 - That PASS also needs a `verify/victory.json` from the independent `team/victory-auditor` reporting `VICTORY CONFIRMED` for every requirement and the current `ORIGINAL_REQUEST.md` hash, unless the plan explicitly recorded `victoryAudit: "skip"` (then `final_verify` records `victory: "SKIPPED (explicit)"`).
 - The security audit fails on integrity-rule violations for the run's mode, and that blocks the merge.
 - Opt-in `verification: "strict"` adds exactly one `team/falsifier` challenge (`PASS`) and one `team/security-auditor` audit (`CLEAN`) per task after its verifier report. Missing, stale, or non-PASS/CLEAN verdicts block `teamwork_next` (`NEEDS_STRICT_WAVE`) and `teamwork_final_verify`; a strict PASS writes `GATE_STATUS.md` with worker/verifier/challenger/auditor rows. The default `standard` mode is unchanged, and the wave reuses the existing agents rather than adding roles.
@@ -338,7 +341,7 @@ git tag v0.3.0 && git push origin main --tags
 ```sh
 npm config set //registry.npmjs.org/:_authToken=TOKEN
 npm whoami                       # verify
-npm pack                         # inspect the 19-file tarball
+npm pack                         # inspect the tarball
 npm publish --dry-run
 npm publish --access public
 ```
@@ -436,9 +439,14 @@ LEMMA is an explicit opt-in capability-gated route (`topology: "proof"`, `lemmaM
   `scripts/lint-prompts.mjs` — run `npm run lint:prompts`. CI runs it whenever
   agents, the plugin or docs change.
 - **Security:** the guardrail model (path containment, server-derived session
-  ids, read-only enforcement, sanitised context injection, non-destructive
-  installers) is documented in [`docs/GUARDRAILS.md`](docs/GUARDRAILS.md). The
-  `team/security-auditor` agent audits a repo with a clean context.
+  ids, read-only enforcement, signed control-plane artifacts, sanitised context
+  injection, non-destructive installers) is documented in
+  [`docs/GUARDRAILS.md`](docs/GUARDRAILS.md). Artifact authenticity is Phase A:
+  it makes a run-dir-only forgery tamper-evident, but **a same-UID shell with
+  read access to `opencode.db` / the plugin KV store can read the HMAC key**.
+  Phase B decides key isolation; see
+  [`docs/adr/0005-artifact-authenticity.md`](docs/adr/0005-artifact-authenticity.md).
+  The `team/security-auditor` agent audits a repo with a clean context.
 - Docs: <https://opencode.ai/v2/docs/build/plugins>
 
 ## License & attribution
