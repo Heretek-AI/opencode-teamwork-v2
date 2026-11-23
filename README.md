@@ -63,7 +63,7 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 | `teamwork_budget` | budget preflight: console credit derivation |
 | `teamwork_route` | priority-ordered route classifier (`document-review` first and before Math/Proof, then explicit Lean 4/LEMMA, then opt-in `massive-proof`; rejects PR/code reviews, bare filenames without a supplied doc, and theorem-solving requests) |
 | `teamwork_plan` | create the run dir + signed `run.manifest.json` / `plan.dag.json` / `state.json` / `costs.json` (with pre-`mkdir` tournament preflight) |
-| `teamwork_document_triage` | ingest/partition a supplied document into `seg-01`..`seg-0K` + `doc-synthesis` with pre-`mkdir` bounds & path containment checks |
+| `teamwork_document_triage` | ingest/partition a supplied document into `seg-01`..`seg-0K` + `doc-synthesis` with pre-`mkdir` bounds & path containment checks; live URLs go through the SSRF guard |
 | `teamwork_document_record` | persist bounded RSA tree node outputs, `unit-report.md`, `candidate-<I>.md`, and `DOCUMENT_REVIEW_REPORT.md` |
 | `teamwork_tournament` | bounded `massive-proof` tournament state machine (`estimate`, `init`, `propose`, `falsify`, `merge`, `score`, `audit`, `cancel`, `status`) |
 | `teamwork_preflight` | re-check a run's named inputs, write `preflight.json` (reports, never blocks) |
@@ -84,6 +84,28 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 | `teamwork_lemma_verify` | execute real `lean`/`lake` verification with `sorry`/admit/axiom rejection, stamping `verify-<r>.json` |
 | `teamwork_worktree` | out-of-repo git worktree provisioning, diff, merge, resolve & cleanup |
 
+**Tool authorization.** Plugin tools are not mediated by the permission hook,
+so every run-mutating `teamwork_*` tool checks the caller itself
+(`authorize.ts`). The trusted session agent (`ctx.session.get`) must match the
+tool/action lane and, for run-bound tools, the caller must descend from the
+plan-time `rootSessionId`; a caller-supplied `agent` label is never authority.
+Examples: `teamwork_plan`/`teamwork_document_triage` are sentinel/crafter lanes,
+`teamwork_security_audit` is `team/security-auditor` only,
+`teamwork_final_verify` is `team/verifier`/sentinel, `teamwork_lemma_node` is
+`team/proof-worker`, and tournament `propose`/`falsify`/`merge`/`score` are
+`proposer`/`falsifier`/`synthesizer`/`referee` respectively. Unresolved identity
+fails closed for mutating tools. Read-only `teamwork_status`,
+`teamwork_resume`, and `teamwork_cost` stay available to every installed
+`team/*` role. See `docs/GUARDRAILS.md` for the full matrix.
+
+**URL network policy.** `document.url` ingestion and preflight URL checks use
+`url-guard.ts`: http/https only, public addresses only (loopback, private,
+link-local, metadata, multicast, reserved, and IPv4-mapped IPv6 are rejected),
+DNS answers are validated and the connection is pinned to them, redirects are
+not followed (a `Location` is validated before refusal), and timeouts/size caps
+apply. `OPENCODE_TEAMWORK_ALLOW_LOCALHOST=1` is the explicit test/development
+opt-in that permits loopback only; the default is deny.
+
 Hooks: `permission.evaluate` enforces the per-agent read-only policy **in code**
 (not just in their prompts). The read-only agents (`team/verifier`,
 `team/falsifier`, `team/scout`, `team/security-auditor`,
@@ -95,7 +117,11 @@ formalization reviewer, and referee also have `shell` denied, and the segment,
 formalization, referee, and victory-auditor roles deny `webfetch` and
 `subagent` as well (the verifier and security auditor deny `webfetch`). In
 short: no writes through `edit` for all eight, and no `shell` writes for the
-falsifier, segment reviewer, formalization reviewer, or referee.
+falsifier, segment reviewer, formalization reviewer, or referee. The
+`team/victory-auditor` keeps `shell` (it can modify files) and is denied `edit`,
+`webfetch`, and `subagent`; its independence comes from a fresh session that
+inspects the delivered artifacts and runs tests itself, not from capability
+isolation.
 The hook also enforces network constraints: when the active run's
 `constraints.network` is `denied` (read from `prompt_draft.md` or a per-task
 `spec.json`), `webfetch` is denied for **every** `team/*` agent — sentinel,

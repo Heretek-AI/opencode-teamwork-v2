@@ -8,6 +8,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Control-plane tool authorization.** `plugins/opencode-teamwork/authorize.ts` applies one trusted-session role map (plus root/descendant ancestry for run-bound tools) across `teamwork_plan`, `task_update`, `security_audit`, `final_verify`, worktree, document-review, LEMMA, and tournament tools. Caller-supplied `agent` labels are recorded, never authoritative; unresolved identity fails closed for mutating tools. Read-only `status`/`resume`/`cost` stay available to installed `team/*` roles.
+- **URL SSRF guard.** `plugins/opencode-teamwork/url-guard.ts` validates and pins outbound document/preflight URLs: http/https only, public addresses only (loopback, private, link-local/metadata, multicast/reserved, and mapped IPv6 rejected), no automatic redirects, 3 s timeout, and size caps. `OPENCODE_TEAMWORK_ALLOW_LOCALHOST=1` is the explicit loopback-only test opt-in.
 - Release-tag provenance guard: `scripts/check-release-tag.mjs` fetches tags and
   refuses to publish a `v*` tag whose commit is not an ancestor of `origin/main`;
   `publish.yml` runs it before publish with full history/tags, only on tag pushes.
