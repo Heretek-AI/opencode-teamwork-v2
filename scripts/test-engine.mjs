@@ -3317,6 +3317,99 @@ try {
 }
 
 // ==========================================
+// Part 8b: network denial for every team agent
+// ==========================================
+{
+  console.log("Testing network-denied constraint enforcement...")
+  const TEAM_AGENTS = [
+    "team/sentinel",
+    "team/worker",
+    "team/verifier",
+    "team/scout",
+    "team/security-auditor",
+    "team/segment-reviewer",
+    "team/formalization-reviewer",
+    "team/referee",
+    "team/victory-auditor",
+  ]
+
+  const makeHook = async (runFiles) => {
+    const root = mkdtempSync(join(tmpdir(), "teamwork-network-test-"))
+    const run = "20261122-000000-netdenied"
+    const runDir = join(root, ".opencode", "teamwork", run)
+    mkdirSync(runDir, { recursive: true })
+    for (const [rel, content] of Object.entries(runFiles)) {
+      const file = join(runDir, rel)
+      mkdirSync(dirname(file), { recursive: true })
+      writeFileSync(file, typeof content === "string" ? content : JSON.stringify(content) + "\n")
+    }
+    let evaluateHook
+    const ctx = {
+      permission: {
+        hook: async (name, fn) => {
+          if (name === "evaluate") evaluateHook = fn
+        },
+      },
+      session: { hook: async () => {} },
+    }
+    await registerTeamworkHooks(ctx, root)
+    assert(typeof evaluateHook === "function", "permission evaluate hook must register")
+    return { root, evaluateHook }
+  }
+
+  const evaluate = (evaluateHook, agent, action = "webfetch") => {
+    const event = { agent, action, effect: "allow", message: "" }
+    evaluateHook(event)
+    return event
+  }
+
+  const denied = await makeHook({ "prompt_draft.md": "# Spec\n\n- constraints.network: denied\n" })
+  try {
+    for (const agent of TEAM_AGENTS) {
+      const event = evaluate(denied.evaluateHook, agent)
+      assert.strictEqual(event.effect, "deny", `${agent}: webfetch must be denied when network is denied`)
+    }
+    assert(
+      /network access is denied/i.test(evaluate(denied.evaluateHook, "team/sentinel").message),
+      "sentinel denial must name the network constraint",
+    )
+    assert.strictEqual(
+      evaluate(denied.evaluateHook, "general").effect,
+      "allow",
+      "non-team agents must be unchanged by the run's network constraint",
+    )
+    console.log("✓ network denied refuses webfetch for every team/* agent")
+  } finally {
+    rmSync(denied.root, { recursive: true, force: true })
+  }
+
+  const allowed = await makeHook({ "prompt_draft.md": "# Spec\n\n- constraints.network: allowed\n" })
+  try {
+    for (const agent of ["team/sentinel", "team/worker", "team/scout", "team/synthesizer"]) {
+      assert.strictEqual(evaluate(allowed.evaluateHook, agent).effect, "allow", `${agent}: allowed network must not deny webfetch`)
+    }
+    // Read-only agents keep their existing code-enforced webfetch denial.
+    assert.strictEqual(evaluate(allowed.evaluateHook, "team/verifier").effect, "deny", "read-only verifier policy unchanged")
+    console.log("✓ network allowed leaves the existing permission policy unchanged")
+  } finally {
+    rmSync(allowed.root, { recursive: true, force: true })
+  }
+
+  // A per-task spec.json alone must be honoured (no prompt_draft.md).
+  const specOnly = await makeHook({
+    "specs/task-1.json": { taskId: "task-1", constraints: { network: "denied", sandbox: "worktree-only" } },
+  })
+  try {
+    const event = evaluate(specOnly.evaluateHook, "team/sentinel")
+    assert.strictEqual(event.effect, "deny", "spec.json-only network denial must deny webfetch")
+    assert(/network access is denied/i.test(event.message), "spec.json-only denial must name the network constraint")
+    console.log("✓ per-task spec.json network denial is honoured without prompt_draft.md")
+  } finally {
+    rmSync(specOnly.root, { recursive: true, force: true })
+  }
+}
+
+// ==========================================
 // Part 9: Document Review route (Issue #1)
 // ==========================================
 {

@@ -35,8 +35,11 @@ remove the sharpest edges.
   hook: for the verifier, scout, security auditor, and victory auditor it denies
   `edit` but not `shell`, which can write anywhere; the falsifier, segment
   reviewer, formalization reviewer, and referee also have `shell` denied.)
-- **`constraints.network` / `constraints.sandbox`** in `docs/ARTIFACTS.md` are
-  descriptive; they are not enforced. "Network: denied" is honor-system.
+- **`constraints.network` is enforced for `webfetch` only.** When a run's
+  `prompt_draft.md` or any per-task `spec.json` says `network: denied`, the
+  permission hook denies `webfetch` for every `team/*` agent. `constraints.sandbox`
+  remains descriptive, and `shell` can still reach the network: there is no
+  sandbox for shell.
 - **Plugin tools are not agent-scoped.** The permission layer does not mediate
   `teamwork_*` tool calls, so a read-only agent can still call `teamwork_cost`
   etc. The session-id allowlist bounds the damage.

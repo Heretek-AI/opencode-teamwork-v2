@@ -95,9 +95,13 @@ formalization, referee, and victory-auditor roles deny `webfetch` and
 `subagent` as well (the verifier and security auditor deny `webfetch`). In
 short: no writes through `edit` for all eight, and no `shell` writes for the
 falsifier, segment reviewer, formalization reviewer, or referee.
-The hook also enforces network constraints
-(`constraints.network: denied`), and `session.context` injects the active run's
-state + recent pitfalls into every team agent's system prompt.
+The hook also enforces network constraints: when the active run's
+`constraints.network` is `denied` (read from `prompt_draft.md` or a per-task
+`spec.json`), `webfetch` is denied for **every** `team/*` agent — sentinel,
+workers, verifiers, reviewers and auditors alike. `shell` network access is
+still honor-system: the permission layer cannot sandbox it. `session.context`
+injects the active run's state + recent pitfalls into every team agent's system
+prompt.
 
 All run artifacts live under `.opencode/teamwork/<session-id>/`; see
 [`docs/ARTIFACTS.md`](docs/ARTIFACTS.md) for the layout, the canonical
