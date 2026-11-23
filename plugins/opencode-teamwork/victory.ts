@@ -662,11 +662,21 @@ function evaluateVictoryCore(
       )
     }
     // `final.json` is normally written after the audit, so a recorded null is
-    // expected; once the audit recorded a digest it must keep matching.
+    // expected. Once the audit recorded a digest, it must keep matching unless
+    // the current final was written after the audit (then it was not reviewed).
     const recordedFinal = (recordedDigests as any).final ?? null
     if (recordedFinal !== null && recordedFinal !== current.final) {
-      authCode = "AUTH_STALE"
-      reasons.push("[AUTH_STALE] victory audit: verify/final.json changed since the audit reviewed it")
+      const currentFinalValue = readBoundedRunJson<any>(run, join(run, "verify", "final.json"), MAX_FINAL_BYTES)
+      const currentFinalAt =
+        currentFinalValue.status === "ok" && typeof currentFinalValue.value?.generatedAt === "string"
+          ? Date.parse(currentFinalValue.value.generatedAt)
+          : NaN
+      const victoryAt = typeof victory.generatedAt === "string" ? Date.parse(victory.generatedAt) : NaN
+      const writtenAfterAudit = Number.isFinite(currentFinalAt) && Number.isFinite(victoryAt) && currentFinalAt > victoryAt
+      if (!writtenAfterAudit) {
+        authCode = "AUTH_STALE"
+        reasons.push("[AUTH_STALE] victory audit: verify/final.json changed since the audit reviewed it")
+      }
     }
   }
 

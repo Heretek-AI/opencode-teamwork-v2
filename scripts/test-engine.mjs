@@ -2007,6 +2007,95 @@ try {
 
   console.log("✓ report binds the worker handoff, refuses a missing one, and a re-recorded handoff stales the report")
 
+  console.log("Testing security-audit rule coverage and reviewed digests...")
+
+  const auditRun = "20261018-000000-ev-audit"
+  await seedVerifiedRun(auditRun, ["A1"], {
+    request: "Deliver the audit-coverage fixture.",
+    integrityMode: "demo",
+    victoryAudit: "skip",
+    victorySkipReason: "fixture: audit coverage test does not run the victory gate",
+    stampVictory: false,
+  })
+  const auditArtifact = JSON.parse(readFileSync(evidenceAuditFile(auditRun), "utf8"))
+  assert.strictEqual(auditArtifact.integrityMode, "demo")
+  assert.deepStrictEqual(
+    auditArtifact.ruleChecks.map((c) => c.rule).sort(),
+    ["core_logic_copied", "delegated_core_work", "fabricated_output", "test_source_read"],
+    "a demo PASS must cover exactly the rules forbidden at demo",
+  )
+  assert(auditArtifact.ruleChecks.every((c) => c.result === "clean"), "no violation was reported, so every check is clean")
+  assert.strictEqual(
+    auditArtifact.reviewedDigests.reports.A1,
+    sha256Hex(readFileSync(evidenceReportFile(auditRun, "A1"), "utf8")),
+    "the audit must record the report digest it reviewed",
+  )
+  assert.strictEqual(auditArtifact.reviewedDigests.final, null, "no final.json exists when the audit is recorded")
+
+  // A PASS whose ruleChecks omit a forbidden rule is refused at the gate.
+  const auditMissingRun = "20261018-000000-ev-audit-missing"
+  await seedVerifiedRun(auditMissingRun, ["A2"], {
+    request: "Deliver the missing-rule audit fixture.",
+    victoryAudit: "skip",
+    victorySkipReason: "fixture: missing-rule test needs the skip path",
+    stampVictory: false,
+  })
+  const auditMissingPayload = JSON.parse(readFileSync(evidenceAuditFile(auditMissingRun), "utf8"))
+  delete auditMissingPayload._auth
+  auditMissingPayload.ruleChecks = auditMissingPayload.ruleChecks.filter((c) => c.rule !== "fabricated_output")
+  await writeSignedFixture(testDir, auditMissingRun, "verify/security-audit.json", auditMissingPayload)
+  const auditMissingFinal = await registeredTools.final_verify.execute({ sessionId: auditMissingRun })
+  assert.strictEqual(auditMissingFinal.status, "FAIL", "a PASS audit missing a forbidden rule must FAIL")
+  assert(
+    auditMissingFinal.reasons.some((r) => r.includes("missing the forbidden rule fabricated_output")),
+    `the missing rule must be named: ${JSON.stringify(auditMissingFinal.reasons)}`,
+  )
+
+  // A PASS audit that records a violation is contradicted by its own coverage.
+  const auditViolationRun = "20261018-000000-ev-audit-violation"
+  await seedVerifiedRun(auditViolationRun, ["A3"], {
+    request: "Deliver the contradiction audit fixture.",
+    victoryAudit: "skip",
+    victorySkipReason: "fixture: contradiction audit test needs the skip path",
+    stampVictory: false,
+  })
+  const auditViolationPayload = JSON.parse(readFileSync(evidenceAuditFile(auditViolationRun), "utf8"))
+  delete auditViolationPayload._auth
+  auditViolationPayload.ruleChecks = auditViolationPayload.ruleChecks.map((c) =>
+    c.rule === "fabricated_output" ? { rule: c.rule, result: "violation", where: "src/fake.ts:1" } : c,
+  )
+  await writeSignedFixture(testDir, auditViolationRun, "verify/security-audit.json", auditViolationPayload)
+  const auditViolationFinal = await registeredTools.final_verify.execute({ sessionId: auditViolationRun })
+  assert.strictEqual(auditViolationFinal.status, "FAIL", "a recorded violation must force FAIL")
+  assert(
+    auditViolationFinal.reasons.some((r) => r.includes("records a violation for fabricated_output")),
+    `the violation must be named: ${JSON.stringify(auditViolationFinal.reasons)}`,
+  )
+
+  // A report changed after the audit → the audit reviewed digests are stale.
+  const auditDriftRun = "20261018-000000-ev-audit-drift"
+  await seedVerifiedRun(auditDriftRun, ["A4"], {
+    request: "Deliver the audit-drift fixture.",
+    victoryAudit: "skip",
+    victorySkipReason: "fixture: audit-drift test needs the skip path",
+    stampVictory: false,
+  })
+  await writePassReport(registeredTools, auditDriftRun, "A4", { summary: "Report rewritten after the security audit." })
+  const auditDriftNext = await registeredTools.next.execute({ sessionId: auditDriftRun })
+  assert.strictEqual(auditDriftNext.status, "AUTH_STALE", `next must surface audit drift: ${auditDriftNext.content}`)
+  assert(
+    auditDriftNext.reasons.some((r) => r.includes("report A4 changed since the audit reviewed it")),
+    `the audit drift must name the report: ${JSON.stringify(auditDriftNext.reasons)}`,
+  )
+  const auditDriftFinal = await registeredTools.final_verify.execute({ sessionId: auditDriftRun })
+  assert.strictEqual(auditDriftFinal.status, "FAIL", "final_verify must FAIL on audit drift")
+  assert(
+    auditDriftFinal.reasons.some((r) => r.includes("[AUTH_STALE]") && r.includes("security audit")),
+    `final_verify must name the stale audit: ${JSON.stringify(auditDriftFinal.reasons)}`,
+  )
+
+  console.log("✓ security audit records rule coverage and reviewed digests; missing rules/violations fail and drift is AUTH_STALE")
+
   // ==========================================
   // Part 1c-ter-strict: opt-in strict verification wave
   // ==========================================
@@ -2323,6 +2412,9 @@ try {
   assert(/write-once/.test(reworkSameHash.content), `re-recording the same report must be refused: ${reworkSameHash.content}`)
   await seedStrictHandoffs(registeredTools, strictReworkRun, ["RH1"])
   await seedHandoffMatrix(registeredTools, strictReworkRun, ["RH1"], { workers: false })
+  // 0.12.0: the run-level security audit is bound to the report bytes it
+  // reviewed, so a reworked report requires a fresh audit before PASS.
+  await registeredTools.security_audit.execute({ sessionId: strictReworkRun, status: "PASS", findings: [] })
   const reworkSecondFinal = await registeredTools.final_verify.execute({ sessionId: strictReworkRun })
   assert.strictEqual(reworkSecondFinal.status, "PASS", `the re-recorded wave must pass: ${reworkSecondFinal.content}`)
   const reworkFinalJson = JSON.parse(readFileSync(finalFileOf(strictReworkRun), "utf8"))
@@ -8051,6 +8143,8 @@ process.exit(0);
       assert.strictEqual(recorded.outputSha256, sha256Hex("73 suites green"), "the engine must hash the output")
       // The seeded verifier handoff cites the original report digest; refresh it.
       await recordHandoffFor(registeredTools, runId, { agent: "team/verifier", taskId: "Q1" })
+      // 0.12.0: the run-level audit is bound to the report it reviewed.
+      await registeredTools.security_audit.execute({ sessionId: runId, status: "PASS", findings: [] })
 
       const consistent = await registeredTools.final_verify.execute({ sessionId: runId })
       assert.strictEqual(consistent.status, "PASS", `a consistent PASS must complete: ${consistent.content}`)
@@ -8091,6 +8185,8 @@ process.exit(0);
       writeJsonFile(reportFile, await authFor(testDir).signRunArtifact(runId, "verify/report-Q1.json", repairedReport))
       // The verifier handoff cites the report digest; refresh it after the rewrite.
       await recordHandoffFor(registeredTools, runId, { agent: "team/verifier", taskId: "Q1" })
+      // 0.12.0: and re-run the run-level audit bound to the repaired report.
+      await registeredTools.security_audit.execute({ sessionId: runId, status: "PASS", findings: [] })
       const restored = await registeredTools.final_verify.execute({ sessionId: runId })
       assert.strictEqual(restored.status, "PASS", `a repaired consistent PASS must complete: ${restored.content}`)
     }
@@ -9710,6 +9806,9 @@ process.exit(0);
           summary: "The report was reworked after the handoff.",
           checks: [{ name: "reworked", type: "check", passed: true }],
         })
+        // Re-bind the run-level audit to the reworked report so this case
+        // isolates the stale handoff citation.
+        await tools.security_audit.execute({ sessionId: staleRun, status: "PASS", findings: [] }, { sessionID: "ses_fixture_security_auditor" })
         const staleFinal = await tools.final_verify.execute({ sessionId: staleRun }, { sessionID: "ses_fixture_verifier" })
         assert.strictEqual(staleFinal.status, "FAIL", "a changed report must make its handoff stale")
         assert(reasonHas(staleFinal, "handoffs/C1-verifier.md is stale: verify/report-C1.json changed"), `the stale citation must be named: ${JSON.stringify(staleFinal.reasons)}`)

@@ -120,6 +120,7 @@ import {
   deriveRequirementsFromRequest,
   describeVictoryGate,
   evaluateVictoryGateChecked,
+  evidenceDigestsFromDisk,
   normalizeVictoryAuditMode,
   originalRequestHash,
   persistRequirementsBaseline,
@@ -801,6 +802,108 @@ function integrityModeRank(mode: IntegrityMode): number {
 function isIntegrityRuleForbidden(rule: IntegrityRule, mode: IntegrityMode): boolean {
   return integrityModeRank(mode) >= integrityModeRank(INTEGRITY_RULES[rule].forbiddenFrom)
 }
+
+/** Every rule the run's integrity mode forbids (the audit must cover each once). */
+function forbiddenIntegrityRules(mode: IntegrityMode): IntegrityRule[] {
+  return INTEGRITY_RULE_IDS.filter((rule) => isIntegrityRuleForbidden(rule, mode))
+}
+
+export interface SecurityAuditRuleCheck {
+  rule: string
+  result: "clean" | "violation"
+  where?: string
+}
+
+/**
+ * 0.12.0: validate a recorded security audit against the run's mode.
+ * A PASS must cover every forbidden rule exactly once, contain no `violation`,
+ * and its `reviewedDigests` must still match the evidence on disk.
+ */
+function evaluateSecurityAuditEvidence(
+  run: string,
+  audit: any,
+  mode: IntegrityMode,
+): { ok: boolean; authStale: boolean; reasons: string[] } {
+  const reasons: string[] = []
+  if (audit?.status !== "PASS") return { ok: true, authStale: false, reasons: [] }
+
+  const forbidden = forbiddenIntegrityRules(mode)
+  const checks = Array.isArray(audit?.ruleChecks) ? audit.ruleChecks : []
+  if (!Array.isArray(audit?.ruleChecks)) {
+    reasons.push(`security audit: ruleChecks is missing (a PASS must cover ${forbidden.join(", ")} at mode ${mode})`)
+  } else {
+    const seen = new Map<string, number>()
+    for (const check of checks) {
+      const rule = check && typeof check === "object" ? check.rule : undefined
+      if (typeof rule !== "string" || !Object.prototype.hasOwnProperty.call(INTEGRITY_RULES, rule)) {
+        reasons.push(`security audit: ruleChecks names an unknown rule "${clean(rule, 64)}"`)
+        continue
+      }
+      seen.set(rule, (seen.get(rule) ?? 0) + 1)
+      if (check.result !== "clean" && check.result !== "violation") {
+        reasons.push(`security audit: ruleChecks[${rule}].result must be clean | violation`)
+      }
+      if (check.result === "violation") {
+        reasons.push(`security audit: ruleChecks records a violation for ${rule} while the audit reports PASS`)
+      }
+    }
+    for (const rule of forbidden) {
+      const count = seen.get(rule) ?? 0
+      if (count === 0) reasons.push(`security audit: ruleChecks is missing the forbidden rule ${rule} at mode ${mode}`)
+      else if (count > 1) reasons.push(`security audit: ruleChecks records ${rule} ${count} times (expected exactly once)`)
+    }
+  }
+
+  let authStale = false
+  const reviewed = audit?.reviewedDigests
+  if (!reviewed || typeof reviewed !== "object" || Array.isArray(reviewed)) {
+    authStale = true
+    reasons.push("[AUTH_STALE] security audit: reviewedDigests is missing; the audit is not bound to the evidence it reviewed")
+  } else {
+    const current = evidenceDigestsFromDisk(run)
+    const recordedReports =
+      reviewed.reports && typeof reviewed.reports === "object" && !Array.isArray(reviewed.reports)
+        ? reviewed.reports
+        : null
+    if (!recordedReports) {
+      authStale = true
+      reasons.push("[AUTH_STALE] security audit: reviewedDigests.reports is missing or malformed")
+    } else {
+      for (const [id, digest] of Object.entries(recordedReports)) {
+        if (!isSafeTaskId(id)) {
+          authStale = true
+          reasons.push(`[AUTH_STALE] security audit: reviewedDigests names an invalid task id "${clean(id, 40)}"`)
+          continue
+        }
+        if (current.reports[id] !== digest) {
+          authStale = true
+          reasons.push(`[AUTH_STALE] security audit: report ${id} changed since the audit reviewed it`)
+        }
+      }
+      for (const id of Object.keys(current.reports)) {
+        if (!Object.prototype.hasOwnProperty.call(recordedReports, id)) {
+          authStale = true
+          reasons.push(`[AUTH_STALE] security audit: report ${id} was never reviewed by this audit`)
+        }
+      }
+    }
+    const recordedFinal = reviewed.final ?? null
+    if (recordedFinal !== null) {
+      const currentFinalValue = readJson<any>(run, join(run, "verify", "final.json"), undefined)
+      const currentFinalAt = typeof currentFinalValue?.generatedAt === "string" ? Date.parse(currentFinalValue.generatedAt) : NaN
+      const auditAt = typeof audit?.timestamp === "string" ? Date.parse(audit.timestamp) : NaN
+      // A final verdict written *after* the audit could not have been reviewed by
+      // it; only a final that predates the audit is a binding mismatch.
+      const writtenAfterAudit = Number.isFinite(currentFinalAt) && Number.isFinite(auditAt) && currentFinalAt > auditAt
+      if (!writtenAfterAudit && recordedFinal !== current.final) {
+        authStale = true
+        reasons.push("[AUTH_STALE] security audit: verify/final.json changed since the audit reviewed it")
+      }
+    }
+  }
+  return { ok: reasons.length === 0, authStale, reasons }
+}
+
 
 /**
  * Read the integrity mode from `<run>/ORIGINAL_REQUEST.md`. That artifact is the
@@ -8130,6 +8233,26 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               ? `Integrity mode: ${integrity.mode} (from ORIGINAL_REQUEST.md).`
               : `Integrity mode: ${integrity.mode} (default; no ORIGINAL_REQUEST.md for this run).`
 
+          // 0.12.0: the security audit is bound to the reports/final it
+          // reviewed. A PASS must also cover every forbidden rule exactly once.
+          if (audit && audit.status === "PASS") {
+            const auditCoverage = evaluateSecurityAuditEvidence(run, audit, integrity.mode)
+            if (auditCoverage.reasons.length > 0) {
+              const stale = auditCoverage.authStale
+              return {
+                status: stale ? "AUTH_STALE" : "BLOCKED_BY_SECURITY",
+                auth: stale ? "AUTH_STALE" : undefined,
+                content: stale
+                  ? `BLOCKED_BY_AUTH: [AUTH_STALE] the security audit no longer matches the evidence it reviewed: ${auditCoverage.reasons.join("; ")}. Re-run teamwork_security_audit.`
+                  : `BLOCKED_BY_SECURITY: the security audit does not cover the run's integrity rules: ${auditCoverage.reasons.join("; ")}. Re-run teamwork_security_audit.`,
+                auditReport: auditFile,
+                reasons: auditCoverage.reasons,
+                passedCount: passedTasks.length,
+                integrityMode: integrity.mode,
+              }
+            }
+          }
+
           if (!audit || audit.status !== "PASS") {
             const auditFailed = audit && audit.status === "FAIL"
             if (state.phase !== "SECURITY_AUDIT" && !auditFailed) {
@@ -9810,6 +9933,18 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           })),
           integrityFindings,
           integrityViolations,
+          // 0.12.0: the engine records coverage, not the caller. Every forbidden
+          // rule appears exactly once; any violation forces FAIL above.
+          ruleChecks: forbiddenIntegrityRules(integrity.mode).map((rule) => {
+            const finding = integrityFindings.find((f: any) => f.rule === rule)
+            return finding
+              ? { rule, result: "violation" as const, ...(finding.where ? { where: finding.where } : {}) }
+              : { rule, result: "clean" as const }
+          }),
+          reviewedDigests: (() => {
+            const digests = evidenceDigestsFromDisk(run)
+            return { reports: digests.reports, final: digests.final }
+          })(),
         }
         const manifestCheck = await readRunManifest(run, auth)
         if (!manifestCheck.ok) {
@@ -10468,6 +10603,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const securityAudit = {
             path: "verify/security-audit.json",
             status: audit?.status === "PASS" ? "PASS" : audit?.status === "FAIL" ? "FAIL" : "MISSING",
+          }
+          // 0.12.0: a PASS audit must cover every forbidden rule exactly once
+          // and its reviewed digests must still match. Violations force FAIL.
+          {
+            const auditCoverage = evaluateSecurityAuditEvidence(run, audit, readIntegrityMode(run).mode)
+            contentIntegrityReasons.push(...auditCoverage.reasons)
           }
           const auditRaw = readBoundedRunFile(run, join(run, "verify", "security-audit.json"), MAX_RUN_FILE_BYTES)
           const auditDigest = auditRaw.status === "ok" ? sha256Hex(auditRaw.text) : null
