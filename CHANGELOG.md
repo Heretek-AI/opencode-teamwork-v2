@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-11-22
+
+### Added
+
+- **Victory acceptance audit.** `teamwork_plan` accepts a requirements baseline and persists `requirements.json`; `teamwork_victory_audit` records an independent `team/victory-auditor` verdict in `verify/victory.json`, bound to the current `ORIGINAL_REQUEST.md` hash and every requirement. `teamwork_final_verify` and `teamwork_next` refuse completion without `VICTORY CONFIRMED` unless the plan explicitly recorded `victoryAudit: "skip"`.
+- **Opt-in strict verification wave.** `verification: "strict"` requires, per task, the verifier report PASS plus a `team/falsifier` challenge PASS and a `team/security-auditor` audit CLEAN (`teamwork_wave_record`), writes a human-readable `GATE_STATUS.md`, and reports `NEEDS_STRICT_WAVE` until both verdicts exist. Standard mode is unchanged.
+- **Persistent run briefing.** `<run>/BRIEFING.md` carries Mission, Identity, Key Constraints, Project Status, Artifact Index and Succession; it is refreshed at lifecycle transitions and a bounded excerpt is injected into `session.context` so compaction preserves the mission.
+- **Five-section handoff protocol.** Worker, verifier, falsifier, security-auditor and victory-auditor prompts and `docs/ARTIFACTS.md` now require Observation, Logic Chain, Caveats, Conclusion and Verification Method.
+- **Live reference evidence.** The corpus gains `12-live-general-run.md`, `13-live-swe-light-run.md`, redacted evidence bundles, a revised gate/artifacts analysis and gap-analysis revision 5.
+
+### Changed
+
+- Completion now enforces an independent fidelity verdict in addition to evidence-derived tests; legacy runs without a request/requirements baseline record an explicit skip.
+- Packaging guards assert the shipped `victory.ts`, `strict.ts` and `briefing.ts` modules.
+- The README, roster and guardrails describe the new victory-auditor role and the strict mode; no runtime dependencies were added.
+
+### Fixed
+
+- A reworked and re-verified task now makes its old challenge/audit verdicts stale: wave verdicts store the verifier report hash and only a new-report re-record can satisfy the strict gate.
+- `GATE_STATUS.md` cell escaping neutralizes backslash/pipe table injection.
+
 ## [0.6.0] - 2026-11-22
 
 ### Added
