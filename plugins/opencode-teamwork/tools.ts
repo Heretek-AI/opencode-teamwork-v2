@@ -145,7 +145,7 @@ import {
 } from "./auth.ts"
 import type { RequirementsFile, VictoryAuditMode } from "./victory.ts"
 import { readAgentBriefingExcerpt, readBriefingExcerpt, refreshAgentBriefing, refreshRunBriefing } from "./briefing.ts"
-import { writeHandoff, resolveHandoffScope, handoffAgentSlug, evaluateHandoffGate, normalizeHandoffMode, resolveHandoffMode } from "./handoff.ts"
+import { writeHandoff, resolveHandoffScope, handoffAgentSlug, evaluateHandoffGateChecked, normalizeHandoffMode, resolveHandoffMode } from "./handoff.ts"
 import type { HandoffGate, HandoffMode, HandoffTaskRef } from "./handoff.ts"
 import { withCrossProcessLock } from "./locks.ts"
 import { fdWithin, readWithinBounded, supportsFdContainment } from "./safe-fs.mjs"
@@ -2028,6 +2028,11 @@ type RunManifest = {
   victoryAudit: VictoryAuditMode
   victorySkipReason?: string
   requireHandoffs: HandoffMode
+  /**
+   * Handoff-index provenance baseline. Absent on a 0.8.0 manifest = `legacy`
+   * (unsigned entries tolerated). New signed plans write `signed`.
+   */
+  handoffAuth?: "signed" | "legacy"
   requestHash: string | null
   requirementsHash: string | null
   planHash: string
@@ -2212,6 +2217,13 @@ function manifestDrift(manifest: RunManifest, current: Omit<RunManifest, "versio
   if (baselineWitness !== currentWitness) {
     drift.push(`requireWitness drifted: manifest=${baselineWitness} current=${currentWitness}`)
   }
+  // Only a signed→legacy downgrade is drift; a 0.8.0 manifest (absent = legacy)
+  // may be re-planned into a signed run.
+  const baselineHandoffAuth = manifest.handoffAuth ?? "legacy"
+  const currentHandoffAuth = current.handoffAuth ?? "legacy"
+  if (baselineHandoffAuth === "signed" && currentHandoffAuth === "legacy") {
+    drift.push(`handoffAuth downgraded: manifest=signed current=legacy`)
+  }
   for (const key of ["requestHash", "requirementsHash", "planHash", "lemmaPolicyHash"] as const) {
     const a = manifest[key]
     const b = current[key]
@@ -2231,6 +2243,7 @@ function currentManifestDrift(manifest: RunManifest, plan: any, state: any, run:
     requireHandoffs: resolveHandoffMode(plan, state).mode,
     trustLevel: normalizeTrustLevel(plan?.trustLevel ?? state?.trustLevel) ?? DEFAULT_TRUST_LEVEL,
     requireWitness: (plan?.requireWitness ?? state?.requireWitness) === true,
+    handoffAuth: plan?.allowUnsignedLegacy === true || state?.allowUnsignedLegacy === true ? "legacy" : "signed",
     requestHash: originalRequestHash(run),
     requirementsHash: currentRequirementsHash(run),
     planHash: planHashOf(plan),
@@ -2328,8 +2341,18 @@ function handoffTaskRefs(plan: any, state: any): HandoffTaskRef[] {
   return [...refs.values()]
 }
 
-/** Resolve the run's persisted modes and recompute the continuity gate. */
-function evaluateHandoffGateFor(run: string, plan: any, state: any): HandoffGate {
+/**
+ * Resolve the run's persisted modes and recompute the continuity gate plus the
+ * provenance check for every present index entry. Only the manifest pins
+ * whether a signature is required; the narrative is never inspected.
+ */
+async function evaluateHandoffGateCheckedFor(
+  run: string,
+  plan: any,
+  state: any,
+  auth: AuthContext | undefined,
+  manifest: RunManifest | undefined,
+): Promise<HandoffGate> {
   const mode = resolveHandoffMode(plan, state).mode
   // The victory handoff is defined as recorded after teamwork_victory_audit.
   // Until a confirmed verdict exists, the victory gate (not the handoff gate)
@@ -2337,10 +2360,13 @@ function evaluateHandoffGateFor(run: string, plan: any, state: any): HandoffGate
   const victoryConfirmed =
     resolveVictoryAuditMode(plan, state, run).mode === "required" &&
     readVictoryVerdict(run)?.verdict === VICTORY_CONFIRMED
-  return evaluateHandoffGate(run, handoffTaskRefs(plan, state), {
+  return evaluateHandoffGateChecked(run, handoffTaskRefs(plan, state), {
     mode,
     strict: resolveVerificationMode(plan, state).mode === "strict",
     victoryAudit: victoryConfirmed,
+    auth,
+    requireSigned: !!manifest && (manifest.handoffAuth ?? "legacy") === "signed",
+    manifestRunKeyId: manifest?.runKeyId,
   })
 }
 
@@ -3285,6 +3311,7 @@ async function createPlanRun(
       victoryAudit: victoryAuditMode,
       victorySkipReason,
       requireHandoffs: requireHandoffsMode,
+      handoffAuth: allowUnsignedLegacy ? "legacy" : "signed",
       requestHash: baselineRequestHash,
       requirementsHash: baselineRequirementsHash,
       planHash: baselinePlanHash,
@@ -3331,6 +3358,7 @@ async function createPlanRun(
         ...(victorySkipReason ? { victorySkipReason } : {}),
         requireHandoffs: requireHandoffsMode,
         ...(runNonce ? { runNonce } : {}),
+        handoffAuth: allowUnsignedLegacy ? "legacy" : "signed",
         requestHash: baselineRequestHash,
         requirementsHash: baselineRequirementsHash,
         planHash: baselinePlanHash,
@@ -5783,7 +5811,13 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // current artifacts before completion. This runs after the stamped
           // final report's own auth/drift checks so AUTH_STALE still wins, but
           // before the final status branch so a handoff failure is actionable.
-          const nextHandoffs = evaluateHandoffGateFor(run, plan, state)
+          const nextHandoffs = await evaluateHandoffGateCheckedFor(
+            run,
+            plan,
+            state,
+            auth,
+            manifestCheck.signed ? manifestCheck.manifest : undefined,
+          )
           if (!nextHandoffs.skipped && !nextHandoffs.ok) {
             const status =
               nextHandoffs.status === "MISSING" ? "NEEDS_HANDOFFS" : "BLOCKED_BY_HANDOFFS"
@@ -6376,6 +6410,18 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const scope = resolveHandoffScope(agent, input?.taskId)
         if (!scope.ok) return { content: scope.error }
 
+        // The manifest pins whether the run requires signed handoff entries. A
+        // present-but-untrustworthy manifest fails closed rather than letting a
+        // handoff record against an ambiguous baseline.
+        const manifestCheck = await readRunManifest(run, auth)
+        if (!manifestCheck.ok) {
+          return {
+            content: `refused: ${authFailureText(manifestCheck.failure)}; a handoff cannot be recorded against an untrustworthy run manifest. Nothing was written.`,
+          }
+        }
+        const requireSigned =
+          manifestCheck.signed && (manifestCheck.manifest.handoffAuth ?? "legacy") === "signed"
+
         if (scope.taskId) {
           const plan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
           const state = readJson<any>(run, join(run, "state.json"), undefined)
@@ -6393,6 +6439,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             agentSessionId: authz.sessionID ?? "",
             taskId: scope.taskId,
             round: input?.round,
+            auth,
+            requireSigned,
             sections: {
               observation: input?.observation,
               logicChain: input?.logicChain,
@@ -7110,7 +7158,13 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // Continuity handoffs are required (or explicitly skipped) by the
           // plan baseline. The matrix is derived from plan/state; handoff prose
           // is never read as a verdict.
-          const handoffGate = evaluateHandoffGateFor(run, plan, state)
+          const handoffGate = await evaluateHandoffGateCheckedFor(
+            run,
+            plan,
+            state,
+            auth,
+            manifestCheck.signed ? manifestCheck.manifest : undefined,
+          )
           if (!handoffGate.skipped) reasons.push(...handoffGate.reasons)
 
           let documentReviewEvidence:
@@ -7381,6 +7435,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                       agent: e.agent,
                       path: e.path,
                       sha256: e.sha256,
+                      ...(e.auth ? { auth: e.auth } : {}),
+                      ...(e.keyId ? { keyId: e.keyId } : {}),
                     })),
                   },
                 }),
@@ -7406,6 +7462,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                         agent: e.agent,
                         path: e.path,
                         sha256: e.sha256,
+                        ...(e.auth ? { auth: e.auth } : {}),
+                        ...(e.keyId ? { keyId: e.keyId } : {}),
                       })),
                     },
                   }),
