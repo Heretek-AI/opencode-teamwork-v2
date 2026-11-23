@@ -18,6 +18,7 @@ import { execFileSync } from "node:child_process"
 import { homedir } from "node:os"
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { inflateRawSync, inflateSync } from "node:zlib"
+import { assertSafeUrl, safeFetch } from "./url-guard.ts"
 
 export const MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 export const MAX_INLINE_BYTES = 512 * 1024
@@ -1166,42 +1167,54 @@ async function readUrlDocument(
   }
 
   try {
-    const res = await fetch(parsed.toString(), {
+    // SSRF guard: resolve and validate the address before connecting, then pin
+    // the connection to that address (no DNS rebinding). Redirects are not
+    // followed; a Location is validated so a redirect cannot point at a blocked
+    // address.
+    const fetched = await safeFetch(parsed.toString(), {
       method: "GET",
-      signal: AbortSignal.timeout(URL_FETCH_TIMEOUT_MS),
-      redirect: "manual",
+      timeoutMs: URL_FETCH_TIMEOUT_MS,
+      maxBytes: MAX_DOCUMENT_BYTES,
     })
-    if (res.status >= 300 && res.status < 400) {
-      return { ok: false, error: `refused: URL redirect (HTTP ${res.status}) rejected` }
+    if (!fetched.ok) {
+      if (fetched.code === "URL_TOO_LARGE") {
+        return { ok: false, error: `refused: URL response exceeds ${MAX_DOCUMENT_BYTES} byte limit` }
+      }
+      if (fetched.code === "URL_BLOCKED_ADDRESS") {
+        return { ok: false, error: `refused: URL blocked by SSRF guard (${cleanDocText(fetched.error, 180)})` }
+      }
+      if (fetched.code === "URL_TIMEOUT") {
+        return { ok: false, error: "refused: URL fetch error (timeout)" }
+      }
+      return { ok: false, error: `refused: URL fetch error (${cleanDocText(fetched.error, 120)})` }
     }
-    if (!res.ok) {
-      return { ok: false, error: `refused: URL fetch failed with HTTP ${res.status}` }
-    }
-    const cl = Number(res.headers.get("content-length") || 0)
-    if (Number.isFinite(cl) && cl > MAX_DOCUMENT_BYTES) {
-      return { ok: false, error: `refused: URL response exceeds ${MAX_DOCUMENT_BYTES} byte limit` }
-    }
-    const chunks: Buffer[] = []
-    let total = 0
-    if (res.body) {
-      const reader = res.body.getReader()
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        if (value) {
-          total += value.byteLength
-          if (total > MAX_DOCUMENT_BYTES) {
-            try {
-              await reader.cancel()
-            } catch {}
-            return { ok: false, error: `refused: URL response exceeds ${MAX_DOCUMENT_BYTES} byte limit` }
+    const status = fetched.status
+    if (status >= 300 && status < 400) {
+      const location = fetched.headers?.location
+      if (location) {
+        try {
+          const next = new URL(String(location), parsed)
+          const target = await assertSafeUrl(next.toString())
+          if (!target.ok) {
+            return {
+              ok: false,
+              error: `refused: URL redirect to a blocked address (${cleanDocText(target.error, 160)})`,
+            }
           }
-          chunks.push(Buffer.from(value))
+        } catch {
+          return { ok: false, error: "refused: URL redirect with an invalid Location" }
         }
       }
+      return { ok: false, error: `refused: URL redirect (HTTP ${status}) rejected` }
     }
-    const full = Buffer.concat(chunks, total)
-    const ct = res.headers.get("content-type") || ""
+    if (status < 200 || status >= 300) {
+      return { ok: false, error: `refused: URL fetch failed with HTTP ${status}` }
+    }
+    const full = fetched.body ?? Buffer.alloc(0)
+    if (full.byteLength > MAX_DOCUMENT_BYTES) {
+      return { ok: false, error: `refused: URL response exceeds ${MAX_DOCUMENT_BYTES} byte limit` }
+    }
+    const ct = String(fetched.headers?.["content-type"] || "")
     return {
       ok: true,
       doc: {
