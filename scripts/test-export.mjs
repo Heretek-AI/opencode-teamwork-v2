@@ -307,6 +307,10 @@ await check("Run terms: buildExportData records integrity mode, preflight bypass
       generatedBy: { agent: "team/final-verifier", session: "ses_final_verify" },
       generatedAt: "2026-10-18T10:04:00.000Z",
       integrityMode: "demo",
+      victory: null,
+      handoffs: null,
+      artifactAuth: "unsigned",
+      engineConsistent: true,
     },
   })
 })
@@ -376,6 +380,83 @@ await check("Run terms: a <script> agent name is escaped in both outputs", () =>
   assert(!md.includes("<script>"), "raw <script> must not appear in the Markdown")
   assert(md.includes("stamped by \\<script\\>alert(1)\\</script\\> / ses\\_final\\_verify"), "the terms verdict must be Markdown-escaped")
 })
+
+await check("Run terms: a signed final with required handoffs shows the victory, handoff and authenticity labels", () => {
+  const signed = {
+    ...FINAL_STAMPED,
+    victory: "CONFIRMED",
+    handoffs: "PASS",
+    evidence: {
+      ...FINAL_STAMPED.evidence,
+      handoffs: { mode: "required", status: "PASS", required: [], entries: [], reasons: [] },
+    },
+    _auth: { v: 1, alg: "hmac-sha256", keyId: "k_fixture", path: "verify/final.json", digest: "sha256", mac: "sha256", at: "2026-10-18T10:04:00.000Z" },
+  }
+  const data = buildExportData(makeRun({ plan: PASS_PLAN, state: PASS_STATE, finalReport: signed, reports: PASS_REPORTS }), SESSION)
+  assert.strictEqual(data.error, null, `buildExportData must succeed, got: ${data.error}`)
+  assert.strictEqual(data.terms.finalVerdict.artifactAuth, "signed")
+  assert.strictEqual(data.terms.finalVerdict.victory, "CONFIRMED")
+  assert.strictEqual(data.terms.finalVerdict.handoffs.label, "required (PASS)")
+  assert.strictEqual(data.terms.finalVerdict.engineConsistent, true)
+  const html = renderExport(data, { format: "html" })
+  const md = renderExport(data, { format: "markdown" })
+  for (const text of ["CONFIRMED", "required (PASS)", "signed", "envelope present; not verified"]) {
+    assert(html.includes(text), `HTML run terms must show ${text}`)
+    assert(md.includes(text), `Markdown run terms must show ${text}`)
+  }
+})
+
+await check("Run terms: a legacy/unsigned final is labelled UNSIGNED in both outputs", () => {
+  const legacy = { ...FINAL_STAMPED, victory: "CONFIRMED", handoffs: "PASS" }
+  const data = buildExportData(makeRun({ plan: PASS_PLAN, state: PASS_STATE, finalReport: legacy, reports: PASS_REPORTS }), SESSION)
+  assert.strictEqual(data.terms.finalVerdict.artifactAuth, "unsigned")
+  const html = renderExport(data, { format: "html" })
+  const md = renderExport(data, { format: "markdown" })
+  assert(html.includes("UNSIGNED"), "HTML must mark the unsigned final")
+  assert(html.includes("no _auth envelope"), "HTML must explain the missing envelope")
+  assert(md.includes("**UNSIGNED**"), "Markdown must mark the unsigned final")
+})
+
+await check("Run terms: a skipped victory shows the recorded reason and a missing handoff gate is flagged", () => {
+  const skipped = {
+    ...FINAL_STAMPED,
+    victory: "SKIPPED (explicit): independent audit waived for a docs-only change",
+    handoffs: "MISSING",
+    evidence: {
+      ...FINAL_STAMPED.evidence,
+      handoffs: { mode: "required", status: "MISSING", required: [], entries: [], reasons: [] },
+    },
+    _auth: { v: 1, alg: "hmac-sha256", keyId: "k_fixture", path: "verify/final.json", digest: "sha256", mac: "sha256", at: "2026-10-18T10:04:00.000Z" },
+  }
+  const data = buildExportData(makeRun({ plan: PASS_PLAN, state: PASS_STATE, finalReport: skipped, reports: PASS_REPORTS }), SESSION)
+  assert.strictEqual(data.terms.finalVerdict.engineConsistent, false, "required-but-missing handoffs must be inconsistent")
+  const html = renderExport(data, { format: "html" })
+  const md = renderExport(data, { format: "markdown" })
+  assert(html.includes("independent audit waived for a docs-only change"), "HTML must show the skip reason")
+  assert(md.includes("independent audit waived for a docs-only change"), "Markdown must show the skip reason")
+  assert(html.includes("required (MISSING)"), "HTML must show the handoff gate status")
+  assert(md.includes("required (MISSING)"), "Markdown must show the handoff gate status")
+  assert(html.includes("ENGINE WOULD REJECT"), "HTML must flag the inconsistent verdict")
+  assert(md.includes("ENGINE WOULD REJECT"), "Markdown must flag the inconsistent verdict")
+})
+
+await check("Run terms: a <script> payload in the skip reason and handoff status stays escaped", () => {
+  const hostile = {
+    ...FINAL_STAMPED,
+    victory: `SKIPPED (explicit): ${XSS}`,
+    handoffs: XSS,
+    evidence: { ...FINAL_STAMPED.evidence, handoffs: { mode: "required", status: XSS, required: [], entries: [], reasons: [] } },
+    _auth: { v: 1, alg: "hmac-sha256", keyId: "k_fixture", path: "verify/final.json", digest: "sha256", mac: "sha256", at: "2026-10-18T10:04:00.000Z" },
+  }
+  const data = buildExportData(makeRun({ plan: PASS_PLAN, state: PASS_STATE, finalReport: hostile, reports: PASS_REPORTS }), SESSION)
+  const html = renderExport(data, { format: "html" })
+  const md = renderExport(data, { format: "markdown" })
+  assert(!html.includes("<script>"), "raw <script> must not appear in the HTML")
+  assert(html.includes("&lt;script&gt;"), "the skip reason must be HTML-escaped")
+  assert(!md.includes("<script>"), "raw <script> must not appear in the Markdown")
+  assert(md.includes("\\<script\\>"), "the skip reason must be Markdown-escaped")
+})
+
 
 // ==========================================
 // 3. HTML entity escaping (XSS)
