@@ -202,7 +202,11 @@ function readOpened(file, maxBytes, runReal) {
       total += n
     }
     if (total > maxBytes) return { status: "oversize", size: total, cap: maxBytes }
-    return { status: "ok", text: buf.subarray(0, total).toString("utf8") }
+    // `bytes` is the exact on-disk content; `text` is its UTF-8 decoding. A
+    // content digest must use `bytes` (an invalid-sequence replacement in
+    // `text` would not re-encode to the same bytes).
+    const bytes = Buffer.from(buf.subarray(0, total))
+    return { status: "ok", text: bytes.toString("utf8"), bytes }
   } catch (err) {
     return mapError(err, file)
   } finally {

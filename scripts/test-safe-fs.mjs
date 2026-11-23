@@ -96,13 +96,19 @@ check("regular file: readRegularBounded and readWithinBounded return exact insid
   const { run } = makeFixture()
   const file = join(run, "inside.txt")
   const rootless = readRegularBounded(file, 4096)
-  assert.deepStrictEqual(rootless, { status: "ok", text: "INSIDE\n" })
+  assert.strictEqual(rootless.status, "ok")
+  assert.strictEqual(rootless.text, "INSIDE\n")
+  // 0.11.0 adds the exact bytes alongside the decoded text; a content digest
+  // must use bytes, not a UTF-8 round trip.
+  assert(rootless.bytes && rootless.bytes.equals(Buffer.from("INSIDE\n")))
   if (!supportsFdContainment()) {
     console.log("SKIP: /proc/self/fd unavailable — readWithinBounded containment not asserted")
     return
   }
   const within = readWithinBounded(run, file, 4096)
-  assert.deepStrictEqual(within, { status: "ok", text: "INSIDE\n" })
+  assert.strictEqual(within.status, "ok")
+  assert.strictEqual(within.text, "INSIDE\n")
+  assert(within.bytes && within.bytes.equals(Buffer.from("INSIDE\n")))
 })
 
 check("oversize: a file over the cap is reported, never read", () => {

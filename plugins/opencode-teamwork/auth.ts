@@ -50,22 +50,19 @@ import {
   verify as cryptoVerify,
 } from "node:crypto"
 import { spawn } from "node:child_process"
+import {
+  artifactSignatureInput,
+  canonicalJson,
+  payloadDigest,
+  approvalKeyIdFromPublicKey,
+  sha256Hex,
+} from "./approval-format.mjs"
+
+export { artifactSignatureInput, canonicalJson, payloadDigest, sha256Hex }
 
 export const AUTH_ALG = "hmac-sha256"
 export const AUTH_ED25519 = "ed25519"
 export type AuthAlg = typeof AUTH_ALG | typeof AUTH_ED25519
-/**
- * Domain separation for content digests. These are MACs over run artifacts, not
- * password hashes; using HMAC here keeps the 64-hex API while making the
- * construction explicitly keyed and non-interchangeable with a password digest.
- * The bytes below are the public label "teamwork-artifact-digest-v1" (not a
- * credential); storing it as bytes keeps secret-scanning rules from treating a
- * domain-separation label as a hard-coded password.
- */
-const DIGEST_DOMAIN_KEY = Buffer.from([
-  0x74, 0x65, 0x61, 0x6d, 0x77, 0x6f, 0x72, 0x6b, 0x2d, 0x61, 0x72, 0x74, 0x69, 0x66,
-  0x61, 0x63, 0x74, 0x2d, 0x64, 0x69, 0x67, 0x65, 0x73, 0x74, 0x2d, 0x76, 0x31,
-])
 export const AUTH_VERSION = 1
 export const KEY_RING_STORAGE_KEY = "auth/key/ring"
 export const ENV_KEY = "OPENCODE_TEAMWORK_HMAC_KEY"
@@ -87,7 +84,6 @@ export const ENV_WITNESS_TIMEOUT_MS = "OPENCODE_TEAMWORK_WITNESS_TIMEOUT_MS"
 export const ENV_APPROVAL_PUBLIC_KEY = "OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY"
 export const ENV_APPROVAL_KEY_ID = "OPENCODE_TEAMWORK_APPROVAL_KEY_ID"
 const KEY_RING_MAX_KEYS = 3
-const SIGNATURE_DOMAIN = "teamwork-artifact-v1"
 const DEFAULT_TIMEOUT_MS = 5000
 const MAX_TIMEOUT_MS = 60000
 
@@ -108,6 +104,9 @@ export type AuthFailureCode =
   | "AUTH_APPROVAL_UNTRUSTED"
   | "AUTH_APPROVAL_STALE"
   | "AUTH_APPROVAL_NOT_HUMAN"
+  | "AUTH_APPROVAL_INCOMPLETE"
+  | "AUTH_APPROVAL_REPLAY"
+  | "AUTH_APPROVAL_SCOPE"
 
 export interface AuthFailure {
   code: AuthFailureCode
@@ -191,60 +190,8 @@ function failureFromError(err: unknown, fallback: AuthFailureCode = "AUTH_UNAVAI
 }
 
 // ---------------------------------------------------------------------------
-// Canonical JSON / hashing / HMAC
+// HMAC helpers (canonical JSON / digests live in approval-format.mjs)
 // ---------------------------------------------------------------------------
-
-/**
- * Canonical JSON: object keys sorted, arrays in order, no whitespace. Throws on
- * `undefined`, non-finite numbers, bigints, functions, symbols, and cycles.
- */
-export function canonicalJson(value: unknown): string {
-  const seen = new Set<object>()
-  const walk = (v: unknown): string => {
-    if (v === null) return "null"
-    const t = typeof v
-    if (t === "string") return JSON.stringify(v)
-    if (t === "boolean") return v ? "true" : "false"
-    if (t === "number") {
-      if (!Number.isFinite(v as number)) throw new Error("canonicalJson: non-finite number")
-      return JSON.stringify(v)
-    }
-    if (t === "undefined") throw new Error("canonicalJson: undefined is not allowed")
-    if (t === "bigint") throw new Error("canonicalJson: bigint is not allowed")
-    if (t === "function" || t === "symbol") throw new Error(`canonicalJson: ${t} is not allowed`)
-    if (Array.isArray(v)) {
-      if (seen.has(v)) throw new Error("canonicalJson: cyclic value")
-      seen.add(v)
-      const out = `[${v.map((item) => walk(item)).join(",")}]`
-      seen.delete(v)
-      return out
-    }
-    if (t === "object") {
-      const obj = v as Record<string, unknown>
-      if (seen.has(obj)) throw new Error("canonicalJson: cyclic value")
-      if (Object.getPrototypeOf(obj) !== Object.prototype && Object.getPrototypeOf(obj) !== null) {
-        throw new Error("canonicalJson: only plain objects are allowed")
-      }
-      seen.add(obj)
-      // Explicit codepoint comparator: a total order independent of locale.
-      const keys = Object.keys(obj).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
-      const parts: string[] = []
-      for (const key of keys) {
-        const item = obj[key]
-        if (item === undefined) throw new Error(`canonicalJson: undefined at key "${key}"`)
-        parts.push(`${JSON.stringify(key)}:${walk(item)}`)
-      }
-      seen.delete(obj)
-      return `{${parts.join(",")}}`
-    }
-    throw new Error(`canonicalJson: unsupported type ${t}`)
-  }
-  return walk(value)
-}
-
-export function sha256Hex(input: string | Buffer): string {
-  return createHmac("sha256", DIGEST_DOMAIN_KEY).update(input).digest("hex")
-}
 
 const SHA256_HEX = /^[0-9a-f]{64}$/
 const BASE64URL = /^[A-Za-z0-9_-]+$/
@@ -290,39 +237,8 @@ export function timingSafeEqualHex(a: unknown, b: unknown): boolean {
   }
 }
 
-function withoutAuth(payload: unknown): Record<string, unknown> {
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    throw new Error("artifact payload must be an object")
-  }
-  const copy: Record<string, unknown> = {}
-  for (const [k, v] of Object.entries(payload as Record<string, unknown>)) {
-    if (k !== "_auth") copy[k] = v
-  }
-  return copy
-}
-
-/** Digest of an artifact payload with `_auth` excluded. */
-export function payloadDigest(payload: unknown): string {
-  return sha256Hex(canonicalJson(withoutAuth(payload)))
-}
-
 function macOver(envelope: Omit<AuthEnvelope, "mac">): string {
   return canonicalJson(envelope)
-}
-
-/**
- * Ed25519 signature input. The leading domain separator keeps these signatures
- * from being valid over any other protocol; every identity-bearing field of the
- * envelope is covered, including the per-run nonce.
- */
-export function artifactSignatureInput(
-  alg: AuthAlg,
-  keyId: string,
-  path: string,
-  nonce: string,
-  payload: unknown,
-): string {
-  return `${SIGNATURE_DOMAIN}\0${alg}\0${keyId}\0${path}\0${nonce}\0${canonicalJson(withoutAuth(payload))}`
 }
 
 function keyAlg(key: KeyRecord): AuthAlg {
@@ -377,10 +293,7 @@ function makeKeyId(): string {
  * artifacts; it only verifies human/CI approvals.
  */
 export function approvalKeyIdFromEnv(env: Record<string, string | undefined>): string | undefined {
-  const publicKey = String(env[ENV_APPROVAL_PUBLIC_KEY] ?? "").trim()
-  if (!publicKey) return undefined
-  const configured = String(env[ENV_APPROVAL_KEY_ID] ?? "").trim()
-  return configured || deriveKeyId("approval", publicKey)
+  return approvalKeyIdFromPublicKey(env[ENV_APPROVAL_PUBLIC_KEY], env[ENV_APPROVAL_KEY_ID])
 }
 
 function corruptRing(message: string): never {
@@ -902,6 +815,15 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
   const signArtifact = async (relPath: string, payload: unknown, opts: SignOptions = {}): Promise<any> => {
     if (typeof relPath !== "string" || relPath.trim() === "") {
       throw new AuthError({ code: "AUTH_INVALID", message: "artifact path is empty" })
+    }
+    // An approval must be signed by the approver's own key holder, never by the
+    // plugin signer or a command signer the agent can call. This is a static
+    // refusal, so `AUTH_APPROVAL_SCOPE` cannot be bypassed by configuration.
+    if (relPath === "approvals" || relPath.startsWith("approvals/") || relPath.startsWith("./approvals/")) {
+      throw new AuthError({
+        code: "AUTH_APPROVAL_SCOPE",
+        message: `refusing to sign ${relPath}: approval artifacts are signed by the approver key (opencode-teamwork approve sign), never by the plugin signer`,
+      })
     }
     let digest: string
     try {
