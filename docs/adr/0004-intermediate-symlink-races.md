@@ -1,6 +1,6 @@
 # ADR 0004: Post-Open fd Containment for Intermediate-Component Symlink Races in Run-Directory Reads
 
-- **Status:** Proposed (design only; the mitigation is **not** implemented)
+- **Status:** Implemented for the read path on Linux (Sprint 1.2); the write path remains proposed
 - **Date:** 2026-11-22
 - **Workstream:** Sprint 2, S4a (follow-up to the PR #10 hardening)
 - **Classification:** ADR / security design gate

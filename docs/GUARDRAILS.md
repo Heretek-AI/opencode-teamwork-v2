@@ -21,6 +21,7 @@ remove the sharpest edges.
 | **Document Review containment & bounds** | `document-review.ts` + `tools.ts` (`teamwork_document_triage`, `teamwork_document_record`) | Segment-ID allowlist `^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$`, `realpathSync` + `O_NOFOLLOW` symlink/escape refusal on source documents and `document-review/` artifacts, 16 MiB file / 512 KiB inline / 4 MiB PDF-inflate caps, and immutable RSA bounds (`maxSegments <= 8`, `reviewTreeShape <= [4,2,1]`, `synthTreeShape <= [4,1]`). |
 | **LEMMA path & process containment** | `plugins/opencode-teamwork/lemma.ts` + `tools.ts` | Validates `LEMMA_ID` (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`), refuses symlinks component-wise (`lstatSync` + `O_NOFOLLOW`), enforces `realpathSync` containment inside the run dir, executes `lean`/`lake` (and probes the LEAP CLI `leap`, legacy `leap-tools`) via `execFileSync` fixed argv (zero shell interpolation), and rejects `sorry`/`admit`/unauthorized `axiom` even on exit `0`. The transitive-axiom allowlist is approved once at plan time (`lemmaPolicy.allowedAxioms`) and persisted in `lemma/manifest.json`; `teamwork_lemma_verify` reads it from disk and refuses any caller-supplied `allowedAxioms`, so an agent that can call the tool cannot widen the gate. Missing (legacy) policies fail closed to the standard axioms. |
 | **Sanitised run-state injection** — only whitelisted/enumerated fields, newlines stripped, id from the directory name | `tools.ts` `describeRun` → `session.hook("context")` | Stored prompt injection from an untrusted `state.json` into a system prompt. |
+| **Run-artifact read containment (ADR 0004)** — shared leaf `safe-fs.mjs`; open → fstat → regular → size → **fd containment** → bounded read | `plugins/opencode-teamwork/safe-fs.mjs` + `tournament.ts`, `tools.ts`, `lemma.ts`, `lib/{bounded-read,export,timeline,runs}.mjs` | Intermediate-directory symlink swaps that redirect a run read outside `<run>/`. On Linux with a usable `/proc/self/fd` the opened descriptor's real path must stay under the run's realpath; bytes are never read from a refused fd. Rootless readers (`readRegularBounded` / `readBounded`) keep the final-component `O_NOFOLLOW` protection only. On Linux with unusable procfs, existing-file reads fail closed. On macOS/Windows the check is unavailable and the previous behavior (and residual risk) remains. |
 | **Strict-wave identity, report binding & write-once** | `tools.ts` (`teamwork_wave_record` + `deriveCallerAgent`) and `strict.ts` | The trusted session identity is the only authorization source: `challenge` requires `team/falsifier`, `audit` requires `team/security-auditor`, and there is no caller-supplied agent label. The tool also refuses a task absent from `plan.dag.json`, a missing/non-PASS verifier report, any verdict other than `challenge: PASS` / `audit: CLEAN`, and a repeat recording for the same report hash. Each verdict stores the sha256 of the exact verifier report bytes it approved; the final gate requires a match, so a reworked task cannot reuse an earlier wave. A changed report is the only overwrite path (the old verdict is stale). `notes`/`evidence` are sanitised and bounded; the artifact is written atomically with symlink refusal and realpath containment, so a planted link cannot redirect it. |
 | **Non-destructive installer** — `refresh` defaults to false; `--refresh` opts in with backup | `lib/team.mjs` `installAgents` | Silent overwrite of a user's edited agent prompts. |
 | **Non-destructive config edits** — refuse symlinks, never rewrite commented (JSONC) configs | `lib/team.mjs` `registerPlugin` | Comment loss / value corruption / symlink write-through when editing `opencode.json(c)`. |
@@ -51,6 +52,18 @@ remove the sharpest edges.
   `ORIGINAL_REQUEST.md` hash), which catches stale or mislabelled verdicts, not
   a fully forged file written with shell/OS access.
 - **No sandbox for shell.** Agents run with full user privileges and network.
+- **Read containment is platform-specific.** `safe-fs.mjs` enforces the
+  post-open containment check only on Linux with a mounted, usable
+  `/proc/self/fd`. If Linux procfs is unavailable, existing-file reads are
+  refused (fail closed); absent files still read as absent. macOS and Windows
+  have no pure-JS fd-to-path primitive, so they keep `O_NOFOLLOW`/lstat,
+  `O_NONBLOCK`, `fstat` and the byte cap, and the intermediate-component symlink
+  race remains a documented residual risk there.
+- **Write-path containment is not claimed.** `writeSafeRunFile` (tournament)
+  and `writeTextSafe`/`writeJsonSafe` (tools) validate by path and then
+  create/mkdir/rename by path. A raced intermediate directory can still redirect
+  a write; ADR 0004 fixes the read path only. The random `wx` temp plus rename
+  does prevent a planted temp-path symlink from overwriting a victim.
 
 ## Running an audit
 
