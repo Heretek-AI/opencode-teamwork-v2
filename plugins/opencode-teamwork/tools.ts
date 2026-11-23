@@ -50,6 +50,8 @@ import {
   splitInstructionAndInlineDoc,
   validateTreeBounds,
 } from "./document-review.ts"
+import { authorizeToolCall } from "./authorize.ts"
+import { assertSafeUrl, safeFetch } from "./url-guard.ts"
 import {
   classifyRoute as classifyLemmaRoute,
   evaluateLemmaFinalEvidence,
@@ -502,6 +504,7 @@ async function deriveCallerAgent(
       if (a) return { agent: a, source: "session" }
     }
   } catch {}
+  if (!run) return undefined
   try {
     const a = readSnapshots(run, join(run, "snapshots.json"))?.bySession?.[sessionID]?.agent
     if (typeof a === "string") {
@@ -828,20 +831,29 @@ function checkInputPath(value: string): { status: PreflightItemStatus; detail?: 
 
 async function checkInputUrl(value: string, checkUrls: boolean): Promise<{ status: PreflightItemStatus; detail?: string }> {
   if (!checkUrls) return { status: "UNCHECKED", detail: "checkUrls: false" }
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), PREFLIGHT_URL_TIMEOUT_MS)
-  try {
-    // HEAD only: no body is read, and redirects are reported (not followed).
-    const res = await fetch(value, { method: "HEAD", signal: controller.signal, redirect: "manual" })
-    return {
-      status: res.status >= 200 && res.status < 400 ? "READY" : "OUTAGE",
-      detail: `HTTP ${res.status}`,
+  // HEAD only: no body is read. Redirects are not followed, but a Location is
+  // validated so a redirect cannot point at a loopback/private/metadata address.
+  const fetched = await safeFetch(value, { method: "HEAD", timeoutMs: PREFLIGHT_URL_TIMEOUT_MS })
+  if (!fetched.ok) {
+    if (fetched.code === "URL_TIMEOUT") return { status: "OUTAGE", detail: "timeout" }
+    return { status: "OUTAGE", detail: clean(fetched.error, 160) }
+  }
+  if (fetched.status >= 300 && fetched.status < 400) {
+    const location = fetched.headers?.location
+    if (location) {
+      try {
+        const next = new URL(String(location), value)
+        const target = await assertSafeUrl(next.toString())
+        if (!target.ok) return { status: "OUTAGE", detail: clean(`redirect to blocked address: ${target.error}`, 160) }
+      } catch {
+        return { status: "OUTAGE", detail: "redirect with an invalid Location" }
+      }
     }
-  } catch (err: any) {
-    const why = err?.name === "AbortError" ? "timeout" : err?.message || "request failed"
-    return { status: "OUTAGE", detail: clean(why, 120) }
-  } finally {
-    clearTimeout(timer)
+    return { status: "READY", detail: `HTTP ${fetched.status} (redirect not followed)` }
+  }
+  return {
+    status: fetched.status >= 200 && fetched.status < 400 ? "READY" : "OUTAGE",
+    detail: `HTTP ${fetched.status}`,
   }
 }
 
@@ -1846,50 +1858,52 @@ function currentManifestDrift(manifest: RunManifest, plan: any, state: any, run:
 }
 
 /**
- * Session-tree binding: the caller of victory_audit / wave_record / report must
- * be a strict descendant of the run's root (the plan-time Sentinel session).
- * Fails closed when the ancestry cannot be resolved.
+ * Session-tree binding for the control plane: identity comes from the trusted
+ * session (`deriveCallerAgent`), and run-bound tools require root/descendant
+ * ancestry. Implemented in authorize.ts so every tool shares one rule set.
  */
-const SESSION_TREE_MAX_DEPTH = 32
-
-async function requireDescendantSession(
-  ctx: any,
-  rootSessionId: string | undefined,
-  sessionID: string | undefined,
-): Promise<{ ok: true } | { ok: false; reason: string }> {
-  if (!sessionID) return { ok: false, reason: "no session identity was supplied" }
-  if (!rootSessionId) return { ok: false, reason: "the run has no recorded rootSessionId (fail closed)" }
-  if (sessionID === rootSessionId) {
-    return { ok: false, reason: "the caller is the root session, not a descendant (fail closed)" }
-  }
-  let current = sessionID
-  for (let depth = 0; depth < SESSION_TREE_MAX_DEPTH; depth++) {
-    let info: any
-    try {
-      if (typeof ctx?.session?.get !== "function") {
-        return { ok: false, reason: "ctx.session.get is unavailable, so session ancestry cannot be resolved (fail closed)" }
-      }
-      info = await withTimeout(Promise.resolve(ctx.session.get({ sessionID: current })), 2000)
-    } catch {
-      return { ok: false, reason: `session ${clean(current, 64)} could not be resolved (fail closed)` }
-    }
-    const parent = info?.parentID ?? info?.parentId ?? info?.parent_id
-    if (typeof parent !== "string" || parent.trim() === "") {
-      return {
-        ok: false,
-        reason: `session ${clean(current, 64)} has no parent, so it does not descend from ${clean(rootSessionId, 64)} (fail closed)`,
-      }
-    }
-    if (parent === rootSessionId) return { ok: true }
-    current = parent
-  }
-  return { ok: false, reason: `session ancestry exceeds ${SESSION_TREE_MAX_DEPTH} levels (fail closed)` }
-}
 
 /** The run's recorded root session (manifest first, then plan/state). */
 function recordedRootSessionId(manifest: RunManifest | undefined, plan: any, state: any): string | undefined {
   const candidate = manifest?.rootSessionId ?? plan?.rootSessionId ?? state?.rootSessionId
   return typeof candidate === "string" && candidate.trim() !== "" ? candidate : undefined
+}
+
+/**
+ * Resolve the trusted caller + the run root, then apply the central role map.
+ * The `agent` input on a tool is only a recorded label: authorization always
+ * uses the session's agent.
+ */
+async function authorizeToolAction(
+  ctx: any,
+  run: string | undefined,
+  toolName: string,
+  action: string | undefined,
+  context: any,
+  opts: { skipSessionTree?: boolean } = {},
+): Promise<{ ok: true; caller: { agent: string; source: "session" } | undefined; sessionID: string | undefined } | { ok: false; content: string }> {
+  const sessionID = typeof context?.sessionID === "string" ? context.sessionID : undefined
+  const caller = sessionID ? await deriveCallerAgent(ctx, run ?? "", sessionID) : undefined
+  let rootSessionId: string | undefined
+  if (run && existsSync(run)) {
+    const plan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
+    const state = readJson<any>(run, join(run, "state.json"), undefined)
+    let manifest: RunManifest | undefined
+    try {
+      const check = await readRunManifest(run, auth)
+      if (check.ok && check.signed) manifest = check.manifest
+    } catch {}
+    rootSessionId = recordedRootSessionId(manifest, plan, state)
+  }
+  const decision = await authorizeToolCall(toolName, action, caller?.agent, {
+    run,
+    rootSessionId,
+    sessionID,
+    ctx,
+    skipSessionTree: opts.skipSessionTree,
+  })
+  if (!decision.ok) return { ok: false, content: decision.error }
+  return { ok: true, caller, sessionID }
 }
 
 async function createPlanRun(
@@ -2758,6 +2772,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         additionalProperties: false,
       },
       execute: async (input: any, context: any) => {
+        const planRun = input?.sessionId ? resolveRun(root, input.sessionId).run : undefined
+        const authz = await authorizeToolAction(ctx, planRun, "plan", undefined, context)
+        if (!authz.ok) return { content: authz.content, refused: "unauthorized" }
         const res = await createPlanRun(ctx, root, input, context, undefined, auth)
         return { content: res.content, ...(res.ok ? {} : { ...(res.refused ? { refused: res.refused } : {}), ...(res.aborted ? { aborted: true } : {}) }) }
       },
@@ -2933,6 +2950,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const sessionId = input?.sessionId || newSessionId()
         const resolvedSession = resolveRun(root, sessionId)
         if (resolvedSession.error) return { content: resolvedSession.error }
+        const authz = await authorizeToolAction(ctx, resolvedSession.run, "document_triage", undefined, context)
+        if (!authz.ok) return { content: authz.content }
 
         const boundsRes = validateTreeBounds({
           maxSegments: input?.maxSegments,
@@ -3130,10 +3149,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         required: ["stage", "summary"],
         additionalProperties: false,
       },
-      execute: (input: any) => {
+      execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
+        const authz = await authorizeToolAction(ctx, run, "document_record", input?.stage, context)
+        if (!authz.ok) return { content: authz.content }
 
         const docDir = join(run, "document-review")
         try {
@@ -3351,10 +3372,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         additionalProperties: false,
       },
-      execute: async (input: any) => {
+      execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
+        const authz = await authorizeToolAction(ctx, run, "preflight", undefined, context)
+        if (!authz.ok) return { content: authz.content }
         const explicitInputs = (Array.isArray(input?.inputs) ? input.inputs : []).filter(
           (v: unknown): v is string => typeof v === "string",
         )
@@ -3406,10 +3429,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       name: "status",
       description: "Read the active (or given) Teamwork run and summarize per-task progress.",
       input: { type: "object", properties: { sessionId: { type: "string" } }, additionalProperties: false },
-      execute: (input: any) => {
+      execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
+        const authz = await authorizeToolAction(ctx, run, "status", undefined, context)
+        if (!authz.ok) return { content: authz.content }
         const state = readJson<any>(run, join(run, "state.json"), {})
         const tasks = state.tasks || {}
         const lines = Object.entries(tasks).map(([id, t]: any) => `  ${clean(id, 64)}: ${clean(t?.status, 16)} (round ${Number(t?.round) || 0})`)
@@ -3422,10 +3447,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       name: "resume",
       description: "Return the tasks that still need work (pending/running/fail) so a restarted Sentinel can continue where it stopped.",
       input: { type: "object", properties: { sessionId: { type: "string" } }, additionalProperties: false },
-      execute: (input: any) => {
+      execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
+        const authz = await authorizeToolAction(ctx, run, "resume", undefined, context)
+        if (!authz.ok) return { content: authz.content }
         const state = readJson<any>(run, join(run, "state.json"), {})
         const open = Object.entries(state.tasks || {}).filter(([, t]: any) => !isPassStatus(t?.status))
         if (!open.length) return { content: `Run ${basename(run)} is complete (all tasks pass).` }
@@ -3449,6 +3476,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
+        const authz = await authorizeToolAction(ctx, run, "cost", undefined, context)
+        if (!authz.ok) return { content: authz.content }
         const file = join(run, "costs.json")
         const snapshotsFile = join(run, "snapshots.json")
 
@@ -3596,6 +3625,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         "Preflight the run budget BEFORE teamwork_plan. Detects whether the session uses opencode/ (managed) models and whether the opencode_console MCP is connected. When both hold, tells the caller to fetch credits via opencode_console_get_usage and pass a full/partial budgetUsd to teamwork_plan. Otherwise, use the default budget.",
       input: { type: "object", properties: {}, additionalProperties: false },
       execute: async (_input: any, context: any) => {
+        const authz = await authorizeToolAction(ctx, undefined, "budget", undefined, context)
+        if (!authz.ok) return { content: authz.content }
         const consoleOnline = await isConsoleMcpConnected(ctx)
         const opencodeModel = await usesOpencodeModel(ctx, context?.sessionID)
         if (consoleOnline && opencodeModel) {
@@ -3687,6 +3718,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       execute: async (input: any, context: any) => {
         const action = clean(input?.action, 32).trim()
         const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+        const tournamentRun = input?.sessionId ? resolveRun(root, input.sessionId).run : undefined
+        const authz = await authorizeToolAction(ctx, tournamentRun, "tournament", action, context)
+        if (!authz.ok) return { content: authz.content, ok: false, refused: "unauthorized" }
 
         if (action === "estimate") {
           const cfgRes = resolveAndValidateTournamentConfig(input?.tournament, input?.tournamentBounds)
@@ -3844,6 +3878,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               }))
               writeJson(join(run, "plan.dag.json"), {
                 sessionId,
+                rootSessionId: callSession,
                 topology: "massive-proof",
                 integrityMode: DEFAULT_INTEGRITY_MODE,
                 preflight: { status: "SKIPPED" },
@@ -3854,6 +3889,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 writeJson(join(run, "state.json"), {
                   version: 1,
                   sessionId,
+                  rootSessionId: callSession,
                   integrityMode: DEFAULT_INTEGRITY_MODE,
                   phase: "DISPATCH",
                   tasks: nullMap(Object.fromEntries(tasks.map((t: any) => [t.id, { status: "pending", round: 0 }]))),
@@ -3873,6 +3909,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               })
             } else {
               existingPlan.tournament = { config: cfgRes.config, estimate }
+              if (!existingPlan.rootSessionId && callSession) existingPlan.rootSessionId = callSession
               writeJson(join(run, "plan.dag.json"), existingPlan)
             }
 
@@ -4283,10 +4320,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         required: ["pitfall"],
         additionalProperties: false,
       },
-      execute: (input: any) => {
+      execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
+        const authz = await authorizeToolAction(ctx, run, "pitfall", undefined, context)
+        if (!authz.ok) return { content: authz.content }
         const file = join(run, "pitfalls.md")
         refuseSymlink(file)
         const line = `- [round ${Number(input.round) || "?"}] ${clean(input.pitfall, 200)}${input.taskId ? ` — seen in ${clean(input.taskId, 64)}` : ""}\n`
@@ -4320,6 +4359,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
+        const authz = await authorizeToolAction(ctx, run, "next", undefined, context)
+        if (!authz.ok) return { content: authz.content }
 
         const plan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
         const state = readJson<any>(run, join(run, "state.json"), undefined)
@@ -5090,9 +5131,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
+        const authz = await authorizeToolAction(ctx, run, "task_update", undefined, context)
+        if (!authz.ok) return { content: authz.content }
         const stateFile = join(run, "state.json")
         const planFile = join(run, "plan.dag.json")
-        const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+        const callSession = authz.sessionID
 
         const taskId = clean(input.taskId, 64)
         if (!taskId) return { content: "Error: taskId is required" }
@@ -5309,10 +5352,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         required: ["status"],
         additionalProperties: false,
       },
-      execute: async (input: any) => {
+      execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
+        const authz = await authorizeToolAction(ctx, run, "security_audit", undefined, context)
+        if (!authz.ok) return { content: authz.content }
         // The auditor works from the recorded request, not from its caller: the
         // mode is read from ORIGINAL_REQUEST.md (legacy runs default to development).
         const integrity = readIntegrityMode(run)
@@ -5493,30 +5538,14 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
-        const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
         // Authorization follows the trusted session identity only. There is no
         // `agent` input: a caller cannot label itself the victory auditor.
-        const caller = callSession ? await deriveCallerAgent(ctx, run, callSession) : undefined
-        if (!caller || caller.agent !== VICTORY_AUDITOR_AGENT) {
-          return {
-            content: `refused: victory_audit must be called by ${VICTORY_AUDITOR_AGENT} (trusted session agent: ${caller?.agent ? clean(caller.agent, 64) : "unknown"}); nothing was written`,
-          }
-        }
-        if (!callSession) {
-          return { content: "refused: victory_audit needs a trusted session identity; nothing was written" }
-        }
+        const authz = await authorizeToolAction(ctx, run, "victory_audit", undefined, context)
+        if (!authz.ok) return { content: authz.content }
+        const callSession = authz.sessionID
         const manifestCheck = await readRunManifest(run, auth)
         if (!manifestCheck.ok) {
           return { content: `refused: ${authFailureText(manifestCheck.failure)}; nothing was written` }
-        }
-        const vPlan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
-        const vState = readJson<any>(run, join(run, "state.json"), undefined)
-        const rootSessionId = recordedRootSessionId(manifestCheck.signed ? manifestCheck.manifest : undefined, vPlan, vState)
-        const ancestry = await requireDescendantSession(ctx, rootSessionId, callSession)
-        if (!ancestry.ok) {
-          return {
-            content: `refused: victory_audit must be called from a session that descends from the run root (${clean(rootSessionId ?? "unrecorded", 64)}); ${ancestry.reason}; nothing was written`,
-          }
         }
         const result = await recordVictoryAudit(
           run,
@@ -5580,29 +5609,14 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         }
         // Authorization follows the trusted session identity only. There is no
         // `agent` input: a caller cannot label itself the falsifier or auditor.
-        const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
-        const caller = callSession ? await deriveCallerAgent(ctx, run, callSession) : undefined
+        const authz = await authorizeToolAction(ctx, run, "wave_record", kind, context)
+        if (!authz.ok) return { content: authz.content }
+        const callSession = authz.sessionID
+        const caller = authz.caller
         const expectedAgent = WAVE_AGENTS[kind]
-        if (!caller || caller.agent !== expectedAgent) {
-          return {
-            content: `refused: a ${kind} verdict must be recorded by ${expectedAgent} (trusted session agent: ${caller?.agent ? clean(caller.agent, 64) : "unknown"}); nothing was written`,
-          }
-        }
-        if (!callSession) {
-          return { content: "refused: wave_record needs a trusted session identity; nothing was written" }
-        }
         const manifestCheck = await readRunManifest(run, auth)
         if (!manifestCheck.ok) {
           return { content: `refused: ${authFailureText(manifestCheck.failure)}; nothing was written` }
-        }
-        const wPlan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
-        const wState = readJson<any>(run, join(run, "state.json"), undefined)
-        const rootSessionId = recordedRootSessionId(manifestCheck.signed ? manifestCheck.manifest : undefined, wPlan, wState)
-        const ancestry = await requireDescendantSession(ctx, rootSessionId, callSession)
-        if (!ancestry.ok) {
-          return {
-            content: `refused: wave_record must be called from a session that descends from the run root (${clean(rootSessionId ?? "unrecorded", 64)}); ${ancestry.reason}; nothing was written`,
-          }
         }
         const result = await recordVerificationWave(
           run,
@@ -5687,16 +5701,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
-        const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
-        const caller = callSession ? await deriveCallerAgent(ctx, run, callSession) : undefined
-        if (!caller || caller.agent !== "team/verifier") {
-          return {
-            content: `refused: teamwork_report must be called by team/verifier (trusted session agent: ${caller?.agent ? clean(caller.agent, 64) : "unknown"}); nothing was written`,
-          }
-        }
-        if (!callSession) {
-          return { content: "refused: teamwork_report needs a trusted session identity; nothing was written" }
-        }
+        const authz = await authorizeToolAction(ctx, run, "report", undefined, context)
+        if (!authz.ok) return { content: authz.content }
+        const callSession = authz.sessionID
         const taskId = input?.taskId
         if (!isSafeTaskId(taskId)) {
           return { content: `refused: invalid task id "${clean(taskId, 32)}"; nothing was written` }
@@ -5728,13 +5735,6 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           return { content: `refused: ${authFailureText(manifestCheck.failure)}; nothing was written` }
         }
         const state = readJson<any>(run, join(run, "state.json"), undefined)
-        const rootSessionId = recordedRootSessionId(manifestCheck.signed ? manifestCheck.manifest : undefined, plan, state)
-        const ancestry = await requireDescendantSession(ctx, rootSessionId, callSession)
-        if (!ancestry.ok) {
-          return {
-            content: `refused: teamwork_report must be called from a session that descends from the run root (${clean(rootSessionId ?? "unrecorded", 64)}); ${ancestry.reason}; nothing was written`,
-          }
-        }
         const fatalFindings = Array.isArray(input?.fatalFindings)
           ? input.fatalFindings.slice(0, 50).map((f: any) => ({
               where: clean(f?.where, 200),
@@ -5838,6 +5838,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             return { content: `Error: No state.json found for run ${basename(run)}.` }
           }
           const plan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
+          // Preserve the abort path below: when the signal fired while the
+          // caller was being resolved, let the evidence scan record FAIL.
+          if (!context?.signal?.aborted) {
+            const authz = await authorizeToolAction(ctx, run, "final_verify", undefined, context)
+            if (!authz.ok) return { content: authz.content }
+          }
           const manifestCheck = await readRunManifest(run, auth)
           if (!manifestCheck.ok) {
             return {
@@ -6404,13 +6410,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         required: ["action"],
         additionalProperties: false,
       },
-      execute: (input: any) => {
+      execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
+        const rawAction = clean(input.action, 16)
+        const authz = await authorizeToolAction(ctx, run, "worktree", rawAction, context)
+        if (!authz.ok) return { content: authz.content }
         const runId = basename(run)
 
-        const action = clean(input.action, 16)
+        const action = rawAction
         // SEC-1: validate at the entry point, before any path or branch is built.
         // Raw value is checked (not clean()ed) so nothing is silently truncated.
         const rawTaskId = input.taskId ? String(input.taskId) : undefined
@@ -6725,7 +6734,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         additionalProperties: false,
       },
-      execute: (input: any) => {
+      execute: async (input: any, context: any) => {
+        const authz = await authorizeToolAction(ctx, undefined, "lemma_probe", undefined, context)
+        if (!authz.ok) return { content: authz.content }
         const probe = probeLemmaToolchain({ timeoutMs: input?.timeoutMs })
         if (!probe.ready) {
           return {
@@ -6765,8 +6776,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
         const action = clean(input?.action, 32)
+        const authz = await authorizeToolAction(ctx, run, "lemma_formalize", action, context)
+        if (!authz.ok) return { content: authz.content }
         const manifestFile = join(run, "lemma", "manifest.json")
-        const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+        const callSession = authz.sessionID
 
         return await withFileLock(manifestFile, async () => {
           if (action === "draft") {
@@ -6848,11 +6861,13 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         required: ["action", "lemmaId"],
         additionalProperties: false,
       },
-      execute: async (input: any) => {
+      execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
         const action = clean(input?.action, 32)
+        const authz = await authorizeToolAction(ctx, run, "lemma_node", action, context)
+        if (!authz.ok) return { content: authz.content }
         if (action !== "create" && action !== "update" && action !== "blueprint" && action !== "attempt") {
           return { content: `refused: unknown action "${action}" (allowed: create | update | blueprint | attempt)` }
         }
@@ -6894,10 +6909,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         required: ["lemmaId"],
         additionalProperties: false,
       },
-      execute: async (input: any) => {
+      execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
+        const authz = await authorizeToolAction(ctx, run, "lemma_verify", undefined, context)
+        if (!authz.ok) return { content: authz.content }
         // Deprecated field: never accept a caller-supplied allowlist. Widening
         // the axiom gate is a plan-time decision persisted in the manifest.
         if (input?.allowedAxioms !== undefined) {
