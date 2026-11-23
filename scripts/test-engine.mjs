@@ -8657,6 +8657,11 @@ process.exit(0);
   const childScript = join(concDir, "run-teamwork-tool.mjs")
   const runFile = (runId, name) => join(concDir, ".opencode", "teamwork", runId, name)
   const stateOf = (runId) => JSON.parse(readFileSync(runFile(runId, "state.json"), "utf8"))
+  const assertClose = (actual, expected, message) =>
+    assert(
+      Math.abs(Number(actual) - expected) < 1e-9,
+      `${message} (actual ${actual}, expected ${expected})`,
+    )
 
   writeFileSync(
     childScript,
@@ -8918,19 +8923,19 @@ process.exit(0);
     const costFirst = await costTools.cost.execute({ sessionId: costRun }, { sessionID: COST_ROOT })
     assert.strictEqual(costFirst.skippedDuplicate, false, "the first application must not be a duplicate")
     let costs = JSON.parse(readFileSync(runFile(costRun, "costs.json"), "utf8"))
-    assert.strictEqual(costs.spentUsd, 0.5, "the first snapshot must add its delta")
-    assert.strictEqual(costs.byTask._sentinel, 0.5)
+    assertClose(costs.spentUsd, 0.5, "the first snapshot must add its delta")
+    assertClose(costs.byTask._sentinel, 0.5, "the first snapshot must populate the sentinel bucket")
     assert.strictEqual(costs.budgetUsd, 20, "budget metadata must be preserved")
     assert(/^[0-9a-f]{64}$/.test(costs.appliedSnapshotDigest), "costs.json must store the applied snapshot digest")
-    assert.strictEqual(costs.snapshotCursors[COST_ROOT].lastCost, 0.5, "the per-session cursor must advance")
+    assertClose(costs.snapshotCursors[COST_ROOT].lastCost, 0.5, "the per-session cursor must advance")
 
     // Crash simulation: costs.json was written, snapshots.json was not.
     writeFileSync(runFile(costRun, "snapshots.json"), snapshotsBefore)
     const costReplay = await costTools.cost.execute({ sessionId: costRun }, { sessionID: COST_ROOT })
     assert.strictEqual(costReplay.skippedDuplicate, true, "the same digest must be skipped")
     costs = JSON.parse(readFileSync(runFile(costRun, "costs.json"), "utf8"))
-    assert.strictEqual(costs.spentUsd, 0.5, "a replay must not double-count")
-    assert.strictEqual(costs.byTask._sentinel, 0.5, "a replay must not grow the bucket")
+    assertClose(costs.spentUsd, 0.5, "a replay must not double-count")
+    assertClose(costs.byTask._sentinel, 0.5, "a replay must not grow the bucket")
     assert.strictEqual(costs.lastCostUpdate.skippedDuplicate, true, "the skip must be recorded in costs.json")
 
     // A genuinely new observation applies only the incremental delta, from the
@@ -8939,8 +8944,8 @@ process.exit(0);
     const costNext = await costTools.cost.execute({ sessionId: costRun }, { sessionID: COST_ROOT })
     assert.strictEqual(costNext.skippedDuplicate, false)
     costs = JSON.parse(readFileSync(runFile(costRun, "costs.json"), "utf8"))
-    assert.strictEqual(costs.spentUsd, 0.7, "a new digest must add only the delta (0.2)")
-    assert.strictEqual(costs.byTask._sentinel, 0.7, "the bucket must be cumulative, not double-counted")
+    assertClose(costs.spentUsd, 0.7, "a new digest must add only the delta (0.2)")
+    assertClose(costs.byTask._sentinel, 0.7, "the bucket must be cumulative, not double-counted")
     assert.strictEqual(costs.budgetUsd, 20, "budget buckets must stay unchanged")
     console.log("✓ cost digest is idempotent across crash replay; new snapshots add only the delta; budget preserved")
   } finally {

@@ -29,7 +29,7 @@ import {
 } from "node:fs"
 import { hostname } from "node:os"
 import { dirname, isAbsolute } from "node:path"
-import { randomBytes } from "node:crypto"
+import { randomBytes, randomInt } from "node:crypto"
 
 const fileLocks = new Map<string, Promise<unknown>>()
 
@@ -181,15 +181,95 @@ export async function withCrossProcessLock<T>(
   // The in-process queue uses the same key as the on-disk lock. A single key
   // per target is what prevents self-deadlock: this process can never own the
   // on-disk lock while another call in this process waits for the queue.
-  return withFileLock(lockPath, () => acquireAndRun(targetPath, lockPath, fn, options))
+  return withFileLock(lockPath, () => acquireAndRun(lockPath, fn, options))
+}
+
+/** Try one `O_CREAT|O_EXCL` create. Returns false only for an existing lock. */
+function tryCreateLock(lockPath: string, owner: LockOwner): boolean {
+  try {
+    // `wx` is O_CREAT|O_EXCL: it never follows or overwrites an existing
+    // entry, including a symlink planted at the lock path.
+    const fd = openSync(lockPath, "wx", 0o600)
+    try {
+      writeSync(fd, JSON.stringify(owner))
+    } finally {
+      closeSync(fd)
+    }
+    return true
+  } catch (err: any) {
+    if (err?.code === "EEXIST") return false
+    throw new Error(`refused: could not create lock file "${lockPath}" (${err?.code ?? err?.message ?? "unknown error"})`)
+  }
+}
+
+/** Whether an observed lock is old enough and locally owned by a dead/self pid. */
+function isStaleLock(
+  owner: LockOwner | undefined,
+  host: string,
+  pid: number,
+  leaseMs: number,
+  now: number,
+  isAlive: (pid: number) => boolean,
+): boolean {
+  if (!owner) return false
+  if (ownerAgeMs(owner, now) <= leaseMs) return false
+  // Never infer liveness for a lock written on another host.
+  if (owner.host !== host) return false
+  return owner.pid === pid || !isAlive(owner.pid)
+}
+
+/**
+ * Best-effort stale-lock removal. Re-read the nonce immediately before the
+ * unlink to narrow the classic reclamation race. Failure is not fatal: the
+ * caller waits/retries, and the timeout still fails closed.
+ */
+function reclaimStaleLock(lockPath: string, observedNonce: string): boolean {
+  const again = readOwner(lockPath)
+  if (!again || again.nonce !== observedNonce) return false
+  try {
+    unlinkSync(lockPath)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Bounded exponential backoff plus cryptographic jitter. */
+function retryDelayMs(attempt: number, baseMs: number, maxMs: number): number {
+  const backoff = Math.min(maxMs, baseMs * 2 ** Math.min(attempt, 8))
+  const jitter = randomInt(0, Math.max(1, Math.floor(backoff / 2)))
+  return backoff + jitter
+}
+
+/**
+ * Release our lock file. Cleanup is deliberately best-effort: an unlink error
+ * (EACCES, ENOENT after a racing reclaimer, etc.) must never mask the primary
+ * error from `fn`. A leftover lock is still reclaimable by the stale path after
+ * the lease, so ignoring here cannot strand the artifact forever.
+ */
+function releaseLock(lockPath: string, nonce: string): void {
+  try {
+    const current = readOwner(lockPath)
+    if (current?.nonce === nonce) unlinkSync(lockPath)
+  } catch {
+    // Best-effort cleanup only; never throw from finally.
+  }
 }
 
 async function acquireAndRun<T>(
-  targetPath: string,
   lockPath: string,
   fn: () => Promise<T> | T,
   options: CrossProcessLockOptions,
 ): Promise<T> {
+  const nonce = await acquireLock(lockPath, options)
+  try {
+    return await fn()
+  } finally {
+    releaseLock(lockPath, nonce)
+  }
+}
+
+async function acquireLock(lockPath: string, options: CrossProcessLockOptions): Promise<string> {
   const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
   const retryBaseMs = Math.max(1, options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS)
@@ -204,52 +284,14 @@ async function acquireAndRun<T>(
 
   mkdirSync(dirname(lockPath), { recursive: true })
 
-  let acquired = false
-  while (!acquired) {
+  while (true) {
     assertLockPathSafe(lockPath)
-    const at = new Date(now()).toISOString()
-    const owner: LockOwner = { pid, host, at, nonce }
-    try {
-      // `wx` is O_CREAT|O_EXCL: it never follows or overwrites an existing
-      // entry, including a symlink planted at the lock path.
-      const fd = openSync(lockPath, "wx", 0o600)
-      try {
-        writeSync(fd, JSON.stringify(owner))
-      } finally {
-        closeSync(fd)
-      }
-      acquired = true
-      break
-    } catch (err: any) {
-      if (err?.code !== "EEXIST") {
-        throw new Error(`refused: could not create lock file "${lockPath}" (${err?.code ?? err?.message ?? "unknown error"})`)
-      }
-    }
+    const owner: LockOwner = { pid, host, at: new Date(now()).toISOString(), nonce }
+    if (tryCreateLock(lockPath, owner)) return nonce
 
     const existing = readOwner(lockPath)
-    const age = existing ? ownerAgeMs(existing, now()) : Number.POSITIVE_INFINITY
-    const sameHost = existing?.host === host
-    // Never infer liveness for a lock written on another host. If the JSON is
-    // unreadable we also keep waiting until the timeout rather than unlinking
-    // an artifact we cannot identify.
-    const stale =
-      !!existing &&
-      age > leaseMs &&
-      sameHost &&
-      (existing.pid === pid || !isAlive(existing.pid))
-
-    if (stale) {
-      // Re-read immediately before unlinking and require the same nonce. This
-      // narrows (but cannot entirely remove) the classic stale-lock race.
-      const again = readOwner(lockPath)
-      if (again && again.nonce === existing!.nonce) {
-        try {
-          unlinkSync(lockPath)
-        } catch (err: any) {
-          if (err?.code !== "ENOENT") throw err
-        }
-      }
-      continue
+    if (isStaleLock(existing, host, pid, leaseMs, now(), isAlive) && existing) {
+      if (reclaimStaleLock(lockPath, existing.nonce)) continue
     }
 
     if (now() >= deadline) {
@@ -260,25 +302,6 @@ async function acquireAndRun<T>(
     }
 
     attempt += 1
-    const backoff = Math.min(retryMaxMs, retryBaseMs * 2 ** Math.min(attempt, 8))
-    const jitter = Math.floor(Math.random() * Math.max(1, Math.floor(backoff / 2)))
-    await sleep(backoff + jitter)
-  }
-
-  try {
-    return await fn()
-  } finally {
-    // Only remove the lock file if it is still ours. Another process could not
-    // have legitimately replaced it while we held it, but a manual recovery or
-    // a stale reclaimer might have; unlinking someone else's lock would be
-    // worse than leaving ours behind.
-    const current = readOwner(lockPath)
-    if (current?.nonce === nonce) {
-      try {
-        unlinkSync(lockPath)
-      } catch (err: any) {
-        if (err?.code !== "ENOENT") throw err
-      }
-    }
+    await sleep(retryDelayMs(attempt, retryBaseMs, retryMaxMs))
   }
 }
