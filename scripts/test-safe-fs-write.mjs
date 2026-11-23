@@ -33,22 +33,37 @@ import {
   writeFileSync,
   linkSync,
 } from "node:fs"
-import { tmpdir } from "node:os"
+import { tmpdir, hostname } from "node:os"
 import { dirname, join } from "node:path"
 import { spawn, spawnSync } from "node:child_process"
 import assert from "node:assert"
 import {
   appendLineWithin,
+  assertSingleSegment,
+  createDirWithin,
+  fdContainmentMode,
   fdTraversalMode,
   openPinnedRoot,
   pinParent,
   recentWriteAnomalies,
+  setFdContainmentModeForTest,
   setFdTraversalModeForTest,
+  setIdentityUnavailableForTest,
+  setWindowsLexicalModeForTest,
   supportsPinnedWrites,
+  unlinkWithin,
   writeFileAtomicAt,
   writeFileAtomicWithin,
   writeOnceWithin,
 } from "../plugins/opencode-teamwork/safe-fs.mjs"
+import {
+  crossProcessLockPath,
+  observeLockArtifact,
+  recentLockDiagnostics,
+  setReleaseHookForTest,
+  withCrossProcessLock,
+  withPinnedCrossProcessLock,
+} from "../plugins/opencode-teamwork/locks.ts"
 import { nextEventSeqFromFd } from "../plugins/opencode-teamwork/tools.ts"
 
 const MARKER = "OUTSIDE_WRITE_SENTINEL_DO_NOT_LEAK"
@@ -537,6 +552,221 @@ await checkAsync("detective fallback: a post-rename swap is refused and audited"
 if (!PINNED) {
   console.log(`SKIP: pinned write containment unavailable (mode=${fdTraversalMode()}) — race/nested/root/write-once blocks skipped`)
 }
+
+// ------------------------------------------------- 13. detective lock/append
+//
+// macOS/Windows have no fd-to-path primitive. These cases exercise the
+// path-based *detective* branches on this host (via the test overrides) so the
+// fallback is covered on Linux instead of only by manual platform runs.
+
+await checkAsync("detective mode: path-based cross-process lock acquires/runs/releases and records the anomaly", async () => {
+  const { run } = makeFixture()
+  setFdTraversalModeForTest("detective")
+  try {
+    const beforeAnomalies = recentWriteAnomalies().length
+    const beforeDiagnostics = recentLockDiagnostics(50).length
+    let ran = false
+    await withPinnedCrossProcessLock(run, "verify/state.json", async () => {
+      ran = true
+      writeFileAtomicWithin(run, "verify/x.json", "DETECTIVE_LOCK")
+    })
+    assert(ran, "the detective lock body must run")
+    assert.strictEqual(readFileSync(join(run, "verify", "x.json"), "utf8"), "DETECTIVE_LOCK")
+    assert.strictEqual(existsSync(join(run, "verify", "state.json.lock")), false, "the detective lock must be released")
+    const anomalies = recentWriteAnomalies().slice(beforeAnomalies)
+    assert(anomalies.some((a) => a.kind === "detective-lock"), "the detective lock must record a detective-lock anomaly")
+    const diagnostics = recentLockDiagnostics(50).slice(beforeDiagnostics)
+    assert(diagnostics.some((d) => d.event === "detective_lock"), "the detective lock must record a lock diagnostic")
+  } finally {
+    setFdTraversalModeForTest(null)
+  }
+})
+
+await checkAsync("fail-closed mode: a path-based lock still refuses instead of silently falling back", async () => {
+  const { run } = makeFixture()
+  setFdTraversalModeForTest("fail-closed")
+  try {
+    await assert.rejects(
+      withPinnedCrossProcessLock(run, "verify/state.json", () => "never"),
+      /unavailable|refused/i,
+      "fail-closed must throw, not degrade to detective",
+    )
+  } finally {
+    setFdTraversalModeForTest(null)
+  }
+})
+
+check("detective append: a static final-component symlink is refused and the victim is untouched", () => {
+  const { run, outside } = makeFixture()
+  const victim = join(outside, "bashrc")
+  writeFileSync(victim, "ORIGINAL\n")
+  symlinkSync(victim, join(run, "pitfalls.md"))
+  setFdTraversalModeForTest("detective")
+  try {
+    assert.throws(
+      () => appendLineWithin(run, "pitfalls.md", () => "{}\n"),
+      (err) => /refused|symlink|ELOOP/i.test(String(err.message)),
+    )
+    assert.strictEqual(readFileSync(victim, "utf8"), "ORIGINAL\n", "the symlink target must not be appended")
+  } finally {
+    setFdTraversalModeForTest(null)
+  }
+})
+
+check("detective append: a post-write identity mismatch is refused and audited", () => {
+  const { run, outside } = makeFixture()
+  setFdTraversalModeForTest("detective")
+  try {
+    const before = recentWriteAnomalies().length
+    assert.throws(
+      () =>
+        appendLineWithin(run, "events.jsonl", () => JSON.stringify({ ok: 1 }) + "\n", {
+          afterAppend: ({ dest }) => {
+            renameSync(dest, join(outside, "stolen-append.jsonl"))
+            writeFileSync(dest, "REPLACED\n")
+          },
+        }),
+      (err) => /identity|refused/i.test(String(err.message)),
+    )
+    assert.strictEqual(readFileSync(join(outside, "stolen-append.jsonl"), "utf8"), JSON.stringify({ ok: 1 }) + "\n")
+    const anomalies = recentWriteAnomalies().slice(before)
+    assert(anomalies.some((a) => a.kind === "detective-append"), "the identity mismatch must record a detective-append anomaly")
+  } finally {
+    setFdTraversalModeForTest(null)
+  }
+})
+
+check("detective append: the fd-containment override exercises the non-Linux branch on Linux", () => {
+  const { run } = makeFixture()
+  setFdTraversalModeForTest("detective")
+  setFdContainmentModeForTest("unsupported")
+  try {
+    assert.strictEqual(fdContainmentMode(), "unsupported")
+    appendLineWithin(run, "events.jsonl", () => JSON.stringify({ branch: "unsupported" }) + "\n")
+    assert.strictEqual(readFileSync(join(run, "events.jsonl"), "utf8").trim(), JSON.stringify({ branch: "unsupported" }))
+  } finally {
+    setFdContainmentModeForTest(null)
+    setFdTraversalModeForTest(null)
+  }
+})
+
+check("detective createDir: a post-create swap outside the run is refused and audited", () => {
+  const { run, outside } = makeFixture()
+  setFdTraversalModeForTest("detective")
+  try {
+    const before = recentWriteAnomalies().length
+    assert.throws(
+      () =>
+        createDirWithin(run, "sub", {
+          afterCreate: () => {
+            renameSync(join(run, "sub"), join(run, "sub.real"))
+            symlinkSync(outside, join(run, "sub"))
+          },
+        }),
+      (err) => /post-create|containment|refused/i.test(String(err.message)),
+    )
+    assert(recentWriteAnomalies().slice(before).some((a) => a.kind === "detective-create-dir"))
+  } finally {
+    setFdTraversalModeForTest(null)
+  }
+})
+
+check("detective unlink: a post-unlink parent swap is refused, and a delete never creates parents", () => {
+  const { run, outside } = makeFixture()
+  mkdirSync(join(run, "sub"), { recursive: true })
+  writeFileSync(join(run, "sub", "gone.txt"), "bye\n")
+  setFdTraversalModeForTest("detective")
+  try {
+    const before = recentWriteAnomalies().length
+    assert.throws(
+      () =>
+        unlinkWithin(run, "sub/gone.txt", {
+          afterUnlink: () => {
+            renameSync(join(run, "sub"), join(run, "sub.real"))
+            symlinkSync(outside, join(run, "sub"))
+          },
+        }),
+      (err) => /post-unlink|containment|refused/i.test(String(err.message)),
+    )
+    assert(recentWriteAnomalies().slice(before).some((a) => a.kind === "detective-unlink"))
+    assert.strictEqual(unlinkWithin(run, "never-created/gone.txt"), false, "a missing file is a no-op delete")
+    assert.strictEqual(existsSync(join(run, "never-created")), false, "a delete must not create parent directories")
+  } finally {
+    setFdTraversalModeForTest(null)
+  }
+})
+
+check("identity: a filesystem reporting dev/ino 0 is refused by name", () => {
+  const { run } = makeFixture()
+  setIdentityUnavailableForTest(true)
+  try {
+    const before = recentWriteAnomalies().length
+    assert.throws(
+      () => writeFileAtomicWithin(run, "identity.txt", "NOPE"),
+      (err) => err.reason === "identity-unavailable" || /identity/i.test(String(err.message)),
+    )
+    assert(recentWriteAnomalies().slice(before).some((a) => a.kind === "identity-unavailable"))
+  } finally {
+    setIdentityUnavailableForTest(false)
+  }
+})
+
+check("Windows lexical policy: trailing dot/space, reserved devices, colon, and non-round-trip names are refused", () => {
+  setWindowsLexicalModeForTest(true)
+  try {
+    for (const bad of [".. ", "...", "CON", "a:b", "..\\", "foo.", "LPT9.log"]) {
+      assert.throws(() => assertSingleSegment(bad), /invalid single path segment|refused/i, `"${bad}" must be refused`)
+    }
+    for (const good of ["name.txt", "a-b_c", "..foo", "report-1.json"]) {
+      assert.strictEqual(assertSingleSegment(good), good, `"${good}" must be accepted`)
+    }
+  } finally {
+    setWindowsLexicalModeForTest(null)
+  }
+  if (process.platform !== "win32") {
+    assert.doesNotThrow(() => assertSingleSegment("CON"), "Linux behaviour must be unchanged")
+  }
+})
+
+// ------------------------------------------------- 14. release / mkdir races
+
+await checkAsync("release TOCTOU: a lock published immediately after release survives", async () => {
+  const target = join(testDir, "release-target.json")
+  const lockPath = crossProcessLockPath(target)
+  let published = false
+  setReleaseHookForTest(({ lockPath: path }) => {
+    writeFileSync(
+      path,
+      JSON.stringify({ pid: process.pid, host: hostname(), at: new Date().toISOString(), nonce: "new-lock" }),
+    )
+    published = true
+  })
+  try {
+    await withCrossProcessLock(target, () => undefined, { timeoutMs: 500 })
+  } finally {
+    setReleaseHookForTest(null)
+  }
+  assert(published, "the release seam must run")
+  assert.strictEqual(observeLockArtifact(lockPath)?.nonce, "new-lock", "a lock published after quarantine must survive release")
+  rmSync(lockPath, { force: true })
+})
+
+await checkAsync("mkdir fallback: an owner-write failure removes the directory and fails closed", async () => {
+  const target = join(testDir, "mkdir-target.json")
+  let ran = false
+  await assert.rejects(
+    withCrossProcessLock(
+      target,
+      () => {
+        ran = true
+      },
+      { disableHardlinks: true, failOwnerWrite: true, timeoutMs: 200 },
+    ),
+    /could not publish the lock owner|refused/i,
+  )
+  assert.strictEqual(ran, false, "the critical section must not run without a published owner")
+  assert.strictEqual(existsSync(crossProcessLockPath(target)), false, "the broken lock directory must be removed")
+})
 
 rmSync(testDir, { recursive: true, force: true })
 console.log(`\n${passed} passed, ${failed} failed`)
