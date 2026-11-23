@@ -101,6 +101,7 @@ import type { BudgetEstimate, TournamentConfig, TournamentManifest } from "./tou
 import {
   DEFAULT_VERIFICATION_MODE,
   evaluateStrictGate,
+  evaluateStrictGateChecked,
   normalizeVerificationMode,
   normalizeWaveKind,
   recordVerificationWave,
@@ -112,16 +113,29 @@ import type { VerificationMode } from "./strict.ts"
 import {
   VICTORY_AUDITOR_AGENT,
   callerRequirementsFile,
+  currentRequirementsHash,
   deriveRequirementsFromRequest,
   describeVictoryGate,
   evaluateVictoryGate,
+  evaluateVictoryGateChecked,
   normalizeVictoryAuditMode,
+  originalRequestHash,
   persistRequirementsBaseline,
   readRequirementsBaseline,
   recordVictoryAudit,
   resolveVictoryAuditMode,
   validateRequirementsBaseline,
 } from "./victory.ts"
+import {
+  canonicalJson,
+  createAuthContext,
+  sha256Hex,
+  timingSafeEqualHex,
+  type ArtifactCheck,
+  type AuthContext,
+  type AuthEnvelope,
+  type AuthFailure,
+} from "./auth.ts"
 import type { RequirementsFile, VictoryAuditMode } from "./victory.ts"
 import { readBriefingExcerpt, refreshRunBriefing } from "./briefing.ts"
 import { fdWithin, readWithinBounded, supportsFdContainment } from "./safe-fs.mjs"
@@ -1668,17 +1682,251 @@ function readRegularJson<T>(run: string, targetFile: string): { ok: true; data: 
   }
 }
 
+// ---------------------------------------------------------------------------
+// Artifact authenticity (Phase A)
+//
+// Control-plane artifacts are HMAC-signed and indexed in ctx.storage. The run
+// manifest is the signed baseline: it pins the plan/request/requirements/policy
+// hashes and the three completion modes, so a later edit that downgrades
+// strict→standard or required→skip is AUTH_STALE. See auth.ts and
+// docs/adr/0005-artifact-authenticity.md.
+// ---------------------------------------------------------------------------
+
+const RUN_MANIFEST = "run.manifest.json"
+const RUN_MANIFEST_VERSION = 1
+
+type RunManifest = {
+  version: 1
+  sessionId: string
+  rootSessionId: string
+  integrityMode: IntegrityMode
+  verification: VerificationMode
+  victoryAudit: VictoryAuditMode
+  requestHash: string | null
+  requirementsHash: string | null
+  planHash: string
+  lemmaPolicyHash: string | null
+  runKeyId: string
+  createdAt: string
+  _auth?: AuthEnvelope
+}
+
+function runManifestFile(run: string): string {
+  return join(run, RUN_MANIFEST)
+}
+
+function planBaselineHash(plan: any): string {
+  return sha256Hex(
+    canonicalJson({
+      topology: plan?.topology ?? null,
+      integrityMode: plan?.integrityMode ?? null,
+      verification: plan?.verification ?? null,
+      victoryAudit: plan?.victoryAudit ?? null,
+      route: plan?.route ?? null,
+      lemmaBounds: plan?.lemmaBounds ?? null,
+      tasks: Array.isArray(plan?.tasks) ? plan.tasks : [],
+    }),
+  )
+}
+
+function planHashOf(plan: unknown): string {
+  return planBaselineHash(plan)
+}
+
+function lemmaPolicyHashOf(run: string): string | null {
+  const res = readRegularJson<any>(run, join(run, "lemma", "manifest.json"))
+  if (!res.ok) return null
+  const policy = res.data?.policy
+  if (policy === undefined || policy === null) return null
+  return sha256Hex(canonicalJson(policy))
+}
+
+function authFailureText(failure: AuthFailure): string {
+  return `[${failure.code}] ${failure.message}`
+}
+
+type ManifestCheck =
+  | { ok: true; manifest: RunManifest; signed: true }
+  | { ok: true; signed: false }
+  | { ok: false; failure: AuthFailure }
+
+/**
+ * Read and verify `run.manifest.json`. A present-but-unsigned manifest is an
+ * AUTH_INVALID failure (never a legacy run), and a missing index entry fails
+ * closed rather than adopting the artifact.
+ */
+async function readRunManifest(run: string, auth?: AuthContext): Promise<ManifestCheck> {
+  if (!existsSync(runManifestFile(run))) return { ok: true, signed: false }
+  const res = readRegularJson<any>(run, runManifestFile(run))
+  if (!res.ok) {
+    if (res.reason === "missing") return { ok: true, signed: false }
+    return {
+      ok: false,
+      failure: {
+        code: "AUTH_INVALID",
+        message: `run.manifest.json is ${res.reason === "symlink" ? "a symlink" : "unreadable or malformed"}`,
+      },
+    }
+  }
+  const value = res.data
+  if (!value || typeof value !== "object" || value.version !== RUN_MANIFEST_VERSION) {
+    return { ok: false, failure: { code: "AUTH_INVALID", message: "run.manifest.json has an invalid schema version" } }
+  }
+  if (!auth) {
+    return { ok: false, failure: { code: "AUTH_UNAVAILABLE", message: "no authenticity context is wired for this run" } }
+  }
+  const check = await auth.verifyRunArtifact(basename(run), RUN_MANIFEST, value)
+  if (check.status === "unsigned") {
+    return { ok: false, failure: { code: "AUTH_INVALID", message: "run.manifest.json has no _auth envelope" } }
+  }
+  if (check.status !== "signed") {
+    return {
+      ok: false,
+      failure: check.failure ?? { code: "AUTH_INVALID", message: "run.manifest.json failed verification" },
+    }
+  }
+  return { ok: true, manifest: value as RunManifest, signed: true }
+}
+
+/**
+ * Compare the signed baseline with the current artifacts. Any drift is
+ * AUTH_STALE and closes the strict→standard / required→skip downgrade path.
+ */
+function manifestDriftReason(drift: string): string {
+  if (drift.startsWith("requestHash")) {
+    return `[AUTH_STALE] victory audit: requestHash does not match the current ORIGINAL_REQUEST.md (${drift})`
+  }
+  if (drift.startsWith("requirementsHash")) {
+    return `[AUTH_STALE] requirements baseline changed since the plan (${drift})`
+  }
+  if (drift.startsWith("verification")) {
+    return `[AUTH_STALE] verification downgrade/change refused (${drift})`
+  }
+  if (drift.startsWith("integrityMode")) {
+    return `[AUTH_STALE] integrity mode downgrade/change refused (${drift})`
+  }
+  if (drift.startsWith("victoryAudit")) {
+    return `[AUTH_STALE] victory audit downgrade/change refused (${drift})`
+  }
+  if (drift.startsWith("planHash")) {
+    return `[AUTH_STALE] plan baseline changed (${drift})`
+  }
+  if (drift.startsWith("lemmaPolicyHash")) {
+    return `[AUTH_STALE] LEMMA policy baseline changed (${drift})`
+  }
+  return `[AUTH_STALE] ${drift}`
+}
+
+function manifestDrift(manifest: RunManifest, current: Omit<RunManifest, "version" | "sessionId" | "rootSessionId" | "runKeyId" | "createdAt" | "_auth">): string[] {
+  const drift: string[] = []
+  if (manifest.integrityMode !== current.integrityMode) {
+    drift.push(`integrityMode drifted: manifest=${manifest.integrityMode} current=${current.integrityMode}`)
+  }
+  if (manifest.verification !== current.verification) {
+    drift.push(`verification drifted: manifest=${manifest.verification} current=${current.verification}`)
+  }
+  if (manifest.victoryAudit !== current.victoryAudit) {
+    drift.push(`victoryAudit drifted: manifest=${manifest.victoryAudit} current=${current.victoryAudit}`)
+  }
+  for (const key of ["requestHash", "requirementsHash", "planHash", "lemmaPolicyHash"] as const) {
+    const a = manifest[key]
+    const b = current[key]
+    if (a !== b) drift.push(`${key} drifted (manifest=${a ?? "null"} current=${b ?? "null"})`)
+  }
+  return drift
+}
+
+/**
+ * Session-tree binding: the caller of victory_audit / wave_record / report must
+ * be a strict descendant of the run's root (the plan-time Sentinel session).
+ * Fails closed when the ancestry cannot be resolved.
+ */
+const SESSION_TREE_MAX_DEPTH = 32
+
+async function requireDescendantSession(
+  ctx: any,
+  rootSessionId: string | undefined,
+  sessionID: string | undefined,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!sessionID) return { ok: false, reason: "no session identity was supplied" }
+  if (!rootSessionId) return { ok: false, reason: "the run has no recorded rootSessionId (fail closed)" }
+  if (sessionID === rootSessionId) {
+    return { ok: false, reason: "the caller is the root session, not a descendant (fail closed)" }
+  }
+  let current = sessionID
+  for (let depth = 0; depth < SESSION_TREE_MAX_DEPTH; depth++) {
+    let info: any
+    try {
+      if (typeof ctx?.session?.get !== "function") {
+        return { ok: false, reason: "ctx.session.get is unavailable, so session ancestry cannot be resolved (fail closed)" }
+      }
+      info = await withTimeout(Promise.resolve(ctx.session.get({ sessionID: current })), 2000)
+    } catch {
+      return { ok: false, reason: `session ${clean(current, 64)} could not be resolved (fail closed)` }
+    }
+    const parent = info?.parentID ?? info?.parentId ?? info?.parent_id
+    if (typeof parent !== "string" || parent.trim() === "") {
+      return {
+        ok: false,
+        reason: `session ${clean(current, 64)} has no parent, so it does not descend from ${clean(rootSessionId, 64)} (fail closed)`,
+      }
+    }
+    if (parent === rootSessionId) return { ok: true }
+    current = parent
+  }
+  return { ok: false, reason: `session ancestry exceeds ${SESSION_TREE_MAX_DEPTH} levels (fail closed)` }
+}
+
+/** The run's recorded root session (manifest first, then plan/state). */
+function recordedRootSessionId(manifest: RunManifest | undefined, plan: any, state: any): string | undefined {
+  const candidate = manifest?.rootSessionId ?? plan?.rootSessionId ?? state?.rootSessionId
+  return typeof candidate === "string" && candidate.trim() !== "" ? candidate : undefined
+}
+
 async function createPlanRun(
   ctx: any,
   root: string,
   input: any,
   context: any,
   beforeMkdir?: (info: { sessionId: string; run: string; integrityMode: IntegrityMode; topology: string }) => Promise<string | undefined> | string | undefined,
+  auth?: AuthContext,
 ): Promise<{ ok: true; sessionId: string; run: string; tasks: any[]; topology: string; integrityMode: IntegrityMode; content: string } | { ok: false; content: string; refused?: string; aborted?: boolean }> {
   const sessionId = input.sessionId || newSessionId()
   const resolved = resolveRun(root, sessionId)
   if (resolved.error) return { ok: false, content: resolved.error }
   const run = resolved.run as string
+  // Authenticity preflight. A signed run is the default. `allowUnsignedLegacy`
+  // is the explicit, recorded opt-out for pre-1.4 runs; without it, a missing
+  // key source refuses the plan before anything is written.
+  const allowUnsignedLegacy = input.allowUnsignedLegacy === true
+  const authReady = await (auth
+    ? auth.ready()
+    : Promise.resolve({ ok: false as const, failure: { code: "AUTH_UNAVAILABLE" as const, message: "no authenticity context is wired" } }))
+  if (!authReady.ok && !allowUnsignedLegacy) {
+    return {
+      ok: false,
+      content: `refused: ${authFailureText(authReady.failure)}; this plan would be unsigned. Configure ctx.storage (the plugin runtime provides it) or set OPENCODE_TEAMWORK_HMAC_KEY for CI, or re-call with allowUnsignedLegacy: true to create an explicitly unsigned legacy run. Nothing was written.`,
+      refused: authReady.failure.code,
+    }
+  }
+  const existingManifestCheck = await readRunManifest(run, auth)
+  if (!existingManifestCheck.ok) {
+    return {
+      ok: false,
+      content: `refused: ${authFailureText(existingManifestCheck.failure)}; the existing run manifest is not trustworthy. Nothing was written.`,
+      refused: existingManifestCheck.failure.code,
+    }
+  }
+  const existingManifest = existingManifestCheck.ok && existingManifestCheck.signed ? existingManifestCheck.manifest : undefined
+  const runHasPlan = existsSync(join(run, "plan.dag.json"))
+  if (!existingManifest && runHasPlan && !allowUnsignedLegacy) {
+    return {
+      ok: false,
+      content:
+        "refused: [AUTH_LEGACY] this run has no signed run.manifest.json (it predates artifact authenticity). Re-call teamwork_plan with allowUnsignedLegacy: true to keep the legacy run, or start a new session. Nothing was written.",
+      refused: "AUTH_LEGACY",
+    }
+  }
   // Refuse an unknown topology before anything is written, so a typo can
   // never become the run's permanent label.
   const topology = normalizeTopology(input.topology)
@@ -1924,6 +2172,42 @@ async function createPlanRun(
         "refused: victoryAudit: \"required\" needs a requirements baseline; pass request or requirements, or record victoryAudit: \"skip\" explicitly. Nothing was written.",
     }
   }
+  // Benchmark mode is the strictest integrity contract: it refuses to exist
+  // unsigned and it refuses the victory-audit skip.
+  if (integrityMode === "benchmark" && allowUnsignedLegacy) {
+    return {
+      ok: false,
+      content:
+        "refused: [AUTH_LEGACY] benchmark mode cannot run unsigned; allowUnsignedLegacy is not permitted with integrityMode: \"benchmark\". Nothing was written.",
+      refused: "AUTH_LEGACY",
+    }
+  }
+  if (integrityMode === "benchmark" && victoryAuditMode === "skip") {
+    return {
+      ok: false,
+      content:
+        "refused: benchmark mode requires the independent victory audit; victoryAudit: \"skip\" is not permitted with integrityMode: \"benchmark\". Nothing was written.",
+    }
+  }
+  if (existingManifest) {
+    const modeDrift: string[] = []
+    if (existingManifest.integrityMode !== integrityMode) {
+      modeDrift.push(`integrityMode (${existingManifest.integrityMode} -> ${integrityMode})`)
+    }
+    if (existingManifest.verification !== verificationMode) {
+      modeDrift.push(`verification (${existingManifest.verification} -> ${verificationMode})`)
+    }
+    if (existingManifest.victoryAudit !== victoryAuditMode) {
+      modeDrift.push(`victoryAudit (${existingManifest.victoryAudit} -> ${victoryAuditMode})`)
+    }
+    if (modeDrift.length > 0) {
+      return {
+        ok: false,
+        content: `refused: [AUTH_STALE] a re-plan cannot change the signed baseline (${modeDrift.join(", ")}); omit the mode to keep it or start a new session. Nothing was written.`,
+        refused: "AUTH_STALE",
+      }
+    }
+  }
   // SEC-1: task ids become keys of state/costs maps and path/branch segments.
   // Refuse the whole plan (before anything is written) on any unsafe id.
   for (const t of input.tasks || []) {
@@ -2097,6 +2381,8 @@ async function createPlanRun(
   // A victory audit is required unless the plan explicitly records a skip.
   // Record the mode in BOTH plan.dag.json and state.json so a later re-plan or
   // hand edit cannot silently drop the gate.
+  const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+  const rootSessionId = callSession ?? sessionId
   const tasks = (input.tasks || []).map((t: any) => ({
     id: clean(t.id, 64),
     dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.map((d: any) => clean(d, 64)) : [],
@@ -2107,8 +2393,9 @@ async function createPlanRun(
     maxRounds: Number.isFinite(t.maxRounds) ? t.maxRounds : 4,
   }))
   const routingReason = typeof input.routingReason === "string" ? clean(input.routingReason, 200).trim() : ""
-  writeJson(join(run, "plan.dag.json"), {
+  const planObject = {
     sessionId,
+    rootSessionId,
     topology,
     integrityMode,
     verification: verificationMode,
@@ -2122,14 +2409,18 @@ async function createPlanRun(
       : {}),
     tasks,
     ...(routingReason ? { routingReason } : {}),
-  })
+    ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
+  }
+  writeJson(join(run, "plan.dag.json"), planObject)
   if (!existsSync(join(run, "state.json"))) {
     writeJson(join(run, "state.json"), {
       version: 1,
       sessionId,
+      rootSessionId,
       integrityMode,
       verification: verificationMode,
       victoryAudit: victoryAuditMode,
+      ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
       ...(isLemma ? { lemmaMode: true, route: "lemma" } : {}),
       phase: "DISPATCH",
       tasks: nullMap(Object.fromEntries(tasks.map((t: any) => [t.id, { status: "pending", round: 0 }]))),
@@ -2145,11 +2436,15 @@ async function createPlanRun(
       (state.integrityMode !== integrityMode ||
         state.verification !== verificationMode ||
         state.victoryAudit !== victoryAuditMode ||
+        state.rootSessionId !== rootSessionId ||
+        (allowUnsignedLegacy && state.allowUnsignedLegacy !== true) ||
         (isLemma && !state.lemmaMode))
     ) {
       state.integrityMode = integrityMode
       state.verification = verificationMode
       state.victoryAudit = victoryAuditMode
+      state.rootSessionId = rootSessionId
+      if (allowUnsignedLegacy) state.allowUnsignedLegacy = true
       if (isLemma) {
         state.lemmaMode = true
         state.route = "lemma"
@@ -2164,10 +2459,69 @@ async function createPlanRun(
       return { ok: false, content: lemmaInit.error }
     }
   }
+  // Signed baseline. The manifest is written last, after requirements, plan,
+  // state and the LEMMA policy are on disk, so its hashes describe exactly
+  // what a later gate re-reads.
+  const baselineRequestHash = originalRequestHash(run)
+  const baselineRequirementsHash = currentRequirementsHash(run)
+  const baselinePlanHash = planHashOf(planObject)
+  const baselineLemmaPolicyHash = lemmaPolicyHashOf(run)
+  if (existingManifest) {
+    const drift = manifestDrift(existingManifest, {
+      integrityMode,
+      verification: verificationMode,
+      victoryAudit: victoryAuditMode,
+      requestHash: baselineRequestHash,
+      requirementsHash: baselineRequirementsHash,
+      planHash: baselinePlanHash,
+      lemmaPolicyHash: baselineLemmaPolicyHash,
+    })
+    if (drift.length > 0) {
+      return {
+        ok: false,
+        content: `refused: [AUTH_STALE] a re-plan must preserve the signed baseline; ${drift.join("; ")}. Nothing was written.`,
+        refused: "AUTH_STALE",
+      }
+    }
+  }
+  const signedRun = !!existingManifest || !allowUnsignedLegacy
+  if (signedRun) {
+    if (!auth || !authReady.ok) {
+      return {
+        ok: false,
+        content: `refused: ${authFailureText(authReady.ok ? { code: "AUTH_UNAVAILABLE", message: "no authenticity context" } : authReady.failure)}; this plan would be unsigned. Nothing was written.`,
+        refused: "AUTH_UNAVAILABLE",
+      }
+    }
+    try {
+      const manifest: RunManifest = {
+        version: RUN_MANIFEST_VERSION,
+        sessionId,
+        rootSessionId,
+        integrityMode,
+        verification: verificationMode,
+        victoryAudit: victoryAuditMode,
+        requestHash: baselineRequestHash,
+        requirementsHash: baselineRequirementsHash,
+        planHash: baselinePlanHash,
+        lemmaPolicyHash: baselineLemmaPolicyHash,
+        runKeyId: authReady.keyId,
+        createdAt: new Date().toISOString(),
+      }
+      const signed = await auth.signRunArtifact(sessionId, RUN_MANIFEST, manifest)
+      writeJsonSafe(run, runManifestFile(run), signed)
+    } catch (err: any) {
+      const failure = err?.failure as AuthFailure | undefined
+      return {
+        ok: false,
+        content: `refused: could not sign ${RUN_MANIFEST} (${failure ? failure.code : "signing failed"}: ${clean(err?.message, 160)}); the run is not complete.`,
+        refused: failure?.code ?? "AUTH_UNAVAILABLE",
+      }
+    }
+  }
   // Use ?? (nullish coalescing) so budgetUsd: 0 is respected as "no budget"
   const budget = input.budgetUsd ?? (tournamentContextActive && existingBudget !== undefined ? existingBudget : 20)
   const costsFile = join(run, "costs.json")
-  const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
   // Same lock as the cost tool so a re-plan cannot race a concurrent cost call.
   await withFileLock(costsFile, async () => {
     const existing = readJson<any>(run, costsFile, undefined)
@@ -2259,12 +2613,17 @@ async function createPlanRun(
     tasks,
     topology,
     integrityMode,
-    content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\n${preflightLine}\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.\nVerification: ${verificationMode}${verificationMode === "strict" ? " (one falsifier challenge + one security-auditor audit per task)" : ""}.\nVictory audit: ${victoryAuditMode}${victoryAuditSource === "caller" ? " (explicit)" : ""}${requirementsBaseline ? `; requirements baseline ${requirementsBaseline.items.length} item(s) from ${requirementsBaseline.source} (requirements.json)` : "; no requirements baseline"}.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${preflight.bypassed ? `\n⚠ Input preflight bypassed (allowMissingInputs: true): ${preflight.status}.` : ""}${creditWarning}`,
+    content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\n${preflightLine}\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.\nVerification: ${verificationMode}${verificationMode === "strict" ? " (one falsifier challenge + one security-auditor audit per task)" : ""}.\nVictory audit: ${victoryAuditMode}${victoryAuditSource === "caller" ? " (explicit)" : ""}${requirementsBaseline ? `; requirements baseline ${requirementsBaseline.items.length} item(s) from ${requirementsBaseline.source} (requirements.json)` : "; no requirements baseline"}.\nAuthenticity: ${signedRun ? `signed baseline (run.manifest.json; key ${clean(authReady.ok ? authReady.keyId : "unknown", 64)})` : "UNSIGNED LEGACY (allowUnsignedLegacy: true; final_verify/next require the recorded bypass)"}.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${preflight.bypassed ? `\n⚠ Input preflight bypassed (allowMissingInputs: true): ${preflight.status}.` : ""}${creditWarning}`,
   }
 }
 
 export async function registerTeamworkTools(ctx: any, root: string) {
   if (!ctx?.tool?.transform) return
+  // Plugin-global KV storage (host-provided). Tests inject a Map-backed shim;
+  // `OPENCODE_TEAMWORK_HMAC_KEY` is the CI/offline override. Missing both is
+  // AUTH_UNAVAILABLE: signed plans then refuse unless allowUnsignedLegacy is
+  // explicitly recorded.
+  const auth = createAuthContext(ctx?.storage, process.env)
   await ctx.tool.transform((editor: any) => {
     editor.namespace({
       name: "teamwork",
@@ -2318,6 +2677,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           allowMissingInputs: {
             type: "boolean",
             description: "Default false. Explicit bypass: plan even when a blocking input is MISSING/OUTAGE. The bypass is recorded in plan.dag.json and events.jsonl.",
+          },
+          allowUnsignedLegacy: {
+            type: "boolean",
+            description:
+              "Default false. Explicit opt-out of the signed baseline: create/keep an unsigned legacy run. New runs should not use it. Refused with integrityMode: benchmark. final_verify/next still require an explicit allowUnsignedLegacy bypass before completing an unsigned run, and record it as an event.",
           },
           lemmaMode: {
             type: "boolean",
@@ -2385,7 +2749,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         additionalProperties: false,
       },
       execute: async (input: any, context: any) => {
-        const res = await createPlanRun(ctx, root, input, context)
+        const res = await createPlanRun(ctx, root, input, context, undefined, auth)
         return { content: res.content, ...(res.ok ? {} : { ...(res.refused ? { refused: res.refused } : {}), ...(res.aborted ? { aborted: true } : {}) }) }
       },
     })
@@ -2696,6 +3060,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
             return undefined
           },
+          auth,
         )
         if (!planRes.ok) return { content: planRes.content }
 
@@ -3934,6 +4299,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             description:
               "Legacy migration escape hatch (default false). When true, a PASS verify/final.json without teamwork_final_verify provenance is accepted for completion and the bypass is recorded as a final_verification_bypass event. Do not use for new runs.",
           },
+          allowUnsignedLegacy: {
+            type: "boolean",
+            description:
+              "Legacy migration escape hatch (default false). An unsigned run with no run.manifest.json returns AUTH_LEGACY until this is passed; the bypass is recorded as a legacy_unsigned_bypass event. A signed run never accepts it.",
+          },
         },
         additionalProperties: false,
       },
@@ -3950,6 +4320,17 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (!state || typeof state.tasks !== "object") {
           return { content: `No valid state.json found for run ${basename(run)}.` }
         }
+
+        const manifestCheck = await readRunManifest(run, auth)
+        if (!manifestCheck.ok) {
+          return {
+            status: "AUTH_INVALID",
+            auth: manifestCheck.failure.code,
+            content: `BLOCKED_BY_AUTH: ${authFailureText(manifestCheck.failure)}. The run cannot complete until the manifest is trustworthy.`,
+          }
+        }
+        const signedRun = manifestCheck.signed
+        const allowUnsignedLegacy = input?.allowUnsignedLegacy === true
 
         const tournamentPresent =
           plan.topology === "massive-proof" &&
@@ -4140,6 +4521,37 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           return { content: "refused: request aborted via AbortSignal.", status: "CANCELLED", aborted: true }
         }
 
+        // Authenticity applies to the completion path. Tournament-active runs
+        // have already returned above with their own phase status; a legacy
+        // tournament can still be driven, but it cannot report ALL_PASSED.
+        if (!signedRun && !allowUnsignedLegacy) {
+          return {
+            status: "AUTH_LEGACY",
+            auth: "AUTH_LEGACY",
+            content:
+              "AUTH_LEGACY: this run has no signed run.manifest.json. Re-call teamwork_next with allowUnsignedLegacy: true to record an explicit legacy bypass; a signed run (the default for new plans) never needs this.",
+          }
+        }
+        if (signedRun) {
+          const drift = manifestDrift(manifestCheck.manifest, {
+            integrityMode: normalizeIntegrityMode(plan?.integrityMode ?? state?.integrityMode) ?? DEFAULT_INTEGRITY_MODE,
+            verification: resolveVerificationMode(plan, state).mode,
+            victoryAudit: resolveVictoryAuditMode(plan, state, run).mode,
+            requestHash: originalRequestHash(run),
+            requirementsHash: currentRequirementsHash(run),
+            planHash: planHashOf(plan),
+            lemmaPolicyHash: lemmaPolicyHashOf(run),
+          })
+          if (drift.length > 0) {
+            return {
+              status: "AUTH_STALE",
+              auth: "AUTH_STALE",
+              content: `BLOCKED_BY_AUTH: the run drifted from its signed baseline: ${drift.map(manifestDriftReason).join("; ")}. A re-plan is not sufficient; start a new session.`,
+              reasons: drift.map(manifestDriftReason),
+            }
+          }
+        }
+
         const taskDefs = new Map<string, any>(plan.tasks.map((t: any) => [t.id, t]))
         const taskStates = nullMap<any>(state.tasks)
 
@@ -4269,6 +4681,25 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (passedTasks.length === taskDefs.size) {
           const auditFile = join(run, "verify", "security-audit.json")
           const audit = existsSync(auditFile) ? readJson<any>(run, auditFile, undefined) : undefined
+          if (signedRun && audit) {
+            const check = auth
+              ? await auth.verifyRunArtifact(basename(run), "verify/security-audit.json", audit)
+              : {
+                  status: "unknown" as const,
+                  failure: { code: "AUTH_UNAVAILABLE" as const, message: "no authenticity context is wired for this run" },
+                }
+            if (check.status !== "signed") {
+              const failure =
+                check.status === "unsigned"
+                  ? { code: "AUTH_MISSING" as const, message: "verify/security-audit.json has no _auth envelope (a signed run requires one)" }
+                  : check.failure ?? { code: "AUTH_INVALID" as const, message: "security audit failed verification" }
+              return {
+                status: failure.code,
+                auth: failure.code,
+                content: `BLOCKED_BY_AUTH: [${failure.code}] ${failure.message}. Re-run teamwork_security_audit before completing the run.`,
+              }
+            }
+          }
           // The final gate reports the run's integrity mode, read from the same
           // artifact the auditor uses (legacy runs default to development). It is
           // disclosed, never enforced here: enforcement stays with the auditor.
@@ -4314,7 +4745,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             const strictTasks = [...taskDefs.keys()]
               .filter((id) => isSafeTaskId(id))
               .map((id) => ({ id, status: String(taskStates[id]?.status ?? "pending") }))
-            const strictGate = evaluateStrictGate(run, strictTasks, "strict")
+            const strictGate = await evaluateStrictGateChecked(run, strictTasks, "strict", {
+              auth,
+              requireSigned: signedRun,
+            })
             if (!strictGate.ok) {
               const status =
                 strictGate.status === "MISSING" ? "NEEDS_STRICT_WAVE" : "BLOCKED_BY_STRICT_WAVE"
@@ -4345,6 +4779,59 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // recorded `allowUnstamped` bypass.
           const finalFile = join(run, "verify", "final.json")
           const finalReport = existsSync(finalFile) ? readJson<any>(run, finalFile, undefined) : undefined
+          if (signedRun && finalReport && typeof finalReport === "object" && finalReport.status === "PASS") {
+            const check = auth
+              ? await auth.verifyRunArtifact(basename(run), "verify/final.json", finalReport)
+              : {
+                  status: "unknown" as const,
+                  failure: { code: "AUTH_UNAVAILABLE" as const, message: "no authenticity context is wired for this run" },
+                }
+            if (check.status !== "signed") {
+              const failure =
+                check.status === "unsigned"
+                  ? { code: "AUTH_MISSING" as const, message: "verify/final.json has no _auth envelope (a signed run requires one)" }
+                  : check.failure ?? { code: "AUTH_INVALID" as const, message: "final report failed verification" }
+              return {
+                status: failure.code,
+                auth: failure.code,
+                content: `BLOCKED_BY_AUTH: [${failure.code}] ${failure.message}. Re-run teamwork_final_verify.`,
+                finalReport: finalFile,
+                integrityMode: integrity.mode,
+              }
+            }
+            // Evidence drift: a stamped PASS must not outlive the report,
+            // audit, or requirements baseline it was computed from.
+            const recordedDigests = finalReport.evidence?.reportDigests
+            const drift: string[] = []
+            if (recordedDigests && typeof recordedDigests === "object") {
+              for (const [id, digest] of Object.entries(recordedDigests)) {
+                if (!isSafeTaskId(id)) continue
+                const raw = readBoundedRunFile(run, join(run, `verify/report-${id}.json`), MAX_RUN_FILE_BYTES)
+                const current = raw.status === "ok" ? sha256Hex(raw.text) : null
+                if (current !== digest) drift.push(`report ${id} changed since final verification`)
+              }
+            }
+            const recordedAudit = finalReport.evidence?.auditDigest
+            const auditRaw = readBoundedRunFile(run, join(run, "verify", "security-audit.json"), MAX_RUN_FILE_BYTES)
+            const currentAudit = auditRaw.status === "ok" ? sha256Hex(auditRaw.text) : null
+            if (recordedAudit !== undefined && recordedAudit !== currentAudit) {
+              drift.push("security audit changed since final verification")
+            }
+            const recordedRequirements = finalReport.requirementsHash
+            if (recordedRequirements !== undefined && recordedRequirements !== currentRequirementsHash(run)) {
+              drift.push("requirements baseline changed since final verification")
+            }
+            if (drift.length > 0) {
+              return {
+                status: "AUTH_STALE",
+                auth: "AUTH_STALE",
+                content: `BLOCKED_BY_AUTH: [AUTH_STALE] the final verdict is stale: ${drift.join("; ")}. Re-run teamwork_final_verify.`,
+                finalReport: finalFile,
+                integrityMode: integrity.mode,
+                reasons: drift.map((d) => `[AUTH_STALE] ${d}`),
+              }
+            }
+          }
 
           if (!finalReport || typeof finalReport !== "object" || typeof finalReport.status !== "string") {
             if (state.phase !== "FINAL_VERIFICATION") {
@@ -4394,8 +4881,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // verdict bound to the current ORIGINAL_REQUEST.md, unless the plan
           // explicitly recorded victoryAudit: "skip".
           const nextVictoryMode = resolveVictoryAuditMode(plan, state, run)
-          const nextVictoryGate =
-            nextVictoryMode.mode === "required" ? evaluateVictoryGate(run, "required") : evaluateVictoryGate(run, "skip")
+          const nextVictoryGate = await evaluateVictoryGateChecked(
+            run,
+            nextVictoryMode.mode === "required" ? "required" : "skip",
+            { auth, requireSigned: signedRun, requirementsHash: currentRequirementsHash(run) },
+          )
           if (!nextVictoryGate.ok) {
             if (state.phase !== "FINAL_VERIFICATION") {
               state.phase = "FINAL_VERIFICATION"
@@ -4450,10 +4940,27 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
 
-          if (state.phase !== "MERGE" && state.phase !== "DONE") {
+          const wasAlreadyMerge = state.phase === "MERGE" || state.phase === "DONE"
+          if (!wasAlreadyMerge) {
             state.phase = "MERGE"
             writeJson(join(run, "state.json"), state)
             await refreshBriefingSafe(run)
+          }
+
+          if (!signedRun && !wasAlreadyMerge) {
+            const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+            const caller = await deriveCallerAgent(ctx, run, callSession)
+            await appendEvent(run, {
+              event: "legacy_unsigned_bypass",
+              sessionId: basename(run),
+              taskId: null,
+              to: "ALL_PASSED",
+              round: 0,
+              agent: caller?.agent ?? null,
+              agentSource: caller?.agent ? "session" : undefined,
+              phase: state.phase ?? null,
+              note: "allowUnsignedLegacy: true completed an unsigned legacy run; artifact _auth envelopes were not verified",
+            })
           }
 
           if (!stamped) {
@@ -4879,7 +5386,26 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           integrityFindings,
           integrityViolations,
         }
-        writeJson(auditFile, report)
+        const manifestCheck = await readRunManifest(run, auth)
+        if (!manifestCheck.ok) {
+          return {
+            content: `refused: ${authFailureText(manifestCheck.failure)}; the security audit was not written.`,
+            refused: manifestCheck.failure.code,
+          }
+        }
+        let auditToWrite: any = report
+        if (manifestCheck.signed) {
+          try {
+            auditToWrite = await auth!.signRunArtifact(basename(run), "verify/security-audit.json", report)
+          } catch (err: any) {
+            const failure = err?.failure as AuthFailure | undefined
+            return {
+              content: `refused: could not sign verify/security-audit.json (${failure ? failure.code : "signing failed"}); the audit was not written.`,
+              refused: failure?.code ?? "AUTH_UNAVAILABLE",
+            }
+          }
+        }
+        writeJson(auditFile, auditToWrite)
 
         const stateFile = join(run, "state.json")
         const state = readJson<any>(run, stateFile, undefined)
@@ -4978,13 +5504,31 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (!callSession) {
           return { content: "refused: victory_audit needs a trusted session identity; nothing was written" }
         }
-        const result = recordVictoryAudit(run, basename(run), {
-          verdict: input.verdict,
-          requirements: input.requirements,
-          findings: input.findings,
-          summary: input.summary,
-          auditorSessionId: callSession,
-        })
+        const manifestCheck = await readRunManifest(run, auth)
+        if (!manifestCheck.ok) {
+          return { content: `refused: ${authFailureText(manifestCheck.failure)}; nothing was written` }
+        }
+        const vPlan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
+        const vState = readJson<any>(run, join(run, "state.json"), undefined)
+        const rootSessionId = recordedRootSessionId(manifestCheck.signed ? manifestCheck.manifest : undefined, vPlan, vState)
+        const ancestry = await requireDescendantSession(ctx, rootSessionId, callSession)
+        if (!ancestry.ok) {
+          return {
+            content: `refused: victory_audit must be called from a session that descends from the run root (${clean(rootSessionId ?? "unrecorded", 64)}); ${ancestry.reason}; nothing was written`,
+          }
+        }
+        const result = await recordVictoryAudit(
+          run,
+          basename(run),
+          {
+            verdict: input.verdict,
+            requirements: input.requirements,
+            findings: input.findings,
+            summary: input.summary,
+            auditorSessionId: callSession,
+          },
+          manifestCheck.signed ? auth : undefined,
+        )
         if (!result.ok) return { content: result.error }
         const state = readJson<any>(run, join(run, "state.json"), undefined)
         await appendEvent(run, {
@@ -5046,15 +5590,33 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (!callSession) {
           return { content: "refused: wave_record needs a trusted session identity; nothing was written" }
         }
-        const result = recordVerificationWave(run, basename(run), {
-          taskId: input?.taskId,
-          kind,
-          verdict: input?.verdict,
-          notes: input?.notes,
-          evidence: input?.evidence,
-          agent: caller.agent,
-          agentSessionId: callSession,
-        })
+        const manifestCheck = await readRunManifest(run, auth)
+        if (!manifestCheck.ok) {
+          return { content: `refused: ${authFailureText(manifestCheck.failure)}; nothing was written` }
+        }
+        const wPlan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
+        const wState = readJson<any>(run, join(run, "state.json"), undefined)
+        const rootSessionId = recordedRootSessionId(manifestCheck.signed ? manifestCheck.manifest : undefined, wPlan, wState)
+        const ancestry = await requireDescendantSession(ctx, rootSessionId, callSession)
+        if (!ancestry.ok) {
+          return {
+            content: `refused: wave_record must be called from a session that descends from the run root (${clean(rootSessionId ?? "unrecorded", 64)}); ${ancestry.reason}; nothing was written`,
+          }
+        }
+        const result = await recordVerificationWave(
+          run,
+          basename(run),
+          {
+            taskId: input?.taskId,
+            kind,
+            verdict: input?.verdict,
+            notes: input?.notes,
+            evidence: input?.evidence,
+            agent: caller.agent,
+            agentSessionId: callSession,
+          },
+          manifestCheck.signed ? auth : undefined,
+        )
         if (!result.ok) return { content: result.error }
         const state = readJson<any>(run, join(run, "state.json"), undefined)
         await appendEvent(run, {
@@ -5072,6 +5634,159 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           content: `STRICT WAVE RECORDED: ${kind}=${result.verdict.verdict} for ${result.verdict.taskId} by ${expectedAgent}.\nArtifact: ${result.artifact}`,
           verdict: result.verdict,
           artifact: result.artifact,
+        }
+      },
+    })
+
+    editor.add({
+      name: "report",
+      description:
+        "Trusted writer for verify/report-<taskId>.json. Only a session whose trusted agent is team/verifier, descending from the run root, may call it. The task must exist in plan.dag.json and a PASS report must carry evidence (a summary or checks). The report is signed for a signed run (run.manifest.json) and indexed in ctx.storage; final_verify requires that signature. A wrong agent, a missing task, or evidence-free PASS is refused.",
+      input: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string" },
+          taskId: { type: "string", description: "Task id from plan.dag.json." },
+          status: { type: "string", description: "PASS | FAIL." },
+          summary: { type: "string", description: "Optional verifier prose (max 2000 chars, sanitized)." },
+          checks: {
+            type: "array",
+            description: "Optional list of named checks. A PASS without a summary needs at least one check.",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+                type: { type: "string" },
+                passed: { type: "boolean" },
+              },
+              required: ["name", "passed"],
+              additionalProperties: true,
+            },
+          },
+          fatalFindings: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                where: { type: "string" },
+                why: { type: "string" },
+                fix: { type: "string" },
+              },
+              required: ["why"],
+              additionalProperties: true,
+            },
+          },
+          feedbackForWorker: { type: "string", description: "Optional remediation notes (max 4000 chars)." },
+          evidence: { type: "string", description: "Optional evidence pointer (max 2000 chars)." },
+        },
+        required: ["sessionId", "taskId", "status"],
+        additionalProperties: false,
+      },
+      execute: async (input: any, context: any) => {
+        const resolved = resolveRun(root, input?.sessionId)
+        if (resolved.error) return { content: resolved.error }
+        const run = resolved.run as string
+        const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+        const caller = callSession ? await deriveCallerAgent(ctx, run, callSession) : undefined
+        if (!caller || caller.agent !== "team/verifier") {
+          return {
+            content: `refused: teamwork_report must be called by team/verifier (trusted session agent: ${caller?.agent ? clean(caller.agent, 64) : "unknown"}); nothing was written`,
+          }
+        }
+        if (!callSession) {
+          return { content: "refused: teamwork_report needs a trusted session identity; nothing was written" }
+        }
+        const taskId = input?.taskId
+        if (!isSafeTaskId(taskId)) {
+          return { content: `refused: invalid task id "${clean(taskId, 32)}"; nothing was written` }
+        }
+        const status = clean(input?.status, 16).toUpperCase()
+        if (status !== "PASS" && status !== "FAIL") {
+          return { content: `refused: report status must be PASS | FAIL (got "${clean(input?.status, 32)}"); nothing was written` }
+        }
+        const plan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
+        const planIds = Array.isArray(plan?.tasks)
+          ? plan.tasks.map((t: any) => t?.id).filter((id: unknown) => typeof id === "string")
+          : []
+        if (!planIds.includes(taskId)) {
+          return { content: `refused: task "${clean(taskId, 64)}" is not in plan.dag.json; nothing was written` }
+        }
+        const checks = Array.isArray(input?.checks)
+          ? input.checks.slice(0, 100).map((c: any) => ({
+              name: clean(c?.name, 200),
+              type: clean(c?.type, 64) || "check",
+              passed: c?.passed === true,
+            }))
+          : []
+        const summary = typeof input?.summary === "string" ? cleanBlock(input.summary, 2000).trim() : ""
+        if (status === "PASS" && summary === "" && checks.length === 0) {
+          return { content: "refused: a PASS report needs evidence — provide a non-empty summary or at least one check; nothing was written" }
+        }
+        const manifestCheck = await readRunManifest(run, auth)
+        if (!manifestCheck.ok) {
+          return { content: `refused: ${authFailureText(manifestCheck.failure)}; nothing was written` }
+        }
+        const state = readJson<any>(run, join(run, "state.json"), undefined)
+        const rootSessionId = recordedRootSessionId(manifestCheck.signed ? manifestCheck.manifest : undefined, plan, state)
+        const ancestry = await requireDescendantSession(ctx, rootSessionId, callSession)
+        if (!ancestry.ok) {
+          return {
+            content: `refused: teamwork_report must be called from a session that descends from the run root (${clean(rootSessionId ?? "unrecorded", 64)}); ${ancestry.reason}; nothing was written`,
+          }
+        }
+        const fatalFindings = Array.isArray(input?.fatalFindings)
+          ? input.fatalFindings.slice(0, 50).map((f: any) => ({
+              where: clean(f?.where, 200),
+              why: clean(f?.why, 500),
+              fix: clean(f?.fix, 500),
+            }))
+          : []
+        const report: any = {
+          taskId,
+          status,
+          verifierAgent: "team/verifier",
+          verifierSessionId: callSession,
+          timestamp: new Date().toISOString(),
+          summary,
+          checks,
+          fatalFindings,
+          feedbackForWorker: typeof input?.feedbackForWorker === "string" ? cleanBlock(input.feedbackForWorker, 4000).trim() : "",
+          evidence: typeof input?.evidence === "string" ? cleanBlock(input.evidence, 2000).trim() : "",
+          requirementsHash: currentRequirementsHash(run),
+        }
+        const relativePath = `verify/report-${taskId}.json`
+        let toWrite: any = report
+        if (manifestCheck.signed) {
+          try {
+            toWrite = await auth!.signRunArtifact(basename(run), relativePath, report)
+          } catch (err: any) {
+            const failure = err?.failure as AuthFailure | undefined
+            return {
+              content: `refused: could not sign ${relativePath} (${failure ? failure.code : "signing failed"}); nothing was written`,
+              refused: failure?.code ?? "AUTH_UNAVAILABLE",
+            }
+          }
+        }
+        try {
+          writeJsonSafe(run, join(run, relativePath), toWrite)
+        } catch (err: any) {
+          return { content: `refused: could not write ${relativePath} (${clean(err?.message, 140)}); nothing was written` }
+        }
+        await appendEvent(run, {
+          event: "verifier_report",
+          sessionId: basename(run),
+          taskId,
+          to: status,
+          round: 0,
+          agent: "team/verifier",
+          agentSource: "session",
+          phase: state?.phase ?? null,
+        })
+        return {
+          content: `VERIFIER REPORT WRITTEN: ${taskId} ${status}${manifestCheck.signed ? " (signed)" : " (unsigned legacy)"}.\nArtifact: ${join(run, relativePath)}`,
+          report: toWrite,
+          artifact: join(run, relativePath),
+          signed: manifestCheck.signed,
         }
       },
     })
@@ -5100,6 +5815,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             },
           },
           failReason: { type: "string", description: "Optional. A reason to force FAIL; appended to the computed reasons." },
+          allowUnsignedLegacy: {
+            type: "boolean",
+            description:
+              "Default false. For a run with no signed run.manifest.json, an explicit legacy bypass is required before final_verify will consider the artifacts. The bypass is recorded as a legacy_unsigned_bypass event. A signed run never accepts this.",
+          },
         },
         additionalProperties: false,
       },
@@ -5117,6 +5837,51 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             return { content: `Error: No state.json found for run ${basename(run)}.` }
           }
           const plan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
+          const manifestCheck = await readRunManifest(run, auth)
+          if (!manifestCheck.ok) {
+            return {
+              status: "FAIL",
+              auth: manifestCheck.failure.code,
+              content: `FINAL VERIFICATION FAILED: [${manifestCheck.failure.code}] ${manifestCheck.failure.message}. Final merge is BLOCKED.`,
+              reasons: [authFailureText(manifestCheck.failure)],
+            }
+          }
+          const allowUnsignedLegacy = input?.allowUnsignedLegacy === true
+          const signedRun = manifestCheck.signed
+          const legacyUnsignedBlock = !signedRun && !allowUnsignedLegacy
+          if (!signedRun && allowUnsignedLegacy) {
+            await appendEvent(run, {
+              event: "legacy_unsigned_bypass",
+              sessionId: basename(run),
+              taskId: null,
+              to: "final_verify",
+              round: 0,
+              agent: caller?.agent ?? null,
+              agentSource: caller?.agent ? "session" : undefined,
+              phase: state.phase ?? null,
+              note: "allowUnsignedLegacy: true accepted an unsigned legacy run; artifact _auth envelopes are not verified",
+            })
+          }
+          const requireSigned = signedRun
+          if (signedRun) {
+            const drift = manifestDrift(manifestCheck.manifest, {
+              integrityMode: normalizeIntegrityMode(plan?.integrityMode ?? state?.integrityMode) ?? DEFAULT_INTEGRITY_MODE,
+              verification: resolveVerificationMode(plan, state).mode,
+              victoryAudit: resolveVictoryAuditMode(plan, state, run).mode,
+              requestHash: originalRequestHash(run),
+              requirementsHash: currentRequirementsHash(run),
+              planHash: planHashOf(plan),
+              lemmaPolicyHash: lemmaPolicyHashOf(run),
+            })
+            if (drift.length > 0) {
+              return {
+                status: "FAIL",
+                auth: "AUTH_STALE",
+                content: `FINAL VERIFICATION FAILED: the run drifted from its signed baseline: ${drift.map(manifestDriftReason).join("; ")}. Final merge is BLOCKED.`,
+                reasons: drift.map(manifestDriftReason),
+              }
+            }
+          }
           // SEC-1: null-prototype map; ids are read as data, never used as paths
           // unless they pass isSafeTaskId.
           const taskStates = nullMap<any>(state.tasks)
@@ -5129,42 +5894,87 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
 
           // Evidence comes from disk only; no input can supply or alter it.
-          const tasks = ids.map((id) => {
+          const tasks: Array<{ id: string; status: string; report: string | null; reportStatus: string }> = []
+          const reportDigests: Record<string, string | null> = Object.create(null)
+          const authReasons: string[] = []
+          for (const id of ids) {
             const safe = isSafeTaskId(id)
             const reportRel = safe ? `verify/report-${id}.json` : null
             const report = reportRel ? readJson<any>(run, join(run, reportRel), undefined) : undefined
             const rawStatus = taskStates[id]?.status
-            return {
+            tasks.push({
               id: clean(id, 64),
               status: typeof rawStatus === "string" ? clean(rawStatus, 32) : "pending",
               report: reportRel,
               reportStatus:
                 report?.status === "PASS" ? "PASS" : report?.status === "FAIL" ? "FAIL" : "MISSING",
+            })
+            if (reportRel) {
+              const raw = readBoundedRunFile(run, join(run, reportRel), MAX_RUN_FILE_BYTES)
+              reportDigests[clean(id, 64)] =
+                raw.status === "ok" ? sha256Hex(raw.text) : null
+              if (requireSigned && raw.status === "ok" && report) {
+                const check = auth
+                  ? await auth.verifyRunArtifact(basename(run), reportRel, report)
+                  : {
+                      status: "unknown" as const,
+                      failure: { code: "AUTH_UNAVAILABLE" as const, message: "no authenticity context is wired for this run" },
+                    }
+                if (check.status === "unsigned") {
+                  authReasons.push(`task ${id}: [AUTH_MISSING] ${reportRel} has no _auth envelope (a signed run requires one)`)
+                } else if (check.status !== "signed") {
+                  const failure = check.failure ?? { code: "AUTH_INVALID" as const, message: "report failed verification" }
+                  authReasons.push(`task ${id}: [${failure.code}] ${failure.message}`)
+                }
+              }
             }
-          })
+          }
           const audit = readJson<any>(run, join(run, "verify", "security-audit.json"), undefined)
           const securityAudit = {
             path: "verify/security-audit.json",
             status: audit?.status === "PASS" ? "PASS" : audit?.status === "FAIL" ? "FAIL" : "MISSING",
           }
+          const auditRaw = readBoundedRunFile(run, join(run, "verify", "security-audit.json"), MAX_RUN_FILE_BYTES)
+          const auditDigest = auditRaw.status === "ok" ? sha256Hex(auditRaw.text) : null
+          if (requireSigned && audit) {
+            const check = auth
+              ? await auth.verifyRunArtifact(basename(run), "verify/security-audit.json", audit)
+              : {
+                  status: "unknown" as const,
+                  failure: { code: "AUTH_UNAVAILABLE" as const, message: "no authenticity context is wired for this run" },
+                }
+            if (check.status === "unsigned") {
+              authReasons.push("[AUTH_MISSING] verify/security-audit.json has no _auth envelope (a signed run requires one)")
+            } else if (check.status !== "signed") {
+              const failure = check.failure ?? { code: "AUTH_INVALID" as const, message: "security audit failed verification" }
+              authReasons.push(`[${failure.code}] ${failure.message}`)
+            }
+          }
           const allTasksVerifiedPass = tasks.length > 0 && tasks.every((t) => t.status === "verified_pass")
 
           const reasons: string[] = []
+          if (legacyUnsignedBlock) {
+            reasons.push(
+              "[AUTH_LEGACY] this run has no signed run.manifest.json; re-call teamwork_final_verify with allowUnsignedLegacy: true to record an explicit legacy bypass",
+            )
+          }
           if (tasks.length === 0) reasons.push("no tasks in plan or state")
           for (const t of tasks) {
             if (t.status !== "verified_pass") reasons.push(`task ${t.id}: state status ${t.status} (not verified_pass)`)
             if (t.reportStatus !== "PASS") reasons.push(`task ${t.id}: report ${t.reportStatus}`)
           }
           if (securityAudit.status !== "PASS") reasons.push(`security audit: ${securityAudit.status}`)
+          reasons.push(...authReasons)
 
           // Opt-in strict wave: recompute the per-task challenge/audit evidence.
           // A missing or non-PASS/CLEAN verdict is a named FAIL reason. Standard
           // mode is a no-op, so its verdict and artifacts are unchanged.
           const verificationMode = resolveVerificationMode(plan, state).mode
-          const strictGate = evaluateStrictGate(
+          const strictGate = await evaluateStrictGateChecked(
             run,
             tasks.filter((t) => t.report !== null).map((t) => ({ id: t.id, status: t.status })),
             verificationMode,
+            { auth, requireSigned },
           )
           if (!strictGate.skipped) reasons.push(...strictGate.reasons)
 
@@ -5381,7 +6191,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // out. The verdict binds to the current ORIGINAL_REQUEST.md hash, so a
           // deleted/edited request or a stale audit cannot complete a run.
           const victoryMode = resolveVictoryAuditMode(plan, state, run).mode
-          const victoryGate = evaluateVictoryGate(run, victoryMode)
+          const victoryGate = await evaluateVictoryGateChecked(run, victoryMode, {
+            auth,
+            requireSigned,
+            requirementsHash: currentRequirementsHash(run),
+          })
           if (!victoryGate.ok) reasons.push(...victoryGate.reasons)
 
           // A supplied failReason can only make the verdict fail, never pass it.
@@ -5447,17 +6261,19 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             : victoryGate.ok
               ? "CONFIRMED"
               : "FAILED"
-          refuseSymlink(finalFile)
-          writeJson(finalFile, {
+          const finalPayload: any = {
             status,
             generatedBy: { agent: caller?.agent ?? null, session: callSession || basename(run) },
             generatedAt: new Date().toISOString(),
             integrityMode: integrity.mode,
             victory: victoryRecord,
+            requirementsHash: currentRequirementsHash(run),
             evidence: {
               tasks,
               securityAudit,
               allTasksVerifiedPass,
+              reportDigests,
+              auditDigest,
               victory: victoryGate.skipped
                 ? { mode: "skip", status: victoryGate.status, reasons: [] }
                 : victoryGate.ok
@@ -5467,6 +6283,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                       auditor: victoryGate.verdict.auditor,
                       auditorSessionId: victoryGate.verdict.auditorSessionId,
                       requestHash: victoryGate.verdict.requestHash,
+                      requirementsHash: (victoryGate.verdict as any).requirementsHash ?? null,
                     }
                   : { mode: "required", status: victoryGate.status, reasons: victoryGate.reasons },
               ...(documentReviewEvidence ? { documentReview: documentReviewEvidence } : {}),
@@ -5505,7 +6322,23 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             reasons: cappedReasons,
             ...(summary ? { summary } : {}),
             ...(findings.length ? { findings } : {}),
-          })
+          }
+          let finalToWrite: any = finalPayload
+          if (signedRun) {
+            try {
+              finalToWrite = await auth!.signRunArtifact(basename(run), "verify/final.json", finalPayload)
+            } catch (err: any) {
+              const failure = err?.failure as AuthFailure | undefined
+              return {
+                status: "FAIL",
+                auth: failure?.code ?? "AUTH_UNAVAILABLE",
+                content: `FINAL VERIFICATION FAILED: could not sign verify/final.json (${failure ? failure.code : "signing failed"}). Final merge is BLOCKED.`,
+                reasons: [`[${failure?.code ?? "AUTH_UNAVAILABLE"}] could not sign verify/final.json`],
+              }
+            }
+          }
+          refuseSymlink(finalFile)
+          writeJson(finalFile, finalToWrite)
 
           await appendEvent(run, {
             event: "final_verification",
@@ -5532,6 +6365,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               finalReport: finalFile,
               integrityMode: integrity.mode,
               victory: victoryRecord,
+              ...(legacyUnsignedBlock ? { auth: "AUTH_LEGACY" } : {}),
               ...(verificationMode === "strict" ? { strictGate: strictGate.status, strictMissing: strictGate.missing } : {}),
               reasons: cappedReasons,
             }
