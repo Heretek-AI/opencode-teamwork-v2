@@ -37,6 +37,10 @@ export const HANDOFF_SECTION_LABELS = HANDOFF_SECTIONS.map((name, i) => `${i + 1
 export const HANDOFF_DIR = "handoffs"
 export const HANDOFF_INDEX_FILE = "index.json"
 export const RUN_LEVEL_HANDOFF_ID = "_run"
+
+/** Whether final completion requires the handoff matrix or records an explicit skip. */
+export const HANDOFF_MODES = ["required", "skip"] as const
+export type HandoffMode = (typeof HANDOFF_MODES)[number]
 /** Per-section cap after sanitisation (UTF-8 bytes). */
 export const MAX_HANDOFF_SECTION_BYTES = 2 * 1024
 /** Total cap for the five section bodies (UTF-8 bytes). */
@@ -54,6 +58,8 @@ const CITE_PATH = /^verify\/[A-Za-z0-9._-]+\.json$/
 export const TASK_SCOPED_HANDOFF_ROLES = [
   "team/worker",
   "team/proof-worker",
+  "team/segment-reviewer",
+  "team/synthesizer",
   "team/verifier",
   "team/falsifier",
   "team/security-auditor",
@@ -462,5 +468,326 @@ export function listHandoffFiles(run: string): string[] {
       .sort()
   } catch {
     return []
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Continuity gate
+//
+// The gate is derived from plan/state, never from a caller's claim. Handoff
+// prose is never parsed for PASS/FAIL: only file identity, index hashes and
+// citation hashes are checked, so a handoff can make a run fail (missing or
+// stale evidence) but can never make one pass.
+// ---------------------------------------------------------------------------
+
+/** True when `value` is a recognised handoff mode. */
+export function normalizeHandoffMode(value: unknown): HandoffMode | undefined {
+  return value === "required" || value === "skip" ? value : undefined
+}
+
+/**
+ * Resolve the run's handoff mode from persisted plan/state. A legacy run with
+ * no field predates the continuity gate and keeps the old behaviour (skip);
+ * strict is never inferred. An unsigned legacy plan records the effective skip.
+ */
+export function resolveHandoffMode(
+  plan: any,
+  state: any,
+): { mode: HandoffMode; source: "plan" | "state" | "legacy" } {
+  const fromPlan = normalizeHandoffMode(plan?.requireHandoffs)
+  if (fromPlan) return { mode: fromPlan, source: "plan" }
+  const fromState = normalizeHandoffMode(state?.requireHandoffs)
+  if (fromState) return { mode: fromState, source: "state" }
+  return { mode: "skip", source: "legacy" }
+}
+
+export interface HandoffTaskRef {
+  id: string
+  agent?: string
+}
+
+export interface RequiredHandoffPair {
+  taskId: string
+  agent: string
+}
+
+export interface HandoffGateRequirement {
+  taskId: string
+  /** One of these agents satisfies the requirement (exactly one entry). */
+  agents: string[]
+  label: string
+}
+
+export interface HandoffGateEntryEvidence {
+  taskId: string
+  agent: string
+  path: string
+  sha256: string
+  agentSessionId: string
+  cites: HandoffCite[]
+}
+
+export interface HandoffGate {
+  mode: HandoffMode
+  skipped: boolean
+  ok: boolean
+  status: "SKIPPED" | "PASS" | "MISSING" | "STALE" | "INVALID"
+  reasons: string[]
+  missing: Array<{ taskId: string; agent: string }>
+  required: RequiredHandoffPair[]
+  entries: HandoffGateEntryEvidence[]
+}
+
+/**
+ * Build the required (taskId, agent) matrix from the plan's tasks and the run's
+ * modes. The task's own assigned agent writes its worker handoff; verifier,
+ * falsifier and security-auditor handoffs are added by mode, not by request.
+ */
+export function requiredHandoffMatrix(
+  tasks: HandoffTaskRef[],
+  opts: { strict: boolean; victoryAudit: boolean },
+): { requirements: HandoffGateRequirement[]; errors: string[] } {
+  const requirements: HandoffGateRequirement[] = []
+  const errors: string[] = []
+  const seen = new Set<string>()
+  const push = (taskId: string, agents: string[], label: string) => {
+    const key = `${taskId}\u0000${agents.join("|")}`
+    if (seen.has(key)) return
+    seen.add(key)
+    requirements.push({ taskId, agents, label })
+  }
+  for (const task of tasks) {
+    if (!isSafeTaskId(task.id)) {
+      errors.push(`handoffs: invalid task id "${clean(task.id, 32)}" cannot have a handoff`)
+      continue
+    }
+    const assigned = typeof task.agent === "string" && task.agent.trim() ? task.agent.trim() : "team/worker"
+    if (!isTaskScopedRole(assigned)) {
+      errors.push(`handoffs: task ${task.id} is assigned ${clean(assigned, 64)}, which cannot record a task handoff`)
+    } else {
+      push(task.id, [assigned], `task ${task.id} worker`)
+    }
+    push(task.id, ["team/verifier"], `task ${task.id} verifier`)
+    if (opts.strict) {
+      push(task.id, ["team/falsifier"], `task ${task.id} falsifier`)
+      push(task.id, ["team/security-auditor"], `task ${task.id} security auditor`)
+    }
+  }
+  // One run-level continuity narrative from the sentinel or orchestrator.
+  push(RUN_LEVEL_HANDOFF_ID, ["team/sentinel", "team/orchestrator"], "run-level sentinel/orchestrator")
+  if (opts.victoryAudit) {
+    push(RUN_LEVEL_HANDOFF_ID, ["team/victory-auditor"], "run-level victory auditor")
+  }
+  return { requirements, errors }
+}
+
+function isAllowedHandoffPair(taskId: string, agent: string): boolean {
+  if (taskId === RUN_LEVEL_HANDOFF_ID) {
+    return isRunLevelRole(agent) || agent === "team/security-auditor"
+  }
+  return isTaskScopedRole(agent)
+}
+
+const HANDOFF_MARKDOWN_HEADER = /^# HANDOFF — ([^\s—]+) — (team\/[a-z][a-z0-9-]{0,31})$/
+const MAX_HANDOFF_MARKDOWN_READ = 64 * 1024
+const MAX_CITED_ARTIFACT_BYTES = 8 * 1024 * 1024
+
+function readCiteHash(run: string, relPath: string): string | null {
+  const res = readBoundedRunFile(run, join(run, relPath), MAX_CITED_ARTIFACT_BYTES)
+  return res.status === "ok" ? sha256Hex(res.text) : null
+}
+
+/**
+ * Recompute the continuity gate from disk. A changed cited report/wave/audit/
+ * victory artifact makes the handoff stale; a duplicate, unknown or tampered
+ * index entry fails it. Handoff prose is never inspected for PASS/FAIL.
+ */
+export function evaluateHandoffGate(
+  run: string,
+  tasks: HandoffTaskRef[],
+  opts: { mode: HandoffMode; strict: boolean; victoryAudit: boolean },
+): HandoffGate {
+  if (opts.mode === "skip") {
+    return {
+      mode: "skip",
+      skipped: true,
+      ok: true,
+      status: "SKIPPED",
+      reasons: [],
+      missing: [],
+      required: [],
+      entries: [],
+    }
+  }
+  const matrix = requiredHandoffMatrix(tasks, { strict: opts.strict, victoryAudit: opts.victoryAudit })
+  const reasons: string[] = [...matrix.errors]
+  const missing: Array<{ taskId: string; agent: string }> = []
+  const taskIds = new Set(tasks.filter((t) => isSafeTaskId(t.id)).map((t) => t.id))
+  let index: HandoffIndex
+  try {
+    index = readIndex(run)
+  } catch (err: any) {
+    return {
+      mode: "required",
+      skipped: false,
+      ok: false,
+      status: "INVALID",
+      reasons: [...reasons, clean(err?.message || "handoffs/index.json is unreadable", 300)],
+      missing,
+      required: matrix.requirements.flatMap((r) => r.agents.map((agent) => ({ taskId: r.taskId, agent }))),
+      entries: [],
+    }
+  }
+
+  // Group entries by their exact (taskId, agent) key. More than one entry for a
+  // pair is a duplicate even when the pair is not required.
+  const byPair = new Map<string, HandoffIndexEntry[]>()
+  for (const entry of index.entries) {
+    const key = `${entry.taskId}\u0000${entry.agent}`
+    const list = byPair.get(key) ?? []
+    list.push(entry)
+    byPair.set(key, list)
+  }
+  for (const [key, list] of byPair) {
+    if (list.length > 1) {
+      const [taskId, agent] = key.split("\u0000")
+      reasons.push(`handoff index has ${list.length} duplicate entries for ${agent} ${taskId}`)
+    }
+  }
+
+  // Unknown / out-of-scope entries fail closed. Legitimate extras (for example
+  // the run-level security auditor) are still validated below.
+  for (const entry of index.entries) {
+    if (!isAllowedHandoffPair(entry.taskId, entry.agent)) {
+      reasons.push(
+        `handoff index has an unsupported role ${clean(entry.agent, 64)} for ${clean(entry.taskId, 32)}`,
+      )
+    }
+    if (entry.taskId !== RUN_LEVEL_HANDOFF_ID && !taskIds.has(entry.taskId)) {
+      reasons.push(`handoff index names unknown task ${clean(entry.taskId, 32)}`)
+    }
+  }
+
+  // Validate every indexed document: regular non-symlink, bytes match the index
+  // hash, and the header agrees with the indexed task/agent.
+  const documentOk = new Map<string, boolean>()
+  for (const entry of index.entries) {
+    const key = `${entry.taskId}\u0000${entry.agent}`
+    const file = join(run, entry.path)
+    const res = readBoundedRunFile(run, file, MAX_HANDOFF_MARKDOWN_READ)
+    if (res.status === "absent") {
+      reasons.push(`handoff file ${entry.path} is missing`)
+      documentOk.set(key, false)
+      continue
+    }
+    if (res.status === "error") {
+      reasons.push(`handoff file ${entry.path} is not readable as a regular file (${clean(res.error, 160)})`)
+      documentOk.set(key, false)
+      continue
+    }
+    const actual = sha256Hex(res.text)
+    if (actual !== entry.sha256) {
+      reasons.push(`handoff ${entry.path} sha256 does not match handoffs/index.json`)
+      documentOk.set(key, false)
+      continue
+    }
+    if (Buffer.byteLength(res.text, "utf8") !== entry.bytes) {
+      reasons.push(`handoff ${entry.path} byte length does not match handoffs/index.json`)
+      documentOk.set(key, false)
+      continue
+    }
+    const header = HANDOFF_MARKDOWN_HEADER.exec(res.text.split("\n", 1)[0] ?? "")
+    if (!header) {
+      reasons.push(`handoff ${entry.path} has no canonical HANDOFF header`)
+      documentOk.set(key, false)
+      continue
+    }
+    if (header[1] !== entry.taskId || header[2] !== entry.agent) {
+      reasons.push(
+        `handoff ${entry.path} header claims ${clean(header[1], 32)}/${clean(header[2], 64)}, not ${entry.taskId}/${entry.agent}`,
+      )
+      documentOk.set(key, false)
+      continue
+    }
+    documentOk.set(key, true)
+  }
+
+  const required: RequiredHandoffPair[] = []
+  let stale = false
+  let invalid = false
+  const evidence: HandoffGateEntryEvidence[] = []
+  for (const req of matrix.requirements) {
+    const candidates: HandoffIndexEntry[] = []
+    for (const agent of req.agents) {
+      required.push({ taskId: req.taskId, agent })
+      const key = `${req.taskId}\u0000${agent}`
+      const list = byPair.get(key) ?? []
+      if (list.length > 0) candidates.push(...list)
+    }
+    const missingAgent = req.agents.join(" or ")
+    if (candidates.length === 0) {
+      missing.push({ taskId: req.taskId, agent: missingAgent })
+      reasons.push(`handoff missing: ${req.taskId} ${missingAgent} (${req.label})`)
+      continue
+    }
+    if (candidates.length > 1) {
+      // Already named by the duplicate check when the same pair repeats; an
+      // alternative role (sentinel AND orchestrator) is a duplicate too.
+      reasons.push(`handoff duplicate: ${req.label} has ${candidates.length} entries (expected exactly one)`)
+      invalid = true
+      continue
+    }
+    const entry = candidates[0]
+    const key = `${entry.taskId}\u0000${entry.agent}`
+    if (documentOk.get(key) !== true) {
+      missing.push({ taskId: req.taskId, agent: entry.agent })
+      continue
+    }
+    const citePath = handoffCiteRelativePath(entry.agent, entry.taskId === RUN_LEVEL_HANDOFF_ID ? undefined : entry.taskId)
+    if (citePath && !entry.cites.some((c) => c.path === citePath)) {
+      invalid = true
+      reasons.push(`handoff ${entry.path} does not cite ${citePath}`)
+    }
+    // Every recorded citation must still match the current artifact.
+    for (const cite of entry.cites) {
+      const current = readCiteHash(run, cite.path)
+      if (current === null) {
+        stale = true
+        reasons.push(`handoff ${entry.path} cites ${cite.path}, which is missing or unreadable`)
+      } else if (current !== cite.sha256) {
+        stale = true
+        reasons.push(`handoff ${entry.path} is stale: ${cite.path} changed since the handoff was recorded`)
+      }
+    }
+    evidence.push({
+      taskId: entry.taskId,
+      agent: entry.agent,
+      path: entry.path,
+      sha256: entry.sha256,
+      agentSessionId: entry.agentSessionId,
+      cites: entry.cites,
+    })
+  }
+
+  // An entry for a required task but an unexpected extra role is not fatal by
+  // itself (e.g. a standard-mode security-auditor handoff); an entry for an
+  // unknown task/role, a duplicate, or a bad document is.
+  if (reasons.length > 0 && !invalid && !stale) {
+    invalid = reasons.some(
+      (r) =>
+        /duplicate|unsupported role|unknown task|sha256|byte length|header|not readable|missing file/.test(r),
+    )
+  }
+  const status: HandoffGate["status"] =
+    reasons.length === 0 ? "PASS" : stale ? "STALE" : invalid ? "INVALID" : "MISSING"
+  return {
+    mode: "required",
+    skipped: false,
+    ok: reasons.length === 0,
+    status,
+    reasons,
+    missing,
+    required,
+    entries: evidence,
   }
 }

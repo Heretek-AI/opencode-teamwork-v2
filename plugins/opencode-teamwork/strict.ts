@@ -509,6 +509,11 @@ export function renderGateStatus(input: {
   gate: StrictGate
   reasons: string[]
   generatedAt?: string
+  handoffs?: {
+    mode: "required" | "skip"
+    status: string
+    entries: Array<{ taskId: string; agent: string; path: string; sha256: string }>
+  }
 }): string {
   const lines: string[] = [
     "# Verification Gate",
@@ -535,6 +540,21 @@ export function renderGateStatus(input: {
     )
   }
   lines.push("", `Gate Result: **${input.finalStatus}**`)
+  if (input.handoffs) {
+    lines.push("", "## Continuity", "")
+    if (input.handoffs.mode === "skip") {
+      lines.push("Handoffs: **SKIPPED (explicit)**")
+    } else {
+      lines.push(`Handoffs: **${cell(input.handoffs.status)}** (required)`, "")
+      lines.push("| Task | Agent | Handoff | sha256 |")
+      lines.push("| --- | --- | --- | --- |")
+      for (const entry of input.handoffs.entries) {
+        lines.push(
+          `| ${cell(entry.taskId)} | ${cell(entry.agent)} | ${cell(entry.path)} | ${cell(entry.sha256)} |`,
+        )
+      }
+    }
+  }
   if (input.finalStatus === "FAIL" && input.reasons.length > 0) {
     lines.push("", "## Reasons", "")
     for (const reason of input.reasons.slice(0, 100)) {

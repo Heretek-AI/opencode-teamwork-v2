@@ -102,6 +102,8 @@ const RULES: Record<string, RoleSpec> = {
       "*": [
         "team/worker",
         "team/proof-worker",
+        "team/segment-reviewer",
+        "team/synthesizer",
         "team/verifier",
         "team/falsifier",
         "team/security-auditor",
