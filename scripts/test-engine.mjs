@@ -54,6 +54,9 @@ import { deflateSync } from "node:zlib"
 import { createHash, randomBytes } from "node:crypto"
 import assert from "node:assert"
 
+// Absolute git binary for the new worktree assertions; never PATH-resolved.
+const GIT_BIN = ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"].find(existsSync) ?? "/usr/bin/git"
+
 const testDir = mkdtempSync(join(tmpdir(), "teamwork-engine-test-"))
 // Sonar S6324: build ESC without embedding a control character in a regex literal.
 const ESC_CHAR = String.fromCharCode(27)
@@ -2254,8 +2257,8 @@ try {
 
     // 9. Missing sentinel worktree: merge/resolve must refuse, never fall back
     // to the user's checkout.
-    const rootHeadBefore = execFileSync("git", ["rev-parse", "HEAD"], { cwd: gitRepoDir, encoding: "utf8" }).trim()
-    const baseHeadBefore = execFileSync("git", ["rev-parse", `teamwork/base-${gitSessionId}`], { cwd: gitRepoDir, encoding: "utf8" }).trim()
+    const rootHeadBefore = execFileSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: gitRepoDir, encoding: "utf8" }).trim()
+    const baseHeadBefore = execFileSync(GIT_BIN, ["rev-parse", `teamwork/base-${gitSessionId}`], { cwd: gitRepoDir, encoding: "utf8" }).trim()
     const missingMerge = await gitTools.worktree.execute({
       sessionId: gitSessionId,
       action: "merge",
@@ -2271,12 +2274,12 @@ try {
     assert(!missingResolve.resolved, "resolve must refuse without a sentinel worktree")
     assert(/sentinel worktree is missing/i.test(missingResolve.content), `resolve refusal must name the missing sentinel: ${missingResolve.content}`)
     assert.strictEqual(
-      execFileSync("git", ["rev-parse", "HEAD"], { cwd: gitRepoDir, encoding: "utf8" }).trim(),
+      execFileSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: gitRepoDir, encoding: "utf8" }).trim(),
       rootHeadBefore,
       "user repo HEAD must not move when merge/resolve are refused",
     )
     assert.strictEqual(
-      execFileSync("git", ["rev-parse", `teamwork/base-${gitSessionId}`], { cwd: gitRepoDir, encoding: "utf8" }).trim(),
+      execFileSync(GIT_BIN, ["rev-parse", `teamwork/base-${gitSessionId}`], { cwd: gitRepoDir, encoding: "utf8" }).trim(),
       baseHeadBefore,
       "sentinel base branch must not move when merge/resolve are refused",
     )
@@ -2292,7 +2295,7 @@ try {
     assert(symSentinel.worktreePath, "sentinel worktree should be re-provisionable for the symlink case")
     rmSync(symSentinel.worktreePath, { recursive: true, force: true })
     symlinkSync(gitRepoDir, symSentinel.worktreePath, "dir")
-    const symHeadBefore = execFileSync("git", ["rev-parse", "HEAD"], { cwd: gitRepoDir, encoding: "utf8" }).trim()
+    const symHeadBefore = execFileSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: gitRepoDir, encoding: "utf8" }).trim()
     const symMerge = await gitTools.worktree.execute({
       sessionId: gitSessionId,
       action: "merge",
@@ -2301,12 +2304,12 @@ try {
     assert(!symMerge.merged, "merge must refuse a symlinked sentinel worktree")
     assert(/sentinel worktree path is a symlink/i.test(symMerge.content), `symlink refusal must be explicit: ${symMerge.content}`)
     assert.strictEqual(
-      execFileSync("git", ["rev-parse", "HEAD"], { cwd: gitRepoDir, encoding: "utf8" }).trim(),
+      execFileSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: gitRepoDir, encoding: "utf8" }).trim(),
       symHeadBefore,
       "user repo HEAD must not move for a symlinked sentinel path",
     )
     rmSync(symSentinel.worktreePath, { force: true })
-    execFileSync("git", ["worktree", "prune"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["worktree", "prune"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
     console.log("✓ symlinked sentinel worktree is refused without touching the user repo")
 
     console.log("✓ Git worktree operations, conflict artifact generation & resolve action verified")
