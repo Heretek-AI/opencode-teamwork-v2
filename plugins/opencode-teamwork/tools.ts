@@ -10105,6 +10105,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           verdict: { type: "string", description: "challenge: PASS; audit: CLEAN. Any other value is refused." },
           notes: { type: "string", description: "Optional adversarial notes (max 1000 chars, sanitized)." },
           evidence: { type: "string", description: "Optional evidence pointer (max 2000 chars, sanitized)." },
+          cites: {
+            type: "array",
+            description:
+              "Optional verify/ evidence paths this verdict reviewed (max 16). The engine hashes each file; a missing file refuses the call and a changed/missing cite makes the verdict stale.",
+            items: { type: "string" },
+          },
         },
         required: ["sessionId", "taskId", "kind", "verdict"],
         additionalProperties: false,
@@ -10139,6 +10145,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             verdict: input?.verdict,
             notes: input?.notes,
             evidence: input?.evidence,
+            cites: input?.cites,
             agent: caller.agent,
             agentSessionId: callSession,
           },
@@ -11084,6 +11091,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                           agent: t.challenge.agent,
                           reportHash: t.challenge.reportHash,
                           ok: t.challenge.ok,
+                          cites: t.challenge.cites,
+                          warnings: t.challenge.warnings,
                         },
                         audit: {
                           path: t.audit.path,
@@ -11091,6 +11100,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                           agent: t.audit.agent,
                           reportHash: t.audit.reportHash,
                           ok: t.audit.ok,
+                          cites: t.audit.cites,
+                          warnings: t.audit.warnings,
                         },
                       })),
                     },

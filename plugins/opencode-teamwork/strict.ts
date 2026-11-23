@@ -59,6 +59,12 @@ const MAX_WAVE_BYTES = 256 * 1024
 const NOTES_MAX = 1000
 const EVIDENCE_MAX = 2000
 const REPORT_HASH = /^[0-9a-f]{64}$/
+const SHA256_HEX = /^[0-9a-f]{64}$/
+const MAX_WAVE_CITES = 16
+const MAX_CITE_BYTES = 1024 * 1024
+// A cited artifact lives inside verify/: a single control-plane file, or a
+// bounded evidence artifact under verify/evidence/.
+const CITE_PATH = /^verify\/(?:evidence\/)?[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 
 function sha256Hex(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex")
@@ -94,6 +100,13 @@ export function resolveVerificationMode(
   return { mode: DEFAULT_VERIFICATION_MODE, source: "default" }
 }
 
+export interface WaveCite {
+  path: string
+  sha256: string
+  /** Byte length, recorded for verify/evidence/** artifacts (0.12.0). */
+  bytes?: number
+}
+
 export interface WaveVerdictFile {
   version: 1
   sessionId: string
@@ -104,6 +117,12 @@ export interface WaveVerdictFile {
   agentSessionId: string
   /** sha256 of the exact verify/report-<taskId>.json bytes this verdict saw. */
   reportHash: string
+  /**
+   * Hashed evidence inside verify/ that this verdict reviewed (0.12.0).
+   * Absent on legacy verdicts, which are read with a `legacy_unbound_wave`
+   * warning instead of being treated as current.
+   */
+  cites?: WaveCite[]
   notes: string
   evidence: string
   generatedAt: string
@@ -113,6 +132,47 @@ export interface WaveVerdictFile {
 export type RecordWaveResult =
   | { ok: true; verdict: WaveVerdictFile; artifact: string }
   | { ok: false; error: string }
+
+/** Hash the caller's cited paths. Paths are validated; a missing file refuses. */
+function resolveWaveCites(
+  run: string,
+  raw: unknown,
+): { ok: true; cites: WaveCite[] } | { ok: false; error: string } {
+  if (raw === undefined || raw === null) return { ok: true, cites: [] }
+  if (!Array.isArray(raw)) {
+    return { ok: false, error: "refused: cites must be an array of verify/<name> paths; nothing was written" }
+  }
+  if (raw.length > MAX_WAVE_CITES) {
+    return {
+      ok: false,
+      error: `refused: cites has ${raw.length} entries; the maximum is ${MAX_WAVE_CITES}; nothing was written`,
+    }
+  }
+  const cites: WaveCite[] = []
+  const seen = new Set<string>()
+  for (const entry of raw) {
+    const rel = typeof entry === "string" ? entry.trim() : ""
+    if (!CITE_PATH.test(rel)) {
+      return {
+        ok: false,
+        error: `refused: cited evidence "${clean(rel, 80)}" must be a verify/<name> path (one segment); nothing was written`,
+      }
+    }
+    if (seen.has(rel)) {
+      return { ok: false, error: `refused: cited evidence "${rel}" is listed twice; nothing was written` }
+    }
+    seen.add(rel)
+    const res = readBoundedRunFile(run, join(run, rel), MAX_CITE_BYTES)
+    if (res.status !== "ok") {
+      return {
+        ok: false,
+        error: `refused: cited evidence ${rel} is missing, unreadable, or not a regular file; nothing was written`,
+      }
+    }
+    cites.push({ path: rel, sha256: sha256Hex(res.text), bytes: Buffer.byteLength(res.text, "utf8") })
+  }
+  return { ok: true, cites }
+}
 
 /**
  * Validate and record one strict-wave verdict. The caller identity is supplied
@@ -128,6 +188,7 @@ export async function recordVerificationWave(
     verdict: unknown
     notes?: unknown
     evidence?: unknown
+    cites?: unknown
     agent: string
     agentSessionId: string
   },
@@ -204,6 +265,8 @@ export async function recordVerificationWave(
     }
   }
   const reportHash = sha256Hex(reportRes.text)
+  const resolvedCites = resolveWaveCites(run, input.cites)
+  if (!resolvedCites.ok) return resolvedCites
 
   const relativePath = `verify/${kind}-${taskId}.json`
   const target = join(run, relativePath)
@@ -236,6 +299,7 @@ export async function recordVerificationWave(
     agent: expectedAgent,
     agentSessionId: input.agentSessionId,
     reportHash,
+    cites: resolvedCites.cites,
     notes: typeof input.notes === "string" ? cleanBlock(input.notes, NOTES_MAX).trim() : "",
     evidence: typeof input.evidence === "string" ? cleanBlock(input.evidence, EVIDENCE_MAX).trim() : "",
     generatedAt: new Date().toISOString(),
@@ -271,6 +335,12 @@ export interface WaveEvidence {
   agent: string | null
   reportHash: string | null
   ok: boolean
+  /** Hashed verify/ evidence this verdict cited (empty on a legacy verdict). */
+  cites: WaveCite[]
+  /** Non-fatal notes, e.g. `legacy_unbound_wave` for a pre-0.12.0 verdict. */
+  warnings: string[]
+  /** True when a cited artifact is missing or no longer matches its hash. */
+  stale: boolean
   reasons: string[]
 }
 
@@ -286,14 +356,25 @@ export interface StrictGate {
   mode: VerificationMode
   skipped: boolean
   ok: boolean
-  status: "SKIPPED" | "PASS" | "MISSING" | "FAIL"
+  status: "SKIPPED" | "PASS" | "MISSING" | "STALE" | "FAIL"
   reasons: string[]
   missing: Array<{ taskId: string; kind: WaveKind }>
   tasks: StrictTaskEvidence[]
 }
 
 function emptyWave(path: string, verdict: string): WaveEvidence {
-  return { path, present: false, verdict, agent: null, reportHash: null, ok: false, reasons: [] }
+  return {
+    path,
+    present: false,
+    verdict,
+    agent: null,
+    reportHash: null,
+    ok: false,
+    cites: [],
+    warnings: [],
+    stale: false,
+    reasons: [],
+  }
 }
 
 /** Read and validate one wave artifact. Reasons name the task and the file. */
@@ -324,10 +405,51 @@ function readWaveEvidence(
   }
   const value = res.value
   const reasons: string[] = []
+  const warnings: string[] = []
+  let stale = false
   const rawVerdict = typeof value?.verdict === "string" ? clean(value.verdict, 48) : ""
   const verdict = rawVerdict || "INVALID"
   const agent = typeof value?.agent === "string" ? clean(value.agent, 64) : null
   const reportHash = typeof value?.reportHash === "string" ? value.reportHash : null
+  const cites: WaveCite[] = []
+  if (value?.cites === undefined) {
+    // Legacy verdict: readable, but never silently treated as bound evidence.
+    warnings.push(
+      `legacy_unbound_wave: ${relativePath} has no cites (recorded before 0.12.0); re-record it to bind reviewed evidence`,
+    )
+  } else if (!Array.isArray(value.cites)) {
+    reasons.push(`${label}: cites must be an array`)
+  } else {
+    for (const entry of value.cites) {
+      const rel = entry && typeof entry === "object" ? entry.path : undefined
+      const digest = entry && typeof entry === "object" ? entry.sha256 : undefined
+      if (typeof rel !== "string" || !CITE_PATH.test(rel) || typeof digest !== "string" || !SHA256_HEX.test(digest)) {
+        reasons.push(`${label}: cites contains an invalid entry`)
+        continue
+      }
+      cites.push({
+        path: rel,
+        sha256: digest,
+        ...(Number.isFinite(entry?.bytes) ? { bytes: Number(entry.bytes) } : {}),
+      })
+    }
+    for (const cite of cites) {
+      const cited = readBoundedRunFile(run, join(run, cite.path), MAX_CITE_BYTES)
+      if (cited.status !== "ok") {
+        stale = true
+        reasons.push(`[AUTH_STALE] ${label}: cited evidence ${cite.path} is missing or unreadable`)
+        continue
+      }
+      const actual = sha256Hex(cited.text)
+      if (actual !== cite.sha256) {
+        stale = true
+        reasons.push(`[AUTH_STALE] ${label}: cited evidence ${cite.path} changed since it was recorded`)
+      } else if (cite.bytes !== undefined && Buffer.byteLength(cited.text, "utf8") !== cite.bytes) {
+        stale = true
+        reasons.push(`[AUTH_STALE] ${label}: cited evidence ${cite.path} byte length changed since it was recorded`)
+      }
+    }
+  }
   const evidence: WaveEvidence = {
     path: relativePath,
     present: true,
@@ -335,6 +457,9 @@ function readWaveEvidence(
     agent,
     reportHash,
     ok: false,
+    cites,
+    warnings,
+    stale,
     reasons,
   }
   if (value?.version !== 1) reasons.push(`${label}: version must be 1 (got ${clean(value?.version, 16) || "none"})`)
@@ -431,8 +556,9 @@ export function evaluateStrictGate(
   const anyFileMissing = evidence.some(
     (task) => !task.challenge.present || !task.audit.present,
   )
+  const anyStale = evidence.some((task) => task.challenge.stale || task.audit.stale)
   const status: StrictGate["status"] =
-    reasons.length === 0 ? "PASS" : anyFileMissing ? "MISSING" : "FAIL"
+    reasons.length === 0 ? "PASS" : anyStale ? "STALE" : anyFileMissing ? "MISSING" : "FAIL"
   return {
     mode,
     skipped: false,
@@ -480,10 +606,11 @@ export async function evaluateStrictGateChecked(
   }
   if (reasons.length === gate.reasons.length) return gate
   const anyFileMissing = gate.tasks.some((task) => !task.challenge.present || !task.audit.present)
+  const anyStale = gate.tasks.some((task) => task.challenge.stale || task.audit.stale)
   return {
     ...gate,
     ok: false,
-    status: anyFileMissing ? "MISSING" : "FAIL",
+    status: anyStale ? "STALE" : anyFileMissing ? "MISSING" : "FAIL",
     reasons,
     missing,
   }

@@ -19,7 +19,7 @@ import {
   verifyLeanFile,
 } from "../plugins/opencode-teamwork/lemma.ts"
 import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
-import { renderGateStatus } from "../plugins/opencode-teamwork/strict.ts"
+import { renderGateStatus, evaluateStrictGate } from "../plugins/opencode-teamwork/strict.ts"
 import { evaluateVictoryGate } from "../plugins/opencode-teamwork/victory.ts"
 import { withCrossProcessLock, crossProcessLockPath, observeLockArtifact, quarantineStaleLock } from "../plugins/opencode-teamwork/locks.ts"
 import { assertSafeUrl, blockedAddressReason } from "../plugins/opencode-teamwork/url-guard.ts"
@@ -2096,6 +2096,136 @@ try {
 
   console.log("✓ security audit records rule coverage and reviewed digests; missing rules/violations fail and drift is AUTH_STALE")
 
+  console.log("Testing wave verdict evidence citations...")
+
+  const citedAgent = async (agent, fn) => {
+    const previous = mockCtx.session.get
+    mockCtx.session.get = async ({ sessionID }) =>
+      sessionID === FIXTURE_ROOT_SESSION ? { agent: "team/sentinel" } : { agent, parentID: FIXTURE_ROOT_SESSION }
+    try {
+      return await fn()
+    } finally {
+      mockCtx.session.get = previous
+    }
+  }
+  const recordCitedWave = (runId, taskId, kind, verdict, agent, opts = {}) =>
+    citedAgent(agent, () =>
+      registeredTools.wave_record.execute(
+        {
+          sessionId: runId,
+          taskId,
+          kind,
+          verdict,
+          ...(opts.cites !== undefined ? { cites: opts.cites } : {}),
+        },
+        { sessionID: `ses_cited_${kind}` },
+      ),
+    )
+  const writeLegacyWave = (runId, taskId, kind, verdict, agent, reportHash) => {    const file = join(testDir, ".opencode", "teamwork", runId, "verify", `${kind}-${taskId}.json`)
+    mkdirSync(dirname(file), { recursive: true })
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: 1,
+        sessionId: runId,
+        taskId,
+        kind,
+        verdict,
+        agent,
+        agentSessionId: `ses_legacy_${kind}`,
+        reportHash,
+        notes: "",
+        evidence: "",
+        generatedAt: new Date().toISOString(),
+      }) + "\n",
+    )
+  }
+
+  // The engine hashes wave citations with plain SHA-256 (the same digest it
+  // records for reportHash), not the keyed artifact digest.
+  const citeSha256 = (text) => createHash("sha256").update(text, "utf8").digest("hex")
+  const citeRun = "20261018-000000-ev-wave"
+  await seedVerifiedRun(citeRun, ["W1"], {
+    request: "Deliver the cited-wave fixture.",
+    victoryAudit: "skip",
+    victorySkipReason: "fixture: cited-wave test does not run the victory gate",
+    verification: "strict",
+    stampVictory: false,
+  })
+  const citeEvidenceFile = join(testDir, ".opencode", "teamwork", citeRun, "verify", "note.json")
+  writeFileSync(citeEvidenceFile, JSON.stringify({ note: "wave-reviewed artifact" }) + "\n")
+  const citeEvidenceText = readFileSync(citeEvidenceFile, "utf8")
+  const citedChallenge = await recordCitedWave(citeRun, "W1", "challenge", "PASS", "team/falsifier", {
+    cites: ["verify/note.json"],
+  })
+  assert.strictEqual(citedChallenge.verdict?.cites?.[0]?.path, "verify/note.json", "the challenge must record the cite")
+  assert.strictEqual(citedChallenge.verdict?.cites?.[0]?.sha256, citeSha256(citeEvidenceText), "the cite must hash the file")
+  assert.strictEqual(citedChallenge.verdict?.cites?.[0]?.bytes, Buffer.byteLength(citeEvidenceText, "utf8"), "the cite must record bytes")
+  const citedAudit = await recordCitedWave(citeRun, "W1", "audit", "CLEAN", "team/security-auditor", {
+    cites: ["verify/report-W1.json", "verify/note.json"],
+  })
+  assert.strictEqual(citedAudit.verdict?.cites?.length, 2, "the audit must record both cites")
+
+  const badCite = await recordCitedWave(citeRun, "W1", "challenge", "PASS", "team/falsifier", { cites: ["../outside.json"] })
+  assert(badCite.content.startsWith("refused:"), `a cite outside verify/ must be refused: ${badCite.content}`)
+  const missingCite = await recordCitedWave(citeRun, "W1", "challenge", "PASS", "team/falsifier", { cites: ["verify/absent.json"] })
+  assert(missingCite.content.startsWith("refused:"), `a missing cited file must be refused: ${missingCite.content}`)
+
+  await seedStrictHandoffs(registeredTools, citeRun, ["W1"])
+  const citedFinal = await registeredTools.final_verify.execute({ sessionId: citeRun })
+  assert.strictEqual(citedFinal.status, "PASS", `unchanged cites must PASS: ${citedFinal.content}`)
+  const citedFinalJson = JSON.parse(readFileSync(join(testDir, ".opencode", "teamwork", citeRun, "verify", "final.json"), "utf8"))
+  assert.strictEqual(citedFinalJson.evidence.strict.tasks[0].challenge.cites[0].path, "verify/note.json")
+
+  appendFileSync(citeEvidenceFile, " ")
+  const citedStaleFinal = await registeredTools.final_verify.execute({ sessionId: citeRun })
+  assert.strictEqual(citedStaleFinal.status, "FAIL", "a changed cited file must FAIL")
+  assert(
+    citedStaleFinal.reasons.some((r) => r.includes("[AUTH_STALE]") && r.includes("cited evidence verify/note.json changed")),
+    `the changed cite must be named: ${JSON.stringify(citedStaleFinal.reasons)}`,
+  )
+  const citedStaleNext = await registeredTools.next.execute({ sessionId: citeRun })
+  assert.strictEqual(citedStaleNext.status, "BLOCKED_BY_STRICT_WAVE", `next must block on a stale cite: ${citedStaleNext.content}`)
+  assert(
+    citedStaleNext.reasons.some((r) => r.includes("verify/note.json")),
+    `next must name the stale cite: ${JSON.stringify(citedStaleNext.reasons)}`,
+  )
+
+  rmSync(citeEvidenceFile)
+  const citedMissingNext = await registeredTools.next.execute({ sessionId: citeRun })
+  assert.strictEqual(citedMissingNext.status, "BLOCKED_BY_STRICT_WAVE", "a missing cite must block the run")
+  assert(
+    citedMissingNext.reasons.some((r) => r.includes("verify/note.json") && r.includes("missing")),
+    `next must name the missing cite: ${JSON.stringify(citedMissingNext.reasons)}`,
+  )
+
+  // A pre-0.12.0 verdict has no cites: readable, but warned and never silent.
+  const legacyWaveRun = "20261018-000000-ev-wave-legacy"
+  await seedVerifiedRun(legacyWaveRun, ["W2"], {
+    request: "Deliver the legacy-wave fixture.",
+    victoryAudit: "skip",
+    victorySkipReason: "fixture: legacy-wave test does not run the victory gate",
+    verification: "strict",
+    allowUnsignedLegacy: true,
+    stampVictory: false,
+  })
+  const legacyWaveReportHash = citeSha256(readFileSync(join(testDir, ".opencode", "teamwork", legacyWaveRun, "verify", "report-W2.json"), "utf8"))
+  writeLegacyWave(legacyWaveRun, "W2", "challenge", "PASS", "team/falsifier", legacyWaveReportHash)
+  writeLegacyWave(legacyWaveRun, "W2", "audit", "CLEAN", "team/security-auditor", legacyWaveReportHash)
+  const legacyWaveGate = evaluateStrictGate(
+    join(testDir, ".opencode", "teamwork", legacyWaveRun),
+    [{ id: "W2", status: "verified_pass" }],
+    "strict",
+  )
+  assert.strictEqual(legacyWaveGate.ok, true, `a legacy wave must still read: ${JSON.stringify(legacyWaveGate.reasons)}`)
+  assert(
+    legacyWaveGate.tasks[0].challenge.warnings.some((w) => w.includes("legacy_unbound_wave")),
+    "a wave without cites must carry the legacy_unbound_wave warning",
+  )
+  assert.strictEqual(legacyWaveGate.tasks[0].challenge.cites.length, 0, "a legacy wave has no recorded cites")
+
+  console.log("✓ waves cite hashed verify/ evidence; a changed/missing cite is STALE and a legacy wave warns")
+
   // ==========================================
   // Part 1c-ter-strict: opt-in strict verification wave
   // ==========================================
@@ -2487,7 +2617,7 @@ try {
       stampVictory: false,
     })
   }
-  const writeRawWave = (runId, taskId, kind, verdict, agent) => {
+  const writeRawWave = (runId, taskId, kind, verdict, agent, reportHash) => {
     const file = strictWaveFile(runId, kind, taskId)
     mkdirSync(dirname(file), { recursive: true })
     writeFileSync(
@@ -2500,6 +2630,7 @@ try {
         verdict,
         agent,
         agentSessionId: `ses_${kind}_forged`,
+        ...(reportHash ? { reportHash } : {}),
         notes: "",
         evidence: "",
         generatedAt: new Date().toISOString(),
