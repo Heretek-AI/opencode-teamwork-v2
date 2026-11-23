@@ -329,6 +329,16 @@ Failure vocabulary: `AUTH_UNAVAILABLE`, `AUTH_KEY_CORRUPT`, `AUTH_MISSING`,
     "R1-impl": {
       "status": "pending|worker_active|worker_done|verifier_active|verified_pass|verified_fail|blocked",
       "round": 1,
+      "claim": {
+        "by": "ses_abc123",
+        "at": "2026-01-12T10:14:58Z",
+        "leaseUntil": "2026-01-12T10:29:58Z",
+        "previousClaimant": {
+          "by": "ses_old123",
+          "at": "2026-01-12T10:00:00Z",
+          "leaseUntil": "2026-01-12T10:15:00Z"
+        }
+      },
       "branch": "teamwork/20260112-101500-a1b2-R1-impl",
       "worktree": "../.teamwork-worktrees/20260112-101500-a1b2/R1-impl",
       "summary": "Implemented core validation logic",
@@ -363,6 +373,33 @@ Task lifecycle:
 - `verified_pass`: Verification passed; ready for `teamwork_worktree` merge to sentinel base.
 - `verified_fail`: Verification failed; if `round < maxRounds`, ready to re-dispatch worker with feedback; if `round >= maxRounds`, automatically transitions to `blocked`.
 - `blocked`: Max rounds exceeded or upstream dependency blocked.
+
+**Task claims (leases).** `teamwork_next` does not just read the graph: before
+returning a ready task it writes a bounded claim under the `state.json`
+cross-process lock:
+
+```json
+"claim": { "by": "<calling session id>", "at": "ISO8601", "leaseUntil": "ISO8601" }
+```
+
+* The lease is **15 minutes**. A task claimed by a different session whose lease
+  is still in the future is skipped from `readyForWorker`/`readyForVerifier` and
+  surfaced in `inProgress` as `claimed` (with the owner and lease). This is what
+  prevents two resumed Sentinels from dispatching duplicate workers.
+* An expired claim is reclaimed on the next `teamwork_next`; the previous
+  claimant is retained as `claim.previousClaimant` for forensics.
+* A same-session `teamwork_next` renews the lease, so a long-running dispatcher
+  can hand the task out again.
+* `teamwork_task_update` to `worker_active` requires a live claim. Only
+  `team/sentinel`/`team/orchestrator` may start an unclaimed task; that override
+  is recorded on the claim (`"override": "sentinel"`) and in the
+  `task_transition` event note. `worker_done` and every terminal state
+  (`verified_pass`, `verified_fail`, `blocked`) clear the claim, as does a
+  return to `pending`.
+* `teamwork_status` and `teamwork_next` surface claims (`status.claims`,
+  `readyForWorker[*].claim`, `inProgress[*].claim`). A lease is coordination,
+  not authentication: role/session-tree authorization still comes from
+  `authorize.ts`.
 
 Resume: re-read `state.json`, skip tasks already `verified_pass`, continue the current
 `round` for `verified_fail`/`worker_active`/`worker_done`.
@@ -509,7 +546,8 @@ citation only — it is never read as a verdict:
 | victory-auditor (run-level) | `verify/victory.json` |
 
 `handoffs/index.json` is the bounded index, serialised through the same
-process-wide file lock as the cost/state writers. It keeps one latest entry per
+cross-process `<artifact>.lock` (plus in-process queue) as the cost/state
+writers. It keeps one latest entry per
 `(taskId, agent)` (a rewrite replaces in place), at most **200 entries** and
 **256 KiB**, with run-relative paths only:
 
@@ -742,9 +780,36 @@ unreachable. It reports; it does not block a run.
   "spentUsd": 0,
   "byTask": {},
   "byTaskTokens": {},
+  "appliedSnapshotDigest": "sha256 hex of the last applied usage observation",
+  "appliedSnapshotAt": "ISO8601",
+  "snapshotCursors": {
+    "ses_abc123": {
+      "lastCost": 0.62,
+      "lastTokens": { "input": 1200, "output": 640, "reasoning": 0, "cache": { "read": 300, "write": 40 } },
+      "agent": "team/sentinel",
+      "timestamp": "ISO8601"
+    }
+  },
+  "lastCostUpdate": {
+    "at": "ISO8601",
+    "source": "opencode session tree (...)",
+    "digest": "sha256 hex",
+    "skippedDuplicate": false
+  },
   "updatedAt": "ISO8601"
 }
 ```
+
+`appliedSnapshotDigest` is the idempotency key for native snapshot updates. The
+digest is a stable sha256 over the observed session id, agent, cost, and token
+totals. When `teamwork_cost` observes the **same** digest again (for example a
+retry after the process crashed between the costs write and the snapshots write,
+or an immediate second call), it adds no cost/token delta and records
+`lastCostUpdate.skippedDuplicate: true`. `snapshotCursors` is the authoritative
+per-session delta baseline; `snapshots.json` remains a compatibility view and is
+refreshed after `costs.json`, but a missing/stale copy cannot double-count.
+Manual `addUsd` calls have no snapshot digest and are recorded without touching
+either digest or cursors.
 
 `byTask` maps a bucket name to its cumulative spend in USD. `byTaskTokens` is an
 additive key (added after the original schema) keyed by bucket name. Both are
@@ -760,11 +825,11 @@ bucket can have spend and no `byTaskTokens` entry (see the all-zero case below):
 ```
 
 Each `byTaskTokens` bucket holds integer token deltas (current session totals
-minus the `lastTokens` recorded in `snapshots.json`), the same way cost deltas
-are computed. A `costs.json` without `byTaskTokens` is valid: readers treat it as
-absent. The manual `addUsd` path has no token data, so it adds dollars to `byTask`
-only and leaves `byTaskTokens` untouched. The session-global `tokens` total is
-unchanged.
+minus the per-session `lastTokens` recorded in `costs.snapshotCursors`, mirrored
+in `snapshots.json`), the same way cost deltas are computed. A `costs.json`
+without `byTaskTokens` is valid: readers treat it as absent. The manual `addUsd`
+path has no token data, so it adds dollars to `byTask` only and leaves
+`byTaskTokens` untouched. The session-global `tokens` total is unchanged.
 
 A token delta whose five components are all zero (for example, a session whose
 cost rose but whose tokens did not change) is skipped **before** either map is
@@ -813,9 +878,10 @@ Cost and token consumption are read directly from OpenCode, not self-reported.
 The engine discovers the full OpenCode session tree rooted at the run's sentinel
 session (`opencode.db` SQLite tree query, background service API, or client get),
 aggregating the root session and all child/subagent sessions (workers, verifiers,
-scouts, auditors). Deltas between calls are tracked in `snapshots.json`. When
-native discovery is unavailable (tests, non-OpenCode host) the tool falls back
-to manual `addUsd`.
+scouts, auditors). Deltas between calls are tracked by the authoritative
+`costs.snapshotCursors` map (and mirrored in `snapshots.json`). When native
+discovery is unavailable (tests, non-OpenCode host) the tool falls back to manual
+`addUsd`.
 
 ### `snapshots.json` — per-session cost baseline for delta tracking
 
@@ -840,6 +906,48 @@ Each `teamwork_cost` call queries the entire session tree, computes
 adds new spend to `costs.json`, and advances `lastCost`. Because the running total
 is the sum of these deltas across the entire tree, cumulative cost is never
 double-counted and subagent consumption is never lost or ignored.
+
+`snapshots.json` is now a **compatibility view**. The authoritative baseline and
+the idempotency digest live in `costs.json` (`snapshotCursors`,
+`appliedSnapshotDigest`), which is written first. A crash after the costs write
+but before the snapshot write is therefore safe: a retry observes the same
+digest and skips the delta. Readers may still consume `snapshots.json`; writers
+refresh it after `costs.json` and never rely on it for correctness.
+
+### Cross-process lock files (`<artifact>.lock`)
+
+Read-modify-write of `state.json`, `costs.json`, `events.jsonl`, and
+`handoffs/index.json` is serialised **across processes**, not just within one
+plugin process. The lock is a sibling file named `<artifact>.lock`:
+
+```json
+{ "pid": 12345, "host": "workstation", "at": "ISO8601", "nonce": "hex" }
+```
+
+* Creation uses `O_CREAT|O_EXCL` (`flag: "wx"`), so an existing entry is never
+  overwritten and a symlink planted at the lock path is refused (never
+  followed). The lock is unlinked in `finally`, and only when its `nonce` still
+  matches the lock this call created.
+* Acquisition retries with bounded exponential backoff plus jitter and fails
+  closed with an explicit `lock timeout` error. A caller that cannot get the
+  lock writes nothing.
+* **Stale detection:** a lock older than 30 s is reclaimed only when it was
+  written on this host by the current pid or by a pid that is no longer alive.
+  A lock from a different host is **never** reclaimed from its pid (that pid is
+  meaningless on this machine). Malformed/unreadable lock files are left in
+  place rather than guessed at.
+* The on-disk lock is always acquired after an in-process queue keyed by the
+  same path, so a process cannot deadlock against its own lock file. Only the
+  short read-modify-write is held; external cost/session reads happen before
+  the lock.
+* **NFS/shared-filesystem caveat:** `O_EXCL` and `unlink` are not reliable
+  mutual-exclusion primitives on every NFS deployment (client-side caching,
+  delayed visibility, and no atomic rename in some configurations). On NFS,
+  treat these locks as best-effort duplicate-dispatch suppression. The
+  idempotent cost digest and the append-only event log limit the damage of a
+  lost lock, but they do not turn NFS into a linearizable lock service. Use a
+  local filesystem for the run root, or an external lock service, when strict
+  cross-host exclusion is required.
 
 ### `events.jsonl` — lifecycle event log (JSON Lines)
 
@@ -969,10 +1077,11 @@ line. It is a line-safety and display sanitiser, not a complete defence against
 hostile text, and it does not guard against prototype-key collisions (see Bucket
 names above).
 
-**Locking and symlinks.** Each append runs inside a per-file, in-process lock
-(`withFileLock` keyed on the `events.jsonl` path). A symlinked
-`events.jsonl` is refused: nothing is written through the link, and the link is left
-in place.
+**Locking and symlinks.** Each append runs inside the cross-process
+`<artifact>.lock` plus the in-process queue keyed on the `events.jsonl` path, so
+two plugin processes cannot assign the same `seq` or interleave a read/count
+with an append. A symlinked `events.jsonl` is refused: nothing is written
+through the link, and the link is left in place.
 
 **Best-effort, fail-open.** Writing is best-effort. Any error (including a refused
 symlink) is swallowed, and no tool result changes because of it. The DAG engine
