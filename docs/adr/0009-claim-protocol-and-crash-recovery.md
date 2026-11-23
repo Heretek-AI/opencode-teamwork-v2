@@ -107,6 +107,51 @@ current host unless `allowSharedWorktrees: true`, and never when the plan set
 default; `TEAMWORK_ALLOW_CROSS_HOST=1` or `allowCrossHost: true` plus
 `confirm: true` is the explicit opt-in.
 
+## 2.5 0.10.1 amendment
+
+The 0.10.0 implementation shipped four defects that this patch corrects without
+changing the protocol version:
+
+- **Release is a nonce-checked quarantine.** `releaseLock` no longer observes the
+  live path and then unlinks it. It renames the lock to
+  `<lock>.release.<nonce>`, reads the moved artifact, removes only a quarantine
+  whose nonce is ours, and restores a foreign/replaced artifact with
+  `link(2)` + `unlink(2)` (never a clobbering rename). A lock published
+  immediately after release therefore survives.
+- **`claim.host` means the claiming process.** New claims stamp
+  `host = SELF_HOST` (the process doing the claiming) and `runHost` (the run's
+  recorded host). Cross-host comparisons use `claim.host`. Protocol-2 claims
+  written by 0.10.0 with the run host as `host` are read as local on a local run;
+  there is no migration write. A claim whose `host` differs from the current
+  process is `cross-host` and is never auto-reclaimed.
+- **Grace and `needs-inspection` block cleanup.** `worktree cleanup` uses
+  `deriveClaimState` and refuses on `live`, `expired` (inside grace),
+  `needs-inspection`, and `cross-host`; only `stale` is recoverable. The same
+  derived state replaces `claimIsLive` in `next`, `task_update`, and `recover`.
+- **`needs-inspection` always wins.** A flagged claim with an unchanged
+  fingerprint is still not reclaimed; `task_update` to `worker_active` returns
+  `CLAIM_NEEDS_INSPECTION`.
+
+Additional correctness fixes in the same patch:
+
+- The fence increments only when the owner/epoch actually changes (or on a round
+  change or release), so the fence returned by `next` is valid for the immediate
+  `task_update`.
+- Inspection tokens bind `(round, fence, claim.by)`; `recover` also accepts a
+  `fence`, and a mismatch is `INSPECTION_STALE`.
+- Release/adopt/requeue/block preserve a bounded task-level `claimHistory`, and
+  a terminal `task_update` release emits `claim_released`.
+- The `state.json` critical section no longer runs the full git fingerprint
+  (tracked diff plus bounded untracked scan) or the verifier report's full diff.
+  Full baselines/report evidence are captured before the lock; only a cheap
+  `HEAD` + `status --porcelain` + tracked-diff hash is re-read under it. The
+  default lock timeout is 30 s (equal to, never above, the 30 s lock lease), so
+  worst-case recovery latency is one lease plus one timeout rather than an
+  unbounded wait.
+- The `mkdir` fallback publishes `owner.json` via temp + rename; an owner-write
+  failure removes the directory and fails closed instead of reporting
+  `"created"`.
+
 ## 3. Compatibility and migration
 
 - Protocol 1 (`claimProtocol` absent) is untouched: 15-minute advisory lease,

@@ -137,7 +137,22 @@ synchronous; a caller cannot interleave an `await` between the pin and its use.
 - `detective` mode keeps the atomic write and adds a post-write
   `realpathSync(dirname(dest))` under-run check plus a post-rename `(dev, ino)`
   identity check, and `nlink === 1` plus (where available) `fdWithin` on the
-  append descriptor. A mismatch throws a named refusal and records an anomaly.
+  append descriptor. An append opens with `O_NOFOLLOW` where the platform
+  defines it; on Windows (no `O_NOFOLLOW`) a symlink at the final component is
+  refused immediately before the open, and the `(dev, ino)` read from the opened
+  descriptor is compared with a post-write `lstat` (`detective-append` anomaly on
+  mismatch). A `createDir`/`unlink` verifies the target/parent realpath after the
+  operation, and a delete never creates parent directories. `dev === 0 ||
+  ino === 0` is refused by name (`identity-unavailable`) instead of being treated
+  as a match. A mismatch throws a named refusal and records an anomaly.
+- The detective lock path (`withPinnedCrossProcessLock` on macOS/Windows) checks
+  the lock parent's realpath before acquisition and after release and records a
+  `detective-lock` anomaly. A failed check fails closed; `fail-closed` never
+  degrades to this path.
+- **Scope of the 0.10.1 patch.** These detective checks close the deterministic
+  pre-planted cases (a final-component symlink or a lock/creating-delete parent
+  swap); they do not make macOS/Windows preventive. Full detective parity and a
+  platform matrix are deferred to 0.13.
 - A transient swap that is reverted before the post-write check can be missed in
   `detective` mode. This is why the mode is not selected on Linux.
 
@@ -211,6 +226,20 @@ synchronous; a caller cannot interleave an `await` between the pin and its use.
     `SKIP` line.
 12. detective fallback: a test hook moves the renamed temp outside; the
     post-check refuses and records a `write_anomaly` audit event.
+13. (0.10.1) detective lock acquires/runs/releases on Linux via
+    `setFdTraversalModeForTest("detective")`, records a `detective-lock`
+    anomaly/diagnostic, and `fail-closed` still throws.
+14. (0.10.1) detective append refuses a pre-planted final-component symlink,
+    refuses a post-write `(dev, ino)` mismatch and records `detective-append`,
+    and exercises the non-Linux containment branch through
+    `setFdContainmentModeForTest("unsupported")`.
+15. (0.10.1) `createDir`/`unlink` post-check swaps are refused and audited; a
+    delete never creates parent directories; `dev`/`ino` 0 is refused by name.
+16. (0.10.1) the Windows lexical table is refused on every platform via
+    `setWindowsLexicalModeForTest`; ordinary names are unaffected.
+17. (0.10.1) release quarantine survives a lock published inside the release
+    seam; the mkdir fallback removes its directory and fails closed when the
+    owner write fails.
 
 The existing `scripts/test-safe-fs.mjs` read suite stays green.
 
