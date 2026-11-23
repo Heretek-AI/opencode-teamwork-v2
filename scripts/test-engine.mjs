@@ -20,6 +20,7 @@ import {
 } from "../plugins/opencode-teamwork/lemma.ts"
 import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
 import { renderGateStatus } from "../plugins/opencode-teamwork/strict.ts"
+import { withCrossProcessLock, crossProcessLockPath } from "../plugins/opencode-teamwork/locks.ts"
 import { assertSafeUrl, blockedAddressReason } from "../plugins/opencode-teamwork/url-guard.ts"
 import { refreshRunBriefing, MAX_BRIEFING_BYTES, refreshAgentBriefing, readAgentBriefingExcerpt, agentBriefingRelativePath, MAX_AGENT_BRIEFING_DIRS } from "../plugins/opencode-teamwork/briefing.ts"
 import { writeHandoff, MAX_HANDOFF_ENTRIES, MAX_HANDOFF_INDEX_BYTES, HANDOFF_SECTION_LABELS } from "../plugins/opencode-teamwork/handoff.ts"
@@ -49,10 +50,10 @@ import {
   utimesSync,
   writeFileSync,
 } from "node:fs"
-import { tmpdir } from "node:os"
+import { tmpdir, hostname } from "node:os"
 import { dirname, join } from "node:path"
 import { createServer } from "node:http"
-import { execFileSync, spawnSync } from "node:child_process"
+import { execFileSync, spawn, spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { deflateSync } from "node:zlib"
 import { createHash, randomBytes } from "node:crypto"
@@ -2913,6 +2914,14 @@ try {
   {
     const RUN = "20261018-000000-session"
     const f = await attrFixture(RUN, "team/proof-worker", ["alpha"], "team/worker")
+    const sessionStateFile = join(f.root, ".opencode", "teamwork", RUN, "state.json")
+    const sessionState = JSON.parse(readFileSync(sessionStateFile, "utf8"))
+    sessionState.tasks.alpha.claim = {
+      by: "ses_attr_session",
+      at: new Date().toISOString(),
+      leaseUntil: new Date(Date.now() + 600000).toISOString(),
+    }
+    writeFileSync(sessionStateFile, JSON.stringify(sessionState, null, 2) + "\n")
     await f.tools.task_update.execute({ sessionId: RUN, taskId: "alpha", status: "worker_active" }, { sessionID: "ses_attr_session" })
     const last = readEvents(f.root, RUN).at(-1)
     assert.strictEqual(last.agent, "team/worker", "the session agent must beat the plan-declared agent")
@@ -8634,5 +8643,307 @@ process.exit(0);
         rmSync(gRoot, { recursive: true, force: true })
       }
     }
+  }
+}
+
+// ==========================================
+// Part 11: cross-process locking, task claims, idempotent cost
+// ==========================================
+{
+  console.log("Testing cross-process locks, task claims, and idempotent cost...")
+  const concDir = mkdtempSync(join(tmpdir(), "teamwork-concurrency-test-"))
+  const CONC_ROOT = "ses_conc_root"
+  const toolsUrl = new URL("../plugins/opencode-teamwork/tools.ts", import.meta.url).href
+  const childScript = join(concDir, "run-teamwork-tool.mjs")
+  const runFile = (runId, name) => join(concDir, ".opencode", "teamwork", runId, name)
+  const stateOf = (runId) => JSON.parse(readFileSync(runFile(runId, "state.json"), "utf8"))
+
+  writeFileSync(
+    childScript,
+    [
+      `import { registerTeamworkTools } from ${JSON.stringify(toolsUrl)}`,
+      `const [root, rootSession, sessionID, toolName, inputJson] = process.argv.slice(2)`,
+      `const tools = {}`,
+      `const map = new Map()`,
+      `await registerTeamworkTools({`,
+      `  tool: { transform: async (cb) => { await cb({ namespace: () => {}, add: (tool) => { tools[tool.name] = tool } }) } },`,
+      `  session: { get: async ({ sessionID: id }) => id === rootSession ? { agent: "team/sentinel" } : { agent: "team/sentinel", parentID: rootSession } },`,
+      `  storage: { get: async (k) => map.get(k), set: async (k, v) => { map.set(k, v) }, remove: async (k) => { map.delete(k) }, scan: async () => ({ entries: [], hasMore: false }) },`,
+      `}, root)`,
+      `const res = await tools[toolName].execute(JSON.parse(inputJson), { sessionID })`,
+      `process.stdout.write(JSON.stringify(res))`,
+    ].join("\n"),
+    "utf8",
+  )
+
+  const concTools = async () => {
+    const tools = {}
+    await registerTeamworkTools(
+      {
+        tool: {
+          transform: async (cb) => {
+            await cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = tool) })
+          },
+        },
+        session: {
+          get: async ({ sessionID }) => {
+            if (sessionID === CONC_ROOT) return { agent: "team/sentinel" }
+            if (typeof sessionID === "string" && sessionID.startsWith("ses_conc_")) {
+              return { agent: "team/sentinel", parentID: CONC_ROOT }
+            }
+            return undefined
+          },
+        },
+        storage: storageFor(concDir),
+      },
+      concDir,
+    )
+    return tools
+  }
+
+  const runChild = (sessionID, toolName, input, rootSession = CONC_ROOT) =>
+    new Promise((resolve, reject) => {
+      const child = spawn(
+        process.execPath,
+        [...process.execArgv, childScript, concDir, rootSession, sessionID, toolName, JSON.stringify(input)],
+        { cwd: concDir, env: process.env },
+      )
+      let stdout = ""
+      let stderr = ""
+      child.stdout.on("data", (chunk) => (stdout += String(chunk)))
+      child.stderr.on("data", (chunk) => (stderr += String(chunk)))
+      child.on("error", reject)
+      child.on("close", (code) => {
+        if (code !== 0) return reject(new Error(`child ${toolName} exited ${code}: ${stderr || stdout}`))
+        try {
+          resolve(JSON.parse(stdout))
+        } catch (err) {
+          reject(new Error(`child ${toolName} returned non-JSON: ${stdout}\n${stderr}`))
+        }
+      })
+    })
+
+  try {
+    const tools = await concTools()
+
+    // --- 11a: two processes race for one ready task; exactly one claims it.
+    const raceRun = "20261122-000000-conc-race"
+    const racePlan = await tools.plan.execute(
+      {
+        sessionId: raceRun,
+        topology: "iterative-coding",
+        skipInterview: true,
+        allowUnsignedLegacy: true,
+        tasks: [{ id: "R1" }],
+      },
+      { sessionID: CONC_ROOT },
+    )
+    assert(racePlan.content.startsWith("Planned"), `race plan failed: ${racePlan.content}`)
+    const [raceA, raceB] = await Promise.all([
+      runChild("ses_conc_a", "next", { sessionId: raceRun, allowUnsignedLegacy: true }),
+      runChild("ses_conc_b", "next", { sessionId: raceRun, allowUnsignedLegacy: true }),
+    ])
+    const claimedBy = [raceA, raceB].filter((r) => (r.readyForWorker || []).some((t) => t.id === "R1"))
+    assert.strictEqual(claimedBy.length, 1, "exactly one concurrent teamwork_next must claim the ready task")
+    const other = raceA === claimedBy[0] ? raceB : raceA
+    assert.strictEqual((other.readyForWorker || []).length, 0, "the loser must not receive the claimed task")
+    assert((other.inProgress || []).some((t) => t.id === "R1"), "the loser must see the task as in progress/claimed")
+    const raceState = stateOf(raceRun)
+    assert.strictEqual(raceState.tasks.R1.claim.by, claimedBy[0].readyForWorker[0].claim.by, "state claim must match the winner")
+    assert(Date.parse(raceState.tasks.R1.claim.leaseUntil) > Date.now(), "the claim must carry a future lease")
+    console.log("✓ two processes race teamwork_next: exactly one claims; the other sees in-progress")
+
+    // --- 11b: an expired claim is reclaimed (previous claimant recorded); a live one is not.
+    const staleRun = "20261122-000000-conc-stale"
+    await tools.plan.execute(
+      { sessionId: staleRun, topology: "iterative-coding", skipInterview: true, allowUnsignedLegacy: true, tasks: [{ id: "S1" }] },
+      { sessionID: CONC_ROOT },
+    )
+    const staleState = stateOf(staleRun)
+    staleState.tasks.S1.claim = {
+      by: "ses_dead",
+      at: new Date(Date.now() - 120000).toISOString(),
+      leaseUntil: new Date(Date.now() - 60000).toISOString(),
+    }
+    writeFileSync(runFile(staleRun, "state.json"), JSON.stringify(staleState, null, 2) + "\n")
+    const reclaimed = await tools.next.execute({ sessionId: staleRun, allowUnsignedLegacy: true }, { sessionID: CONC_ROOT })
+    assert(reclaimed.readyForWorker.some((t) => t.id === "S1"), "an expired claim must be reclaimable")
+    const reclaimedTask = reclaimed.readyForWorker.find((t) => t.id === "S1")
+    assert.strictEqual(reclaimedTask.claim.by, CONC_ROOT)
+    assert.strictEqual(reclaimedTask.claim.previousClaimant.by, "ses_dead", "the previous claimant must be recorded")
+    assert.strictEqual(stateOf(staleRun).tasks.S1.claim.previousClaimant.by, "ses_dead")
+
+    const liveState = stateOf(staleRun)
+    liveState.tasks.S1.claim = {
+      by: "ses_live",
+      at: new Date().toISOString(),
+      leaseUntil: new Date(Date.now() + 600000).toISOString(),
+    }
+    writeFileSync(runFile(staleRun, "state.json"), JSON.stringify(liveState, null, 2) + "\n")
+    const notReclaimed = await tools.next.execute({ sessionId: staleRun, allowUnsignedLegacy: true }, { sessionID: CONC_ROOT })
+    assert(!notReclaimed.readyForWorker.some((t) => t.id === "S1"), "a live claim from another session must not be reclaimed")
+    assert((notReclaimed.inProgress || []).some((t) => t.id === "S1" && t.claim?.by === "ses_live"), "the live claim must be surfaced")
+    console.log("✓ expired claims are reclaimed with the previous claimant; live claims are left alone")
+
+    // --- 11c: two processes update different tasks; both updates survive.
+    const updateRun = "20261122-000000-conc-update"
+    await tools.plan.execute(
+      {
+        sessionId: updateRun,
+        topology: "iterative-coding",
+        skipInterview: true,
+        allowUnsignedLegacy: true,
+        tasks: [{ id: "U1" }, { id: "U2" }],
+      },
+      { sessionID: CONC_ROOT },
+    )
+    await Promise.all([
+      runChild("ses_conc_u1", "task_update", { sessionId: updateRun, taskId: "U1", status: "worker_active" }),
+      runChild("ses_conc_u2", "task_update", { sessionId: updateRun, taskId: "U2", status: "worker_active" }),
+    ])
+    const updated = stateOf(updateRun)
+    assert.strictEqual(updated.tasks.U1.status, "worker_active", "U1 update must persist")
+    assert.strictEqual(updated.tasks.U2.status, "worker_active", "U2 update must persist (no lost update)")
+    assert.strictEqual(updated.tasks.U1.claim.by, "ses_conc_u1")
+    assert.strictEqual(updated.tasks.U2.claim.by, "ses_conc_u2")
+    console.log("✓ concurrent task_update calls on different tasks both persist under the cross-process lock")
+
+    // --- 11d: a held lock fails closed with a clear timeout.
+    const timeoutTarget = join(concDir, "lock-timeout-target.json")
+    writeFileSync(
+      crossProcessLockPath(timeoutTarget),
+      JSON.stringify({ pid: process.pid, host: hostname(), at: new Date().toISOString(), nonce: "held-by-test" }),
+    )
+    await assert.rejects(
+      withCrossProcessLock(timeoutTarget, () => { throw new Error("must not run") }, { timeoutMs: 80, retryBaseMs: 5, retryMaxMs: 10 }),
+      /lock timeout/,
+      "a held lock must fail closed",
+    )
+    rmSync(crossProcessLockPath(timeoutTarget), { force: true })
+
+    const symlinkTarget = join(concDir, "lock-symlink-target.json")
+    const symlinkVictim = join(concDir, "lock-symlink-victim.json")
+    writeFileSync(symlinkVictim, "victim\n")
+    symlinkSync(symlinkVictim, crossProcessLockPath(symlinkTarget))
+    await assert.rejects(
+      withCrossProcessLock(symlinkTarget, () => "nope", { timeoutMs: 50 }),
+      /symlink/,
+      "a symlinked lock path must be refused",
+    )
+    assert.strictEqual(readFileSync(symlinkVictim, "utf8"), "victim\n", "a refused lock must not touch the link target")
+    console.log("✓ lock timeout fails closed; a symlinked lock path is refused without following it")
+
+    // --- 11e: worker_active requires a claim; a Sentinel override is recorded; terminal states clear it.
+    const claimRun = "20261122-000000-conc-claim"
+    await tools.plan.execute(
+      { sessionId: claimRun, topology: "iterative-coding", skipInterview: true, allowUnsignedLegacy: true, tasks: [{ id: "C1" }] },
+      { sessionID: CONC_ROOT },
+    )
+    const workerCtxTools = {}
+    await registerTeamworkTools(
+      {
+        tool: {
+          transform: async (cb) => {
+            await cb({ namespace: () => {}, add: (tool) => (workerCtxTools[tool.name] = tool) })
+          },
+        },
+        session: {
+          get: async ({ sessionID }) => {
+            if (sessionID === CONC_ROOT) return { agent: "team/sentinel" }
+            if (sessionID === "ses_conc_worker") return { agent: "team/worker", parentID: CONC_ROOT }
+            return undefined
+          },
+        },
+        storage: storageFor(concDir),
+      },
+      concDir,
+    )
+    const refused = await workerCtxTools.task_update.execute(
+      { sessionId: claimRun, taskId: "C1", status: "worker_active" },
+      { sessionID: "ses_conc_worker" },
+    )
+    assert(/without a claim/.test(refused.content), `task_update without a claim must be refused: ${refused.content}`)
+    assert.strictEqual(stateOf(claimRun).tasks.C1.status, "pending", "a refused claim must not change the task")
+
+    const override = await tools.task_update.execute(
+      { sessionId: claimRun, taskId: "C1", status: "worker_active" },
+      { sessionID: CONC_ROOT },
+    )
+    assert(override.content.includes("updated"), `sentinel override must start the task: ${override.content}`)
+    assert.strictEqual(stateOf(claimRun).tasks.C1.claim.override, "sentinel", "the sentinel override must be recorded on the claim")
+    const events = readFileSync(runFile(claimRun, "events.jsonl"), "utf8")
+      .split("\n")
+      .filter((line) => line !== "")
+      .map((line) => JSON.parse(line))
+    const overrideEvent = events.at(-1)
+    assert(/sentinel override/.test(overrideEvent.note || ""), "the override must be recorded in events.jsonl")
+
+    for (const status of ["worker_done", "verifier_active", "verified_fail"]) {
+      await tools.task_update.execute({ sessionId: claimRun, taskId: "C1", status }, { sessionID: CONC_ROOT })
+    }
+    assert.strictEqual(stateOf(claimRun).tasks.C1.claim, undefined, "a terminal state must clear the claim")
+    console.log("✓ worker_active without a claim is refused; Sentinel override is recorded; terminal clears the claim")
+
+    // --- 11f: the same snapshot digest adds its delta once; a crash-replay is idempotent.
+    const costRun = "20261122-000000-conc-cost"
+    const COST_ROOT = "ses_cost_root"
+    let costUsage
+    const costTools = {}
+    await registerTeamworkTools(
+      {
+        tool: {
+          transform: async (cb) => {
+            await cb({ namespace: () => {}, add: (tool) => (costTools[tool.name] = tool) })
+          },
+        },
+        session: {
+          get: async ({ sessionID }) => {
+            if (sessionID !== COST_ROOT) return { agent: "team/sentinel" }
+            return {
+              agent: "team/sentinel",
+              ...(costUsage ? { cost: costUsage.cost, tokens: costUsage.tokens } : {}),
+            }
+          },
+        },
+        storage: storageFor(concDir),
+      },
+      concDir,
+    )
+    await costTools.plan.execute(
+      { sessionId: costRun, topology: "iterative-coding", skipInterview: true, allowUnsignedLegacy: true, tasks: [{ id: "K1" }] },
+      { sessionID: COST_ROOT },
+    )
+    const snapshotsBefore = readFileSync(runFile(costRun, "snapshots.json"), "utf8")
+    costUsage = { cost: 0.5, tokens: { input: 100, output: 40, reasoning: 0, cache: { read: 10, write: 2 } } }
+    const costFirst = await costTools.cost.execute({ sessionId: costRun }, { sessionID: COST_ROOT })
+    assert.strictEqual(costFirst.skippedDuplicate, false, "the first application must not be a duplicate")
+    let costs = JSON.parse(readFileSync(runFile(costRun, "costs.json"), "utf8"))
+    assert.strictEqual(costs.spentUsd, 0.5, "the first snapshot must add its delta")
+    assert.strictEqual(costs.byTask._sentinel, 0.5)
+    assert.strictEqual(costs.budgetUsd, 20, "budget metadata must be preserved")
+    assert(/^[0-9a-f]{64}$/.test(costs.appliedSnapshotDigest), "costs.json must store the applied snapshot digest")
+    assert.strictEqual(costs.snapshotCursors[COST_ROOT].lastCost, 0.5, "the per-session cursor must advance")
+
+    // Crash simulation: costs.json was written, snapshots.json was not.
+    writeFileSync(runFile(costRun, "snapshots.json"), snapshotsBefore)
+    const costReplay = await costTools.cost.execute({ sessionId: costRun }, { sessionID: COST_ROOT })
+    assert.strictEqual(costReplay.skippedDuplicate, true, "the same digest must be skipped")
+    costs = JSON.parse(readFileSync(runFile(costRun, "costs.json"), "utf8"))
+    assert.strictEqual(costs.spentUsd, 0.5, "a replay must not double-count")
+    assert.strictEqual(costs.byTask._sentinel, 0.5, "a replay must not grow the bucket")
+    assert.strictEqual(costs.lastCostUpdate.skippedDuplicate, true, "the skip must be recorded in costs.json")
+
+    // A genuinely new observation applies only the incremental delta, from the
+    // costs.json cursor (not the stale snapshots.json baseline).
+    costUsage = { cost: 0.7, tokens: { input: 150, output: 50, reasoning: 0, cache: { read: 12, write: 3 } } }
+    const costNext = await costTools.cost.execute({ sessionId: costRun }, { sessionID: COST_ROOT })
+    assert.strictEqual(costNext.skippedDuplicate, false)
+    costs = JSON.parse(readFileSync(runFile(costRun, "costs.json"), "utf8"))
+    assert.strictEqual(costs.spentUsd, 0.7, "a new digest must add only the delta (0.2)")
+    assert.strictEqual(costs.byTask._sentinel, 0.7, "the bucket must be cumulative, not double-counted")
+    assert.strictEqual(costs.budgetUsd, 20, "budget buckets must stay unchanged")
+    console.log("✓ cost digest is idempotent across crash replay; new snapshots add only the delta; budget preserved")
+  } finally {
+    rmSync(concDir, { recursive: true, force: true })
   }
 }
