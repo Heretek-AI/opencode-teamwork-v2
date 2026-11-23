@@ -85,7 +85,6 @@ import {
   manifestPathOf,
   mergeCandidates,
   proposeCandidate,
-  readBoundedFileNoFollow,
   readBoundedRunFile,
   readBoundedRunJson,
   readTournamentManifest,
@@ -125,6 +124,7 @@ import {
 } from "./victory.ts"
 import type { RequirementsFile, VictoryAuditMode } from "./victory.ts"
 import { readBriefingExcerpt, refreshRunBriefing } from "./briefing.ts"
+import { fdWithin, readWithinBounded, supportsFdContainment } from "./safe-fs.mjs"
 
 // ---------------------------------------------------------------------------
 // OpenCode native cost tracking
@@ -186,22 +186,11 @@ function normalizeTokens(t: any): TokenUsage {
   }
 }
 
-function readSnapshots(file: string): SnapshotsFile | undefined {
-  try {
-    const fd = openSync(file, "r")
-    let raw = ""
-    try {
-      raw = readFileSync(fd, "utf8")
-    } finally {
-      closeSync(fd)
-    }
-    const parsed = JSON.parse(raw) as SnapshotsFile
-    if (!parsed || typeof parsed !== "object" || typeof parsed.bySession !== "object") return undefined
-    if (!Array.isArray(parsed.rootSessionIds)) parsed.rootSessionIds = []
-    return parsed
-  } catch {
-    return undefined
-  }
+function readSnapshots(run: string, file: string): SnapshotsFile | undefined {
+  const parsed = readJson<SnapshotsFile | undefined>(run, file, undefined)
+  if (!parsed || typeof parsed !== "object" || typeof parsed.bySession !== "object") return undefined
+  if (!Array.isArray(parsed.rootSessionIds)) parsed.rootSessionIds = []
+  return parsed
 }
 
 /**
@@ -504,7 +493,7 @@ async function deriveCallerAgent(
     }
   } catch {}
   try {
-    const a = readSnapshots(join(run, "snapshots.json"))?.bySession?.[sessionID]?.agent
+    const a = readSnapshots(run, join(run, "snapshots.json"))?.bySession?.[sessionID]?.agent
     if (typeof a === "string") {
       const c = clean(a, 64).trim()
       if (c) return { agent: c, source: "session" }
@@ -716,7 +705,7 @@ const MAX_RUN_FILE_BYTES = 512 * 1024
 function readIntegrityMode(run: string): { mode: IntegrityMode; source: "artifact" | "default" } {
   const file = join(run, "ORIGINAL_REQUEST.md")
   try {
-    const text = readRunText(file)
+    const text = readRunText(run, file)
     if (text !== undefined) {
       // Only the metadata block counts: a "- Integrity mode:" line inside the
       // verbatim request body must never override the header.
@@ -884,7 +873,7 @@ function summarizePreflight(items: PreflightItem[]) {
 /** Read the verbatim request body back out of `<run>/ORIGINAL_REQUEST.md`. */
 function readRecordedRequest(run: string): string | undefined {
   try {
-    const text = readRunText(join(run, "ORIGINAL_REQUEST.md"))
+    const text = readRunText(run, join(run, "ORIGINAL_REQUEST.md"))
     if (text === undefined) return undefined
     const marker = "\n## Request\n"
     const at = text.indexOf(marker)
@@ -1029,20 +1018,25 @@ const MAX_RUN_TEXT_BYTES = 1 * 1024 * 1024
 /**
  * Bounded, symlink- and FIFO-safe text read for a run artifact. Returns
  * `undefined` for absent/refused/unreadable files so callers fall back exactly
- * as before, but an outside file can never be pulled into run context. The
- * underlying reader is `readBoundedFileNoFollow` (O_NOFOLLOW|O_NONBLOCK +
- * fstat in tournament.ts). Known gap: authn of run content is out of scope —
- * a writer already inside the run dir can still influence context, never a
- * verdict (verdicts are recomputed from evidence).
+ * as before, but an outside file can never be pulled into run context. The path
+ * is validated with the tournament run-containment check and then opened with
+ * the shared `readWithinBounded` primitive (O_NOFOLLOW|O_NONBLOCK, fstat, cap,
+ * and the post-open /proc/self/fd containment check on Linux). On macOS/Windows
+ * the intermediate-component race remains the documented residual risk.
+ * Known gap: authn of run content is out of scope — a writer already inside the
+ * run dir can still influence context, never a verdict (verdicts are recomputed
+ * from evidence).
  */
-function readRunText(file: string, maxBytes = MAX_RUN_TEXT_BYTES): string | undefined {
-  const res = readBoundedFileNoFollow(file, maxBytes)
+function readRunText(run: string, file: string, maxBytes = MAX_RUN_TEXT_BYTES): string | undefined {
+  const check = ensureSafeTournamentSubpath(run, file)
+  if (!check.ok) return undefined
+  const res = readWithinBounded(check.runReal, check.path, maxBytes)
   return res.status === "ok" ? res.text : undefined
 }
 
 function readPitfalls(run: string, taskId?: string): string[] {
   try {
-    const content = readRunText(join(run, "pitfalls.md"))
+    const content = readRunText(run, join(run, "pitfalls.md"))
     if (content === undefined) return []
     const lines = content
       .split("\n")
@@ -1058,6 +1052,19 @@ function readPitfalls(run: string, taskId?: string): string[] {
 }
 
 /**
+ * lstat that treats only ENOENT as absent. Unlike existsSync(), a dangling
+ * symlink is still seen (and can be refused), because lstat does not follow it.
+ */
+function lstatIfExists(file: string) {
+  try {
+    return lstatSync(file)
+  } catch (e: any) {
+    if (e?.code === "ENOENT") return null
+    throw e
+  }
+}
+
+/**
  * Validate the run root itself: `.opencode` and `.opencode/teamwork` must not
  * be symlinks, and the resolved base must stay inside the project root. This
  * closes the "commit `.opencode/teamwork` as a symlink" escape that a run-dir
@@ -1067,13 +1074,21 @@ function runsBase(root: string): { base: string } | { error: string } {
   const parent = join(root, ".opencode")
   const base = join(parent, "teamwork")
   for (const p of [parent, base]) {
+    let st
     try {
-      if (existsSync(p) && lstatSync(p).isSymbolicLink()) return { error: "refused: run root is a symlink" }
+      st = lstatIfExists(p)
     } catch {
       return { error: "refused: run root is not readable" }
     }
+    if (st?.isSymbolicLink()) return { error: "refused: run root is a symlink" }
   }
-  if (existsSync(base)) {
+  let baseStat
+  try {
+    baseStat = lstatIfExists(base)
+  } catch {
+    return { error: "refused: run root is not readable" }
+  }
+  if (baseStat) {
     try {
       const rel = relative(realpathSync(root), realpathSync(base))
       if (!rel || rel.startsWith("..") || isAbsolute(rel)) return { error: "refused: run root escapes the project" }
@@ -1140,9 +1155,15 @@ function resolveRun(root: string, sessionId?: string): { run?: string; error?: s
     const run = join(base, sessionId)
     const rel = relative(base, run)
     if (!rel || rel.startsWith("..") || isAbsolute(rel)) return { error: "refused: session id escapes the run root" }
-    if (existsSync(run)) {
+    let runStat
+    try {
+      runStat = lstatIfExists(run)
+    } catch {
+      return { error: "refused: run dir is not resolvable" }
+    }
+    if (runStat) {
       try {
-        if (lstatSync(run).isSymbolicLink()) return { error: "refused: run dir is a symlink" }
+        if (runStat.isSymbolicLink()) return { error: "refused: run dir is a symlink" }
         const relReal = relative(realpathSync(base), realpathSync(run))
         if (!relReal || relReal.startsWith("..") || isAbsolute(relReal)) return { error: "refused: run dir escapes the run root" }
       } catch {
@@ -1155,8 +1176,8 @@ function resolveRun(root: string, sessionId?: string): { run?: string; error?: s
   return latest ? { run: latest } : { error: "no Teamwork run found" }
 }
 
-function readJson<T>(file: string, fallback: T): T {
-  const text = readRunText(file, MAX_RUN_JSON_BYTES)
+function readJson<T>(run: string, file: string, fallback: T): T {
+  const text = readRunText(run, file, MAX_RUN_JSON_BYTES)
   if (text === undefined) return fallback
   try {
     return JSON.parse(text) as T
@@ -1201,7 +1222,7 @@ export function touch(file: string, content: string) {
  * yields "first event" so the fail-open append path can never block or follow
  * a link. Exported for the regression tests.
  */
-export function nextEventSeq(file: string): number {
+export function nextEventSeq(file: string, run?: string): number {
   let fd: number
   try {
     fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
@@ -1212,6 +1233,17 @@ export function nextEventSeq(file: string): number {
     const stat = fstatSync(fd)
     // A FIFO/device/socket must never be followed or block an append.
     if (!stat.isFile()) return 1
+    // Optional ADR 0004 check: on Linux, never count a descriptor that resolved
+    // outside the run. Other platforms keep the existing behavior.
+    if (run && supportsFdContainment()) {
+      let runReal: string
+      try {
+        runReal = realpathSync(run)
+      } catch {
+        return 1
+      }
+      if (!fdWithin(runReal, fd)) return 1
+    }
     const fromTail = seqFromTail(readTail(fd, stat.size))
     if (fromTail !== null) return fromTail
     return countNonEmptyLines(fd) + 1
@@ -1359,7 +1391,7 @@ async function appendEvent(
           : null
       const line = JSON.stringify({
         ts: new Date().toISOString(),
-        seq: nextEventSeq(eventsFile),
+        seq: nextEventSeq(eventsFile, run),
         event: ev.event,
         sessionId: clean(ev.sessionId, 64),
         taskId: opt(ev.taskId, 64),
@@ -1422,7 +1454,7 @@ function isUnsafePathDetail(msg: string): boolean {
 export function describeRun(root: string): string | undefined {
   const { run } = resolveRun(root)
   if (!run) return undefined
-  const state = readJson<any>(join(run, "state.json"), undefined)
+  const state = readJson<any>(run, join(run, "state.json"), undefined)
   if (!state) return undefined
   const tasks = Object.values(state.tasks || {}) as any[]
   const pass = tasks.filter((t) => isPassStatus(t?.status)).length
@@ -1446,7 +1478,7 @@ export function describeRun(root: string): string | undefined {
 }
 
 function describeCostLine(run: string): string {
-  const costs = readJson<any>(join(run, "costs.json"), undefined)
+  const costs = readJson<any>(run, join(run, "costs.json"), undefined)
   if (!costs || typeof costs.budgetUsd !== "number") return "Cost: unknown."
   const budget = costs.budgetUsd
   const spent = Number(costs.spentUsd) || 0
@@ -1513,12 +1545,24 @@ function ensureSafeRunSubpath(run: string, targetFile: string) {
   if (!rel || isAbsolute(rel) || rel.startsWith("..")) {
     throw new Error("refused: target path escapes run directory")
   }
-  const realRun = existsSync(absRun) ? realpathSync(absRun) : absRun
+  let runStat
+  try {
+    runStat = lstatIfExists(absRun)
+  } catch {
+    throw new Error("refused: run directory is not resolvable")
+  }
+  if (runStat?.isSymbolicLink()) throw new Error("refused: run directory is a symlink")
+  const realRun = runStat ? realpathSync(absRun) : absRun
   let cur = absTarget
   while (cur !== absRun && cur !== dirname(cur)) {
     refuseSymlink(cur)
-    if (existsSync(cur)) {
-      const st = lstatSync(cur)
+    let st
+    try {
+      st = lstatIfExists(cur)
+    } catch {
+      throw new Error(`refused: cannot inspect "${basename(cur)}"`)
+    }
+    if (st) {
       if (cur !== absTarget && !st.isDirectory()) {
         throw new Error(`refused: parent "${basename(cur)}" is not a directory`)
       }
@@ -1535,6 +1579,9 @@ function ensureSafeRunSubpath(run: string, targetFile: string) {
 }
 
 function writeTextSafe(run: string, targetFile: string, content: string) {
+  // Write-path residual (ADR 0004): the containment check is by path. A raced
+  // intermediate directory can still redirect the temp create/rename outside
+  // the run. The read path is the one with post-open fd containment.
   ensureSafeRunSubpath(run, targetFile)
   mkdirSync(dirname(targetFile), { recursive: true })
   const tmp = targetFile + ".tmp"
@@ -1920,12 +1967,10 @@ async function createPlanRun(
   // gate runs BEFORE mkdir, so a refusal leaves no run dir and no plan files
   // behind. `skipInterview` is the explicit, recorded bypass.
   const specFile = join(run, "prompt_draft.md")
-  let specText = ""
-  try {
-    if (existsSync(specFile)) specText = readFileSync(specFile, "utf8").trim()
-  } catch {
-    specText = "" // unreadable spec = no usable spec
-  }
+  // Root-aware read: a symlinked (including dangling) or non-regular spec is
+  // refused, and on Linux a raced intermediate directory cannot leak bytes.
+  const specRead = readBoundedRunFile(run, specFile, MAX_RUN_FILE_BYTES)
+  const specText = specRead.status === "ok" ? specRead.text.trim() : ""
   const hasSpec = specText.length > 0
   const specGate: "satisfied" | "bypassed" | "not_required" | undefined =
     input.requireSpec === false ? "not_required" : hasSpec ? "satisfied" : input.skipInterview === true ? "bypassed" : undefined
@@ -2036,7 +2081,7 @@ async function createPlanRun(
     // A re-plan keeps the run's checkpoint but must still carry the mode
     // the caller chose (defaults to development when omitted).
     const stateFile = join(run, "state.json")
-    const state = readJson<any>(stateFile, undefined)
+    const state = readJson<any>(run, stateFile, undefined)
     if (
       state &&
       (state.integrityMode !== integrityMode ||
@@ -2067,7 +2112,7 @@ async function createPlanRun(
   const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
   // Same lock as the cost tool so a re-plan cannot race a concurrent cost call.
   await withFileLock(costsFile, async () => {
-    const existing = readJson<any>(costsFile, undefined)
+    const existing = readJson<any>(run, costsFile, undefined)
     if (!existing) {
       writeJson(costsFile, {
         sessionId,
@@ -2103,7 +2148,7 @@ async function createPlanRun(
     // Establish the native cost baseline for the calling session, preserving
     // any baselines already recorded for other sessions (merge, don't clobber).
     const now = new Date().toISOString()
-    const snaps = readSnapshots(join(run, "snapshots.json")) ?? { sessionId, rootSessionIds: [], bySession: {} }
+    const snaps = readSnapshots(run, join(run, "snapshots.json")) ?? { sessionId, rootSessionIds: [], bySession: {} }
     snaps.sessionId = sessionId
     if (!snaps.rootSessionIds) snaps.rootSessionIds = []
     if (callSession && !snaps.rootSessionIds.includes(callSession)) {
@@ -2895,7 +2940,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const note = problems.length
           ? `preflight ${summary.status}: ${problems.length} item(s) missing or unreachable`
           : undefined
-        const state = readJson<any>(join(run, "state.json"), {})
+        const state = readJson<any>(run, join(run, "state.json"), {})
         await appendEvent(run, {
           event: "preflight",
           sessionId: basename(run),
@@ -2933,7 +2978,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
-        const state = readJson<any>(join(run, "state.json"), {})
+        const state = readJson<any>(run, join(run, "state.json"), {})
         const tasks = state.tasks || {}
         const lines = Object.entries(tasks).map(([id, t]: any) => `  ${clean(id, 64)}: ${clean(t?.status, 16)} (round ${Number(t?.round) || 0})`)
         const pass = Object.values(tasks).filter((t: any) => isPassStatus(t?.status)).length
@@ -2949,7 +2994,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
-        const state = readJson<any>(join(run, "state.json"), {})
+        const state = readJson<any>(run, join(run, "state.json"), {})
         const open = Object.entries(state.tasks || {}).filter(([, t]: any) => !isPassStatus(t?.status))
         if (!open.length) return { content: `Run ${basename(run)} is complete (all tasks pass).` }
         return {
@@ -2980,7 +3025,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         // Serialise the whole read-modify-write (including the client read) so
         // parallel workers cannot lose each other's attribution.
         return await withFileLock(file, async () => {
-          const costs = readJson<any>(file, undefined)
+          const costs = readJson<any>(run, file, undefined)
           if (!costs || typeof costs !== "object") {
             return { content: `No costs.json for run ${basename(run)} — call teamwork_plan first.` }
           }
@@ -2990,7 +3035,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           costs.byTaskTokens = nullMap(costs.byTaskTokens)
           const budget = costs.budgetUsd ?? 20
 
-          const snaps = readSnapshots(snapshotsFile) ?? { sessionId: basename(run), rootSessionIds: [], bySession: {} }
+          const snaps = readSnapshots(run, snapshotsFile) ?? { sessionId: basename(run), rootSessionIds: [], bySession: {} }
           snaps.sessionId = basename(run)
           if (!snaps.rootSessionIds) snaps.rootSessionIds = []
           if (callSession && !snaps.rootSessionIds.includes(callSession)) {
@@ -3404,7 +3449,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             // accumulated spend and buckets.
             const costsFile = join(run, "costs.json")
             await withFileLock(costsFile, async () => {
-              const current = readJson<any>(costsFile, undefined)
+              const current = readJson<any>(run, costsFile, undefined)
               if (!current) {
                 writeJson(costsFile, {
                   sessionId,
@@ -3839,8 +3884,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
 
-        const plan = readJson<any>(join(run, "plan.dag.json"), undefined)
-        const state = readJson<any>(join(run, "state.json"), undefined)
+        const plan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
+        const state = readJson<any>(run, join(run, "state.json"), undefined)
         if (!plan || !Array.isArray(plan.tasks)) {
           return { content: `No valid plan.dag.json found for run ${basename(run)}.` }
         }
@@ -4165,7 +4210,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
         if (passedTasks.length === taskDefs.size) {
           const auditFile = join(run, "verify", "security-audit.json")
-          const audit = existsSync(auditFile) ? readJson<any>(auditFile, undefined) : undefined
+          const audit = existsSync(auditFile) ? readJson<any>(run, auditFile, undefined) : undefined
           // The final gate reports the run's integrity mode, read from the same
           // artifact the auditor uses (legacy runs default to development). It is
           // disclosed, never enforced here: enforcement stays with the auditor.
@@ -4241,7 +4286,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // unstamped (hand-written or legacy) report needs the explicit,
           // recorded `allowUnstamped` bypass.
           const finalFile = join(run, "verify", "final.json")
-          const finalReport = existsSync(finalFile) ? readJson<any>(finalFile, undefined) : undefined
+          const finalReport = existsSync(finalFile) ? readJson<any>(run, finalFile, undefined) : undefined
 
           if (!finalReport || typeof finalReport !== "object" || typeof finalReport.status !== "string") {
             if (state.phase !== "FINAL_VERIFICATION") {
@@ -4487,13 +4532,13 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (!taskId) return { content: "Error: taskId is required" }
 
         return await withFileLock(stateFile, async () => {
-          const state = readJson<any>(stateFile, undefined)
+          const state = readJson<any>(run, stateFile, undefined)
           if (!state || typeof state.tasks !== "object") {
             return { content: `Error: No state.json found for run ${basename(run)}.` }
           }
           // SEC-1: null-prototype task map; existence is an OWN-property check, never truthiness.
           state.tasks = nullMap(state.tasks)
-          const plan = readJson<any>(planFile, undefined)
+          const plan = readJson<any>(run, planFile, undefined)
           const def = Array.isArray(plan?.tasks) ? plan.tasks.find((t: any) => t.id === taskId) : undefined
           if (!def && !Object.prototype.hasOwnProperty.call(state.tasks, taskId)) {
             return { content: `Error: Task "${taskId}" not found in plan or state.` }
@@ -4562,7 +4607,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (status === "verified_pass") {
             const inlinePass = input.verification?.status === "PASS"
             const reportFile = isSafeTaskId(taskId) ? join(run, "verify", `report-${taskId}.json`) : undefined
-            const report = reportFile && existsSync(reportFile) ? readJson<any>(reportFile, undefined) : undefined
+            const report = reportFile && existsSync(reportFile) ? readJson<any>(run, reportFile, undefined) : undefined
             if (!inlinePass && report?.status !== "PASS") {
               return {
                 content: `Error: Refusing verified_pass for task "${taskId}" without PASS evidence. Provide input.verification.status = "PASS", or write a verifier report at ${reportFile ?? "verify/report-<taskId>.json"} with "status": "PASS".`,
@@ -4613,7 +4658,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const anyActive = allTasks.some((t) => t.status === "worker_active" || t.status === "verifier_active")
           if (allPassed) {
             const auditFile = join(run, "verify", "security-audit.json")
-            const audit = existsSync(auditFile) ? readJson<any>(auditFile, undefined) : undefined
+            const audit = existsSync(auditFile) ? readJson<any>(run, auditFile, undefined) : undefined
             state.phase = audit?.status === "PASS" ? "MERGE" : "SECURITY_AUDIT"
           } else if (!anyActive && allTasks.some((t) => t.status === "blocked")) {
             state.phase = "PRESENT_PARTIAL"
@@ -4779,7 +4824,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         writeJson(auditFile, report)
 
         const stateFile = join(run, "state.json")
-        const state = readJson<any>(stateFile, undefined)
+        const state = readJson<any>(run, stateFile, undefined)
         if (state) {
           if (status === "PASS") {
             state.phase = "MERGE"
@@ -4883,7 +4928,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           auditorSessionId: callSession,
         })
         if (!result.ok) return { content: result.error }
-        const state = readJson<any>(join(run, "state.json"), undefined)
+        const state = readJson<any>(run, join(run, "state.json"), undefined)
         await appendEvent(run, {
           event: "victory_audit",
           sessionId: basename(run),
@@ -4953,7 +4998,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           agentSessionId: callSession,
         })
         if (!result.ok) return { content: result.error }
-        const state = readJson<any>(join(run, "state.json"), undefined)
+        const state = readJson<any>(run, join(run, "state.json"), undefined)
         await appendEvent(run, {
           event: "verification_wave",
           sessionId: basename(run),
@@ -5009,11 +5054,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
         return await withFileLock(finalFile, async () => {
           const caller = await deriveCallerAgent(ctx, run, callSession)
-          const state = readJson<any>(join(run, "state.json"), undefined)
+          const state = readJson<any>(run, join(run, "state.json"), undefined)
           if (!state || typeof state.tasks !== "object") {
             return { content: `Error: No state.json found for run ${basename(run)}.` }
           }
-          const plan = readJson<any>(join(run, "plan.dag.json"), undefined)
+          const plan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
           // SEC-1: null-prototype map; ids are read as data, never used as paths
           // unless they pass isSafeTaskId.
           const taskStates = nullMap<any>(state.tasks)
@@ -5029,7 +5074,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const tasks = ids.map((id) => {
             const safe = isSafeTaskId(id)
             const reportRel = safe ? `verify/report-${id}.json` : null
-            const report = reportRel ? readJson<any>(join(run, reportRel), undefined) : undefined
+            const report = reportRel ? readJson<any>(run, join(run, reportRel), undefined) : undefined
             const rawStatus = taskStates[id]?.status
             return {
               id: clean(id, 64),
@@ -5039,7 +5084,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 report?.status === "PASS" ? "PASS" : report?.status === "FAIL" ? "FAIL" : "MISSING",
             }
           })
-          const audit = readJson<any>(join(run, "verify", "security-audit.json"), undefined)
+          const audit = readJson<any>(run, join(run, "verify", "security-audit.json"), undefined)
           const securityAudit = {
             path: "verify/security-audit.json",
             status: audit?.status === "PASS" ? "PASS" : audit?.status === "FAIL" ? "FAIL" : "MISSING",
@@ -5978,7 +6023,7 @@ export async function registerTeamworkHooks(ctx: any, root: string) {
     if (event.action === "webfetch" && (event.agent === "team/worker" || event.agent === "team/verifier")) {
       const { run } = resolveRun(root)
       if (run) {
-        const specText = readRunText(join(run, "prompt_draft.md"))
+        const specText = readRunText(run, join(run, "prompt_draft.md"))
         if (specText && /network:\s*["']?denied["']?/i.test(specText)) {
           event.effect = "deny"
           event.message = "Network access is denied by run spec constraints."
