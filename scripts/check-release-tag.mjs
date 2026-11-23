@@ -71,19 +71,35 @@ if (!fetchMain.ok) {
   process.exit(1)
 }
 
+// Resolve the requested tag from git's own ref listing instead of passing the
+// caller-supplied name back to git as an argument. The command has no dynamic
+// argv; matching happens in JS against a strict `refs/tags/<tag>` equality.
 const tagRef = `refs/tags/${tag}`
-const tagCommit = git(["rev-parse", "--verify", "--quiet", "--end-of-options", `${tagRef}^{commit}`])
-if (!tagCommit.ok) {
+const listedTags = git(["for-each-ref", "--format=%(refname)%00%(objectname)%00%(*objectname)", "refs/tags"])
+if (!listedTags.ok) {
+  console.error("check-release-tag: refusing to publish: could not list local tags.")
+  if (listedTags.stderr) console.error(listedTags.stderr)
+  process.exit(1)
+}
+let tagCommit = ""
+for (const line of listedTags.stdout.split("\n")) {
+  const [ref, object, peeled] = line.split("\0")
+  if (ref === tagRef) {
+    tagCommit = peeled || object
+    break
+  }
+}
+if (!tagCommit) {
   console.error(`check-release-tag: refusing to publish: tag ${tag} does not exist (expected ${tagRef}).`)
   process.exit(1)
 }
 
-const ancestry = git(["merge-base", "--is-ancestor", "--", tagCommit.stdout, "origin/main"])
+const ancestry = git(["merge-base", "--is-ancestor", "--", tagCommit, "origin/main"])
 if (!ancestry.ok) {
   console.error(
     [
       `check-release-tag: refusing to publish ${tag}.`,
-      `${tag} (${tagCommit.stdout.slice(0, 12)}) is not an ancestor of origin/main.`,
+      `${tag} (${tagCommit.slice(0, 12)}) is not an ancestor of origin/main.`,
       "Release tags must point at a commit that is already on main; tag the intended main commit",
       "before pushing. Never rewrite a tag that has already been published.",
     ].join("\n"),
@@ -91,4 +107,4 @@ if (!ancestry.ok) {
   process.exit(1)
 }
 
-console.log(`check-release-tag: ${tag} (${tagCommit.stdout.slice(0, 12)}) is an ancestor of origin/main — OK.`)
+console.log(`check-release-tag: ${tag} (${tagCommit.slice(0, 12)}) is an ancestor of origin/main — OK.`)
