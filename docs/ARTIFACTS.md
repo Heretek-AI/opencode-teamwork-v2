@@ -189,7 +189,7 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "sessionId": "20261122-120000-abcd",
   "rootSessionId": "ses_...",
   "integrityMode": "development|demo|benchmark",
@@ -203,6 +203,10 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
   "planHash": "sha256",
   "lemmaPolicyHash": "sha256 | null",
   "runKeyId": "k_...",
+  "trustLevel": "local-hmac|external-signer|human-approved|ci-attested",
+  "requireWitness": false,
+  "approvalPolicy": "external-dir|in-run-legacy|none",
+  "approvalKeyId": "approval_... | null",
   "createdAt": "2026-11-22T12:00:00.000Z",
   "_auth": {
     "v": 1,
@@ -215,6 +219,13 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
   }
 }
 ```
+
+- Version 2 is written by 0.10.2+. Version 1 manifests remain readable;
+  their in-run `approvals/<runId>.json` is honoured only for those pre-0.10.2
+  runs and is recorded as `approval_unbound`.
+- `approvalPolicy`/`approvalKeyId` are part of the signed baseline and drift
+  checks. `human-approved`/`ci-attested` pin `external-dir` and the configured
+  verify-only approver key; a re-plan cannot remove or change either.
 
 - `rootSessionId` is the plan-time caller session. `teamwork_victory_audit`,
   `teamwork_wave_record`, and `teamwork_report` require the caller session to
@@ -284,16 +295,23 @@ stored at `auth/witness/<runId>/<relPath>`.
 `teamwork_plan` also records `trustLevel` (`local-hmac` default,
 `external-signer`, `human-approved`, `ci-attested`) and `requireWitness`.
 `final_verify` enforces them: `external-signer` refuses HMAC envelopes
-(`AUTH_TRUST_LEVEL`), `human-approved`/`ci-attested` require a signed
-`approvals/<runId>.json` bound to the manifest digest (`AUTH_APPROVAL_MISSING`),
-and a required witness without a receipt fails `AUTH_WITNESS_UNAVAILABLE`.
+(`AUTH_TRUST_LEVEL`), `human-approved`/`ci-attested` require an Ed25519
+`approvals/<runId>.json` from `OPENCODE_TEAMWORK_APPROVAL_DIR` signed by a key
+distinct from `runKeyId` and bound to the manifest digest
+(`AUTH_APPROVAL_MISSING`, `AUTH_APPROVAL_DIR`, `AUTH_APPROVAL_UNTRUSTED`,
+`AUTH_APPROVAL_STALE`, `AUTH_APPROVAL_NOT_HUMAN`), and a required witness
+without a receipt fails `AUTH_WITNESS_UNAVAILABLE`. Version 1 (pre-0.10.2)
+manifests keep the in-run approval path readable and record
+`approval_unbound`. The signed manifest is version 2 and pins `approvalKeyId`
+and `approvalPolicy`; a re-plan cannot change either.
 `OPENCODE_TEAMWORK_SIGNER` that is configured but unavailable/malformed fails
 `AUTH_SIGNER_UNAVAILABLE`; there is no fallback to local HMAC.
 
 Failure vocabulary: `AUTH_UNAVAILABLE`, `AUTH_KEY_CORRUPT`, `AUTH_MISSING`,
 `AUTH_INVALID`, `AUTH_UNKNOWN_KEY`, `AUTH_INDEX_MISSING`, `AUTH_STALE`,
 `AUTH_LEGACY`, `AUTH_SIGNER_UNAVAILABLE`, `AUTH_WITNESS_UNAVAILABLE`,
-`AUTH_TRUST_LEVEL`, `AUTH_APPROVAL_MISSING`.
+`AUTH_TRUST_LEVEL`, `AUTH_APPROVAL_MISSING`, `AUTH_APPROVAL_DIR`,
+`AUTH_APPROVAL_UNTRUSTED`, `AUTH_APPROVAL_STALE`, `AUTH_APPROVAL_NOT_HUMAN`.
 
 > **Boundary.** A same-UID shell with read access to `opencode.db` / the plugin
 > KV store can read a local HMAC or Ed25519 private key and mint envelopes, and
@@ -641,7 +659,7 @@ continuity record a fresh agent session starts from.
 - Phase: DISPATCH
 - Tasks: 3 total — pending 2, active 1, verified_pass 0, failed 0, blocked 0
 - Gate (strict): PASS|FAIL|MISSING        # strict runs only
-- Victory: CONFIRMED|REJECTED|PENDING|SKIPPED (with the recorded reason when explicit)
+- Victory: CONFIRMED|REJECTED|PENDING|SKIPPED (with the recorded reason when explicit); a semantic CONFIRMED whose `verify/victory.json` has no `_auth` envelope is rendered `CONFIRMED (unverified envelope)`
 
 ## Artifact Index
 - plan.dag.json

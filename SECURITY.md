@@ -57,8 +57,12 @@ public key before the artifact is accepted.
 
 `opencode-teamwork doctor --security` prints the relevant host facts (key
 source/algorithm, signer/witness config, `ptrace_scope`, root-equivalent group
-membership, DB mode, config/plugin writability, SELinux). It does not turn a
-warning into protection.
+membership, DB mode including `-wal`/`-shm`, config/plugin writability, the
+approval directory, write-containment mode, SELinux). A knowable problem is a
+`fail`; an uninspectable fact is `unknown`, never "safe".
+`doctor --security --require-hardened` exits 2 when any check is `fail` or
+`unknown`; plain `doctor --security` is advisory (exit 0 with a warning
+summary). The doctor does not turn a warning into protection.
 
 ## Trust levels
 
@@ -71,8 +75,45 @@ enforces it.
 | --- | --- | --- |
 | `local-hmac` | HMAC-SHA256 key ring in plugin storage (or `OPENCODE_TEAMWORK_HMAC_KEY`) | A verified HMAC envelope and index entry. |
 | `external-signer` | Local Ed25519 key or `OPENCODE_TEAMWORK_SIGNER=command:<path>` | Verified **Ed25519** envelopes only; an HMAC envelope fails `AUTH_TRUST_LEVEL`. |
-| `human-approved` | Any configured source | A signed `approvals/<run>.json` bound to the run id and the signed manifest digest, with a non-empty `approvedBy`. |
-| `ci-attested` | Any configured source | The same approval artifact with a non-empty `attestedBy` and `trustLevel: "ci-attested"`. |
+| `human-approved` | Any configured run source | An Ed25519 approval in `OPENCODE_TEAMWORK_APPROVAL_DIR` bound to the run id and signed-manifest digest, with `approvedBy` and a fresh bounded lifetime. |
+| `ci-attested` | Any configured run source | The same approval with `attestedBy` and `trustLevel: "ci-attested"`. |
+
+### What `human-approved` / `ci-attested` establish
+
+An approval is a separate `_auth` envelope over
+`{runId, trustLevel, approvedBy|attestedBy, approvedAt, expiresAt?, manifestDigest}`:
+
+- It must be read from an **absolute approval directory** outside the run and
+  the repository, a real directory (never a symlink), owned by a **different
+  UID** than the run process. A file must be a regular file, not a symlink, also
+  owned by that other UID.
+- Its envelope must be **Ed25519**, and its `_auth.keyId` must be **different**
+  from the manifest's `runKeyId`. An HMAC approval or an approval signed with
+  the run key fails `AUTH_APPROVAL_NOT_HUMAN`. Configure the verify-only
+  approver key with `OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY` (and optionally
+  `_KEY_ID`); the key id is pinned in the signed manifest as `approvalKeyId`.
+- It must bind the current signed `manifestDigest` and `runId`, have
+  `approvedAt >= manifest.createdAt`, and not be expired. The default lifetime
+  is 24 hours (`OPENCODE_TEAMWORK_APPROVAL_TTL_MS`, capped at 7 days); a stale
+  or over-long approval fails `AUTH_APPROVAL_STALE`.
+- `approvedBy`/`attestedBy` must look like a principal: `uid:<name>`,
+  `oidc:<issuer>#<sub>`, or `ci:<workflow>`. A bare `team/...` or `ses_...`
+  label fails `AUTH_APPROVAL_NOT_HUMAN`.
+
+This establishes that a **different configured principal signed this exact
+manifest digest while the approval was fresh**. It does **not** establish that
+a human read the code, understood the diff, or approves the behaviour: the
+identity is a claimed label, not an identity proof, and approval content is not
+validated. The run process must still be configured so that the approver key
+and directory are outside the agent's write reach; a same-UID approver is not a
+boundary.
+
+A new plan with `human-approved`/`ci-attested` refuses **before writing
+anything** when the directory or approver key is missing
+(`AUTH_APPROVAL_DIR` / `AUTH_APPROVAL_UNTRUSTED`). Manifests written by 0.10.1
+and earlier (version 1) keep their old in-run `approvals/<run>.json` path
+readable, but `final_verify` records `approval_unbound` and does not claim a
+distinct principal for it.
 
 Benchmark integrity refuses an explicit `local-hmac` trust level and warns when
 the default is used.
@@ -118,6 +159,10 @@ that boundary in-process.
 | `OPENCODE_TEAMWORK_SIGNER_TIMEOUT_MS` | Signer timeout (default 5000, max 60000). |
 | `OPENCODE_TEAMWORK_WITNESS` | `command:<absolute path>` or `http(s)://<url>`. |
 | `OPENCODE_TEAMWORK_WITNESS_TIMEOUT_MS` | Witness timeout (default 5000, max 60000). |
+| `OPENCODE_TEAMWORK_APPROVAL_DIR` | Absolute approval directory outside the run and repo, owned by a different UID. Required for `human-approved`/`ci-attested`. |
+| `OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY` | SPKI Ed25519 public key of the approver (verify-only). Pinned as `approvalKeyId` at plan time. |
+| `OPENCODE_TEAMWORK_APPROVAL_KEY_ID` | Optional approval key id; defaults to a digest of the approval public key. |
+| `OPENCODE_TEAMWORK_APPROVAL_TTL_MS` | Default approval lifetime when `expiresAt` is omitted (24 h; max 7 days). |
 
 The command signer receives `{v, alg, keyId, path, digest, nonce, at, message}`
 and must return `{alg: "ed25519", keyId, sig}`. The plugin verifies the returned
@@ -136,6 +181,10 @@ unavailable, malformed, timing-out, or non-verifying signer fails closed with
 - **Nonce and index storage.** The nonce, key-id pin, and digest index live in
   plugin storage. A same-UID writer can rewrite them; the witness is the
   optional cross-check.
-- **Approval artifact.** `approvals/<run>.json` is verified with the configured
-  key. With `local-hmac`, a same-UID writer can mint it; choose an external
-  signer for an approval that means something outside the run directory.
+- **Approval artifact.** `approvals/<runId>.json` is verified with the
+  configured approval key. With `local-hmac`, a same-UID writer can mint a run
+  envelope; that is why 0.10.2 requires an Ed25519 approver key distinct from
+  `runKeyId` and an approval directory owned by another UID. The approval proves
+  which configured key signed which manifest digest; it does not prove the
+  approver's real-world identity, that a human read the change, or that the
+  approval content is accurate.

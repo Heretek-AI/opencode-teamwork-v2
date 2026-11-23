@@ -1,4 +1,4 @@
-import { registerTeamworkTools, registerTeamworkHooks, describeRun, touch, nextEventSeq } from "../plugins/opencode-teamwork/tools.ts"
+import { registerTeamworkTools, registerTeamworkHooks, describeRun, touch, nextEventSeq, setApprovalOwnerUidForTest } from "../plugins/opencode-teamwork/tools.ts"
 import { createAuthContext, canonicalJson, payloadDigest, sha256Hex } from "../plugins/opencode-teamwork/auth.ts"
 import {
   analyzeLeanDeclarations,
@@ -330,12 +330,8 @@ function makeSeedVerifiedRun(tools, ctx, root) {
       for (const status of ["worker_active", "worker_done", "verifier_active"]) {
         await tools.task_update.execute({ sessionId: runId, taskId, status })
       }
-      await tools.task_update.execute({
-        sessionId: runId,
-        taskId,
-        status: "verified_pass",
-        verification: { status: "PASS" },
-      })
+      // 0.10.2: a signed run requires a verified PASS report, not the inline
+      // verification.status shortcut. Write it at the current round.
       const reportRes = await tools.report.execute(
         {
           sessionId: runId,
@@ -347,6 +343,16 @@ function makeSeedVerifiedRun(tools, ctx, root) {
         { sessionID: "ses_fixture_verifier" },
       )
       assert(!reportRes.content.startsWith("refused:"), `fixture report failed: ${reportRes.content}`)
+      const passUpdate = await tools.task_update.execute({
+        sessionId: runId,
+        taskId,
+        status: "verified_pass",
+        verification: { status: "PASS" },
+      })
+      assert(
+        passUpdate.status === "verified_pass",
+        `fixture verified_pass must accept the signed report: ${passUpdate.content}`,
+      )
     }
     await tools.security_audit.execute({
       sessionId: runId,
@@ -380,6 +386,25 @@ async function makeToolsFor(root) {
     root,
   )
   return tools
+}
+
+/**
+ * 0.10.2: on a signed run, verified_pass requires a verified PASS report. This
+ * helper writes one through the real trusted-verifier tool.
+ */
+async function writePassReport(tools, runId, taskId, { summary, checks } = {}) {
+  const res = await tools.report.execute(
+    {
+      sessionId: runId,
+      taskId,
+      status: "PASS",
+      summary: summary ?? `Fixture PASS for ${taskId}.`,
+      checks: checks ?? [{ name: "fixture", type: "check", passed: true }],
+    },
+    { sessionID: "ses_fixture_verifier" },
+  )
+  assert(!String(res.content).startsWith("refused:"), `fixture report ${runId}/${taskId} failed: ${res.content}`)
+  return res
 }
 
 try {
@@ -498,12 +523,16 @@ try {
     taskId: "T1",
     status: "verifier_active",
   })
-  await registeredTools.task_update.execute({
+  await writePassReport(registeredTools, "20261018-000000-test", "T1", {
+    checks: [{ name: "fixture", passed: true }],
+  })
+  const passT1 = await registeredTools.task_update.execute({
     sessionId: "20261018-000000-test",
     taskId: "T1",
     status: "verified_pass",
     verification: { status: "PASS", passedChecks: 5, totalChecks: 5 },
   })
+  assert.strictEqual(passT1.status, "verified_pass", `T1 must reach verified_pass: ${passT1.content}`)
 
   // Step 6: T1 passed -> T2 is unblocked and ready for worker!
   nextRes = await registeredTools.next.execute({ sessionId: "20261018-000000-test" })
@@ -520,6 +549,9 @@ try {
       status,
     })
   }
+  await writePassReport(registeredTools, "20261018-000000-test", "T2", {
+    checks: [{ name: "fixture", passed: true }],
+  })
   await registeredTools.task_update.execute({
     sessionId: "20261018-000000-test",
     taskId: "T2",
@@ -661,14 +693,16 @@ try {
   const passRun = "20261018-000000-verified"
   await registeredTools.plan.execute({ sessionId: passRun, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "P1" }, { id: "P2" }] })
   for (const taskId of ["P1", "P2"]) {
-    for (const status of ["worker_active", "worker_done", "verifier_active", "verified_pass"]) {
-      await registeredTools.task_update.execute({
-        sessionId: passRun,
-        taskId,
-        status,
-        ...(status === "verified_pass" ? { verification: { status: "PASS" } } : {}),
-      })
+    for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+      await registeredTools.task_update.execute({ sessionId: passRun, taskId, status })
     }
+    await writePassReport(registeredTools, passRun, taskId)
+    await registeredTools.task_update.execute({
+      sessionId: passRun,
+      taskId,
+      status: "verified_pass",
+      verification: { status: "PASS" },
+    })
   }
   const passStatus = await registeredTools.status.execute({ sessionId: passRun })
   assert(passStatus.content.includes("2/2 pass"), `status must count verified_pass: ${passStatus.content}`)
@@ -904,6 +938,7 @@ try {
   for (const status of ["worker_active", "worker_done", "verifier_active"]) {
     await registeredTools.task_update.execute({ sessionId: gateRun, taskId: "G1", status })
   }
+  await writePassReport(registeredTools, gateRun, "G1")
   await registeredTools.task_update.execute({
     sessionId: gateRun,
     taskId: "G1",
@@ -2433,17 +2468,29 @@ try {
     status: "verified_pass",
   })
   assert(noEvidence.content.startsWith("Error: Refusing verified_pass"), `evidence-free verified_pass must be refused: ${noEvidence.content}`)
-  assert(noEvidence.content.includes("verification.status") && noEvidence.content.includes("report-G1.json"), `refusal must name both evidence paths: ${noEvidence.content}`)
+  assert(noEvidence.content.includes("report-G1.json") && noEvidence.content.includes("legacy-only"), `refusal must name the report path and the legacy-only inline shortcut: ${noEvidence.content}`)
   assert.strictEqual(JSON.parse(readFileSync(transitionState, "utf8")).tasks.G1.status, "verifier_active", "refusal must leave state unchanged")
 
-  // (f) verifier_active -> verified_pass with an inline PASS is accepted.
+  // (f) on a signed run the inline PASS shortcut is refused; a verified report
+  // is the only accepted evidence.
+  const inlineRefused = await registeredTools.task_update.execute({
+    sessionId: transitionRun,
+    taskId: "G1",
+    status: "verified_pass",
+    verification: { status: "PASS", passedChecks: 2, totalChecks: 2 },
+  })
+  assert.strictEqual(inlineRefused.status, "REPORT_MISSING", `inline PASS on a signed run must be refused: ${inlineRefused.content}`)
+  assert(/inline verification\.status = "PASS" shortcut is not accepted on a signed run/.test(inlineRefused.content), inlineRefused.content)
+  await writePassReport(registeredTools, transitionRun, "G1", {
+    checks: [{ name: "fixture", passed: true }],
+  })
   const withEvidence = await registeredTools.task_update.execute({
     sessionId: transitionRun,
     taskId: "G1",
     status: "verified_pass",
     verification: { status: "PASS", passedChecks: 2, totalChecks: 2 },
   })
-  assert.strictEqual(withEvidence.status, "verified_pass", `inline PASS evidence must be accepted: ${withEvidence.content}`)
+  assert.strictEqual(withEvidence.status, "verified_pass", `verified PASS report evidence must be accepted: ${withEvidence.content}`)
   assert.strictEqual(JSON.parse(readFileSync(transitionState, "utf8")).tasks.G1.status, "verified_pass")
 
   // (g) blocked stays reachable from verified_pass (escalation can never deadlock).
@@ -2459,9 +2506,7 @@ try {
   for (const status of ["worker_active", "worker_done", "verifier_active"]) {
     await registeredTools.task_update.execute({ sessionId: transitionRun, taskId: "G2", status })
   }
-  const reportFile = join(testDir, ".opencode", "teamwork", transitionRun, "verify", "report-G2.json")
-  mkdirSync(dirname(reportFile), { recursive: true })
-  writeFileSync(reportFile, JSON.stringify({ taskId: "G2", status: "PASS", feedbackForWorker: "", fatalFindings: [] }) + "\n")
+  await writePassReport(registeredTools, transitionRun, "G2")
   const fromReport = await registeredTools.task_update.execute({
     sessionId: transitionRun,
     taskId: "G2",
@@ -3345,6 +3390,20 @@ try {
     }
     const walk = async (runId, statuses, round) => {
       for (const status of statuses) {
+        if (status === "verified_pass") {
+          const report = await tools.report.execute(
+            {
+              sessionId: runId,
+              taskId: "L1",
+              status: "PASS",
+              summary: `Ledger fixture PASS (round ${round}).`,
+              checks: [{ name: "fixture", passed: true }],
+              round,
+            },
+            { sessionID: "ses_fixture_verifier" },
+          )
+          assert(!report.content.startsWith("refused:"), `ledger report must be written: ${report.content}`)
+        }
         await tools.task_update.execute({ sessionId: runId, taskId: "L1", status, round, ...(status === "verified_pass" ? { verification: { status: "PASS" } } : {}) })
       }
     }
@@ -3857,6 +3916,10 @@ try {
     }
 
     const passTask = async (sessionId, taskId) => {
+      for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+        const res = await tools.task_update.execute({ sessionId, taskId, status })
+        assert(!res.content.startsWith("Error:"), `task_update ${taskId}->${status} failed: ${res.content}`)
+      }
       await writeSignedFixture(docRoot, sessionId, `verify/report-${taskId}.json`, {
         taskId,
         verifierAgent: "team/verifier",
@@ -3865,15 +3928,13 @@ try {
         checks: [{ name: "rubric", type: "rubric", passed: true }],
         fatalFindings: [],
       })
-      for (const status of ["worker_active", "worker_done", "verifier_active", "verified_pass"]) {
-        const res = await tools.task_update.execute({
-          sessionId,
-          taskId,
-          status,
-          ...(status === "verified_pass" ? { verification: { status: "PASS", passedChecks: 2, totalChecks: 2 } } : {}),
-        })
-        assert(!res.content.startsWith("Error:"), `task_update ${taskId}->${status} failed: ${res.content}`)
-      }
+      const pass = await tools.task_update.execute({
+        sessionId,
+        taskId,
+        status: "verified_pass",
+        verification: { status: "PASS", passedChecks: 2, totalChecks: 2 },
+      })
+      assert(!pass.content.startsWith("Error:"), `task_update ${taskId}->verified_pass failed: ${pass.content}`)
     }
 
     // --- 9.1: Positive Markdown E2E ---
@@ -4979,15 +5040,17 @@ try {
 
       // final_verify while tournament incomplete MUST stamp FAIL
       const runPath = join(testDir9, ".opencode", "teamwork", sid)
+      await tools9.task_update.execute({ sessionId: sid, taskId: "T1", status: "worker_active", agent: "team/proposer" })
+      await tools9.task_update.execute({ sessionId: sid, taskId: "T1", status: "worker_done", agent: "team/proposer" })
+      await tools9.task_update.execute({ sessionId: sid, taskId: "T1", status: "verifier_active", agent: "team/verifier" })
       await writeSignedFixture(testDir9, sid, "verify/report-T1.json", {
         taskId: "T1",
         status: "PASS",
         summary: "Tournament fixture PASS.",
+        checks: [{ name: "fixture", passed: true }],
       })
-      await tools9.task_update.execute({ sessionId: sid, taskId: "T1", status: "worker_active", agent: "team/proposer" })
-      await tools9.task_update.execute({ sessionId: sid, taskId: "T1", status: "worker_done", agent: "team/proposer" })
-      await tools9.task_update.execute({ sessionId: sid, taskId: "T1", status: "verifier_active", agent: "team/verifier" })
-      await tools9.task_update.execute({ sessionId: sid, taskId: "T1", status: "verified_pass", agent: "team/verifier" })
+      const tournamentPass = await tools9.task_update.execute({ sessionId: sid, taskId: "T1", status: "verified_pass", agent: "team/verifier" })
+      assert.strictEqual(tournamentPass.status, "verified_pass", `tournament fixture must reach verified_pass: ${tournamentPass.content}`)
       await tools9.security_audit.execute({ sessionId: sid, status: "PASS", summary: "Clean" })
       const fvIncomplete = await tools9.final_verify.execute({ sessionId: sid })
       assert.strictEqual(fvIncomplete.status, "FAIL", "final_verify must refuse PASS while tournament is incomplete")
@@ -6118,12 +6181,14 @@ process.exit(0);
       for (const st of ["worker_active", "worker_done", "verifier_active"]) {
         await tools.task_update.execute({ sessionId: RUN, taskId: "L1", status: st })
       }
-      await tools.task_update.execute({ sessionId: RUN, taskId: "L1", status: "verified_pass", verification: { status: "PASS" } })
       await writeSignedFixture(rootV, RUN, "verify/report-L1.json", {
         taskId: "L1",
         status: "PASS",
         summary: "LEMMA fixture PASS.",
+        checks: [{ name: "fixture", passed: true }],
       })
+      const lemmaPassUpdate = await tools.task_update.execute({ sessionId: RUN, taskId: "L1", status: "verified_pass", verification: { status: "PASS" } })
+      assert.strictEqual(lemmaPassUpdate.status, "verified_pass", `LEMMA fixture verified_pass must accept the signed report: ${lemmaPassUpdate.content}`)
       await tools.security_audit.execute({ sessionId: RUN, status: "PASS", findings: [] })
 
       // (d) clean .lean + exit 0 -> PASS, but without final FAITHFUL review final_verify must FAIL
@@ -6645,12 +6710,14 @@ process.exit(0);
       await advanceTask("worker_active")
       await advanceTask("worker_done")
       await advanceTask("verifier_active")
-      await tools.task_update.execute({ sessionId: RUN_FINAL, taskId: "L1", status: "verified_pass", verification: { status: "PASS" } })
       await writeSignedFixture(rootP, RUN_FINAL, "verify/report-L1.json", {
         taskId: "L1",
         status: "PASS",
         summary: "LEMMA policy fixture PASS.",
+        checks: [{ name: "fixture", passed: true }],
       })
+      const policyPassUpdate = await tools.task_update.execute({ sessionId: RUN_FINAL, taskId: "L1", status: "verified_pass", verification: { status: "PASS" } })
+      assert.strictEqual(policyPassUpdate.status, "verified_pass", `policy fixture verified_pass must accept the signed report: ${policyPassUpdate.content}`)
       await tools.security_audit.execute({ sessionId: RUN_FINAL, status: "PASS", findings: [] })
       await tools.lemma_formalize.execute({ sessionId: RUN_FINAL, action: "review_final", verdict: "FAITHFUL", notes: "matches" })
       const fvPolicyOk = await tools.final_verify.execute({ sessionId: RUN_FINAL })
@@ -7181,6 +7248,38 @@ process.exit(0);
     assert(text.includes("- Tasks: 2 total — pending 2, active 0, verified_pass 0, failed 0, blocked 0"), `status counts must be exact: ${text}`)
     assert(text.includes("- Gate (strict): MISSING"), "strict run must show a MISSING gate before evidence exists")
     assert(text.includes("- Victory: PENDING"), "victory must read PENDING before an audit")
+
+    // An unsigned CONFIRMED victory is never rendered as a plain CONFIRMED.
+    {
+      const reqs = JSON.parse(readFileSync(join(run, "requirements.json"), "utf8"))
+      const requestText = readFileSync(join(run, "ORIGINAL_REQUEST.md"), "utf8")
+      writeFileSync(
+        join(run, "verify", "victory.json"),
+        JSON.stringify(
+          {
+            verdict: "VICTORY CONFIRMED",
+            auditor: "team/victory-auditor",
+            auditorSessionId: "ses_victory_auditor",
+            requestHash: sha256Hex(requestText),
+            requirementsHash: sha256Hex(canonicalJson(reqs)),
+            requirements: (reqs.items || []).map((item) => ({
+              id: item.id,
+              met: true,
+              evidence: `Fixture evidence for ${item.id}`,
+            })),
+          },
+          null,
+          2,
+        ) + "\n",
+      )
+      refreshRunBriefing(run)
+      text = readFileSync(briefingFile, "utf8")
+      assert(
+        text.includes("- Victory: CONFIRMED (unverified envelope)"),
+        `an unsigned victory must be labelled unverified: ${text}`,
+      )
+      assert(!text.includes("- Victory: CONFIRMED\n"), "an unsigned victory must not render as plain CONFIRMED")
+    }
     assert(text.includes("- plan.dag.json") && text.includes("- state.json"), "artifact index must list plan/state")
     assert(text.includes("- ORIGINAL_REQUEST.md") && text.includes("- requirements.json"), "artifact index must list request/requirements")
     assert(!text.includes("- verify/final.json") && !text.includes("- GATE_STATUS.md"), "absent artifacts must not be indexed")
@@ -7203,6 +7302,9 @@ process.exit(0);
     // Ordered transitions: each status is only reachable from the previous one.
     await tools.task_update.execute({ sessionId: sid, taskId: "T1", status: "worker_done" })
     await tools.task_update.execute({ sessionId: sid, taskId: "T1", status: "verifier_active" })
+    await writePassReport(tools, sid, "T1", {
+      checks: [{ name: "fixture", passed: true }],
+    })
     await tools.task_update.execute({
       sessionId: sid,
       taskId: "T1",
@@ -7698,14 +7800,136 @@ process.exit(0);
       const unsigned = readJsonFile(reportFile)
       delete unsigned._auth
       writeJsonFile(reportFile, unsigned)
-      for (const status of ["worker_active", "worker_done", "verifier_active"]) {
-        await registeredTools.task_update.execute({ sessionId: runId, taskId: "R1", status })
-      }
-      await registeredTools.task_update.execute({ sessionId: runId, taskId: "R1", status: "verified_pass", verification: { status: "PASS" } })
+      // A signed run refuses the unsigned report at the transition, so plant
+      // the claimed verified_pass state and prove final_verify still blocks it.
+      const unsignedState = readJsonFile(runFile(testDir, runId, "state.json"))
+      unsignedState.tasks.R1.status = "verified_pass"
+      writeJsonFile(runFile(testDir, runId, "state.json"), unsignedState)
       await registeredTools.security_audit.execute({ sessionId: runId, status: "PASS", findings: [] })
       const fv = await registeredTools.final_verify.execute({ sessionId: runId })
       assert.strictEqual(fv.status, "FAIL", "an unsigned report must fail a signed run")
       assert(fv.reasons.some((r) => r.includes("AUTH_MISSING") && r.includes("report-R1.json")), `the unsigned report must be named: ${JSON.stringify(fv.reasons)}`)
+    }
+
+    // 0.10.2 content integrity: PASS evidence is computed, not asserted.
+    {
+      const runId = "20261123-000030-content-integrity"
+      await seedVerifiedRun(runId, ["Q1"], { request: "Content integrity fixture.", victoryAudit: "skip" })
+      const call = (input) =>
+        registeredTools.report.execute(input, { sessionID: "ses_report_verifier" })
+
+      const failedCheck = await call({
+        sessionId: runId,
+        taskId: "Q1",
+        status: "PASS",
+        summary: "claims pass",
+        checks: [{ name: "rubric", passed: false }],
+      })
+      assert(/every checks\[\]\.passed to be true/.test(failedCheck.content), failedCheck.content)
+
+      const fatal = await call({
+        sessionId: runId,
+        taskId: "Q1",
+        status: "PASS",
+        summary: "claims pass",
+        fatalFindings: [{ why: "the feature is absent" }],
+      })
+      assert(/cannot carry fatalFindings/.test(fatal.content), fatal.content)
+
+      const withOutput = await call({
+        sessionId: runId,
+        taskId: "Q1",
+        status: "PASS",
+        summary: "verified with evidence",
+        checks: [{ name: "npm test", passed: true, exitCode: 0, output: "73 suites green" }],
+      })
+      const recorded = withOutput.report.checks[0]
+      assert.strictEqual(recorded.output, "73 suites green", "checks[].output must be kept")
+      assert.strictEqual(recorded.exitCode, 0, "checks[].exitCode must be kept")
+      assert.strictEqual(recorded.outputSha256, sha256Hex("73 suites green"), "the engine must hash the output")
+      // The seeded verifier handoff cites the original report digest; refresh it.
+      await recordHandoffFor(registeredTools, runId, { agent: "team/verifier", taskId: "Q1" })
+
+      const consistent = await registeredTools.final_verify.execute({ sessionId: runId })
+      assert.strictEqual(consistent.status, "PASS", `a consistent PASS must complete: ${consistent.content}`)
+
+      // A hand-forged (but validly signed) PASS with a failed check is refused.
+      const reportFile = reportPath(runId, "Q1")
+      const forge = async (mutate) => {
+        const payload = readJsonFile(reportFile)
+        mutate(payload)
+        writeJsonFile(reportFile, await authFor(testDir).signRunArtifact(runId, "verify/report-Q1.json", payload))
+        return registeredTools.final_verify.execute({ sessionId: runId })
+      }
+      const forgedFailed = await forge((payload) => {
+        payload.checks = [{ name: "forged", passed: false }]
+      })
+      assert.strictEqual(forgedFailed.status, "FAIL", "final_verify must refuse a PASS with a failed check")
+      assert(
+        forgedFailed.reasons.some((r) => r.includes("not a valid PASS") && r.includes("forged")),
+        JSON.stringify(forgedFailed.reasons),
+      )
+
+      const forgedFatal = await forge((payload) => {
+        payload.checks = [{ name: "forged", passed: true }]
+        payload.fatalFindings = [{ where: "x", why: "y", fix: "z" }]
+      })
+      assert.strictEqual(forgedFatal.status, "FAIL", "final_verify must refuse a PASS with fatal findings")
+      assert(forgedFatal.reasons.some((r) => r.includes("fatalFindings is non-empty")), JSON.stringify(forgedFatal.reasons))
+
+      const forgedHash = await forge((payload) => {
+        payload.fatalFindings = []
+        payload.checks = [{ name: "output", passed: true, output: "hello", outputSha256: sha256Hex("other") }]
+      })
+      assert.strictEqual(forgedHash.status, "FAIL", "final_verify must refuse a mismatched outputSha256")
+      assert(forgedHash.reasons.some((r) => r.includes("outputSha256 does not match")), JSON.stringify(forgedHash.reasons))
+
+      const repairedReport = readJsonFile(reportFile)
+      repairedReport.checks = [{ name: "output", passed: true, output: "hello", outputSha256: sha256Hex("hello") }]
+      writeJsonFile(reportFile, await authFor(testDir).signRunArtifact(runId, "verify/report-Q1.json", repairedReport))
+      // The verifier handoff cites the report digest; refresh it after the rewrite.
+      await recordHandoffFor(registeredTools, runId, { agent: "team/verifier", taskId: "Q1" })
+      const restored = await registeredTools.final_verify.execute({ sessionId: runId })
+      assert.strictEqual(restored.status, "PASS", `a repaired consistent PASS must complete: ${restored.content}`)
+    }
+
+    // The inline PASS shortcut survives only on an explicit unsigned legacy run,
+    // and its use is recorded.
+    {
+      const runId = "20261123-000031-inline-legacy"
+      const planned = await registeredTools.plan.execute(
+        {
+          sessionId: runId,
+          topology: "iterative-coding",
+          skipInterview: true,
+          allowUnsignedLegacy: true,
+          victoryAudit: "skip",
+          victorySkipReason: "fixture: no victory audit for a legacy inline-evidence run",
+          tasks: [{ id: "L1" }],
+        },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+      assert(planned.content.startsWith("Planned"), `legacy plan must succeed: ${planned.content}`)
+      for (const status of ["worker_active", "worker_done", "verifier_active", "verified_pass"]) {
+        const res = await registeredTools.task_update.execute({
+          sessionId: runId,
+          taskId: "L1",
+          status,
+          ...(status === "verified_pass" ? { verification: { status: "PASS" } } : {}),
+        })
+        assert.strictEqual(res.status, status, `legacy ${status} must be accepted: ${res.content}`)
+      }
+      const events = readEvents(testDir, runId)
+      assert(
+        events.some((e) => e.event === "verification_inline_legacy"),
+        "the inline legacy path must be recorded as an event",
+      )
+      const state = readJsonFile(runFile(testDir, runId, "state.json"))
+      assert.strictEqual(state.tasks.L1.verificationSource, "inline-legacy", "the task must record the inline source")
+      assert(
+        !existsSync(runFile(testDir, runId, "run.manifest.json")),
+        "the legacy run must stay unsigned",
+      )
     }
 
     // Trust levels (ADR 0008): a run cannot silently complete at a weaker level
@@ -7734,68 +7958,232 @@ process.exit(0);
     }
 
     {
-      const runId = "20261123-000023-auth-trust-human-approval"
-      await seedVerifiedRun(runId, ["A1"], {
-        request: "Trust level human-approved fixture.",
-        victoryAudit: "skip",
-        trustLevel: "human-approved",
+      // 0.10.2 trust honesty: human/CI approvals must come from an external
+      // directory and a distinct Ed25519 approver key.
+      const approvalsDir = mkdtempSync(join(tmpdir(), "teamwork-approvals-"))
+      const pair = generateKeyPairSync("ed25519")
+      const approvalPublic = pair.publicKey.export({ format: "der", type: "spki" }).toString("base64url")
+      const approvalPrivate = pair.privateKey.export({ format: "der", type: "pkcs8" }).toString("base64url")
+      const approverAuth = createAuthContext(storageFor(testDir), {
+        OPENCODE_TEAMWORK_ED25519_PRIVATE_KEY: approvalPrivate,
+        OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: approvalPublic,
+        OPENCODE_TEAMWORK_ED25519_KEY_ID: "approver_fixture",
       })
-      const missing = await registeredTools.final_verify.execute({ sessionId: runId })
-      assert.strictEqual(missing.status, "FAIL")
-      assert(
-        missing.reasons.some((r) => r.includes("AUTH_APPROVAL_MISSING")),
-        `a missing human approval must be named: ${JSON.stringify(missing.reasons)}`,
-      )
-      const manifest = readJsonFile(runFile(testDir, runId, "run.manifest.json"))
-      const approval = {
-        runId,
-        trustLevel: "human-approved",
-        approvedBy: "fixture-human",
-        at: new Date().toISOString(),
-        manifestDigest: payloadDigest(manifest),
+      const savedApprovalEnv = {}
+      const approvalEnv = {
+        OPENCODE_TEAMWORK_APPROVAL_DIR: approvalsDir,
+        OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY: approvalPublic,
+        OPENCODE_TEAMWORK_APPROVAL_KEY_ID: "approver_fixture",
       }
-      writeJsonFile(
-        runFile(testDir, runId, `approvals/${runId}.json`),
-        await authFor(testDir).signArtifact(`approvals/${runId}.json`, approval, { nonce: manifest.runNonce }),
-      )
-      const approved = await registeredTools.final_verify.execute({ sessionId: runId })
-      assert.strictEqual(approved.status, "PASS", `a signed human approval must complete: ${approved.content}`)
-
-      const tampered = readJsonFile(runFile(testDir, runId, `approvals/${runId}.json`))
-      tampered.manifestDigest = "0".repeat(64)
-      writeJsonFile(runFile(testDir, runId, `approvals/${runId}.json`), tampered)
-      const stale = await registeredTools.final_verify.execute({ sessionId: runId })
-      assert.strictEqual(stale.status, "FAIL", "a tampered approval must fail")
-      assert(
-        stale.reasons.some((r) => r.includes("AUTH_INVALID") && r.includes("approvals/")),
-        `a tampered approval must be named: ${JSON.stringify(stale.reasons)}`,
-      )
-    }
-
-    {
-      const runId = "20261123-000027-auth-trust-ci-attested"
-      await seedVerifiedRun(runId, ["A1"], {
-        request: "Trust level ci-attested fixture.",
-        victoryAudit: "skip",
-        trustLevel: "ci-attested",
+      for (const key of Object.keys(approvalEnv)) {
+        savedApprovalEnv[key] = process.env[key]
+        process.env[key] = approvalEnv[key]
+      }
+      setApprovalOwnerUidForTest(typeof process.geteuid === "function" ? process.geteuid() + 1 : 1)
+      const writeExternalApproval = async (runId, payload) => {
+        const file = join(approvalsDir, `${runId}.json`)
+        writeJsonFile(file, await approverAuth.signArtifact(`approvals/${runId}.json`, payload))
+        return file
+      }
+      const approvalPayload = (manifest, runId, trustLevel, overrides = {}) => ({
+        runId,
+        trustLevel,
+        approvedBy: "uid:john",
+        approvedAt: new Date().toISOString(),
+        manifestDigest: payloadDigest(manifest),
+        ...overrides,
       })
-      const missing = await registeredTools.final_verify.execute({ sessionId: runId })
-      assert.strictEqual(missing.status, "FAIL")
-      assert(missing.reasons.some((r) => r.includes("AUTH_APPROVAL_MISSING")))
-      const manifest = readJsonFile(runFile(testDir, runId, "run.manifest.json"))
-      const attestation = {
-        runId,
-        trustLevel: "ci-attested",
-        attestedBy: "fixture-ci",
-        at: new Date().toISOString(),
-        manifestDigest: payloadDigest(manifest),
+      try {
+        // Missing approval directory: the plan is refused before any write.
+        for (const key of Object.keys(approvalEnv)) delete process.env[key]
+        const noDirRun = "20261123-000023-auth-approval-no-dir"
+        const noDirPlan = await registeredTools.plan.execute(
+          {
+            sessionId: noDirRun,
+            topology: "iterative-coding",
+            skipInterview: true,
+            trustLevel: "human-approved",
+            tasks: [{ id: "A1" }],
+          },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        assert(
+          noDirPlan.content.includes("plan refused") || noDirPlan.content.startsWith("refused:"),
+          `a missing approval dir must refuse the plan: ${noDirPlan.content}`,
+        )
+        assert(noDirPlan.content.includes("AUTH_APPROVAL_DIR"), noDirPlan.content)
+        assert(
+          !existsSync(runFile(testDir, noDirRun, "plan.dag.json")),
+          "a refused human-approved plan must write no run directory",
+        )
+        for (const key of Object.keys(approvalEnv)) process.env[key] = approvalEnv[key]
+
+        const runId = "20261123-000023-auth-trust-human-approval"
+        await seedVerifiedRun(runId, ["A1"], {
+          request: "Trust level human-approved fixture.",
+          victoryAudit: "skip",
+          trustLevel: "human-approved",
+        })
+        const manifest = readJsonFile(runFile(testDir, runId, "run.manifest.json"))
+        assert.strictEqual(manifest.version, 2, "0.10.2 plans must write manifest version 2")
+        assert.strictEqual(manifest.approvalPolicy, "external-dir")
+        assert.strictEqual(manifest.approvalKeyId, "approver_fixture")
+
+        const missing = await registeredTools.final_verify.execute({ sessionId: runId })
+        assert.strictEqual(missing.status, "FAIL")
+        assert(
+          missing.reasons.some((r) => r.includes("AUTH_APPROVAL_MISSING")),
+          `a missing human approval must be named: ${JSON.stringify(missing.reasons)}`,
+        )
+
+        // An approval inside the run directory is ignored when the external
+        // dir is configured (the old in-run path is version-1 legacy only).
+        writeJsonFile(
+          runFile(testDir, runId, `approvals/${runId}.json`),
+          await authFor(testDir).signArtifact(`approvals/${runId}.json`, approvalPayload(manifest, runId, "human-approved"), {
+            nonce: manifest.runNonce,
+          }),
+        )
+        const ignoredInRun = await registeredTools.final_verify.execute({ sessionId: runId })
+        assert.strictEqual(ignoredInRun.status, "FAIL", "an in-run approval must be ignored for a version 2 manifest")
+        assert(ignoredInRun.reasons.some((r) => r.includes("AUTH_APPROVAL_MISSING")), JSON.stringify(ignoredInRun.reasons))
+
+        // HMAC approval (the run's own key) is not a human approval.
+        writeJsonFile(
+          join(approvalsDir, `${runId}.json`),
+          await authFor(testDir).signArtifact(`approvals/${runId}.json`, approvalPayload(manifest, runId, "human-approved")),
+        )
+        const hmacApproval = await registeredTools.final_verify.execute({ sessionId: runId })
+        assert.strictEqual(hmacApproval.status, "FAIL", "an HMAC approval must not satisfy human-approved")
+        assert(
+          hmacApproval.reasons.some((r) => r.includes("AUTH_APPROVAL_NOT_HUMAN")),
+          `an HMAC approval must be named not-human: ${JSON.stringify(hmacApproval.reasons)}`,
+        )
+
+        // A bare role label is not a human/CI principal.
+        await writeExternalApproval(runId, approvalPayload(manifest, runId, "human-approved", { approvedBy: "team/sentinel" }))
+        const bareLabel = await registeredTools.final_verify.execute({ sessionId: runId })
+        assert.strictEqual(bareLabel.status, "FAIL", "a bare team/... approver label must be refused")
+        assert(
+          bareLabel.reasons.some((r) => r.includes("AUTH_APPROVAL_NOT_HUMAN")),
+          JSON.stringify(bareLabel.reasons),
+        )
+
+        // Stale approval: expiresAt in the past.
+        await writeExternalApproval(
+          runId,
+          approvalPayload(manifest, runId, "human-approved", {
+            approvedAt: manifest.createdAt,
+            expiresAt: new Date(Date.parse(manifest.createdAt) + 10).toISOString(),
+          }),
+        )
+        const expired = await registeredTools.final_verify.execute({ sessionId: runId })
+        assert.strictEqual(expired.status, "FAIL", "an expired approval must fail")
+        assert(expired.reasons.some((r) => r.includes("AUTH_APPROVAL_STALE")), JSON.stringify(expired.reasons))
+
+        // approvedAt before the manifest baseline is stale.
+        await writeExternalApproval(
+          runId,
+          approvalPayload(manifest, runId, "human-approved", {
+            approvedAt: new Date(Date.parse(manifest.createdAt) - 1000).toISOString(),
+          }),
+        )
+        const beforeManifest = await registeredTools.final_verify.execute({ sessionId: runId })
+        assert.strictEqual(beforeManifest.status, "FAIL")
+        assert(beforeManifest.reasons.some((r) => r.includes("AUTH_APPROVAL_STALE")), JSON.stringify(beforeManifest.reasons))
+
+        // A distinct Ed25519 approver with a uid identity is accepted.
+        await writeExternalApproval(runId, approvalPayload(manifest, runId, "human-approved", { approvedBy: "uid:john" }))
+        const approved = await registeredTools.final_verify.execute({ sessionId: runId })
+        assert.strictEqual(approved.status, "PASS", `a distinct Ed25519 approval must complete: ${approved.content}`)
+
+        // Same-UID approval ownership is refused (the seam simulates the
+        // normal single-UID host here).
+        setApprovalOwnerUidForTest(null)
+        const sameOwner = await registeredTools.final_verify.execute({ sessionId: runId })
+        assert.strictEqual(sameOwner.status, "FAIL", "a same-UID approval directory must be refused")
+        assert(sameOwner.reasons.some((r) => r.includes("AUTH_APPROVAL_UNTRUSTED")), JSON.stringify(sameOwner.reasons))
+        setApprovalOwnerUidForTest(typeof process.geteuid === "function" ? process.geteuid() + 1 : 1)
+
+        // A tampered (unsigned) field is AUTH_INVALID.
+        const tampered = readJsonFile(join(approvalsDir, `${runId}.json`))
+        tampered.manifestDigest = "0".repeat(64)
+        writeJsonFile(join(approvalsDir, `${runId}.json`), tampered)
+        const stale = await registeredTools.final_verify.execute({ sessionId: runId })
+        assert.strictEqual(stale.status, "FAIL", "a tampered approval must fail")
+        assert(
+          stale.reasons.some((r) => r.includes("AUTH_INVALID") && r.includes(`${runId}.json`)),
+          `a tampered approval must be named: ${JSON.stringify(stale.reasons)}`,
+        )
+
+        // Pre-0.10.2 (manifest version 1) keeps the in-run approval readable,
+        // and records that it was unbound.
+        const legacyRunId = "20261123-000023-auth-approval-legacy-v1"
+        await seedVerifiedRun(legacyRunId, ["A1"], {
+          request: "Trust level legacy approval fixture.",
+          victoryAudit: "skip",
+          trustLevel: "human-approved",
+        })
+        const legacyManifest = readJsonFile(runFile(testDir, legacyRunId, "run.manifest.json"))
+        legacyManifest.version = 1
+        delete legacyManifest.approvalPolicy
+        delete legacyManifest.approvalKeyId
+        writeJsonFile(
+          runFile(testDir, legacyRunId, "run.manifest.json"),
+          await authFor(testDir).signRunArtifact(legacyRunId, "run.manifest.json", legacyManifest),
+        )
+        const legacyApproval = {
+          runId: legacyRunId,
+          trustLevel: "human-approved",
+          approvedBy: "fixture-human",
+          at: new Date().toISOString(),
+          manifestDigest: payloadDigest(legacyManifest),
+        }
+        writeJsonFile(
+          runFile(testDir, legacyRunId, `approvals/${legacyRunId}.json`),
+          await authFor(testDir).signArtifact(`approvals/${legacyRunId}.json`, legacyApproval, {
+            nonce: legacyManifest.runNonce,
+          }),
+        )
+        const legacyFinal = await registeredTools.final_verify.execute({ sessionId: legacyRunId })
+        assert.strictEqual(legacyFinal.status, "PASS", `a pre-0.10.2 in-run approval must stay readable: ${legacyFinal.content}`)
+        const legacyEvents = readFileSync(runFile(testDir, legacyRunId, "events.jsonl"), "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line))
+        assert(
+          legacyEvents.some((e) => e.event === "approval_unbound"),
+          `the legacy path must record approval_unbound: ${JSON.stringify(legacyEvents.slice(-3))}`,
+        )
+
+        // ci-attested uses the same directory/key rules with attestedBy.
+        const ciRunId = "20261123-000027-auth-trust-ci-attested"
+        await seedVerifiedRun(ciRunId, ["A1"], {
+          request: "Trust level ci-attested fixture.",
+          victoryAudit: "skip",
+          trustLevel: "ci-attested",
+        })
+        const ciMissing = await registeredTools.final_verify.execute({ sessionId: ciRunId })
+        assert.strictEqual(ciMissing.status, "FAIL")
+        assert(ciMissing.reasons.some((r) => r.includes("AUTH_APPROVAL_MISSING")))
+        const ciManifest = readJsonFile(runFile(testDir, ciRunId, "run.manifest.json"))
+        await writeExternalApproval(ciRunId, {
+          runId: ciRunId,
+          trustLevel: "ci-attested",
+          attestedBy: "ci:github/workflows/ci.yml",
+          approvedAt: new Date().toISOString(),
+          manifestDigest: payloadDigest(ciManifest),
+        })
+        const attested = await registeredTools.final_verify.execute({ sessionId: ciRunId })
+        assert.strictEqual(attested.status, "PASS", `a signed CI attestation must complete: ${attested.content}`)
+      } finally {
+        setApprovalOwnerUidForTest(null)
+        for (const [key, value] of Object.entries(savedApprovalEnv)) {
+          if (value === undefined) delete process.env[key]
+          else process.env[key] = value
+        }
+        rmSync(approvalsDir, { recursive: true, force: true })
       }
-      writeJsonFile(
-        runFile(testDir, runId, `approvals/${runId}.json`),
-        await authFor(testDir).signArtifact(`approvals/${runId}.json`, attestation, { nonce: manifest.runNonce }),
-      )
-      const attested = await registeredTools.final_verify.execute({ sessionId: runId })
-      assert.strictEqual(attested.status, "PASS", `a signed CI attestation must complete: ${attested.content}`)
     }
 
     {
