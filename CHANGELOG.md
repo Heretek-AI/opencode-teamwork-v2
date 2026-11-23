@@ -4,10 +4,16 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2026-11-22
 
 ### Added
 
+- **Safe-FS read containment (ADR 0004).** A shared `safe-fs.mjs` primitive checks the opened descriptor's `/proc/self/fd` real path before any byte is read (Linux; fail-closed on unusable procfs), and every run-file reader now routes through a run-root-aware reader: `readRunText`, `readJson`, `readSnapshots`, the spec gate, LEMMA reads, handoffs/briefings, and the `lib`/`bin` CLI readers. Dangling-symlink roots are refused, `O_NONBLOCK`/`EINTR` cover FIFOs, and a deterministic race harness (with a leaking negative control) guards the class. macOS/Windows keep the previous checks and the documented residual.
+- **Canonical handoffs and per-agent briefings.** `teamwork_handoff` writes the five-section handoff to `<run>/handoffs/<task|_run>-<agent>.md` with a bounded sha256 index and artifact citations; a read-only falsifier can write through the tool. Per-agent `<run>/agents/<slug>-<sha256(session)[:32]>/BRIEFING.md` is written lazily by the context hook, with a shared fallback and a 64-directory cap. `describeRun` resolves the calling session's run via `run-by-root/<rootSessionId>` with a newest-run fallback.
+- **Cross-process locks, task claims, and idempotent cost.** `<target>.lock` uses `O_CREAT|O_EXCL`, owner metadata, bounded backoff, same-host stale reclaim, and nonce-checked release. `teamwork_next` atomically claims ready tasks with a 15-minute lease; `task_update` to `worker_active` requires a live claim (recorded sentinel override). `costs.json` stores an applied snapshot digest/cursors, so a crash between costs and snapshots cannot double-count.
+- **Victory-skip reasons and export run terms.** An explicit `victoryAudit: "skip"` now requires a sanitized, bounded `victorySkipReason`, persisted in the signed baseline and re-plan locked; benchmark refuses skip. Export shows victory, handoff-gate, and artifact-auth labels (envelope presence only), and marks a reported PASS with required-but-unmet handoffs as **ENGINE WOULD REJECT**.
+- **Isolation assessment (ADR 0006).** The Phase A boundary is documented precisely: a run-dir-only writer cannot forge a verdict, but a same-UID shell with `opencode.db` access can read the HMAC key; a same-UID signer, OS keychain, or auto-approvable `ctx.permission.assert` is a signing oracle, not a boundary. Real isolation requires a different privilege domain and a non-oracle signing decision (admin-only options assessed).
+- **Completed SWE Light runtime evidence.** A second SWE Light run completed with `VICTORY CONFIRMED` (implementer → reviewer 0 issues/0 edits → 3-phase victory audit, 26m33s, 3/32 spawns), plus the artifact-sandbox and two-root-layout observations; the corpus now records both completed SWE Light runs.
 - **Control-plane tool authorization.** `plugins/opencode-teamwork/authorize.ts` applies one trusted-session role map (plus root/descendant ancestry for run-bound tools) across `teamwork_plan`, `task_update`, `security_audit`, `final_verify`, worktree, document-review, LEMMA, and tournament tools. Caller-supplied `agent` labels are recorded, never authoritative; unresolved identity fails closed for mutating tools. Read-only `status`/`resume`/`cost` stay available to installed `team/*` roles.
 - **URL SSRF guard.** `plugins/opencode-teamwork/url-guard.ts` validates and pins outbound document/preflight URLs: http/https only, public addresses only (loopback, private, link-local/metadata, multicast/reserved, and mapped IPv6 rejected), no automatic redirects, 3 s timeout, and size caps. `OPENCODE_TEAMWORK_ALLOW_LOCALHOST=1` is the explicit loopback-only test opt-in.
 - Release-tag provenance guard: `scripts/check-release-tag.mjs` fetches tags and
@@ -29,6 +35,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   honor-system.
 - `teamwork_final_verify`/`teamwork_next` verify signatures and the signed baseline: a forged/copied/edited artifact fails as `AUTH_MISSING`, `AUTH_INVALID`, `AUTH_UNKNOWN_KEY`, `AUTH_INDEX_MISSING`, or `AUTH_STALE`, and a `strict→standard`/`required→skip`/integrity-mode downgrade is refused. Unsigned legacy runs return `AUTH_LEGACY` until an explicit, recorded `allowUnsignedLegacy` bypass; `benchmark` refuses that bypass and `victoryAudit: "skip"`.
 - Standalone CLI readers label authenticity as `signed`/`unsigned`/`unknown` by envelope presence only; they cannot verify and do not claim to.
+
+### Fixed
+
+- Intermediate-component symlink reads are refused before any bytes are returned on Linux; the write path (`mkdir`/`rename`) remains a documented residual.
+- `teamwork_next` no longer hands the same ready task to two coordinators: live claims are skipped and expired leases are reclaimed with the previous claimant recorded.
+- Concurrent `state.json`/`costs.json` updates no longer lose writes; cost replay is idempotent across a crash between costs and snapshots.
+- A strict wave verdict is write-once for a given verifier report; a reworked report makes the old verdict stale and only a new-report record can pass.
+- Required handoffs are validated against current citations; missing/stale/duplicate entries cannot complete a run.
+
+### Security
+
+- Signed plan baseline and verdicts, the trusted `teamwork_report` writer, and session-tree binding make run-dir forgery and mode downgrades tamper-evident.
+- Control-plane tools are role-scoped; outbound document/preflight URLs are DNS-pinned and reject private/link-local/metadata targets and redirects.
+- `constraints.network: denied` covers `webfetch` for every team agent; merge/resolve never falls back to the user's repo root.
+- New release tags must be ancestors of `origin/main`; published tags are never rewritten.
+- Known boundary: HMAC is tamper-evident against a run-dir-only writer, not a same-UID shell that can read `opencode.db`; ADR 0006 assesses the admin-only isolation options.
 
 ### Notes
 
