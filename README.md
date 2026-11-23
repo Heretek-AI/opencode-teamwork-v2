@@ -444,10 +444,22 @@ LEMMA is an explicit opt-in capability-gated route (`topology: "proof"`, `lemmaM
   [`docs/GUARDRAILS.md`](docs/GUARDRAILS.md). Artifact authenticity is Phase A:
   it makes a run-dir-only forgery tamper-evident, but **a same-UID shell with
   read access to `opencode.db` / the plugin KV store can read the HMAC key**.
-  Phase B decides key isolation; see
+  Phase B is assessed in
+  [`docs/adr/0006-artifact-trust-isolation.md`](docs/adr/0006-artifact-trust-isolation.md);
+  the Phase A decision is in
   [`docs/adr/0005-artifact-authenticity.md`](docs/adr/0005-artifact-authenticity.md).
   The `team/security-auditor` agent audits a repo with a clean context.
 - Docs: <https://opencode.ai/v2/docs/build/plugins>
+
+> **Artifact-trust boundary (ADR 0005/0006):** signed control-plane artifacts
+> are tamper-evident against a writer limited to the run directory. They are
+> **not** protected against a same-UID shell: the HMAC key lives in
+> `opencode.db` (mode `0600`, same user), so a local shell can read it and mint
+> valid envelopes. No in-process, zero-dependency control fixes this; Phase B
+> needs a different privilege domain (admin-only: separate UID/system service,
+> TPM/`tss` access, or SELinux labels) and a non-oracle signing decision. See
+> [`docs/adr/0006-artifact-trust-isolation.md`](docs/adr/0006-artifact-trust-isolation.md)
+> and [`docs/adr/0005-artifact-authenticity.md`](docs/adr/0005-artifact-authenticity.md).
 
 ## License & attribution
 

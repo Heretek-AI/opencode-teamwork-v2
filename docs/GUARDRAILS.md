@@ -44,19 +44,30 @@ remove the sharpest edges.
 - **Plugin tools are not agent-scoped.** The permission layer does not mediate
   `teamwork_*` tool calls, so a read-only agent can still call `teamwork_cost`
   etc. The session-id allowlist bounds the damage.
-- **Artifact authenticity is Phase A only.** Control-plane artifacts carry an
-  HMAC `_auth` envelope and a digest-index entry outside the run dir (ADR 0005),
-  so a run-dir-only writer can no longer forge a PASS, copy an envelope between
-  files/runs, or downgrade the signed plan baseline. **A same-UID shell with
-  read access to `opencode.db` (or the plugin KV backing store) can read the
-  HMAC key and mint a valid envelope.** `ctx.storage` lives in the same user
-  account as the run directory, so its index is not a separate privilege
-  domain either. Phase B decides key isolation (OS keychain, helper process,
-  hardware key, or asymmetric signatures); until then, do not claim protection
-  against a local user who can read the database. Free-form inputs that are not
-  control-plane verdicts (`state.json` task summaries, `pitfalls.md`,
-  `prompt_draft.md`, spec text) remain untrusted and are sanitised before
-  injection, not authenticated.
+- **Artifact authenticity is tamper-evident, not local-user-proof.**
+  Control-plane artifacts carry an HMAC `_auth` envelope and a digest-index
+  entry outside the run dir ([ADR 0005](adr/0005-artifact-authenticity.md)), so
+  a run-dir-only writer can no longer forge a PASS, copy an envelope between
+  files/runs, or downgrade the signed plan baseline. **This does not stop a
+  same-UID shell:** with read access to `opencode.db` (or the plugin KV backing
+  store) it can read the HMAC key and mint a valid envelope, and `ctx.storage`
+  is in the same user account, so the digest index is not a separate privilege
+  domain either. Moving the key to a
+  same-UID helper, using the OS keychain, or gating on `ctx.permission.assert`
+  does not fix this: a same-UID helper is a signing oracle, the keychain is
+  same-UID accessible, and `assert` is auto-approvable under `--auto`. **No
+  in-process, zero-dependency control fixes this.** Phase B options and the
+  administrator-only requirements (separate UID/system service, TPM/`tss`
+  access, SELinux labels) are assessed in
+  [ADR 0006](adr/0006-artifact-trust-isolation.md), which recommends accepting
+  and documenting this boundary for now; a real Phase B needs a different
+  privilege domain and a non-oracle signing decision (a human-presence gate or
+  an independent verifier). Until then, do not claim protection against a local
+  user who can read the database, and do not describe artifacts as
+  tamper-proof, signed by a trusted authority, or safe against a local user.
+  Free-form inputs that are not control-plane verdicts (`state.json` task
+  summaries, `pitfalls.md`, `prompt_draft.md`, spec text) remain untrusted and
+  are sanitised before injection, not authenticated.
 - **No sandbox for shell.** Agents run with full user privileges and network.
 - **Read containment is platform-specific.** `safe-fs.mjs` enforces the
   post-open containment check only on Linux with a mounted, usable
