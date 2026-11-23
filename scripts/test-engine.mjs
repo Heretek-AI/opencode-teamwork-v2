@@ -20,7 +20,7 @@ import {
 } from "../plugins/opencode-teamwork/lemma.ts"
 import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
 import { renderGateStatus } from "../plugins/opencode-teamwork/strict.ts"
-import { withCrossProcessLock, crossProcessLockPath } from "../plugins/opencode-teamwork/locks.ts"
+import { withCrossProcessLock, crossProcessLockPath, observeLockArtifact, quarantineStaleLock } from "../plugins/opencode-teamwork/locks.ts"
 import { assertSafeUrl, blockedAddressReason } from "../plugins/opencode-teamwork/url-guard.ts"
 import { refreshRunBriefing, MAX_BRIEFING_BYTES, refreshAgentBriefing, readAgentBriefingExcerpt, agentBriefingRelativePath, MAX_AGENT_BRIEFING_DIRS } from "../plugins/opencode-teamwork/briefing.ts"
 import { writeHandoff, MAX_HANDOFF_ENTRIES, MAX_HANDOFF_INDEX_BYTES, HANDOFF_SECTION_LABELS, evaluateHandoffGateChecked } from "../plugins/opencode-teamwork/handoff.ts"
@@ -9362,6 +9362,14 @@ process.exit(0);
     const raceState = stateOf(raceRun)
     assert.strictEqual(raceState.tasks.R1.claim.by, claimedBy[0].readyForWorker[0].claim.by, "state claim must match the winner")
     assert(Date.parse(raceState.tasks.R1.claim.leaseUntil) > Date.now(), "the claim must carry a future lease")
+    // Both processes see the same post-claim fence, and the loser sees a live claim.
+    const winnerTask = claimedBy[0].readyForWorker.find((t) => t.id === "R1")
+    const loserTask = (other.inProgress || []).find((t) => t.id === "R1")
+    assert.strictEqual(typeof winnerTask.fence, "number", "next must return the claim fence")
+    assert.strictEqual(winnerTask.fence, raceState.tasks.R1.fence, "the winner's fence must match state")
+    assert.strictEqual(loserTask.fence, winnerTask.fence, "both processes must observe the same fence")
+    assert.strictEqual(loserTask.claimState, "live", "the loser must classify the winning claim as live")
+    assert.strictEqual(loserTask.claim.by, winnerTask.claim.by)
     console.log("✓ two processes race teamwork_next: exactly one claims; the other sees in-progress")
 
     // --- 11b: an expired claim is reclaimed (previous claimant recorded); a live one is not.
@@ -9371,6 +9379,13 @@ process.exit(0);
       { sessionID: CONC_ROOT },
     )
     const staleState = stateOf(staleRun)
+    // This case pins the 0.9.0 (claimProtocol 1) contract: absent protocol
+    // fields must behave exactly as before. Protocol-2 behaviour is covered in
+    // 11g-11n below.
+    delete staleState.claimProtocol
+    delete staleState.claimLeaseMs
+    delete staleState.host
+    delete staleState.storage
     staleState.tasks.S1.claim = {
       by: "ses_dead",
       at: new Date(Date.now() - 120000).toISOString(),
@@ -9554,6 +9569,511 @@ process.exit(0);
     assertClose(costs.byTask._sentinel, 0.7, "the bucket must be cumulative, not double-counted")
     assert.strictEqual(costs.budgetUsd, 20, "budget buckets must stay unchanged")
     console.log("✓ cost digest is idempotent across crash replay; new snapshots add only the delta; budget preserved")
+    // --- 11g: protocol-2 claim states, grace, and fingerprint-checked reclaim.
+    const statePathIn = (rootDir, id) => join(rootDir, ".opencode", "teamwork", id, "state.json")
+    const writeStateFile = (file, value) => writeFileSync(file, JSON.stringify(value, null, 2) + "\n")
+    const gitInit = (dir) => {
+      execFileSync(GIT_BIN, ["init"], { cwd: dir, stdio: ["pipe", "pipe", "pipe"] })
+      execFileSync(GIT_BIN, ["config", "user.email", "test@test.com"], { cwd: dir, stdio: ["pipe", "pipe", "pipe"] })
+      execFileSync(GIT_BIN, ["config", "user.name", "Test Runner"], { cwd: dir, stdio: ["pipe", "pipe", "pipe"] })
+    }
+    const makeClaimsGitRun = async (runId, taskId = "G1") => {
+      const repo = mkdtempSync(join(tmpdir(), "teamwork-claims-git-"))
+      gitInit(repo)
+      writeFileSync(join(repo, "README.md"), "# claims fixture\n")
+      execFileSync(GIT_BIN, ["add", "README.md"], { cwd: repo, stdio: ["pipe", "pipe", "pipe"] })
+      execFileSync(GIT_BIN, ["commit", "-m", "initial"], { cwd: repo, stdio: ["pipe", "pipe", "pipe"] })
+      const gt = await makeToolsFor(repo)
+      await gt.plan.execute(
+        {
+          sessionId: runId,
+          topology: "distributed-coding",
+          skipInterview: true,
+          allowUnsignedLegacy: true,
+          tasks: [{ id: taskId }],
+        },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+      await gt.next.execute({ sessionId: runId, allowUnsignedLegacy: true }, { sessionID: FIXTURE_ROOT_SESSION })
+      const sentinel = await gt.worktree.execute({ sessionId: runId, action: "setup", role: "sentinel" }, { sessionID: FIXTURE_ROOT_SESSION })
+      const worker = await gt.worktree.execute(
+        { sessionId: runId, action: "setup", role: "worker", taskId },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+      return { repo, gt, sentinel, worker, taskId }
+    }
+
+    {
+      const grace = await makeClaimsGitRun("20261122-000010-claims-grace")
+      try {
+        const { gt, repo, worker, taskId } = grace
+        const stateFile = statePathIn(repo, "20261122-000010-claims-grace")
+        let st = JSON.parse(readFileSync(stateFile, "utf8"))
+        assert.strictEqual(st.claimProtocol, 2, "a new run must record claim protocol 2")
+        assert.strictEqual(st.claimLeaseMs, 300000, "the default claim lease must be 5 minutes")
+        assert.strictEqual(st.host, hostname(), "the run must record its host")
+        assert(worker.baselineRecorded, "worktree setup must capture the claim baseline")
+
+        await gt.task_update.execute(
+          { sessionId: "20261122-000010-claims-grace", taskId, status: "worker_active", worktree: worker.worktreePath },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        st = JSON.parse(readFileSync(stateFile, "utf8"))
+        const baseFence = st.tasks[taskId].fence
+        assert(baseFence >= 1, "a claim must set a fence")
+        assert(st.tasks[taskId].claim.baseline, "worker_active must keep a baseline on the claim")
+        assert.notStrictEqual(st.tasks[taskId].claim.baseline.fingerprint, "unknown", "the baseline fingerprint must be known")
+
+        // A pending task is eligible for `next`; an active claim on it exercises
+        // every claim state without changing the protocol path.
+        const setClaim = (leaseMs, by = "ses_conc_dead") => {
+          const s = JSON.parse(readFileSync(stateFile, "utf8"))
+          s.tasks[taskId].status = "pending"
+          s.tasks[taskId].claim.by = by
+          s.tasks[taskId].claim.leaseUntil = new Date(Date.now() + leaseMs).toISOString()
+          writeStateFile(stateFile, s)
+        }
+
+        setClaim(120000)
+        let res = await gt.next.execute({ sessionId: "20261122-000010-claims-grace", allowUnsignedLegacy: true }, { sessionID: FIXTURE_ROOT_SESSION })
+        assert.strictEqual((res.readyForWorker || []).length, 0, "a live claim must not be reclaimable")
+        let inProgress = (res.inProgress || []).find((t) => t.id === taskId)
+        assert.strictEqual(inProgress.claimState, "live", `a live claim must be labelled live: ${JSON.stringify(inProgress)}`)
+
+        setClaim(-60000)
+        res = await gt.next.execute({ sessionId: "20261122-000010-claims-grace", allowUnsignedLegacy: true }, { sessionID: FIXTURE_ROOT_SESSION })
+        assert.strictEqual((res.readyForWorker || []).length, 0, "an expired claim inside the grace window must not be reclaimable")
+        inProgress = (res.inProgress || []).find((t) => t.id === taskId)
+        assert.strictEqual(inProgress.claimState, "expired", "a claim past its lease but inside grace must be expired")
+
+        setClaim(-20 * 60000)
+        res = await gt.next.execute({ sessionId: "20261122-000010-claims-grace", allowUnsignedLegacy: true }, { sessionID: FIXTURE_ROOT_SESSION })
+        const reclaimed = (res.readyForWorker || []).find((t) => t.id === taskId)
+        assert(reclaimed, `a stale claim with an unchanged fingerprint must be reclaimed: ${JSON.stringify(res.inProgress)}`)
+        assert.strictEqual(reclaimed.fence, baseFence + 1, "reclaim must increment the fence exactly once")
+        assert.strictEqual(reclaimed.claim.previousClaimant.by, "ses_conc_dead", "reclaim must record the previous claimant")
+        st = JSON.parse(readFileSync(stateFile, "utf8"))
+        assert.strictEqual(st.tasks[taskId].fence, baseFence + 1, "the reclaimed fence must persist")
+
+        // Changed side effects: an untracked file appears after the baseline.
+        setClaim(-20 * 60000)
+        writeFileSync(join(worker.worktreePath, "unexpected.txt"), "side effect\n")
+        res = await gt.next.execute({ sessionId: "20261122-000010-claims-grace", allowUnsignedLegacy: true }, { sessionID: FIXTURE_ROOT_SESSION })
+        assert.strictEqual((res.readyForWorker || []).length, 0, "a changed fingerprint must not be reclaimed")
+        inProgress = (res.inProgress || []).find((t) => t.id === taskId)
+        assert.strictEqual(inProgress.claimState, "needs-inspection", "a changed fingerprint must be needs-inspection")
+        const statusRes = await gt.status.execute({ sessionId: "20261122-000010-claims-grace" }, { sessionID: FIXTURE_ROOT_SESSION })
+        assert((statusRes.needsInspection || []).includes(taskId), `status must list the task as needing inspection: ${JSON.stringify(statusRes.needsInspection)}`)
+
+        // Missing baseline: still needs-inspection, never silent reclaim.
+        rmSync(join(worker.worktreePath, "unexpected.txt"))
+        st = JSON.parse(readFileSync(stateFile, "utf8"))
+        delete st.tasks[taskId].claim.baseline
+        writeStateFile(stateFile, st)
+        res = await gt.next.execute({ sessionId: "20261122-000010-claims-grace", allowUnsignedLegacy: true }, { sessionID: FIXTURE_ROOT_SESSION })
+        assert.strictEqual((res.readyForWorker || []).length, 0, "a stale claim with no baseline must not be reclaimed")
+        inProgress = (res.inProgress || []).find((t) => t.id === taskId)
+        assert.strictEqual(inProgress.claimState, "needs-inspection", "a missing baseline must be needs-inspection")
+        console.log("✓ claim protocol 2: live/expired/stale/needs-inspection states, grace, and fingerprint-checked reclaim with fence++")
+      } finally {
+        rmSync(grace.repo, { recursive: true, force: true })
+      }
+    }
+
+    // --- 11h: fences and ownership on every transition.
+    {
+      const fenceRun = "20261122-000011-claims-fence"
+      await tools.plan.execute(
+        { sessionId: fenceRun, topology: "iterative-coding", skipInterview: true, allowUnsignedLegacy: true, tasks: [{ id: "F1" }] },
+        { sessionID: CONC_ROOT },
+      )
+      const claimed = await tools.next.execute({ sessionId: fenceRun, allowUnsignedLegacy: true }, { sessionID: CONC_ROOT })
+      const fence = claimed.readyForWorker.find((t) => t.id === "F1").fence
+      assert.strictEqual(typeof fence, "number", "next must return a fence")
+      const before = stateOf(fenceRun).tasks.F1
+      const staleFence = await tools.task_update.execute(
+        { sessionId: fenceRun, taskId: "F1", status: "worker_active", fence: fence - 1 },
+        { sessionID: CONC_ROOT },
+      )
+      assert.strictEqual(staleFence.status, "STALE_FENCE", `a stale fence must be refused: ${staleFence.content}`)
+      const afterStale = stateOf(fenceRun).tasks.F1
+      assert.strictEqual(afterStale.status, before.status, "a stale fence must not change status")
+      assert.strictEqual(afterStale.fence, before.fence, "a stale fence must not change the fence")
+
+      // A live claim held by another session is not mutable by the Sentinel
+      // without an explicit, recorded reason.
+      const otherState = stateOf(fenceRun)
+      otherState.tasks.F1.claim = {
+        by: "ses_conc_other",
+        at: new Date().toISOString(),
+        leaseUntil: new Date(Date.now() + 600000).toISOString(),
+        host: hostname(),
+        epoch: 1,
+        heartbeatAt: new Date().toISOString(),
+      }
+      writeFileSync(runFile(fenceRun, "state.json"), JSON.stringify(otherState, null, 2) + "\n")
+      const ownedByOther = await tools.task_update.execute(
+        { sessionId: fenceRun, taskId: "F1", status: "worker_active" },
+        { sessionID: CONC_ROOT },
+      )
+      assert.strictEqual(ownedByOther.status, "CLAIM_OWNED_BY_OTHER", `a non-owner must be refused: ${ownedByOther.content}`)
+      const override = await tools.task_update.execute(
+        { sessionId: fenceRun, taskId: "F1", status: "worker_active", reason: "operator confirmed the worker is gone" },
+        { sessionID: CONC_ROOT },
+      )
+      assert.strictEqual(override.status, "worker_active", `a reasoned Sentinel override must succeed: ${override.content}`)
+      const overridden = stateOf(fenceRun).tasks.F1
+      assert.strictEqual(overridden.claim.override, "sentinel", "the override must be recorded on the claim")
+      assert(overridden.fence > before.fence, "the override must increment the fence")
+      const eventLines = readFileSync(runFile(fenceRun, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l))
+      assert(eventLines.some((e) => e.event === "claim_override"), "the override must be recorded as claim_override")
+      console.log("✓ stale fences are refused with state unchanged; non-owner live claims are CLAIM_OWNED_BY_OTHER; a reasoned Sentinel override increments the fence")
+    }
+
+    // --- 11i: heartbeat renewal and bounded tenure.
+    {
+      const hbRun = "20261122-000012-claims-heartbeat"
+      await tools.plan.execute(
+        { sessionId: hbRun, topology: "iterative-coding", skipInterview: true, allowUnsignedLegacy: true, tasks: [{ id: "H1" }] },
+        { sessionID: CONC_ROOT },
+      )
+      await tools.next.execute({ sessionId: hbRun, allowUnsignedLegacy: true }, { sessionID: CONC_ROOT })
+      const setClaimBy = (by, extra = {}) => {
+        const s = stateOf(hbRun)
+        s.tasks.H1.claim = {
+          by,
+          at: new Date().toISOString(),
+          leaseUntil: new Date(Date.now() + 60000).toISOString(),
+          host: hostname(),
+          epoch: 1,
+          heartbeatAt: new Date().toISOString(),
+          tenureStartAt: new Date().toISOString(),
+          renewals: 0,
+          ...extra,
+        }
+        writeFileSync(runFile(hbRun, "state.json"), JSON.stringify(s, null, 2) + "\n")
+      }
+      const fenceBefore = stateOf(hbRun).tasks.H1.fence
+      setClaimBy(CONC_ROOT)
+      const ownerRenew = await tools.recover.execute({ sessionId: hbRun, taskId: "H1", action: "heartbeat" }, { sessionID: CONC_ROOT })
+      assert.strictEqual(ownerRenew.renewed, true, `owner heartbeat must renew: ${ownerRenew.content}`)
+      assert.strictEqual(stateOf(hbRun).tasks.H1.fence, fenceBefore, "heartbeat must not change the fence")
+
+      setClaimBy(CONC_ROOT)
+      const descendantRenew = await tools.recover.execute({ sessionId: hbRun, taskId: "H1", action: "heartbeat" }, { sessionID: "ses_conc_child" })
+      assert.strictEqual(descendantRenew.renewed, true, `a descendant of the owner must renew: ${descendantRenew.content}`)
+
+      setClaimBy("ses_conc_other")
+      const refusedRenew = await tools.recover.execute({ sessionId: hbRun, taskId: "H1", action: "heartbeat" }, { sessionID: CONC_ROOT })
+      assert.strictEqual(refusedRenew.status, "CLAIM_NOT_OWNED", `a non-owner heartbeat must be refused: ${refusedRenew.content}`)
+
+      setClaimBy(CONC_ROOT, { tenureStartAt: new Date(Date.now() - 61 * 60000).toISOString(), renewals: 5 })
+      const tenure = await tools.recover.execute({ sessionId: hbRun, taskId: "H1", action: "heartbeat" }, { sessionID: CONC_ROOT })
+      assert.strictEqual(tenure.renewed, false, "max tenure must stop renewal")
+      assert.strictEqual(tenure.status, "EXPIRED", `max tenure must force expiry: ${tenure.content}`)
+      assert.strictEqual(stateOf(hbRun).tasks.H1.claim.needsInspection, true, "a forced-expired claim must need inspection")
+      console.log("✓ heartbeat renews for the owner/descendant, refuses others, and enforces the maximum tenure")
+    }
+
+    // --- 11j: cross-host claims are never auto-reclaimed; release needs an explicit decision.
+    {
+      const xRun = "20261122-000013-claims-crosshost"
+      await tools.plan.execute(
+        { sessionId: xRun, topology: "iterative-coding", skipInterview: true, allowUnsignedLegacy: true, tasks: [{ id: "X1" }] },
+        { sessionID: CONC_ROOT },
+      )
+      const xs = stateOf(xRun)
+      xs.host = "remote-host"
+      xs.tasks.X1.claim = {
+        by: "ses_remote",
+        at: new Date(Date.now() - 30 * 60000).toISOString(),
+        leaseUntil: new Date(Date.now() - 20 * 60000).toISOString(),
+        host: "remote-host",
+        epoch: 1,
+        heartbeatAt: new Date(Date.now() - 30 * 60000).toISOString(),
+      }
+      writeFileSync(runFile(xRun, "state.json"), JSON.stringify(xs, null, 2) + "\n")
+      const xNext = await tools.next.execute({ sessionId: xRun, allowUnsignedLegacy: true }, { sessionID: CONC_ROOT })
+      assert.strictEqual((xNext.readyForWorker || []).length, 0, "a cross-host claim must never be auto-reclaimed")
+      const xProgress = (xNext.inProgress || []).find((t) => t.id === "X1")
+      assert.strictEqual(xProgress.claimState, "cross-host", "the claim must be labelled cross-host")
+      const xStatus = await tools.status.execute({ sessionId: xRun }, { sessionID: CONC_ROOT })
+      assert((xStatus.warnings || []).some((w) => w.startsWith("FOREIGN_HOST")), "status must warn FOREIGN_HOST")
+      assert((xStatus.warnings || []).some((w) => w.startsWith("SHARED_FS_SUSPECTED")), "status must warn SHARED_FS_SUSPECTED")
+
+      const refusedRelease = await tools.recover.execute(
+        { sessionId: xRun, taskId: "X1", action: "release", reason: "remote worker is gone" },
+        { sessionID: CONC_ROOT },
+      )
+      assert.strictEqual(refusedRelease.status, "CROSS_HOST_RELEASE_REFUSED", `cross-host release must default to refuse: ${refusedRelease.content}`)
+      const allowedRelease = await tools.recover.execute(
+        { sessionId: xRun, taskId: "X1", action: "release", reason: "remote worker is gone", allowCrossHost: true, confirm: true },
+        { sessionID: CONC_ROOT },
+      )
+      assert.strictEqual(allowedRelease.status, "OK", `an explicit cross-host release must succeed: ${allowedRelease.content}`)
+      assert.strictEqual(stateOf(xRun).tasks.X1.claim, undefined, "the release must clear the claim")
+      const xEvents = readFileSync(runFile(xRun, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l))
+      assert(xEvents.some((e) => e.event === "claim_released"), "the release must be recorded as claim_released")
+      console.log("✓ cross-host claims are never auto-reclaimed; status warns FOREIGN_HOST/SHARED_FS_SUSPECTED; cross-host release refuses by default and is recorded when explicitly allowed")
+    }
+
+    // --- 11k: inspection tokens, INSPECTION_STALE, and adopt with no new commit.
+    {
+      const adoptRun = "20261122-000014-claims-adopt"
+      const adopt = await makeClaimsGitRun(adoptRun, "A1")
+      try {
+        const { gt, repo, worker } = adopt
+        const stateFile = statePathIn(repo, adoptRun)
+        await gt.task_update.execute(
+          { sessionId: adoptRun, taskId: "A1", status: "worker_active", worktree: worker.worktreePath },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        writeFileSync(join(worker.worktreePath, "work.txt"), "composed\n")
+        execFileSync(GIT_BIN, ["add", "work.txt"], { cwd: worker.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+        execFileSync(GIT_BIN, ["commit", "-m", "worker work"], { cwd: worker.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+
+        const noToken = await gt.recover.execute(
+          { sessionId: adoptRun, taskId: "A1", action: "adopt" },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        assert.strictEqual(noToken.status, "INSPECTION_TOKEN_REQUIRED", `adopt without inspect must be refused: ${noToken.content}`)
+
+        const inspected = await gt.recover.execute(
+          { sessionId: adoptRun, taskId: "A1", action: "inspect" },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        assert.strictEqual(inspected.status, "INSPECTED", `inspect must succeed: ${inspected.content}`)
+        assert(inspected.token, "inspect must return a single-use token")
+        assert.strictEqual(inspected.baselineAncestor, true, "the baseline head must be an ancestor of the worker commit")
+
+        writeFileSync(join(worker.worktreePath, "unexpected.txt"), "changed after inspect\n")
+        const stale = await gt.recover.execute(
+          { sessionId: adoptRun, taskId: "A1", action: "adopt", token: inspected.token },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        assert.strictEqual(stale.status, "INSPECTION_STALE", `a changed fingerprint must be INSPECTION_STALE: ${stale.content}`)
+        rmSync(join(worker.worktreePath, "unexpected.txt"))
+
+        // Inspect a dirty worktree, then adopt: the token matches, so the
+        // refusal is the dirty-worktree rule rather than a stale token.
+        writeFileSync(join(worker.worktreePath, "work.txt"), "dirty\n")
+        const dirtyInspect = await gt.recover.execute(
+          { sessionId: adoptRun, taskId: "A1", action: "inspect" },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        const dirtyAdopt = await gt.recover.execute(
+          { sessionId: adoptRun, taskId: "A1", action: "adopt", token: dirtyInspect.token },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        assert.strictEqual(dirtyAdopt.status, "DIRTY_WORKTREE", `a dirty worktree must not be adopted: ${dirtyAdopt.content}`)
+        execFileSync(GIT_BIN, ["checkout", "--", "work.txt"], { cwd: worker.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+
+        const branch = `teamwork/${adoptRun}-A1`
+        const baseBranch = `teamwork/base-${adoptRun}`
+        const countBefore = execFileSync(GIT_BIN, ["rev-list", "--count", `${baseBranch}..${branch}`], { cwd: repo, encoding: "utf8" }).trim()
+        const finalInspect = await gt.recover.execute(
+          { sessionId: adoptRun, taskId: "A1", action: "inspect" },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        const adopted = await gt.recover.execute(
+          { sessionId: adoptRun, taskId: "A1", action: "adopt", token: finalInspect.token, note: "recovered a committed round" },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        assert.strictEqual(adopted.status, "OK", `a clean committed branch must be adoptable: ${adopted.content}`)
+        const countAfter = execFileSync(GIT_BIN, ["rev-list", "--count", `${baseBranch}..${branch}`], { cwd: repo, encoding: "utf8" }).trim()
+        assert.strictEqual(countAfter, countBefore, "adopt must not create a commit")
+        const adoptedState = JSON.parse(readFileSync(stateFile, "utf8")).tasks.A1
+        assert.strictEqual(adoptedState.status, "worker_done", "adopt must mark worker_done")
+        assert(adoptedState.checkpoint && adoptedState.checkpoint.headSha, "adopt must write a checkpoint")
+        assert.strictEqual(adoptedState.claim, undefined, "adopt must release the claim")
+        console.log("✓ recovery tokens: adopt needs inspect, a post-inspect change is INSPECTION_STALE, dirty worktrees are refused, and a clean committed branch is adopted with no new commit")
+      } finally {
+        rmSync(adopt.repo, { recursive: true, force: true })
+      }
+    }
+
+    // --- 11l: verifier report binding (round/head/diff), merge BRANCH_MOVED, legacy warning.
+    {
+      const bindRun = "20261122-000015-claims-bind"
+      const bind = await makeClaimsGitRun(bindRun, "B1")
+      try {
+        const { gt, repo, worker } = bind
+        const stateFile = statePathIn(repo, bindRun)
+        await gt.task_update.execute(
+          { sessionId: bindRun, taskId: "B1", status: "worker_active", worktree: worker.worktreePath },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        writeFileSync(join(worker.worktreePath, "impl.txt"), "implemented\n")
+        execFileSync(GIT_BIN, ["add", "impl.txt"], { cwd: worker.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+        execFileSync(GIT_BIN, ["commit", "-m", "implement B1"], { cwd: worker.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+        await gt.task_update.execute(
+          { sessionId: bindRun, taskId: "B1", status: "worker_done", branch: `teamwork/${bindRun}-B1` },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        await gt.next.execute({ sessionId: bindRun, allowUnsignedLegacy: true }, { sessionID: FIXTURE_ROOT_SESSION })
+        await gt.task_update.execute({ sessionId: bindRun, taskId: "B1", status: "verifier_active" }, { sessionID: FIXTURE_ROOT_SESSION })
+        const reportRes = await gt.report.execute(
+          {
+            sessionId: bindRun,
+            taskId: "B1",
+            status: "PASS",
+            summary: "bound PASS",
+            checks: [{ name: "tests", passed: true }],
+          },
+          { sessionID: "ses_fixture_verifier" },
+        )
+        assert(!reportRes.content.startsWith("refused:"), `the bound report must be written: ${reportRes.content}`)
+        assert.strictEqual(reportRes.report.round, 1, "the report must record the current round")
+        assert(reportRes.report.headSha, "the report must record the branch head")
+        assert(reportRes.report.diffHash, "the report must record the branch diff hash")
+
+        const pass = await gt.task_update.execute({ sessionId: bindRun, taskId: "B1", status: "verified_pass" }, { sessionID: FIXTURE_ROOT_SESSION })
+        assert.strictEqual(pass.status, "verified_pass", `a matching report must pass: ${pass.content}`)
+
+        // Old round: the same report cannot satisfy a later round.
+        const roundState = JSON.parse(readFileSync(stateFile, "utf8"))
+        roundState.tasks.B1.status = "verifier_active"
+        roundState.tasks.B1.round = 2
+        writeStateFile(stateFile, roundState)
+        const oldRound = await gt.task_update.execute({ sessionId: bindRun, taskId: "B1", status: "verified_pass" }, { sessionID: FIXTURE_ROOT_SESSION })
+        assert.strictEqual(oldRound.status, "REPORT_ROUND_STALE", `an old-round report must be refused: ${oldRound.content}`)
+
+        // Branch moved after PASS: verified_pass and merge both refuse. Restore
+        // the fence the report was written at so the failed check is the head.
+        roundState.tasks.B1.round = 1
+        roundState.tasks.B1.fence = reportRes.report.fence
+        roundState.tasks.B1.status = "verifier_active"
+        writeStateFile(stateFile, roundState)
+        writeFileSync(join(worker.worktreePath, "late.txt"), "late change\n")
+        execFileSync(GIT_BIN, ["add", "late.txt"], { cwd: worker.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+        execFileSync(GIT_BIN, ["commit", "-m", "late change"], { cwd: worker.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+        const movedPass = await gt.task_update.execute({ sessionId: bindRun, taskId: "B1", status: "verified_pass" }, { sessionID: FIXTURE_ROOT_SESSION })
+        assert.strictEqual(movedPass.status, "BRANCH_MOVED", `a moved branch must refuse verified_pass: ${movedPass.content}`)
+        const movedMerge = await gt.worktree.execute({ sessionId: bindRun, action: "merge", taskId: "B1" }, { sessionID: FIXTURE_ROOT_SESSION })
+        assert.strictEqual(movedMerge.status, "BRANCH_MOVED", `a moved branch must refuse merge: ${movedMerge.content}`)
+
+        // Legacy report (no round/head/diff) is accepted with a warning, never
+        // silently treated as current.
+        const legacyRun = "20261122-000016-claims-legacy-report"
+        await gt.plan.execute(
+          { sessionId: legacyRun, topology: "iterative-coding", skipInterview: true, allowUnsignedLegacy: true, tasks: [{ id: "L1" }] },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+          await gt.task_update.execute({ sessionId: legacyRun, taskId: "L1", status }, { sessionID: FIXTURE_ROOT_SESSION })
+        }
+        mkdirSync(join(repo, ".opencode", "teamwork", legacyRun, "verify"), { recursive: true })
+        writeFileSync(
+          join(repo, ".opencode", "teamwork", legacyRun, "verify", "report-L1.json"),
+          JSON.stringify({ taskId: "L1", status: "PASS", summary: "legacy unbound report" }, null, 2) + "\n",
+        )
+        const legacyPass = await gt.task_update.execute({ sessionId: legacyRun, taskId: "L1", status: "verified_pass" }, { sessionID: FIXTURE_ROOT_SESSION })
+        assert.strictEqual(legacyPass.status, "verified_pass", `a legacy report must be accepted: ${legacyPass.content}`)
+        assert.strictEqual(legacyPass.warning, "legacy_unbound_report", "a legacy report must carry the unbound warning")
+        console.log("✓ verifier reports are round/fence/head/diff bound; old rounds and moved branches are refused; merge refuses BRANCH_MOVED; legacy reports warn")
+      } finally {
+        rmSync(bind.repo, { recursive: true, force: true })
+      }
+    }
+
+    // --- 11m: lock publication, stale reclaim, quarantine single winner and mtime aging.
+    {
+      const lockTarget = join(concDir, "lock-protocol-target.json")
+      const lockPath = crossProcessLockPath(lockTarget)
+      const old = new Date(Date.now() - 120000)
+
+      writeFileSync(lockPath, "")
+      utimesSync(lockPath, old, old)
+      await withCrossProcessLock(lockTarget, () => undefined, { leaseMs: 30000, timeoutMs: 1000 })
+      assert(!existsSync(lockPath), "an empty lock older than the lease must be reclaimed")
+
+      writeFileSync(lockPath, '{"pid":')
+      utimesSync(lockPath, old, old)
+      await withCrossProcessLock(lockTarget, () => undefined, { leaseMs: 30000, timeoutMs: 1000 })
+      assert(!existsSync(lockPath), "a partial lock older than the lease must be reclaimed")
+
+      // Falsified owner.at: a future timestamp cannot defeat mtime aging...
+      writeFileSync(
+        lockPath,
+        JSON.stringify({ pid: 999999, host: hostname(), at: "2100-01-01T00:00:00.000Z", nonce: "future-at" }),
+      )
+      utimesSync(lockPath, old, old)
+      await withCrossProcessLock(lockTarget, () => undefined, { leaseMs: 30000, timeoutMs: 1000 })
+      assert(!existsSync(lockPath), "a falsified future owner.at must not defeat mtime aging")
+      // ...and an old owner.at cannot make a fresh lock stale.
+      writeFileSync(
+        lockPath,
+        JSON.stringify({ pid: 999999, host: hostname(), at: "2000-01-01T00:00:00.000Z", nonce: "old-at" }),
+      )
+      await assert.rejects(
+        withCrossProcessLock(lockTarget, () => undefined, { timeoutMs: 80, retryBaseMs: 5, retryMaxMs: 10 }),
+        /lock timeout/,
+        "a fresh lock with an old owner.at must still be held",
+      )
+      rmSync(lockPath, { force: true })
+
+      // Quarantine is a winner election: two real processes observe the same
+      // stale artifact; exactly one rename succeeds.
+      const raceTarget = join(concDir, "lock-quarantine-target.json")
+      const raceLock = crossProcessLockPath(raceTarget)
+      writeFileSync(raceLock, JSON.stringify({ pid: 999999, host: hostname(), at: new Date().toISOString(), nonce: "quarantine-nonce" }))
+      utimesSync(raceLock, old, old)
+      const locksUrl = new URL("../plugins/opencode-teamwork/locks.ts", import.meta.url).href
+      const lockRaceScript = join(concDir, "lock-race.mjs")
+      writeFileSync(
+        lockRaceScript,
+        [
+          `import { observeLockArtifact, quarantineStaleLock } from ${JSON.stringify(locksUrl)}`,
+          `const p = process.argv[2]`,
+          `const o = observeLockArtifact(p)`,
+          `process.stdout.write(JSON.stringify({ won: o ? quarantineStaleLock(p, o) : false }))`,
+        ].join("\n"),
+      )
+      const runLockRace = () =>
+        new Promise((resolve, reject) => {
+          const child = spawn(process.execPath, [...process.execArgv, lockRaceScript, raceLock], { cwd: concDir })
+          let out = ""
+          child.stdout.on("data", (chunk) => (out += String(chunk)))
+          child.on("error", reject)
+          child.on("close", (code) => {
+            if (code !== 0) return reject(new Error(`lock race child exited ${code}`))
+            try {
+              resolve(JSON.parse(out))
+            } catch (err) {
+              reject(err)
+            }
+          })
+        })
+      const raceResults = await Promise.all([runLockRace(), runLockRace()])
+      assert.strictEqual(raceResults.filter((r) => r.won).length, 1, `exactly one quarantine reclaimer must win: ${JSON.stringify(raceResults)}`)
+
+      // A replaced lock (different inode/nonce) is never removed by a stale
+      // observation.
+      writeFileSync(raceLock, JSON.stringify({ pid: 999999, host: hostname(), at: new Date().toISOString(), nonce: "old-nonce" }))
+      utimesSync(raceLock, old, old)
+      const observed = observeLockArtifact(raceLock)
+      writeFileSync(raceLock, JSON.stringify({ pid: process.pid, host: hostname(), at: new Date().toISOString(), nonce: "new-nonce" }))
+      assert.strictEqual(quarantineStaleLock(raceLock, observed), false, "a replaced lock must not be quarantined")
+      assert.strictEqual(observeLockArtifact(raceLock).nonce, "new-nonce", "the replacement lock must survive")
+      rmSync(raceLock, { force: true })
+      console.log("✓ lock protocol: empty/partial locks age out, quarantine has exactly one winner, a replaced lock survives, and mtime (not owner.at) decides staleness")
+    }
+
+    // --- 11n: protocol-2 fails closed without a caller identity; legacy stays protocol 1.
+    {
+      const unresolvedRun = "20261122-000017-claims-unresolved"
+      await tools.plan.execute(
+        { sessionId: unresolvedRun, topology: "iterative-coding", skipInterview: true, allowUnsignedLegacy: true, tasks: [{ id: "U1" }] },
+        { sessionID: CONC_ROOT },
+      )
+      const unresolved = await tools.next.execute({ sessionId: unresolvedRun, allowUnsignedLegacy: true }, {})
+      assert(!(unresolved.readyForWorker || []).length, "an unresolved caller must never receive ready tasks unclaimed")
+      assert(/refused|identity|CLAIM_PROTOCOL/i.test(unresolved.content), `the refusal must be explicit: ${unresolved.content}`)
+
+      const legacyStatus = await tools.status.execute({ sessionId: staleRun }, { sessionID: CONC_ROOT })
+      assert.strictEqual(legacyStatus.claimProtocol, 1, "a state.json without claimProtocol must report protocol 1")
+      console.log("✓ claim protocol 2 fails closed without a resolvable caller; a legacy state.json stays protocol 1")
+    }
   } finally {
     rmSync(concDir, { recursive: true, force: true })
   }

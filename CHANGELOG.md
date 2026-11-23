@@ -8,6 +8,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Claim protocol 2: fencing, side-effect baselines and explicit recovery
+  (0.10.0, ADR 0009).** New runs record `claimProtocol: 2`,
+  `claimLeaseMs` (default 300000, bounded 60 s–60 m), `host` and lock-storage
+  diagnostics. A task gains a monotonic `fence` (claim/reclaim/release/
+  override/round change), `claim.{host,epoch,heartbeatAt,baseline,history}`,
+  `inspection` and `checkpoint`. `teamwork_next` returns the fence, never
+  reclaims a stale claim whose git/artifact fingerprint changed or is unknown
+  (it becomes `needs-inspection`), and never auto-reclaims a cross-host claim.
+  `teamwork_task_update` accepts an optional `fence` and enforces
+  `STALE_FENCE`, `CLAIM_OWNED_BY_OTHER` and `CLAIM_EXPIRED` on **every**
+  transition; a Sentinel override of another session's claim needs a recorded
+  `reason`. Ownership is the claiming session or a session descended from it,
+  and the owner/descendant auto-renews on `next`/`task_update`/worktree
+  `setup`/`diff`/`handoff`/`report` (bounded at 60 min or 20 renewals).
+  `teamwork_recover` adds `heartbeat`/`inspect`/`release`/`block`/`requeue`/
+  `adopt`/`discard`; `inspect` issues a single-use, hashed 10-minute token,
+  `adopt`/`requeue`/`block` re-check the fingerprint (`INSPECTION_STALE`), and
+  `adopt` marks a clean committed branch `worker_done` with a checkpoint while
+  making **no commit**. `teamwork_report` binds `round`/`fence`/`branch`/
+  `baseSha`/`headSha`/`diffHash`; `verified_pass` refuses an old-round or moved
+  report (`REPORT_ROUND_STALE`/`BRANCH_MOVED`), and `worktree merge` refuses
+  `BRANCH_MOVED`. Legacy reports are accepted with a `legacy_unbound_report`
+  warning. `worktree setup` records the baseline and renews the claim, `diff`
+  returns `HEAD`/`baseSha`/`diffHash`, and `cleanup` refuses a live claim.
+  Cross-host worktree actions refuse unless `allowSharedWorktrees: true` (never
+  with `requireSameHost: true`), and a foreign-host claim release needs
+  `allowCrossHost`/`TEAMWORK_ALLOW_CROSS_HOST=1` plus `confirm`.
+- **Atomic lock publication and quarantine reclaim.** `<artifact>.lock` is now
+  published as a unique `wx` temp + `link(2)` (atomic `mkdir` fallback detected
+  once and cached), aged from `lstat().mtimeMs` rather than the owner's `at`,
+  and reclaimed by a single-winner quarantine `rename(2)`. Empty/partial locks
+  age out instead of stranding the artifact; a replaced live lock is never
+  unlinked by nonce.
 - **Signed handoff index entries (0.9.0 workstream B, ADR 0007).**
   `teamwork_handoff` now signs the `handoffs/index.json` entry, never the
   markdown: `_auth` covers `{kind:"teamwork.handoff", v:1, runId, runKeyId,
