@@ -4,7 +4,7 @@
 
 - `assets/builtin/` holds verbatim copies of the files the Google Antigravity Linux CLI materialises from its embedded "builtin" fixtures into its app-data directory. [OBSERVED]
 - The copy was made for interoperability analysis of the Antigravity teamwork/swarm surface, alongside the notes in `docs/re/antigravity-teamwork/`. [POLICY — project purpose statement]
-- Files are byte-identical to the installed originals: copied with `cp -a`, with no reformatting, normalisation, or edits. [OBSERVED — verified with `diff -r`, below]
+- Files are byte-identical to the installed originals **at capture time (1.5.14)**: copied with `cp -a`, with no reformatting, normalisation, or edits. [OBSERVED — verified with `diff -r`, below] The current install is **1.5.15** and its tree differs; see *Version fork* below.
 - Captured payload: 24 files, 612 KB (`du -sh`), covering:
   - `plugins/swarm/` — the whole plugin subtree (16 files), including `sidecars/swarm_board/`.
   - `skills/native_swarm/` (2 files), `skills/swarm_pane/`, `skills/swarm_monitor/`, `skills/swarm_narrator/`, `skills/run-workflow/` (1 file each).
@@ -17,13 +17,23 @@
 - Capture date: 2026-11-21 (UTC), from the local installation on this machine.
 - CLI version at capture time: `1.5.14` (`agy --version`).
 
-## Same Binary as the Analysed Artifact [OBSERVED]
+## Same Binary as the Analysed Artifact [OBSERVED — at capture time, 1.5.14]
 
 The fixture tree was produced by the exact binary analysed in `00-artifact-identity.md`, not by a different build:
 
-- Installed binary `/home/john/.local/bin/agy`: 273,240,776 bytes; SHA-256 `37873b8062391b6202a3d3199ec012abc9e53aab720d26cd65699441497d8c94`.
-- Analysed artifact `/tmp/opencode/antigravity-re/antigravity`: 273,240,776 bytes; same SHA-256.
-- `cmp /home/john/.local/bin/agy /tmp/opencode/antigravity-re/antigravity` exits 0, i.e. the two files are byte-identical.
+- Installed binary `/home/john/.local/bin/agy` **on 2026-11-21**: 273,240,776 bytes; SHA-256 `37873b8062391b6202a3d3199ec012abc9e53aab720d26cd65699441497d8c94`.
+- Analysed artifact, re-extracted from the archived tarball to `/tmp/opencode/ver-fix-1.5.14/antigravity`: 273,240,776 bytes; same SHA-256.
+- `cmp` against that 1.5.14 copy exits 0. (The old working path `/tmp/opencode/antigravity-re/antigravity` no longer exists; the archive `~/Downloads/cli_linux_x64.tar.gz` is the durable copy.)
+
+### Version fork (2026-11-23) [OBSERVED]
+
+The installed CLI is now **1.5.15** — `/home/john/.local/bin/agy`, 273,879,752 bytes, SHA-256 `7b004d26c3fdea25a7c9d456de4bfaccef4be1e4cc7fd6db628859c5c941fa2d`. Its materialised builtin tree differs from this capture:
+
+- `.checksum` is `builtin:930df4a72b3ebb9547221dbd601535185717e8e73bac68ca96713e69832d3aaa` (vs this capture's `builtin:f46b8917…`).
+- Five `plugins/swarm/sidecars/swarm_board/` files differ: `app.js`, `board_cache.mjs`, `hive.js`, `main.mjs`, `README.md`.
+- The live tree has 46 files (vs 24 here) because it includes `keep.txt` and the eleven unrelated skills listed above.
+
+This directory remains the **1.5.14** capture and is intentionally not re-captured; `09` cites it by `file:line` and those are 1.5.14 line numbers. See [`../live/VERSION-FORK.md`](../live/VERSION-FORK.md).
 
 ## How Materialisation Is Triggered [OBSERVED / INFERRED]
 
@@ -57,11 +67,14 @@ $ find docs/re/antigravity-teamwork/assets -type f | wc -l
 25
 $ du -sh docs/re/antigravity-teamwork/assets
 624K
+# Against the 1.5.14 install (2026-11-21), the swarm subtree was identical:
 $ diff -r ~/.gemini/antigravity-cli/builtin/plugins/swarm docs/re/antigravity-teamwork/assets/builtin/plugins/swarm && echo "swarm subtree identical"
 swarm subtree identical
 $ cat ~/.gemini/antigravity-cli/builtin/.checksum
 builtin:f46b8917adf35c9c4c091259cf2bb7ca77245389ad3255b371389cf5c7a75a7c
 ```
+
+> **2026-11-23:** re-running the same `diff` against the now-installed 1.5.15 tree reports five differing `swarm_board` files and additional skills, and `.checksum` reads `builtin:930df4a7…`. This block documents the 1.5.14 capture, not the current install. [OBSERVED — `diff -rq`]
 
 Skill subtrees are checked the same way:
 

@@ -2,6 +2,8 @@
 
 Static-evidence reconstruction of the configuration gates that can enable, disable, or re-model the `/teamwork` subsystem in the Google Antigravity Linux CLI (extracted binary `antigravity`, SHA-256 `37873b8062391b6202a3d3199ec012abc9e53aab720d26cd65699441497d8c94`, 273,240,776 bytes). [OBSERVED] No part of the binary was executed; no network access and no authentication were used. [OBSERVED]
 
+**Version scope.** Every offset in this document is a **1.5.14** offset (the static axis). The live CLI is now **1.5.15** (SHA-256 `7b004d26…41fa2d`); literals shifted and the builtin tree changed, so these offsets are version-scoped and do not resolve in 1.5.15 without re-anchoring. See [`PROVENANCE.md`](PROVENANCE.md) *live axis vs static axis*.
+
 Companion documents: `00-artifact-identity.md` (identity, section map, toolchain), `01-command-contract.md` (command surface), `02-agent-registry.md` (roster, registry builders, and the string-layout limitation), `PROVENANCE.md` (method limits).
 
 ## Confidence Legend
