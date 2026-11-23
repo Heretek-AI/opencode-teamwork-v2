@@ -16,7 +16,6 @@
 //     never satisfy a newer request.
 //   * Symlink-safe bounded reads/writes via the tournament artifact helpers.
 
-import { createHash } from "node:crypto"
 import { basename, join } from "node:path"
 import {
   clean,
@@ -240,7 +239,7 @@ export function persistRequirementsBaseline(
 export function originalRequestHash(run: string): string | null {
   const res = readBoundedRunFile(run, join(run, "ORIGINAL_REQUEST.md"), MAX_REQUEST_BYTES)
   if (res.status !== "ok") return null
-  return createHash("sha256").update(res.text, "utf8").digest("hex")
+  return sha256Hex(res.text)
 }
 
 /** Canonical digest of a requirements baseline (or null when absent). */

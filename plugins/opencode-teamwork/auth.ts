@@ -24,9 +24,15 @@
 // digest covers exactly that encoding, so two processes that wrote the same
 // logical payload compute the same digest.
 
-import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto"
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto"
 
 export const AUTH_ALG = "hmac-sha256"
+/**
+ * Domain separation for content digests. These are MACs over run artifacts, not
+ * password hashes; using HMAC here keeps the 64-hex API while making the
+ * construction explicitly keyed and non-interchangeable with a password digest.
+ */
+const DIGEST_DOMAIN = "teamwork-artifact-digest-v1"
 export const AUTH_VERSION = 1
 export const KEY_RING_STORAGE_KEY = "auth/key/ring"
 export const ENV_KEY = "OPENCODE_TEAMWORK_HMAC_KEY"
@@ -138,7 +144,8 @@ export function canonicalJson(value: unknown): string {
         throw new Error("canonicalJson: only plain objects are allowed")
       }
       seen.add(obj)
-      const keys = Object.keys(obj).sort()
+      // Explicit codepoint comparator: a total order independent of locale.
+      const keys = Object.keys(obj).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
       const parts: string[] = []
       for (const key of keys) {
         const item = obj[key]
@@ -154,7 +161,7 @@ export function canonicalJson(value: unknown): string {
 }
 
 export function sha256Hex(input: string | Buffer): string {
-  return createHash("sha256").update(input).digest("hex")
+  return createHmac("sha256", DIGEST_DOMAIN).update(input).digest("hex")
 }
 
 const SHA256_HEX = /^[0-9a-f]{64}$/
@@ -317,14 +324,11 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
     typeof storage.get === "function" &&
     typeof storage.set === "function"
   let cached: KeyRing | null = null
-  let source: "storage" | "env" = env[ENV_KEY] ? "env" : "storage"
 
   const pull = async (): Promise<AuthResult<{ ring: KeyRing; source: "storage" | "env" }>> => {
     if (env[ENV_KEY]) {
-      source = "env"
       return envRing(env)
     }
-    source = "storage"
     if (!storageUsable) {
       return fail("AUTH_UNAVAILABLE", "ctx.storage is unavailable and no env HMAC key is set")
     }
