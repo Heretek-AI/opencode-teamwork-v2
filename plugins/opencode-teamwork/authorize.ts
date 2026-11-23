@@ -196,7 +196,8 @@ function deny(code: AuthorizationFailureCode, error: string): AuthorizationDecis
 const SESSION_TREE_MAX_DEPTH = 32
 
 function cleanId(value: unknown): string {
-  return String(value ?? "").replace(/[^0-9A-Za-z._:-]/g, "").slice(0, 80)
+  if (value === undefined || value === null) return ""
+  return String(value).replace(/[^0-9A-Za-z._:-]/g, "").slice(0, 80)
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
@@ -283,9 +284,10 @@ export async function authorizeToolCall(
     )
   }
   if (!INSTALLED_TEAM_ROLES.has(agent) || !roles.includes(agent)) {
+    const actionLabel = act ? ` action "${act}"` : ""
     return deny(
       "AUTHZ_ROLE_DENIED",
-      `refused: ${tool}${act ? ` action "${act}"` : ""} is restricted to ${describeRoles(roles)} (trusted session agent: ${cleanId(agent)}); nothing was written`,
+      `refused: ${tool}${actionLabel} is restricted to ${describeRoles(roles)} (trusted session agent: ${cleanId(agent)}); nothing was written`,
     )
   }
 
