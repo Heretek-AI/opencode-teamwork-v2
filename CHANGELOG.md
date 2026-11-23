@@ -4,6 +4,31 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Release-tag provenance guard: `scripts/check-release-tag.mjs` fetches tags and
+  refuses to publish a `v*` tag whose commit is not an ancestor of `origin/main`;
+  `publish.yml` runs it before publish with full history/tags, only on tag pushes.
+
+### Changed
+
+- `teamwork_worktree` merge/resolve now require a verified sentinel worktree
+  (present, real directory, contained, and a git worktree root). A missing or
+  symlinked sentinel path is refused; the tool never falls back to the user's
+  repository root.
+- Network denial (`constraints.network: denied`) now applies to `webfetch` for
+  every `team/*` agent, not only worker/verifier, and is resolved from per-task
+  `spec.json` as well as `prompt_draft.md`. `shell` network access remains
+  honor-system.
+
+### Notes
+
+- `v0.6.0` and `v0.7.0` are sibling release commits with trees identical to
+  their `main` release commits. They predate the tag guard; every future `v*`
+  tag is ancestor-checked and published tags are never rewritten.
+
 ## [0.7.0] - 2026-11-22
 
 ### Added
