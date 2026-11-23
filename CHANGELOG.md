@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.10.0] - 2026-11-23
 
 ### Added
 
@@ -63,6 +63,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and reclaimed by a single-winner quarantine `rename(2)`. Empty/partial locks
   age out instead of stranding the artifact; a replaced live lock is never
   unlinked by nonce.
+- **Pinned-fd write containment on Linux (0.11.0, ADR 0010).** Run writes now
+  pin the run root and each path segment with `O_DIRECTORY|O_NOFOLLOW`, then
+  create, rename, append, and unlink through `/proc/self/fd/<dirfd>/<name>`, so
+  an intermediate-directory swap cannot redirect a write outside the run.
+  `writeFileAtomicWithin`, `writeOnceWithin`, `appendLineWithin`, and
+  `touchWithin` replace the path-based writers in `tournament.ts`, `tools.ts`,
+  `lemma.ts`, and the run locks; appends refuse a hardlinked target
+  (`nlink === 1`); known run subdirectories are pre-created at plan time.
+  Non-Linux and unusable-procfs hosts fall back to a post-write
+  `realpath`/`(dev,ino)` check that refuses and audits a detected redirect, and
+  Linux without procfs fails closed. A deterministic race harness with a
+  leaking negative control covers the class. macOS/Windows remain
+  detective-only; no native addon is used.
 
 ## [0.9.0] - 2026-11-23
 
