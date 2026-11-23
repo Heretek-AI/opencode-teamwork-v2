@@ -27,6 +27,7 @@ import {
 import { detectAvailableModels, pickModels, applyOverrides } from "../lib/picker.mjs"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import { runDoctor, nextSteps } from "../lib/doctor.mjs"
+import { collectSecurityReport } from "../lib/security.mjs"
 import { buildTimeline, renderTimeline, timelineWarnings } from "../lib/timeline.mjs"
 import { buildExportData, renderExport } from "../lib/export.mjs"
 
@@ -52,6 +53,7 @@ Commands:
   export     Render a run as an offline HTML report (default) or Markdown (-m)
   prune      Prune git worktrees for completed Teamwork runs
   doctor     Diagnose config, agents, model sync and git/worktree health
+             (--security adds key source, signer/witness, ptrace, groups, DB)
   help       Show this help
 
 Options:
@@ -74,7 +76,7 @@ Options:
 `
 
 function parseArgs(argv) {
-  const options = { command: undefined, yes: false, all: undefined, assignments: {}, register: true, dryRun: false, refresh: false, configDir: undefined, session: undefined, json: false, noColor: false, help: false, markdown: false, output: undefined }
+  const options = { command: undefined, yes: false, all: undefined, assignments: {}, register: true, dryRun: false, refresh: false, configDir: undefined, session: undefined, json: false, noColor: false, help: false, markdown: false, output: undefined, security: false }
   const rest = [...argv]
   options.command = rest.shift()
   while (rest.length) {
@@ -114,6 +116,9 @@ function parseArgs(argv) {
         break
       case "--no-color":
         options.noColor = true
+        break
+      case "--security":
+        options.security = true
         break
       case "--html":
         options.markdown = false
@@ -467,10 +472,14 @@ function doctorCommand(options) {
   const configDir = resolveConfigDir(options.configDir)
   const report = runDoctor({ configDir, cwd: process.cwd() })
   const steps = nextSteps(report.checks)
+  const security = options.security || options.json ? collectSecurityReport({ env: process.env, configDir }) : undefined
 
   if (options.json) {
-    // Additive: existing consumers still see { ok, checks }; nextSteps is new.
-    console.log(JSON.stringify({ ...report, nextSteps: steps }, null, 2))
+    // Additive: existing consumers still see { ok, checks }; nextSteps and
+    // (when requested or --json) the security section are new.
+    console.log(
+      JSON.stringify({ ...report, nextSteps: steps, ...(security ? { security } : {}) }, null, 2),
+    )
     process.exitCode = report.ok ? 0 : 1
     return
   }
@@ -489,6 +498,18 @@ function doctorCommand(options) {
     console.log(warned ? `Environment looks healthy (${warned} warning(s)).` : "Environment looks healthy.")
   } else {
     console.log(`Environment has ${failed} failing check(s)${warned ? ` and ${warned} warning(s)` : ""}.`)
+  }
+  if (security) {
+    console.log("\nArtifact-trust security posture (ADR 0006/0008):")
+    for (const check of security.checks) {
+      const indicator = DOCTOR_INDICATORS[check.status] || DOCTOR_INDICATORS.fail
+      console.log(`${indicator} ${check.name.padEnd(20)} ${check.message}`)
+    }
+    console.log(
+      security.warnings.length
+        ? `\n${security.warnings.length} security warning(s). Authenticity is tamper-evident against a run-dir-only writer; it is not a same-UID boundary (see SECURITY.md).`
+        : "\nNo security warnings. Authenticity is tamper-evident against a run-dir-only writer; it is not a same-UID boundary (see SECURITY.md).",
+    )
   }
   if (steps.length) {
     console.log("\nNext steps:")

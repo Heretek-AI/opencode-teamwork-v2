@@ -134,8 +134,10 @@ import {
   victorySkipLabel,
 } from "./victory.ts"
 import {
+  AuthError,
   canonicalJson,
   createAuthContext,
+  payloadDigest,
   sha256Hex,
   type AuthContext,
   type AuthEnvelope,
@@ -723,6 +725,18 @@ const INTEGRITY_MODES = ["development", "demo", "benchmark"] as const
 type IntegrityMode = (typeof INTEGRITY_MODES)[number]
 const DEFAULT_INTEGRITY_MODE: IntegrityMode = "development"
 const REQUEST_MAX = 20000
+
+// Artifact trust levels (ADR 0008). `local-hmac` is the Phase A default; the
+// stronger levels are enforced by final_verify and can only be chosen at plan
+// time (a re-plan cannot weaken them).
+const TRUST_LEVELS = ["local-hmac", "external-signer", "human-approved", "ci-attested"] as const
+type TrustLevel = (typeof TRUST_LEVELS)[number]
+const DEFAULT_TRUST_LEVEL: TrustLevel = "local-hmac"
+
+function normalizeTrustLevel(value: unknown): TrustLevel | undefined {
+  const v = String(value ?? "").trim()
+  return (TRUST_LEVELS as readonly string[]).includes(v) ? (v as TrustLevel) : undefined
+}
 
 /**
  * Canonical integrity rules and the lowest mode that forbids each one
@@ -2019,6 +2033,10 @@ type RunManifest = {
   planHash: string
   lemmaPolicyHash: string | null
   runKeyId: string
+  /** Ed25519/HMAC key id pinned at plan time (same as runKeyId when present). */
+  runNonce?: string
+  trustLevel?: TrustLevel
+  requireWitness?: boolean
   createdAt: string
   _auth?: AuthEnvelope
 }
@@ -2095,7 +2113,10 @@ async function readRunManifest(run: string, auth?: AuthContext): Promise<Manifes
   if (!auth) {
     return { ok: false, failure: { code: "AUTH_UNAVAILABLE", message: "no authenticity context is wired for this run" } }
   }
-  const check = await auth.verifyRunArtifact(basename(run), RUN_MANIFEST, value)
+  const check = await auth.verifyRunArtifact(basename(run), RUN_MANIFEST, value, {
+    ...(typeof value.runNonce === "string" && value.runNonce !== "" ? { requireNonce: value.runNonce } : {}),
+    ...(typeof value.runKeyId === "string" && value.runKeyId !== "" ? { expectedKeyId: value.runKeyId } : {}),
+  })
   if (check.status === "unsigned") {
     return { ok: false, failure: { code: "AUTH_INVALID", message: "run.manifest.json has no _auth envelope" } }
   }
@@ -2104,6 +2125,16 @@ async function readRunManifest(run: string, auth?: AuthContext): Promise<Manifes
       ok: false,
       failure: check.failure ?? { code: "AUTH_INVALID", message: "run.manifest.json failed verification" },
     }
+  }
+  // Re-bind the signed baseline so a fresh process (or a cleared cache) uses the
+  // manifest's nonce/key id for every subsequent artifact.
+  if (typeof value.runNonce === "string" && value.runNonce !== "") {
+    const bound = await auth.bindRunNonce(basename(run), value.runNonce)
+    if (!bound.ok) return { ok: false, failure: bound.failure }
+  }
+  if (typeof value.runKeyId === "string" && value.runKeyId !== "") {
+    const bound = await auth.bindRunKeyId(basename(run), value.runKeyId)
+    if (!bound.ok) return { ok: false, failure: bound.failure }
   }
   return { ok: true, manifest: value as RunManifest, signed: true }
 }
@@ -2133,6 +2164,12 @@ function manifestDriftReason(drift: string): string {
   }
   if (drift.startsWith("requireHandoffs")) {
     return `[AUTH_STALE] handoff gate downgrade/change refused (${drift})`
+  }
+  if (drift.startsWith("trustLevel")) {
+    return `[AUTH_STALE] artifact trust level downgrade/change refused (${drift})`
+  }
+  if (drift.startsWith("requireWitness")) {
+    return `[AUTH_STALE] witness requirement downgrade/change refused (${drift})`
   }
   if (drift.startsWith("planHash")) {
     return `[AUTH_STALE] plan baseline changed (${drift})`
@@ -2165,6 +2202,16 @@ function manifestDrift(manifest: RunManifest, current: Omit<RunManifest, "versio
   if (baselineHandoffs !== current.requireHandoffs) {
     drift.push(`requireHandoffs drifted: manifest=${baselineHandoffs} current=${current.requireHandoffs}`)
   }
+  const baselineTrust = normalizeTrustLevel(manifest.trustLevel) ?? DEFAULT_TRUST_LEVEL
+  const currentTrust = normalizeTrustLevel(current.trustLevel) ?? DEFAULT_TRUST_LEVEL
+  if (baselineTrust !== currentTrust) {
+    drift.push(`trustLevel drifted: manifest=${baselineTrust} current=${currentTrust}`)
+  }
+  const baselineWitness = manifest.requireWitness === true
+  const currentWitness = current.requireWitness === true
+  if (baselineWitness !== currentWitness) {
+    drift.push(`requireWitness drifted: manifest=${baselineWitness} current=${currentWitness}`)
+  }
   for (const key of ["requestHash", "requirementsHash", "planHash", "lemmaPolicyHash"] as const) {
     const a = manifest[key]
     const b = current[key]
@@ -2182,11 +2229,85 @@ function currentManifestDrift(manifest: RunManifest, plan: any, state: any, run:
     victorySkipReason:
       recordedVictorySkipReason(plan?.victorySkipReason) ?? recordedVictorySkipReason(state?.victorySkipReason),
     requireHandoffs: resolveHandoffMode(plan, state).mode,
+    trustLevel: normalizeTrustLevel(plan?.trustLevel ?? state?.trustLevel) ?? DEFAULT_TRUST_LEVEL,
+    requireWitness: (plan?.requireWitness ?? state?.requireWitness) === true,
     requestHash: originalRequestHash(run),
     requirementsHash: currentRequirementsHash(run),
     planHash: planHashOf(plan),
     lemmaPolicyHash: lemmaPolicyHashOf(run),
   })
+}
+
+/**
+ * Enforce the run's persisted trust level at completion:
+ *   * external-signer — the manifest (and every sampled artifact) must carry a
+ *     verified Ed25519 envelope, never HMAC.
+ *   * human-approved / ci-attested — a signed `approvals/<run>.json` bound to
+ *     this run id and the current manifest digest.
+ *   * requireWitness — a witness receipt must exist for the signed manifest.
+ * Returns named refusal reasons; an empty array means the level is satisfied.
+ */
+async function evaluateTrustGate(
+  run: string,
+  runId: string,
+  manifest: RunManifest,
+  auth: AuthContext | undefined,
+  trustLevel: TrustLevel,
+  observedAlgs: Array<string | undefined>,
+): Promise<string[]> {
+  const reasons: string[] = []
+  if (trustLevel === "external-signer") {
+    const seen = [manifest._auth?.alg, ...observedAlgs].filter((alg): alg is string => alg !== undefined)
+    const hmac = seen.filter((alg) => alg !== "ed25519")
+    if (manifest._auth?.alg !== "ed25519" || hmac.length > 0) {
+      reasons.push(
+        `[AUTH_TRUST_LEVEL] external-signer requires verified Ed25519 envelopes; found ${seen.join(", ") || "no envelope"}`,
+      )
+    }
+  }
+  if (trustLevel === "human-approved" || trustLevel === "ci-attested") {
+    const relPath = `approvals/${runId}.json`
+    const res = readRegularJson<any>(run, join(run, relPath))
+    if (!res.ok) {
+      reasons.push(`[AUTH_APPROVAL_MISSING] ${relPath} is ${res.reason}; trustLevel ${trustLevel} requires a signed approval artifact`)
+    } else if (!auth) {
+      reasons.push("[AUTH_UNAVAILABLE] no authenticity context is wired to verify the approval artifact")
+    } else {
+      const approval = res.data
+      const verified = await auth.verifyArtifact(relPath, approval, {
+        ...(manifest.runNonce ? { requireNonce: manifest.runNonce } : {}),
+        expectedKeyId: manifest.runKeyId,
+      })
+      if (!verified.ok) {
+        reasons.push(`[${verified.failure.code}] ${relPath} failed verification: ${verified.failure.message}`)
+      } else {
+        if (approval.runId !== runId) {
+          reasons.push(`[AUTH_INVALID] ${relPath} is bound to run ${clean(approval.runId, 64)} (expected ${runId})`)
+        }
+        if (approval.trustLevel !== trustLevel) {
+          reasons.push(`[AUTH_INVALID] ${relPath} records trustLevel ${clean(approval.trustLevel, 32)} (expected ${trustLevel})`)
+        }
+        if (approval.manifestDigest !== payloadDigest(manifest)) {
+          reasons.push(`[AUTH_INVALID] ${relPath} manifestDigest does not match the signed run manifest`)
+        }
+        const approver = trustLevel === "human-approved" ? approval.approvedBy : approval.attestedBy
+        if (typeof approver !== "string" || approver.trim() === "") {
+          reasons.push(
+            `[AUTH_APPROVAL_MISSING] ${relPath} needs ${trustLevel === "human-approved" ? "approvedBy" : "attestedBy"}`,
+          )
+        }
+      }
+    }
+  }
+  if (manifest.requireWitness === true) {
+    const hasReceipt = auth ? await auth.hasWitnessReceipt(runId, RUN_MANIFEST) : false
+    if (!hasReceipt) {
+      reasons.push(
+        "[AUTH_WITNESS_UNAVAILABLE] requireWitness is set but no witness receipt was recorded for run.manifest.json",
+      )
+    }
+  }
+  return reasons
 }
 
 /** Every task that must have continuity handoffs (plan first, state as fallback). */
@@ -2475,6 +2596,8 @@ async function createPlanRun(
   let persistedHandoffs: HandoffMode | undefined
   let persistedVictorySkipReason: string | undefined
   let persistedVictoryAudit: VictoryAuditMode | undefined
+  let persistedTrustLevel: TrustLevel | undefined
+  let persistedRequireWitness: boolean | undefined
   if (existsSync(run)) {
     const planRes = readBoundedRunJson<any>(run, join(run, "plan.dag.json"), MAX_MANIFEST_BYTES)
     if (planRes.status === "error") {
@@ -2567,6 +2690,59 @@ async function createPlanRun(
     persistedVictorySkipReason =
       recordedVictorySkipReason(planRes.status === "ok" ? planRes.value?.victorySkipReason : undefined) ??
       recordedVictorySkipReason(stateRes.status === "ok" ? stateRes.value?.victorySkipReason : undefined)
+    const fromPlanTrustRaw = planRes.status === "ok" ? planRes.value?.trustLevel : undefined
+    const fromStateTrustRaw = stateRes.status === "ok" ? stateRes.value?.trustLevel : undefined
+    const fromPlanTrust =
+      fromPlanTrustRaw === undefined || fromPlanTrustRaw === null ? undefined : normalizeTrustLevel(fromPlanTrustRaw)
+    const fromStateTrust =
+      fromStateTrustRaw === undefined || fromStateTrustRaw === null ? undefined : normalizeTrustLevel(fromStateTrustRaw)
+    if (
+      (fromPlanTrustRaw !== undefined && fromPlanTrustRaw !== null && !fromPlanTrust) ||
+      (fromStateTrustRaw !== undefined && fromStateTrustRaw !== null && !fromStateTrust)
+    ) {
+      return {
+        ok: false,
+        content:
+          "refused: plan.dag.json or state.json records an invalid trustLevel; repair the run or start a new session. Nothing was written.",
+      }
+    }
+    if (fromPlanTrust && fromStateTrust && fromPlanTrust !== fromStateTrust) {
+      return {
+        ok: false,
+        content:
+          "refused: plan.dag.json and state.json disagree about trustLevel; repair the run or start a new session. Nothing was written.",
+      }
+    }
+    persistedTrustLevel = fromPlanTrust ?? fromStateTrust
+    const fromPlanWitnessRaw = planRes.status === "ok" ? planRes.value?.requireWitness : undefined
+    const fromStateWitnessRaw = stateRes.status === "ok" ? stateRes.value?.requireWitness : undefined
+    if (
+      (fromPlanWitnessRaw !== undefined && typeof fromPlanWitnessRaw !== "boolean") ||
+      (fromStateWitnessRaw !== undefined && typeof fromStateWitnessRaw !== "boolean")
+    ) {
+      return {
+        ok: false,
+        content:
+          "refused: plan.dag.json or state.json records an invalid requireWitness; repair the run or start a new session. Nothing was written.",
+      }
+    }
+    if (
+      typeof fromPlanWitnessRaw === "boolean" &&
+      typeof fromStateWitnessRaw === "boolean" &&
+      fromPlanWitnessRaw !== fromStateWitnessRaw
+    ) {
+      return {
+        ok: false,
+        content:
+          "refused: plan.dag.json and state.json disagree about requireWitness; repair the run or start a new session. Nothing was written.",
+      }
+    }
+    persistedRequireWitness =
+      typeof fromPlanWitnessRaw === "boolean"
+        ? fromPlanWitnessRaw
+        : typeof fromStateWitnessRaw === "boolean"
+          ? fromStateWitnessRaw
+          : undefined
   }
   if (persistedVerification && requestedVerification && persistedVerification !== requestedVerification) {
     return {
@@ -2576,6 +2752,55 @@ async function createPlanRun(
   }
   const verificationMode: VerificationMode =
     persistedVerification ?? requestedVerification ?? DEFAULT_VERIFICATION_MODE
+  // Artifact trust level: chosen once at plan time, persisted in plan/state and
+  // the signed manifest, and enforced by final_verify. A re-plan may repeat it
+  // but never change it.
+  const requestedTrustLevel =
+    input.trustLevel === undefined || input.trustLevel === null ? undefined : normalizeTrustLevel(input.trustLevel)
+  if (input.trustLevel !== undefined && input.trustLevel !== null && !requestedTrustLevel) {
+    return {
+      ok: false,
+      content: `refused: invalid trustLevel "${clean(input.trustLevel, 32)}" (accepted: ${TRUST_LEVELS.join(", ")}; default: ${DEFAULT_TRUST_LEVEL}); nothing was written.`,
+    }
+  }
+  if (persistedTrustLevel && requestedTrustLevel && persistedTrustLevel !== requestedTrustLevel) {
+    return {
+      ok: false,
+      content: `refused: [AUTH_STALE] trustLevel is already persisted as "${persistedTrustLevel}" for this run and cannot be changed by a re-plan; omit it to keep the level or start a new session. Nothing was written.`,
+      refused: "AUTH_STALE",
+    }
+  }
+  const trustLevel: TrustLevel = persistedTrustLevel ?? requestedTrustLevel ?? DEFAULT_TRUST_LEVEL
+  if (input.requireWitness !== undefined && typeof input.requireWitness !== "boolean") {
+    return { ok: false, content: "refused: requireWitness must be a boolean; nothing was written." }
+  }
+  if (
+    persistedRequireWitness !== undefined &&
+    typeof input.requireWitness === "boolean" &&
+    persistedRequireWitness !== input.requireWitness
+  ) {
+    return {
+      ok: false,
+      content: `refused: [AUTH_STALE] requireWitness is already persisted as ${persistedRequireWitness} for this run and cannot be changed by a re-plan; omit it to keep the setting or start a new session. Nothing was written.`,
+      refused: "AUTH_STALE",
+    }
+  }
+  const requireWitness = persistedRequireWitness ?? input.requireWitness === true
+  // `external-signer` needs a source that actually produces an Ed25519
+  // envelope. A local HMAC key cannot be promoted by a label. An external
+  // signer that is configured but broken is reported as AUTH_SIGNER_UNAVAILABLE
+  // by ready()/signing below.
+  if (trustLevel === "external-signer" && auth) {
+    const signingAlg = auth.signingAlg()
+    if (signingAlg !== "ed25519") {
+      return {
+        ok: false,
+        content:
+          "refused: [AUTH_SIGNER_UNAVAILABLE] trustLevel \"external-signer\" requires an Ed25519 key or an OPENCODE_TEAMWORK_SIGNER=command:<path> signer; only a local HMAC key is configured. Nothing was written.",
+        refused: "AUTH_SIGNER_UNAVAILABLE",
+      }
+    }
+  }
   // The request record is verbatim, so refuse rather than truncate. The
   // length check runs before anything is written.
   const request = typeof input.request === "string" ? input.request : undefined
@@ -2648,6 +2873,21 @@ async function createPlanRun(
         "refused: benchmark mode requires the independent victory audit; victoryAudit: \"skip\" is not permitted with integrityMode: \"benchmark\". Nothing was written.",
     }
   }
+  // Benchmark is the strictest integrity contract. An explicit local-HMAC trust
+  // level is refused; the default only warns, so existing benchmark fixtures
+  // remain valid while the downgrade stays visible.
+  if (integrityMode === "benchmark" && trustLevel === "local-hmac" && requestedTrustLevel === "local-hmac") {
+    return {
+      ok: false,
+      content:
+        "refused: [AUTH_TRUST_LEVEL] benchmark mode refuses an explicit trustLevel \"local-hmac\"; use external-signer, human-approved, or ci-attested (or omit trustLevel for the documented local-hmac default). Nothing was written.",
+      refused: "AUTH_TRUST_LEVEL",
+    }
+  }
+  const benchmarkTrustWarning =
+    integrityMode === "benchmark" && trustLevel === "local-hmac"
+      ? "\n⚠ Benchmark integrity with trustLevel local-hmac: verdicts are tamper-evident only against a run-dir-only writer; a same-UID shell can mint HMAC envelopes."
+      : ""
   // An explicit skip is a recorded completion bypass and must carry a reason.
   // The reason is part of the signed baseline: a re-plan may repeat it, never
   // change it. The legacy no-baseline default skip is exempt (it cannot carry
@@ -2737,6 +2977,14 @@ async function createPlanRun(
     const baselineHandoffs = normalizeHandoffMode(existingManifest.requireHandoffs) ?? "skip"
     if (baselineHandoffs !== requireHandoffsMode) {
       modeDrift.push(`requireHandoffs (${baselineHandoffs} -> ${requireHandoffsMode})`)
+    }
+    const baselineTrust = normalizeTrustLevel(existingManifest.trustLevel) ?? DEFAULT_TRUST_LEVEL
+    if (baselineTrust !== trustLevel) {
+      modeDrift.push(`trustLevel (${baselineTrust} -> ${trustLevel})`)
+    }
+    const baselineWitness = existingManifest.requireWitness === true
+    if (baselineWitness !== requireWitness) {
+      modeDrift.push(`requireWitness (${baselineWitness} -> ${requireWitness})`)
     }
     if (modeDrift.length > 0) {
       return {
@@ -2939,6 +3187,8 @@ async function createPlanRun(
     verification: verificationMode,
     victoryAudit: victoryAuditMode,
     victoryAuditSource,
+    trustLevel,
+    requireWitness,
     ...(victorySkipReason ? { victorySkipReason } : {}),
     requireHandoffs: requireHandoffsMode,
     requireHandoffsSource,
@@ -2964,6 +3214,8 @@ async function createPlanRun(
         integrityMode,
         verification: verificationMode,
         victoryAudit: victoryAuditMode,
+        trustLevel,
+        requireWitness,
         ...(victorySkipReason ? { victorySkipReason } : {}),
         requireHandoffs: requireHandoffsMode,
         ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
@@ -2985,6 +3237,8 @@ async function createPlanRun(
           (state.integrityMode !== integrityMode ||
             state.verification !== verificationMode ||
             state.victoryAudit !== victoryAuditMode ||
+            state.trustLevel !== trustLevel ||
+            state.requireWitness !== requireWitness ||
             state.victorySkipReason !== victorySkipReason ||
             state.requireHandoffs !== requireHandoffsMode ||
             state.rootSessionId !== rootSessionId ||
@@ -2994,6 +3248,8 @@ async function createPlanRun(
           state.integrityMode = integrityMode
           state.verification = verificationMode
           state.victoryAudit = victoryAuditMode
+          state.trustLevel = trustLevel
+          state.requireWitness = requireWitness
           if (victorySkipReason) state.victorySkipReason = victorySkipReason
           else delete state.victorySkipReason
           state.requireHandoffs = requireHandoffsMode
@@ -3052,6 +3308,17 @@ async function createPlanRun(
       }
     }
     try {
+      // A new signed run gets a fresh 128-bit nonce. A re-plan reuses the
+      // manifest's nonce; an older manifest without one stays legacy-shaped.
+      const runNonce = existingManifest
+        ? existingManifest.runNonce
+        : randomBytes(16).toString("base64url")
+      if (runNonce) {
+        const bound = await auth.bindRunNonce(sessionId, runNonce)
+        if (!bound.ok) throw new AuthError(bound.failure)
+      }
+      const boundKey = await auth.bindRunKeyId(sessionId, authReady.keyId)
+      if (!boundKey.ok) throw new AuthError(boundKey.failure)
       const manifest: RunManifest = {
         version: RUN_MANIFEST_VERSION,
         sessionId,
@@ -3059,8 +3326,11 @@ async function createPlanRun(
         integrityMode,
         verification: verificationMode,
         victoryAudit: victoryAuditMode,
+        trustLevel,
+        requireWitness,
         ...(victorySkipReason ? { victorySkipReason } : {}),
         requireHandoffs: requireHandoffsMode,
+        ...(runNonce ? { runNonce } : {}),
         requestHash: baselineRequestHash,
         requirementsHash: baselineRequirementsHash,
         planHash: baselinePlanHash,
@@ -3176,7 +3446,7 @@ async function createPlanRun(
     tasks,
     topology,
     integrityMode,
-    content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\n${preflightLine}\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.\nVerification: ${verificationMode}${verificationMode === "strict" ? " (one falsifier challenge + one security-auditor audit per task)" : ""}.\nVictory audit: ${victoryAuditMode}${victoryAuditSource === "caller" ? " (explicit)" : ""}${victorySkipReason ? ` (reason: ${clean(victorySkipReason, 500)})` : ""}${requirementsBaseline ? `; requirements baseline ${requirementsBaseline.items.length} item(s) from ${requirementsBaseline.source} (requirements.json)` : "; no requirements baseline"}.\nHandoff gate: ${requireHandoffsMode}${requireHandoffsSource === "caller" ? " (explicit)" : requireHandoffsSource === "unsigned" ? " (unsigned legacy baseline records skip)" : ""}.\nAuthenticity: ${signedRun ? `signed baseline (run.manifest.json; key ${clean(authReady.ok ? authReady.keyId : "unknown", 64)})` : "UNSIGNED LEGACY (allowUnsignedLegacy: true; final_verify/next require the recorded bypass)"}.${specGate === "bypassed" ? "\n⚠ Spec presence gate bypassed (skipInterview: true): planned without an approved prompt_draft.md; the bypass is caller-controlled and recorded, not proof of approval." : ""}${preflight.bypassed ? `\n⚠ Input preflight bypassed (allowMissingInputs: true): ${preflight.status}.` : ""}${creditWarning}`,
+    content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\n${preflightLine}\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.\nVerification: ${verificationMode}${verificationMode === "strict" ? " (one falsifier challenge + one security-auditor audit per task)" : ""}.\nVictory audit: ${victoryAuditMode}${victoryAuditSource === "caller" ? " (explicit)" : ""}${victorySkipReason ? ` (reason: ${clean(victorySkipReason, 500)})` : ""}${requirementsBaseline ? `; requirements baseline ${requirementsBaseline.items.length} item(s) from ${requirementsBaseline.source} (requirements.json)` : "; no requirements baseline"}.\nHandoff gate: ${requireHandoffsMode}${requireHandoffsSource === "caller" ? " (explicit)" : requireHandoffsSource === "unsigned" ? " (unsigned legacy baseline records skip)" : ""}.\nTrust level: ${trustLevel}${requireWitness ? "; witness required" : ""}.\nAuthenticity: ${signedRun ? `signed baseline (run.manifest.json; key ${clean(authReady.ok ? authReady.keyId : "unknown", 64)})` : "UNSIGNED LEGACY (allowUnsignedLegacy: true; final_verify/next require the recorded bypass)"}.${benchmarkTrustWarning}${specGate === "bypassed" ? "\n⚠ Spec presence gate bypassed (skipInterview: true): planned without an approved prompt_draft.md; the bypass is caller-controlled and recorded, not proof of approval." : ""}${preflight.bypassed ? `\n⚠ Input preflight bypassed (allowMissingInputs: true): ${preflight.status}.` : ""}${creditWarning}`,
   }
 }
 
@@ -3232,6 +3502,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             type: "string",
             description:
               "required | skip. Default required for a new run with a request/requirements baseline, skip for a legacy/unsigned run. Required makes final_verify and next demand the continuity handoff matrix (assigned worker + verifier per task, falsifier + security-auditor per task in strict mode, one sentinel/orchestrator run-level, and the victory-auditor handoff when victoryAudit is required). Persisted in plan.dag.json, state.json and the signed manifest; a re-plan may repeat but not change it. Benchmark mode refuses skip.",
+          },
+          trustLevel: {
+            type: "string",
+            description:
+              "local-hmac | external-signer | human-approved | ci-attested. Default local-hmac. Persisted in plan.dag.json, state.json and the signed run.manifest.json; a re-plan may repeat but not change it. external-signer requires an Ed25519 key (local key ring or OPENCODE_TEAMWORK_SIGNER=command:<path>) and final_verify refuses an HMAC envelope. human-approved requires a signed approvals/<run>.json bound to the run manifest; ci-attested requires a signed CI attestation artifact. Benchmark refuses an explicit local-hmac.",
+          },
+          requireWitness: {
+            type: "boolean",
+            description:
+              "Default false. When true, final_verify requires a recorded witness receipt for the run manifest (OPENCODE_TEAMWORK_WITNESS=command:<path> or http(s)://<url>). A configured witness is appended on every signed artifact write; an unavailable/malformed witness fails closed with AUTH_WITNESS_UNAVAILABLE. A local file witness is detection-only.",
           },
           budgetUsd: { type: "number", description: "Run budget in USD. When using opencode/ models + opencode_console, derive this from credits (full or partial, per the user's choice)." },
           budgetSource: { type: "string", description: "Where the budget came from: credits | default | manual." },
@@ -6718,6 +6998,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               }
             }
           }
+          const trustLevel: TrustLevel = signedRun
+            ? normalizeTrustLevel(manifestCheck.manifest.trustLevel) ?? DEFAULT_TRUST_LEVEL
+            : DEFAULT_TRUST_LEVEL
+          const observedAlgs: Array<string | undefined> = []
           // SEC-1: null-prototype map; ids are read as data, never used as paths
           // unless they pass isSafeTaskId.
           const taskStates = nullMap<any>(state.tasks)
@@ -6761,6 +7045,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 } else if (check.status !== "signed") {
                   const failure = check.failure ?? { code: "AUTH_INVALID" as const, message: "report failed verification" }
                   authReasons.push(`task ${id}: [${failure.code}] ${failure.message}`)
+                } else {
+                  observedAlgs.push(check.auth?.alg)
                 }
               }
             }
@@ -6784,6 +7070,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             } else if (check.status !== "signed") {
               const failure = check.failure ?? { code: "AUTH_INVALID" as const, message: "security audit failed verification" }
               authReasons.push(`[${failure.code}] ${failure.message}`)
+            } else {
+              observedAlgs.push(check.auth?.alg)
             }
           }
           const allTasksVerifiedPass = tasks.length > 0 && tasks.every((t) => t.status === "verified_pass")
@@ -6801,6 +7089,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
           if (securityAudit.status !== "PASS") reasons.push(`security audit: ${securityAudit.status}`)
           reasons.push(...authReasons)
+          if (signedRun) {
+            reasons.push(
+              ...(await evaluateTrustGate(run, basename(run), manifestCheck.manifest, auth, trustLevel, observedAlgs)),
+            )
+          }
 
           // Opt-in strict wave: recompute the per-task challenge/audit evidence.
           // A missing or non-PASS/CLEAN verdict is a named FAIL reason. Standard

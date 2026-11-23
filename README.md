@@ -140,7 +140,8 @@ topologies, and the JSON schemas (`spec.json`, `plan.dag.json`, `state.json`,
 ### Completion guarantees
 
 - `verified_pass` requires a legal lifecycle transition and PASS evidence (an inline PASS verdict or a `PASS` per-task report).
-- A plan writes a signed `run.manifest.json` (the default). Verifier reports, security audit, strict-wave verdicts, victory verdict, and final verdict carry an HMAC `_auth` envelope and a `ctx.storage` digest-index entry. `final_verify`/`next` fail as `AUTH_MISSING`, `AUTH_INVALID`, `AUTH_UNKNOWN_KEY`, `AUTH_INDEX_MISSING`, or `AUTH_STALE` when an artifact is forged, copied, edited, or the signed plan/requirements/policy baseline drifts. See [`docs/adr/0005-artifact-authenticity.md`](docs/adr/0005-artifact-authenticity.md).
+- A plan writes a signed `run.manifest.json` (the default). Verifier reports, security audit, strict-wave verdicts, victory verdict, and final verdict carry an `_auth` envelope and a `ctx.storage` digest-index entry. `final_verify`/`next` fail as `AUTH_MISSING`, `AUTH_INVALID`, `AUTH_UNKNOWN_KEY`, `AUTH_INDEX_MISSING`, or `AUTH_STALE` when an artifact is forged, copied, edited, or the signed plan/requirements/policy baseline drifts. See [`docs/adr/0005-artifact-authenticity.md`](docs/adr/0005-artifact-authenticity.md).
+- `_auth` supports HMAC-SHA256 (backward-compatible `mac`) and Ed25519 (`sig`). Every new signed run pins a 128-bit `runNonce` and `runKeyId` in the manifest, so a cross-run copy or a rotated re-sign fails. With Ed25519, verification needs only the SPKI public key. `teamwork_plan` also records `trustLevel` (`local-hmac` default, `external-signer`, `human-approved`, `ci-attested`) and optional `requireWitness`; `final_verify` enforces the level, and `OPENCODE_TEAMWORK_SIGNER`/`OPENCODE_TEAMWORK_WITNESS` fail closed (`AUTH_SIGNER_UNAVAILABLE`/`AUTH_WITNESS_UNAVAILABLE`). See [`docs/adr/0008-signer-spi-and-trust-levels.md`](docs/adr/0008-signer-spi-and-trust-levels.md) and [`SECURITY.md`](SECURITY.md).
 - A run completes only with a `PASS` `verify/final.json` stamped by `teamwork_final_verify`; an unstamped report needs the recorded `allowUnstamped` bypass. An unsigned legacy run returns `AUTH_LEGACY` until the recorded `allowUnsignedLegacy` bypass is passed at the completion gate; `benchmark` refuses that bypass, `victoryAudit: "skip"`, and `requireHandoffs: "skip"`.
 - `teamwork_victory_audit`, `teamwork_wave_record`, and `teamwork_report` require the caller session to descend from the plan-time `rootSessionId`, so a top-level `opencode run --agent team/victory-auditor` cannot self-authorize.
 - That PASS also needs a `verify/victory.json` from the independent `team/victory-auditor` reporting `VICTORY CONFIRMED` for every requirement and the current `ORIGINAL_REQUEST.md` hash, unless the plan explicitly recorded `victoryAudit: "skip"` with a non-empty `victorySkipReason` (then `final_verify` records `victory: "SKIPPED (explicit): <reason>"`). A skip without a reason is refused; the legacy no-baseline default is labelled `SKIPPED (legacy default: no requirements baseline)`.
@@ -488,23 +489,31 @@ LEMMA is an explicit opt-in capability-gated route (`topology: "proof"`, `lemmaM
 - **Security:** the guardrail model (path containment, server-derived session
   ids, read-only enforcement, signed control-plane artifacts, sanitised context
   injection, non-destructive installers) is documented in
-  [`docs/GUARDRAILS.md`](docs/GUARDRAILS.md). Artifact authenticity is Phase A:
-  it makes a run-dir-only forgery tamper-evident, but **a same-UID shell with
-  read access to `opencode.db` / the plugin KV store can read the HMAC key**.
-  Phase B is assessed in
+  [`docs/GUARDRAILS.md`](docs/GUARDRAILS.md) and
+  [`SECURITY.md`](SECURITY.md). Artifact authenticity is tamper-evident against
+  a run-dir-only writer, but **a same-UID shell with read access to
+  `opencode.db` / the plugin KV store can read a local HMAC or Ed25519 private
+  key** and can call a same-UID command signer. Phase B is assessed in
   [`docs/adr/0006-artifact-trust-isolation.md`](docs/adr/0006-artifact-trust-isolation.md);
   the Phase A decision is in
-  [`docs/adr/0005-artifact-authenticity.md`](docs/adr/0005-artifact-authenticity.md).
+  [`docs/adr/0005-artifact-authenticity.md`](docs/adr/0005-artifact-authenticity.md);
+  the Ed25519 signer SPI, public-key verification, trust levels and witness are
+  in [`docs/adr/0008-signer-spi-and-trust-levels.md`](docs/adr/0008-signer-spi-and-trust-levels.md).
   The `team/security-auditor` agent audits a repo with a clean context.
 - Docs: <https://opencode.ai/v2/docs/build/plugins>
 
-> **Artifact-trust boundary (ADR 0005/0006):** signed control-plane artifacts
-> are tamper-evident against a writer limited to the run directory. They are
-> **not** protected against a same-UID shell: the HMAC key lives in
-> `opencode.db` (mode `0600`, same user), so a local shell can read it and mint
-> valid envelopes. No in-process, zero-dependency control fixes this; Phase B
-> needs a different privilege domain (admin-only: separate UID/system service,
-> TPM/`tss` access, or SELinux labels) and a non-oracle signing decision. See
+> **Artifact-trust boundary (ADR 0005/0006/0008):** signed control-plane
+> artifacts are tamper-evident against a writer limited to the run directory.
+> They are **not** protected against a same-UID shell: a local HMAC or Ed25519
+> private key lives in `opencode.db` (mode `0600`, same user) or the
+> environment, so a local shell can read it and mint envelopes; a same-UID
+> command signer is callable by that shell too. Ed25519 makes verification
+> possible with only a public key, but no in-process, zero-dependency control
+> creates a different privilege domain. The hardened profile needs an
+> admin/deployment change (separate UID or remote signer, plus human approval or
+> an independent verifier) and is documented in
+> [`SECURITY.md`](SECURITY.md). See
+> [`docs/adr/0008-signer-spi-and-trust-levels.md`](docs/adr/0008-signer-spi-and-trust-levels.md),
 > [`docs/adr/0006-artifact-trust-isolation.md`](docs/adr/0006-artifact-trust-isolation.md)
 > and [`docs/adr/0005-artifact-authenticity.md`](docs/adr/0005-artifact-authenticity.md).
 

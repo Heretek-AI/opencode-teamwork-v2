@@ -235,7 +235,7 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
   handoff gate, so it records `requireHandoffs: "skip"`. `benchmark` refuses the
   bypass and refuses both `victoryAudit: "skip"` and `requireHandoffs: "skip"`.
 
-### `_auth` envelopes and the digest index (ADR 0005)
+### `_auth` envelopes and the digest index (ADR 0005/0008)
 
 Every signed control-plane artifact carries an `_auth` object in addition to its
 normal fields:
@@ -243,29 +243,59 @@ normal fields:
 | Field | Meaning |
 | --- | --- |
 | `v` | envelope version (`1`) |
-| `alg` | `hmac-sha256` |
-| `keyId` | key used (current or one of up to two previous keys) |
+| `alg` | `hmac-sha256` (field `mac`) or `ed25519` (field `sig`) |
+| `keyId` | key used (current or retired ring key); must equal the signed manifest's `runKeyId` |
 | `path` | exact run-relative path; a copied envelope fails |
 | `digest` | sha256 of `canonicalJson(payload without _auth)` |
-| `mac` | HMAC-SHA256 over the envelope without `mac` |
+| `mac` | HMAC-SHA256 over the envelope without `mac` (`hmac-sha256` only) |
+| `sig` | base64url Ed25519 signature over `"teamwork-artifact-v1\0alg\0keyId\0path\0nonce\0canonicalJson(payload)"` (`ed25519` only) |
+| `nonce` | per-run 128-bit nonce; required for `ed25519`, bound to the run for both algorithms |
 | `at` | ISO-8601 timestamp |
 
+Every new signed run writes a `runNonce` and `runKeyId` into the signed
+`run.manifest.json`; the plugin binds both at `auth/run/<runId>/.nonce` and
+`.keyid`. Artifacts signed for that run carry the nonce and must match the key
+id, so a copy from another run or a re-sign with a rotated key fails.
+
 The plugin also writes `ctx.storage` key `auth/run/<runId>/<relPath>` with the
-same `path`/`digest`/`keyId`/`mac`/`at`. A signed run fails closed when the
-index entry is missing (`AUTH_INDEX_MISSING`) or stale (`AUTH_STALE`); an old
-artifact is never auto-adopted. The key ring lives at `auth/key/ring`
-(`{version: 1, keys: [...]}`), current + up to two previous keys. A malformed
-ring is `AUTH_KEY_CORRUPT` and is never silently rotated. CI/offline can set
-`OPENCODE_TEAMWORK_HMAC_KEY` (base64url, 32 bytes) and
-`OPENCODE_TEAMWORK_HMAC_KEY_ID`.
+same `path`/`digest`/`keyId`/`alg`/`mac` or `sig`/`nonce`/`at`. A signed run
+fails closed when the index entry is missing (`AUTH_INDEX_MISSING`) or stale
+(`AUTH_STALE`); an old artifact is never auto-adopted. The key ring lives at
+`auth/key/ring` (`{version: 1, keys: [...]}`), current + up to two previous
+keys; entries may be `hmac-sha256` or `ed25519` (PKCS#8 private key and/or SPKI
+public key). A malformed ring is `AUTH_KEY_CORRUPT` and is never silently
+rotated.
+
+Key configuration: `OPENCODE_TEAMWORK_HMAC_KEY` + `_ID` (CI/offline HMAC),
+`OPENCODE_TEAMWORK_ED25519_PRIVATE_KEY` / `_PUBLIC_KEY` / `_KEY_ID` (local
+Ed25519, public-only verification allowed), or
+`OPENCODE_TEAMWORK_SIGNER=command:<absolute path>` +
+`OPENCODE_TEAMWORK_SIGNER_PUBLIC_KEY` (+ optional `_KEY_ID`, `_TIMEOUT_MS`) for
+an external Ed25519 signer. An optional witness is configured with
+`OPENCODE_TEAMWORK_WITNESS=command:<path>` or `http(s)://<url>` and receipts are
+stored at `auth/witness/<runId>/<relPath>`.
+
+`teamwork_plan` also records `trustLevel` (`local-hmac` default,
+`external-signer`, `human-approved`, `ci-attested`) and `requireWitness`.
+`final_verify` enforces them: `external-signer` refuses HMAC envelopes
+(`AUTH_TRUST_LEVEL`), `human-approved`/`ci-attested` require a signed
+`approvals/<runId>.json` bound to the manifest digest (`AUTH_APPROVAL_MISSING`),
+and a required witness without a receipt fails `AUTH_WITNESS_UNAVAILABLE`.
+`OPENCODE_TEAMWORK_SIGNER` that is configured but unavailable/malformed fails
+`AUTH_SIGNER_UNAVAILABLE`; there is no fallback to local HMAC.
 
 Failure vocabulary: `AUTH_UNAVAILABLE`, `AUTH_KEY_CORRUPT`, `AUTH_MISSING`,
 `AUTH_INVALID`, `AUTH_UNKNOWN_KEY`, `AUTH_INDEX_MISSING`, `AUTH_STALE`,
-`AUTH_LEGACY`.
+`AUTH_LEGACY`, `AUTH_SIGNER_UNAVAILABLE`, `AUTH_WITNESS_UNAVAILABLE`,
+`AUTH_TRUST_LEVEL`, `AUTH_APPROVAL_MISSING`.
 
 > **Boundary.** A same-UID shell with read access to `opencode.db` / the plugin
-> KV store can read the key. Phase A makes a run-dir-only forgery evident; it
-> does not isolate the key. See `docs/adr/0005-artifact-authenticity.md`.
+> KV store can read a local HMAC or Ed25519 private key and mint envelopes, and
+> can call a same-UID command signer. Ed25519 makes verification possible with
+> only a public key; it does not isolate the key. See
+> `docs/adr/0005-artifact-authenticity.md`,
+> `docs/adr/0006-artifact-trust-isolation.md`,
+> `docs/adr/0008-signer-spi-and-trust-levels.md` and `SECURITY.md`.
 
 ### `spec.json` — one per dispatched worker (written by the sentinel)
 

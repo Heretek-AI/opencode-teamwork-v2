@@ -1,5 +1,5 @@
 import { registerTeamworkTools, registerTeamworkHooks, describeRun, touch, nextEventSeq } from "../plugins/opencode-teamwork/tools.ts"
-import { createAuthContext, canonicalJson, sha256Hex } from "../plugins/opencode-teamwork/auth.ts"
+import { createAuthContext, canonicalJson, payloadDigest, sha256Hex } from "../plugins/opencode-teamwork/auth.ts"
 import {
   analyzeLeanDeclarations,
   bindVerifiedDeclaration,
@@ -56,7 +56,7 @@ import { createServer } from "node:http"
 import { execFileSync, spawn, spawnSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { deflateSync } from "node:zlib"
-import { createHash, randomBytes } from "node:crypto"
+import { createHash, generateKeyPairSync, randomBytes } from "node:crypto"
 import assert from "node:assert"
 
 // Absolute git binary for the new worktree assertions; never PATH-resolved.
@@ -302,7 +302,7 @@ function makeSeedVerifiedRun(tools, ctx, root) {
   return async (
     runId,
     taskIds,
-    { request, integrityMode, auditStatus = "PASS", stampVictory = request !== undefined, victoryAudit, victorySkipReason, verification, allowUnsignedLegacy, requireHandoffs, handoffs = true } = {},
+    { request, integrityMode, auditStatus = "PASS", stampVictory = request !== undefined, victoryAudit, victorySkipReason, verification, allowUnsignedLegacy, requireHandoffs, handoffs = true, trustLevel, requireWitness } = {},
   ) => {
     await tools.plan.execute(
       {
@@ -319,6 +319,8 @@ function makeSeedVerifiedRun(tools, ctx, root) {
           : {}),
         ...(verification !== undefined ? { verification } : {}),
         ...(requireHandoffs !== undefined ? { requireHandoffs } : {}),
+        ...(trustLevel !== undefined ? { trustLevel } : {}),
+        ...(requireWitness !== undefined ? { requireWitness } : {}),
         ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
         tasks: taskIds.map((id) => ({ id })),
       },
@@ -7416,8 +7418,8 @@ process.exit(0);
       const copied = await registeredTools.final_verify.execute({ sessionId: targetRun })
       assert.strictEqual(copied.status, "FAIL", "a victory copied into another run must fail")
       assert(
-        copied.reasons.some((r) => r.includes("AUTH_INDEX_MISSING")),
-        `the missing index must be named: ${JSON.stringify(copied.reasons)}`,
+        copied.reasons.some((r) => r.includes("AUTH_INDEX_MISSING") || r.includes("nonce does not match")),
+        `a cross-run copy must name the nonce or the missing index: ${JSON.stringify(copied.reasons)}`,
       )
     }
 
@@ -7700,7 +7702,180 @@ process.exit(0);
       assert(fv.reasons.some((r) => r.includes("AUTH_MISSING") && r.includes("report-R1.json")), `the unsigned report must be named: ${JSON.stringify(fv.reasons)}`)
     }
 
-    console.log("✓ authenticity: forgery, tampering, copies, staleness, downgrades, rotation, legacy bypass, storage/env keys, session-tree binding, and the trusted report writer")
+    // Trust levels (ADR 0008): a run cannot silently complete at a weaker level
+    // than its signed manifest records.
+    {
+      const runId = "20261123-000022-auth-trust-external-hmac"
+      await seedVerifiedRun(runId, ["A1"], { request: "Trust level external-signer fixture.", victoryAudit: "skip" })
+      for (const name of ["plan.dag.json", "state.json"]) {
+        const file = runFile(testDir, runId, name)
+        const value = readJsonFile(file)
+        value.trustLevel = "external-signer"
+        writeJsonFile(file, value)
+      }
+      const manifest = readJsonFile(runFile(testDir, runId, "run.manifest.json"))
+      manifest.trustLevel = "external-signer"
+      writeJsonFile(
+        runFile(testDir, runId, "run.manifest.json"),
+        await authFor(testDir).signRunArtifact(runId, "run.manifest.json", manifest),
+      )
+      const fv = await registeredTools.final_verify.execute({ sessionId: runId })
+      assert.strictEqual(fv.status, "FAIL", `HMAC envelopes must not satisfy external-signer: ${fv.content}`)
+      assert(
+        fv.reasons.some((r) => r.includes("AUTH_TRUST_LEVEL")),
+        `the trust-level refusal must be named: ${JSON.stringify(fv.reasons)}`,
+      )
+    }
+
+    {
+      const runId = "20261123-000023-auth-trust-human-approval"
+      await seedVerifiedRun(runId, ["A1"], {
+        request: "Trust level human-approved fixture.",
+        victoryAudit: "skip",
+        trustLevel: "human-approved",
+      })
+      const missing = await registeredTools.final_verify.execute({ sessionId: runId })
+      assert.strictEqual(missing.status, "FAIL")
+      assert(
+        missing.reasons.some((r) => r.includes("AUTH_APPROVAL_MISSING")),
+        `a missing human approval must be named: ${JSON.stringify(missing.reasons)}`,
+      )
+      const manifest = readJsonFile(runFile(testDir, runId, "run.manifest.json"))
+      const approval = {
+        runId,
+        trustLevel: "human-approved",
+        approvedBy: "fixture-human",
+        at: new Date().toISOString(),
+        manifestDigest: payloadDigest(manifest),
+      }
+      writeJsonFile(
+        runFile(testDir, runId, `approvals/${runId}.json`),
+        await authFor(testDir).signArtifact(`approvals/${runId}.json`, approval, { nonce: manifest.runNonce }),
+      )
+      const approved = await registeredTools.final_verify.execute({ sessionId: runId })
+      assert.strictEqual(approved.status, "PASS", `a signed human approval must complete: ${approved.content}`)
+
+      const tampered = readJsonFile(runFile(testDir, runId, `approvals/${runId}.json`))
+      tampered.manifestDigest = "0".repeat(64)
+      writeJsonFile(runFile(testDir, runId, `approvals/${runId}.json`), tampered)
+      const stale = await registeredTools.final_verify.execute({ sessionId: runId })
+      assert.strictEqual(stale.status, "FAIL", "a tampered approval must fail")
+      assert(
+        stale.reasons.some((r) => r.includes("AUTH_INVALID") && r.includes("approvals/")),
+        `a tampered approval must be named: ${JSON.stringify(stale.reasons)}`,
+      )
+    }
+
+    {
+      const runId = "20261123-000027-auth-trust-ci-attested"
+      await seedVerifiedRun(runId, ["A1"], {
+        request: "Trust level ci-attested fixture.",
+        victoryAudit: "skip",
+        trustLevel: "ci-attested",
+      })
+      const missing = await registeredTools.final_verify.execute({ sessionId: runId })
+      assert.strictEqual(missing.status, "FAIL")
+      assert(missing.reasons.some((r) => r.includes("AUTH_APPROVAL_MISSING")))
+      const manifest = readJsonFile(runFile(testDir, runId, "run.manifest.json"))
+      const attestation = {
+        runId,
+        trustLevel: "ci-attested",
+        attestedBy: "fixture-ci",
+        at: new Date().toISOString(),
+        manifestDigest: payloadDigest(manifest),
+      }
+      writeJsonFile(
+        runFile(testDir, runId, `approvals/${runId}.json`),
+        await authFor(testDir).signArtifact(`approvals/${runId}.json`, attestation, { nonce: manifest.runNonce }),
+      )
+      const attested = await registeredTools.final_verify.execute({ sessionId: runId })
+      assert.strictEqual(attested.status, "PASS", `a signed CI attestation must complete: ${attested.content}`)
+    }
+
+    {
+      // End-to-end Ed25519 at the tool layer: plan, seed, and final_verify all
+      // sign with a local Ed25519 key, so trustLevel external-signer completes.
+      const edRoot = mkdtempSync(join(testDir, "auth-external-"))
+      const pair = generateKeyPairSync("ed25519")
+      const envKeys = {
+        OPENCODE_TEAMWORK_ED25519_PRIVATE_KEY: pair.privateKey.export({ format: "der", type: "pkcs8" }).toString("base64url"),
+        OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: pair.publicKey.export({ format: "der", type: "spki" }).toString("base64url"),
+      }
+      const savedEnv = {}
+      for (const key of Object.keys(envKeys)) {
+        savedEnv[key] = process.env[key]
+        process.env[key] = envKeys[key]
+      }
+      try {
+        const edTools = await makeToolsFor(edRoot)
+        const edCtx = { session: { get: async (args) => fixtureSessionGet(args) }, storage: storageFor(edRoot) }
+        const seedEd = makeSeedVerifiedRun(edTools, edCtx, edRoot)
+        const runId = "20261123-000028-auth-trust-external-ed25519"
+        await seedEd(runId, ["A1"], {
+          request: "Ed25519 external-signer fixture.",
+          victoryAudit: "skip",
+          trustLevel: "external-signer",
+        })
+        const fv = await edTools.final_verify.execute({ sessionId: runId })
+        assert.strictEqual(fv.status, "PASS", `an Ed25519 run must complete at external-signer: ${fv.content}`)
+        const manifest = JSON.parse(readFileSync(join(edRoot, ".opencode", "teamwork", runId, "run.manifest.json"), "utf8"))
+        assert.strictEqual(manifest._auth.alg, "ed25519")
+        assert(typeof manifest.runNonce === "string" && manifest.runNonce.length >= 22)
+      } finally {
+        for (const [key, value] of Object.entries(savedEnv)) {
+          if (value === undefined) delete process.env[key]
+          else process.env[key] = value
+        }
+        rmSync(edRoot, { recursive: true, force: true })
+      }
+    }
+
+    {
+      const runId = "20261123-000024-auth-trust-witness"
+      await seedVerifiedRun(runId, ["A1"], {
+        request: "Trust level witness fixture.",
+        victoryAudit: "skip",
+        requireWitness: true,
+      })
+      const fv = await registeredTools.final_verify.execute({ sessionId: runId })
+      assert.strictEqual(fv.status, "FAIL")
+      assert(
+        fv.reasons.some((r) => r.includes("AUTH_WITNESS_UNAVAILABLE")),
+        `a required but missing witness must be named: ${JSON.stringify(fv.reasons)}`,
+      )
+    }
+
+    {
+      const externalPlan = await registeredTools.plan.execute({
+        sessionId: "20261123-000025-auth-trust-external-no-key",
+        topology: "iterative-coding",
+        skipInterview: true,
+        trustLevel: "external-signer",
+        victoryAudit: "skip",
+        victorySkipReason: "fixture: external-signer capability refusal only",
+        request: "External signer requires a key.",
+        tasks: [{ id: "E1" }],
+      })
+      assert(
+        externalPlan.content.includes("AUTH_SIGNER_UNAVAILABLE"),
+        `external-signer without an Ed25519 key must be refused: ${externalPlan.content}`,
+      )
+      const bench = await registeredTools.plan.execute({
+        sessionId: "20261123-000026-auth-trust-bench-hmac",
+        topology: "iterative-coding",
+        skipInterview: true,
+        integrityMode: "benchmark",
+        trustLevel: "local-hmac",
+        request: "Benchmark refuses explicit local-hmac.",
+        tasks: [{ id: "B1" }],
+      })
+      assert(
+        bench.content.includes("AUTH_TRUST_LEVEL"),
+        `benchmark must refuse an explicit local-hmac trust level: ${bench.content}`,
+      )
+    }
+
+    console.log("✓ authenticity: forgery, tampering, copies, staleness, downgrades, rotation, legacy bypass, storage/env keys, session-tree binding, trust levels, witness, and the trusted report writer")
   }
 
   // ==========================================
