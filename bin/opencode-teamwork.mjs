@@ -27,7 +27,7 @@ import {
 import { detectAvailableModels, pickModels, applyOverrides } from "../lib/picker.mjs"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import { runDoctor, nextSteps } from "../lib/doctor.mjs"
-import { collectSecurityReport } from "../lib/security.mjs"
+import { collectSecurityReport, hardenedExitCode } from "../lib/security.mjs"
 import { buildTimeline, renderTimeline, timelineWarnings } from "../lib/timeline.mjs"
 import { buildExportData, renderExport } from "../lib/export.mjs"
 
@@ -53,7 +53,9 @@ Commands:
   export     Render a run as an offline HTML report (default) or Markdown (-m)
   prune      Prune git worktrees for completed Teamwork runs
   doctor     Diagnose config, agents, model sync and git/worktree health
-             (--security adds key source, signer/witness, ptrace, groups, DB)
+             (--security adds key source, signer/witness, ptrace, groups, DB,
+             approval dir and containment; --require-hardened exits 2 on
+             any fail/unknown security check)
   help       Show this help
 
 Options:
@@ -62,6 +64,8 @@ Options:
       --model <id>=<m>   Override one agent (repeatable), id may omit the "team/" prefix
       --session <id>     Target a specific session ID (for inspect, prune or export)
       --json             Print doctor or timeline output as raw JSON
+      --security         Add the artifact-trust security posture section
+      --require-hardened With --security: exit 2 if any check is fail/unknown
       --html             Export as HTML (default for export)
   -m, --markdown         Export as Markdown (for export)
   -o, --output <file>    Export destination (for export); "-" streams to stdout
@@ -76,7 +80,7 @@ Options:
 `
 
 function parseArgs(argv) {
-  const options = { command: undefined, yes: false, all: undefined, assignments: {}, register: true, dryRun: false, refresh: false, configDir: undefined, session: undefined, json: false, noColor: false, help: false, markdown: false, output: undefined, security: false }
+  const options = { command: undefined, yes: false, all: undefined, assignments: {}, register: true, dryRun: false, refresh: false, configDir: undefined, session: undefined, json: false, noColor: false, help: false, markdown: false, output: undefined, security: false, requireHardened: false }
   const rest = [...argv]
   options.command = rest.shift()
   while (rest.length) {
@@ -119,6 +123,10 @@ function parseArgs(argv) {
         break
       case "--security":
         options.security = true
+        break
+      case "--require-hardened":
+        options.security = true
+        options.requireHardened = true
         break
       case "--html":
         options.markdown = false
@@ -472,7 +480,14 @@ function doctorCommand(options) {
   const configDir = resolveConfigDir(options.configDir)
   const report = runDoctor({ configDir, cwd: process.cwd() })
   const steps = nextSteps(report.checks)
-  const security = options.security || options.json ? collectSecurityReport({ env: process.env, configDir }) : undefined
+  const runDir =
+    typeof options.session === "string" && /^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$/.test(options.session)
+      ? join(process.cwd(), ".opencode", "teamwork", options.session)
+      : undefined
+  const security =
+    options.security || options.json
+      ? collectSecurityReport({ env: process.env, configDir, repoRoot: process.cwd(), ...(runDir ? { runDir } : {}) })
+      : undefined
 
   if (options.json) {
     // Additive: existing consumers still see { ok, checks }; nextSteps and
@@ -480,7 +495,7 @@ function doctorCommand(options) {
     console.log(
       JSON.stringify({ ...report, nextSteps: steps, ...(security ? { security } : {}) }, null, 2),
     )
-    process.exitCode = report.ok ? 0 : 1
+    process.exitCode = options.requireHardened && security ? hardenedExitCode(security) : report.ok ? 0 : 1
     return
   }
 
@@ -505,15 +520,28 @@ function doctorCommand(options) {
       const indicator = DOCTOR_INDICATORS[check.status] || DOCTOR_INDICATORS.fail
       console.log(`${indicator} ${check.name.padEnd(20)} ${check.message}`)
     }
+    const failedSecurity = security.failures.length
+    const unknownSecurity = security.unknowns.length
+    const securitySummary =
+      failedSecurity || unknownSecurity
+        ? `\n${failedSecurity} security failure(s), ${unknownSecurity} unknown check(s), ${security.warnings.length} warning(s).`
+        : security.warnings.length
+          ? `\n${security.warnings.length} security warning(s).`
+          : "\nNo security warnings."
     console.log(
-      security.warnings.length
-        ? `\n${security.warnings.length} security warning(s). Authenticity is tamper-evident against a run-dir-only writer; it is not a same-UID boundary (see SECURITY.md).`
-        : "\nNo security warnings. Authenticity is tamper-evident against a run-dir-only writer; it is not a same-UID boundary (see SECURITY.md).",
+      `${securitySummary} Authenticity is tamper-evident against a run-dir-only writer; it is not a same-UID boundary (see SECURITY.md).`,
     )
   }
   if (steps.length) {
     console.log("\nNext steps:")
     for (const step of steps) console.log(`  → ${step}`)
+  }
+  if (options.requireHardened) {
+    process.exitCode = security ? hardenedExitCode(security) : 2
+    if (process.exitCode === 2) {
+      console.log("\nHardened profile NOT satisfied: a fail or unknown security check is present.")
+    }
+    return
   }
   process.exitCode = report.ok ? 0 : 1
 }

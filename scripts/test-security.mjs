@@ -5,8 +5,9 @@
 // `scripts/lint-security-claims.mjs`. Host probes are overridden so the test
 // never depends on the developer's kernel groups or ptrace setting.
 
-import { collectSecurityReport, SECURITY_CHECK_NAMES } from "../lib/security.mjs"
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
+import { collectSecurityReport, hardenedExitCode, SECURITY_CHECK_NAMES } from "../lib/security.mjs"
+import { TEAM_AGENTS } from "../lib/team.mjs"
+import { mkdtempSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -19,9 +20,36 @@ const cliPath = join(root, "bin", "opencode-teamwork.mjs")
 const lintPath = join(root, "scripts", "lint-security-claims.mjs")
 const testDir = mkdtempSync(join(tmpdir(), "teamwork-security-test-"))
 
+/** Make the doctor's own environment checks pass (warnings are fine). */
+function fakeInstalledConfig(configDir) {
+  const agentDir = join(configDir, "agents", "team")
+  mkdirSync(agentDir, { recursive: true })
+  for (const agent of TEAM_AGENTS) writeFileSync(join(agentDir, agent.file), `# ${agent.id} fixture\n`)
+}
+
+const allPassOptions = (overrides = {}) => ({
+  env: { OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: "fixture-public-key" },
+  platform: "linux",
+  configDir: join(testDir, "absent-config"),
+  pluginDir: join(testDir, "absent-plugin"),
+  ptraceScope: "1",
+  groupFile: join(testDir, "group-pass"),
+  groups: [1000],
+  dbPath: join(testDir, "absent.db"),
+  selinux: "1",
+  euid: 4242,
+  repoRoot: join(testDir, "repo"),
+  containmentMode: "pinned",
+  readContainment: true,
+  ...overrides,
+})
+
 try {
+  writeFileSync(join(testDir, "group-pass"), "users:x:1000:\nstaff:x:1001:\n")
+  mkdirSync(join(testDir, "repo"), { recursive: true })
+
   // ==========================================================================
-  // 1. Security posture: docker group + ptrace_scope=0 are named warnings
+  // 1. Security posture: docker group + ptrace_scope=0 are named failures
   // ==========================================================================
   {
     console.log("Testing the doctor security posture probes...")
@@ -29,6 +57,7 @@ try {
     writeFileSync(groupFile, "root:x:0:\nwheel:x:10:fixture\nsudo:x:27:\ndocker:x:998:fixture\n")
     const configDir = join(testDir, "config")
     mkdirSync(configDir, { recursive: true })
+    fakeInstalledConfig(configDir)
     const report = collectSecurityReport({
       env: {},
       platform: "linux",
@@ -39,29 +68,37 @@ try {
       groups: [0, 10, 27, 998],
       dbPath: join(testDir, "opencode.db"),
       selinux: "1",
+      euid: 4242,
+      repoRoot: join(testDir, "repo"),
+      containmentMode: "pinned",
+      readContainment: true,
     })
-    assert.strictEqual(report.ok, true, "warnings must not make the report fail")
+    assert.strictEqual(report.ok, false, "knowable failures must make the posture not-ok")
     assert.deepStrictEqual(
       report.checks.map((c) => c.name),
       SECURITY_CHECK_NAMES,
       "the security check names must be stable",
     )
     const ptrace = report.checks.find((c) => c.name === "ptrace_scope")
-    assert.strictEqual(ptrace.status, "warn", "ptrace_scope=0 must warn")
+    assert.strictEqual(ptrace.status, "fail", "ptrace_scope=0 must fail")
     assert(/same-UID/.test(ptrace.message))
     const groups = report.checks.find((c) => c.name === "privileged_groups")
-    assert.strictEqual(groups.status, "warn", "docker/wheel membership must warn")
+    assert.strictEqual(groups.status, "fail", "docker/wheel membership must fail")
     assert(/docker/.test(groups.message) && /wheel/.test(groups.message), groups.message)
-    assert(report.warnings.some((w) => w.startsWith("ptrace_scope:")))
-    assert(report.warnings.some((w) => w.startsWith("privileged_groups:")))
+    assert(report.failures.some((c) => c.name === "ptrace_scope"))
+    assert(report.failures.some((c) => c.name === "privileged_groups"))
+    assert.strictEqual(hardenedExitCode(report), 2, "a failure must hard-fail the hardened profile")
 
-    // The CLI exposes the same section in text and JSON.
+    // The CLI exposes the same section in text and JSON. Plain --security stays
+    // advisory: exit 0 with a warning/failure summary.
     const text = spawnSync(process.execPath, [cliPath, "doctor", "--security", "--config-dir", configDir], {
       encoding: "utf8",
     })
+    assert.strictEqual(text.status, 0, `plain doctor --security must exit 0: ${text.stdout}${text.stderr}`)
     assert(text.stdout.includes("Artifact-trust security posture"), text.stdout + text.stderr)
     assert(text.stdout.includes("key_source"))
     assert(text.stdout.includes("ptrace_scope"))
+    assert(/security failure\(s\)|security warning\(s\)|No security warnings/.test(text.stdout), text.stdout)
 
     const json = spawnSync(process.execPath, [cliPath, "doctor", "--json", "--config-dir", configDir], {
       encoding: "utf8",
@@ -71,11 +108,118 @@ try {
     assert.deepStrictEqual(parsed.security.checks.map((c) => c.name), SECURITY_CHECK_NAMES)
     assert(parsed.checks.length === 7, "the original seven doctor checks must remain unchanged")
 
-    console.log("✓ doctor security flags docker/wheel membership and ptrace_scope=0 in text and JSON")
+    console.log("✓ doctor security reports failures, plain --security exits 0, and the hardened helper returns 2")
   }
 
   // ==========================================================================
-  // 2. Claim lint: forbidden phrase fails, a negated boundary note passes
+  // 2. --require-hardened exits 2 on a knowable failure
+  // ==========================================================================
+  {
+    console.log("Testing --require-hardened exit codes...")
+    const configDir = join(testDir, "config-hardened")
+    mkdirSync(configDir, { recursive: true })
+    const env = {
+      ...process.env,
+      OPENCODE_TEAMWORK_SIGNER: `command:${join(testDir, "missing-signer")}`,
+      OPENCODE_TEAMWORK_SIGNER_PUBLIC_KEY: "fixture-public-key",
+      OPENCODE_TEAMWORK_APPROVAL_DIR: "",
+    }
+    const hardened = spawnSync(process.execPath, [cliPath, "doctor", "--require-hardened", "--config-dir", configDir], {
+      encoding: "utf8",
+      env,
+    })
+    assert.strictEqual(hardened.status, 2, `a fail must exit 2: ${hardened.stdout}${hardened.stderr}`)
+    assert(/configured signer path/.test(hardened.stdout), hardened.stdout)
+
+    const allPass = collectSecurityReport(allPassOptions())
+    assert.strictEqual(allPass.ok, true, JSON.stringify(allPass.failures))
+    assert.strictEqual(hardenedExitCode(allPass), 0, "an all-pass fixture must exit 0")
+
+    // A non-Linux host cannot inspect ptrace/groups: unknown, not safe.
+    const nonLinux = collectSecurityReport(
+      allPassOptions({ platform: "darwin", ptraceScope: undefined, groups: [] }),
+    )
+    assert.strictEqual(nonLinux.checks.find((c) => c.name === "ptrace_scope").status, "unknown")
+    assert.strictEqual(nonLinux.checks.find((c) => c.name === "privileged_groups").status, "unknown")
+    assert.strictEqual(hardenedExitCode(nonLinux), 2, "unknown checks must refuse the hardened profile")
+
+    console.log("✓ --require-hardened exits 2 on fail/unknown and 0 only when every check passes")
+  }
+
+  // ==========================================================================
+  // 3. Caller-owned signer / approval dir failures
+  // ==========================================================================
+  {
+    console.log("Testing caller-owned signer and approval directory probes...")
+    const signerPath = join(testDir, "signer.sh")
+    writeFileSync(signerPath, "#!/bin/sh\nexit 0\n")
+    const signerReport = collectSecurityReport(
+      allPassOptions({
+        env: {
+          OPENCODE_TEAMWORK_SIGNER: `command:${signerPath}`,
+          OPENCODE_TEAMWORK_SIGNER_PUBLIC_KEY: "fixture-public-key",
+        },
+        euid: statSync(signerPath).uid,
+      }),
+    )
+    const signerCheck = signerReport.checks.find((c) => c.name === "signer")
+    assert.strictEqual(signerCheck.status, "fail", signerCheck.message)
+    assert(/owned|writable/.test(signerCheck.message), signerCheck.message)
+
+    const approvalDir = join(testDir, "writable-approvals")
+    mkdirSync(approvalDir, { recursive: true })
+    const approvalReport = collectSecurityReport(
+      allPassOptions({
+        env: { OPENCODE_TEAMWORK_APPROVAL_DIR: approvalDir },
+        euid: statSync(approvalDir).uid,
+      }),
+    )
+    const approvalCheck = approvalReport.checks.find((c) => c.name === "approval_dir")
+    assert.strictEqual(approvalCheck.status, "fail", approvalCheck.message)
+    assert(/owned or writable/.test(approvalCheck.message), approvalCheck.message)
+
+    const insideRepo = join(testDir, "repo", "approvals")
+    mkdirSync(insideRepo, { recursive: true })
+    const insideReport = collectSecurityReport(
+      allPassOptions({
+        env: { OPENCODE_TEAMWORK_APPROVAL_DIR: insideRepo },
+        euid: statSync(insideRepo).uid + 1,
+        repoRoot: join(testDir, "repo"),
+      }),
+    )
+    const insideCheck = insideReport.checks.find((c) => c.name === "approval_dir")
+    assert.strictEqual(insideCheck.status, "fail", insideCheck.message)
+    assert(/inside the repository/.test(insideCheck.message), insideCheck.message)
+
+    const runRoot = join(testDir, "fixture-run")
+    const insideRunDir = join(runRoot, "approvals")
+    mkdirSync(insideRunDir, { recursive: true })
+    const insideRunReport = collectSecurityReport(
+      allPassOptions({
+        env: { OPENCODE_TEAMWORK_APPROVAL_DIR: insideRunDir },
+        euid: statSync(insideRunDir).uid + 1,
+        repoRoot: join(testDir, "repo"),
+        runDir: runRoot,
+      }),
+    )
+    const insideRunCheck = insideRunReport.checks.find((c) => c.name === "approval_dir")
+    assert.strictEqual(insideRunCheck.status, "fail", insideRunCheck.message)
+    assert(/inside the run directory/.test(insideRunCheck.message), insideRunCheck.message)
+
+    const detectiveReport = collectSecurityReport(
+      allPassOptions({
+        env: { OPENCODE_TEAMWORK_WITNESS: "command:/usr/bin/fixture-witness" },
+        containmentMode: "detective",
+      }),
+    )
+    const containment = detectiveReport.checks.find((c) => c.name === "containment")
+    assert.strictEqual(containment.status, "fail", containment.message)
+
+    console.log("✓ caller-owned signer and approval dirs fail; asserted trust levels require pinned containment")
+  }
+
+  // ==========================================================================
+  // 4. Claim lint: forbidden phrase fails, a negated boundary note passes
   // ==========================================================================
   {
     console.log("Testing the security-claim lint...")
