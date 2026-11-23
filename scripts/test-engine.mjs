@@ -20,6 +20,7 @@ import {
 } from "../plugins/opencode-teamwork/lemma.ts"
 import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
 import { renderGateStatus } from "../plugins/opencode-teamwork/strict.ts"
+import { assertSafeUrl, blockedAddressReason } from "../plugins/opencode-teamwork/url-guard.ts"
 import { refreshRunBriefing, MAX_BRIEFING_BYTES } from "../plugins/opencode-teamwork/briefing.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import {
@@ -70,6 +71,7 @@ const ESC_CHAR = String.fromCharCode(27)
 // digest index. No env key is set for the suite; dedicated cases opt in.
 // ---------------------------------------------------------------------------
 const FIXTURE_ROOT_SESSION = "ses_fixture_root"
+const ALLOW_LOCALHOST_ENV = "OPENCODE_TEAMWORK_ALLOW_LOCALHOST"
 const rootStores = new Map()
 function storageFor(root) {
   let entry = rootStores.get(root)
@@ -103,8 +105,81 @@ function authFor(root) {
 }
 function fixtureSessionGet({ sessionID }) {
   if (sessionID === FIXTURE_ROOT_SESSION) return { agent: "team/sentinel" }
-  if (sessionID === "ses_fixture_verifier") return { agent: "team/verifier", parentID: FIXTURE_ROOT_SESSION }
+  if (sessionID === "ses_root_ok") return { agent: "team/sentinel" }
+  const agent = FIXTURE_AGENT_SESSIONS[sessionID]
+  if (agent) return { agent, parentID: FIXTURE_ROOT_SESSION }
   return undefined
+}
+
+// Trusted-session fixtures for the control-plane role map. Every non-root
+// session descends from FIXTURE_ROOT_SESSION; tests that need a wrong caller
+// pass an explicit unknown session or override ctx.session.get.
+const FIXTURE_AGENT_SESSIONS = {
+  ses_fixture_verifier: "team/verifier",
+  ses_fixture_security_auditor: "team/security-auditor",
+  ses_fixture_victory_auditor: "team/victory-auditor",
+  ses_fixture_falsifier: "team/falsifier",
+  ses_fixture_segment_reviewer: "team/segment-reviewer",
+  ses_fixture_synthesizer: "team/synthesizer",
+  ses_fixture_proof_worker: "team/proof-worker",
+  ses_fixture_formalization_reviewer: "team/formalization-reviewer",
+  ses_fixture_proposer: "team/proposer",
+  ses_fixture_referee: "team/referee",
+  ses_fixture_worker: "team/worker",
+  ses_fixture_crafter: "team/crafter",
+  ses_fixture_scout: "team/scout",
+  ses_fixture_orchestrator: "team/orchestrator",
+  ses_victory_auditor: "team/victory-auditor",
+  ses_report_verifier: "team/verifier",
+  ses_final_verify: "team/verifier",
+}
+
+/** The intended trusted session for a control tool, used only when a test
+ *  call does not supply one. Explicit contexts still win. */
+function fixtureSessionFor(toolName, input) {
+  const action = String(input?.action || "").trim().toLowerCase()
+  const kind = String(input?.kind || "").trim().toLowerCase()
+  const stage = String(input?.stage || "").trim().toLowerCase()
+  switch (toolName) {
+    case "security_audit":
+      return "ses_fixture_security_auditor"
+    case "victory_audit":
+      return "ses_fixture_victory_auditor"
+    case "report":
+      return "ses_fixture_verifier"
+    case "wave_record":
+      return kind === "audit" ? "ses_fixture_security_auditor" : "ses_fixture_falsifier"
+    case "document_record":
+      return stage === "synthesis_candidate" || stage === "final_report" ? "ses_fixture_synthesizer" : "ses_fixture_segment_reviewer"
+    case "lemma_formalize":
+      return action === "draft" ? "ses_fixture_proof_worker" : "ses_fixture_formalization_reviewer"
+    case "lemma_node":
+      return "ses_fixture_proof_worker"
+    case "lemma_verify":
+      return "ses_fixture_verifier"
+    case "tournament":
+      if (action === "propose") return "ses_fixture_proposer"
+      if (action === "falsify") return "ses_fixture_falsifier"
+      if (action === "merge") return "ses_fixture_synthesizer"
+      if (action === "score" || action === "audit") return "ses_fixture_referee"
+      return FIXTURE_ROOT_SESSION
+    default:
+      return FIXTURE_ROOT_SESSION
+  }
+}
+
+/** Wrap a registered tool so test calls without a context act as the intended
+ *  trusted role. Explicit contexts (including wrong/unknown sessions) are kept. */
+function withFixtureSession(tool) {
+  return {
+    ...tool,
+    execute: (input, context) => {
+      const base = context && typeof context === "object" ? context : {}
+      const sessionID =
+        typeof base.sessionID === "string" && base.sessionID ? base.sessionID : fixtureSessionFor(tool.name, input)
+      return tool.execute(input, { ...base, sessionID })
+    },
+  }
 }
 async function writeSignedFixture(root, runId, relPath, payload) {
   const signed = await authFor(root).signRunArtifact(runId, relPath, payload)
@@ -216,7 +291,7 @@ async function makeToolsFor(root) {
     {
       tool: {
         transform: async (cb) => {
-          await cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = tool) })
+          await cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = withFixtureSession(tool)) })
         },
       },
       session: { get: async (args) => fixtureSessionGet(args) },
@@ -235,7 +310,7 @@ try {
         const editor = {
           namespace: () => {},
           add: (tool) => {
-            registeredTools[tool.name] = tool
+            registeredTools[tool.name] = withFixtureSession(tool)
           },
         }
         await cb(editor)
@@ -888,6 +963,8 @@ try {
       server.close(resolve)
       if (typeof server.closeAllConnections === "function") server.closeAllConnections()
     })
+  const previousAllowLocalhost = process.env[ALLOW_LOCALHOST_ENV]
+  process.env[ALLOW_LOCALHOST_ENV] = "1"
   try {
     preflightServer = createServer((req, res) => {
       res.writeHead(req.url === "/ok" ? 200 : 500)
@@ -939,6 +1016,8 @@ try {
     assert(!existsSync(join(testDir, ".opencode", "teamwork", pfUrlDownRun)), "a connection refusal must create no run directory")
   } finally {
     if (preflightServer) await stopServer(preflightServer)
+    if (previousAllowLocalhost === undefined) delete process.env[ALLOW_LOCALHOST_ENV]
+    else process.env[ALLOW_LOCALHOST_ENV] = previousAllowLocalhost
   }
 
   // Standalone teamwork_preflight: re-reads ORIGINAL_REQUEST.md, writes
@@ -1002,7 +1081,7 @@ try {
   const fvPassReport = JSON.parse(readFileSync(finalFileOf(fvPassRun), "utf8"))
   assert.strictEqual(fvPassReport.status, "PASS", "verify/final.json must record PASS")
   assert.strictEqual(fvPassReport.generatedBy.session, "ses_final_verify", "generatedBy.session must record the calling session")
-  assert.strictEqual(fvPassReport.generatedBy.agent, null, "no session agent is available in this test")
+  assert.strictEqual(fvPassReport.generatedBy.agent, "team/verifier", "the trusted verifier session agent must be recorded")
   assert(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(fvPassReport.generatedAt), "generatedAt must be ISO8601 UTC")
   assert.strictEqual(fvPassReport.integrityMode, "development", "a run with no request artifact defaults to development")
   assert.strictEqual(fvPassReport.summary, "All acceptance criteria met.", "summary must be cleaned and recorded")
@@ -1084,7 +1163,7 @@ try {
   assert(bypassEvent.note.includes("allowUnstamped"), `the note must explain the bypass: ${bypassEvent.note}`)
   assert.strictEqual(typeof bypassEvent.seq, "number", "the bypass event must carry an engine-assigned seq")
   assert(bypassEvent.seq > 0, "the bypass event seq must be positive")
-  assert.strictEqual(bypassEvent.agent, null, "no session agent is available in this test")
+  assert.strictEqual(bypassEvent.agent, "team/sentinel", "the trusted sentinel session agent must be recorded on a bypass")
 
   // (k) A report with provenance but no evidence is still unstamped.
   const fvNoEvidenceRun = "20261018-000000-fv-noevidence"
@@ -2244,11 +2323,12 @@ try {
             await cb({
               namespace: () => {},
               add: (tool) => {
-                gitTools[tool.name] = tool
+                gitTools[tool.name] = withFixtureSession(tool)
               },
             })
           },
         },
+        session: { get: async (args) => fixtureSessionGet(args) },
         storage: storageFor(gitRepoDir),
       },
       gitRepoDir,
@@ -2591,12 +2671,19 @@ try {
             await cb({
               namespace: () => {},
               add: (tool) => {
-                tools[tool.name] = tool
+                tools[tool.name] = withFixtureSession(tool)
               },
             })
           },
         },
-        session: { get: async () => (sessionAgent ? { agent: sessionAgent } : undefined) },
+        session: {
+          get: async ({ sessionID }) => {
+            if (sessionID === ROOT_SES) return { agent: "team/sentinel" }
+            if (sessionID === FIXTURE_ROOT_SESSION) return { agent: "team/sentinel", parentID: ROOT_SES }
+            if (sessionID === "ses_attr_session" && sessionAgent) return { agent: sessionAgent, parentID: ROOT_SES }
+            return undefined
+          },
+        },
         storage: storageFor(root),
       },
       root,
@@ -2723,24 +2810,24 @@ try {
     console.log("✓ explicit agent (team/worker and team/verifier) is recorded as the actor in events.jsonl")
   }
 
-  // --- 6f: with no explicit agent and no calling session, the plan-declared agent is the fallback.
+  // --- 6f: with no explicit agent, the calling session's trusted agent is recorded.
   {
     const RUN = "20261018-000000-plan"
     const f = await attrFixture(RUN, "team/worker")
     await f.tools.task_update.execute({ sessionId: RUN, taskId: "alpha", status: "worker_active" })
     const last = readEvents(f.root, RUN).at(-1)
-    assert.strictEqual(last.agent, "team/worker", "plan-declared agent must be the fallback actor")
-    assert.strictEqual(last.agentSource, "plan", "a plan-declared actor must be labelled plan")
-    console.log("✓ plan-declared agent is the fallback actor when none is supplied")
+    assert.strictEqual(last.agent, "team/sentinel", "the trusted calling-session agent must be recorded")
+    assert.strictEqual(last.agentSource, "session", "a session-resolved actor must be labelled session")
+    console.log("✓ the trusted calling-session agent is recorded when no explicit agent is supplied")
   }
 
   // --- 6f(2): the calling session's agent wins over the plan and is labelled session.
   {
     const RUN = "20261018-000000-session"
-    const f = await attrFixture(RUN, "team/worker", ["alpha"], "team/scout")
-    await f.tools.task_update.execute({ sessionId: RUN, taskId: "alpha", status: "worker_active" }, { sessionID: ROOT_SES })
+    const f = await attrFixture(RUN, "team/proof-worker", ["alpha"], "team/worker")
+    await f.tools.task_update.execute({ sessionId: RUN, taskId: "alpha", status: "worker_active" }, { sessionID: "ses_attr_session" })
     const last = readEvents(f.root, RUN).at(-1)
-    assert.strictEqual(last.agent, "team/scout", "the session agent must beat the plan-declared agent")
+    assert.strictEqual(last.agent, "team/worker", "the session agent must beat the plan-declared agent")
     assert.strictEqual(last.agentSource, "session", "a session-resolved actor must be labelled session")
     console.log("✓ session-resolved agent is recorded with agentSource=session")
   }
@@ -2955,8 +3042,8 @@ try {
         const tools = {}
         await registerTeamworkTools(
           {
-            tool: { transform: async (cb) => cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = tool) }) },
-            session: { get: async () => undefined },
+            tool: { transform: async (cb) => cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = withFixtureSession(tool)) }) },
+            session: { get: async (args) => fixtureSessionGet(args) },
             storage: storageFor(root),
           },
           root,
@@ -3017,10 +3104,10 @@ try {
       {
         tool: {
           transform: async (cb) => {
-            await cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = tool) })
+            await cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = withFixtureSession(tool)) })
           },
         },
-        session: { get: async () => undefined },
+        session: { get: async (args) => fixtureSessionGet(args) },
         storage: storageFor(ledgerDir),
       },
       ledgerDir,
@@ -3142,10 +3229,10 @@ try {
         {
           tool: {
             transform: async (cb) => {
-              await cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = tool) })
+              await cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = withFixtureSession(tool)) })
             },
           },
-          session: { get: async () => undefined },
+          session: { get: async (args) => fixtureSessionGet(args) },
           storage: storageFor(root),
         },
         root,
@@ -3517,7 +3604,7 @@ try {
           await cb({
             namespace: () => {},
             add: (t) => {
-              tools[t.name] = t
+              tools[t.name] = withFixtureSession(t)
             },
           })
         },
@@ -3528,12 +3615,7 @@ try {
         },
       },
       session: {
-        get: async ({ sessionID }) =>
-          sessionID === FIXTURE_ROOT_SESSION
-            ? { agent: "team/sentinel" }
-            : sessionID === "ses_fixture_verifier"
-              ? { agent: "team/verifier", parentID: FIXTURE_ROOT_SESSION }
-              : { agent: "team/verifier" },
+        get: async (args) => fixtureSessionGet(args),
         hook: async () => {},
       },
       storage: storageFor(docRoot),
@@ -3787,6 +3869,8 @@ try {
     assert.strictEqual(inlineRes.topology, "document-review")
     assert.strictEqual(inlineRes.segments.length, 2)
 
+    const previousDocAllowLocalhost = process.env[ALLOW_LOCALHOST_ENV]
+    process.env[ALLOW_LOCALHOST_ENV] = "1"
     const srv = createServer((req, res) => {
       if (req.url === "/paper.md") {
         res.writeHead(200, { "Content-Type": "text/markdown" })
@@ -3858,6 +3942,8 @@ try {
     })
     assert(closedRes.content.startsWith("refused:"))
     assert(!existsSync(join(docRoot, ".opencode", "teamwork", closedRun)))
+    if (previousDocAllowLocalhost === undefined) delete process.env[ALLOW_LOCALHOST_ENV]
+    else process.env[ALLOW_LOCALHOST_ENV] = previousDocAllowLocalhost
     console.log("✓ 9.3 Positive inline content & localhost URL checks passed")
 
     // --- 9.4: Math-paper precedence ---
@@ -4306,7 +4392,7 @@ try {
           const editor = {
             namespace: () => {},
             add: (tool) => {
-              tools9[tool.name] = tool
+              tools9[tool.name] = withFixtureSession(tool)
             },
           }
           await cb(editor)
@@ -4318,7 +4404,7 @@ try {
         },
       },
       session: {
-        get: async () => undefined,
+        get: async (args) => fixtureSessionGet(args),
         hook: async () => {},
       },
       storage: storageFor(testDir9),
@@ -4676,12 +4762,15 @@ try {
       assert.strictEqual(fvIncomplete.status, "FAIL", "final_verify must refuse PASS while tournament is incomplete")
 
       // Non-referee refused on score
-      const badActor = await tools9.tournament.execute({
-        action: "score",
-        sessionId: sid,
-        agent: "team/proposer",
-        scores: [{ candidateId: "merge-ab", soundness: 90, completeness: 90, clarity: 90, verdict: "PASS" }],
-      })
+      const badActor = await tools9.tournament.execute(
+        {
+          action: "score",
+          sessionId: sid,
+          agent: "team/proposer",
+          scores: [{ candidateId: "merge-ab", soundness: 90, completeness: 90, clarity: 90, verdict: "PASS" }],
+        },
+        { sessionID: "ses_fixture_proposer" },
+      )
       assert(badActor.content.startsWith("refused:"), "non-referee must be refused on score")
 
       // Score with tie-breaking check (cand-a and merge-ab tied at 90 -> merge-ab wins by higher level!)
@@ -6991,7 +7080,7 @@ process.exit(0);
     const mockCtx = {
       tool: {
         transform: async (cb) => {
-          await cb({ namespace: () => {}, add: (tool) => (registeredTools[tool.name] = tool) })
+          await cb({ namespace: () => {}, add: (tool) => (registeredTools[tool.name] = withFixtureSession(tool)) })
         },
       },
       session: { get: async (args) => fixtureSessionGet(args) },
@@ -7262,7 +7351,7 @@ process.exit(0);
       const noStoreTools = {}
       await registerTeamworkTools(
         {
-          tool: { transform: async (cb) => cb({ namespace: () => {}, add: (tool) => (noStoreTools[tool.name] = tool) }) },
+          tool: { transform: async (cb) => cb({ namespace: () => {}, add: (tool) => (noStoreTools[tool.name] = withFixtureSession(tool)) }) },
           session: { get: async (args) => fixtureSessionGet(args) },
         },
         noStoreRoot,
@@ -7389,5 +7478,255 @@ process.exit(0);
     }
 
     console.log("✓ authenticity: forgery, tampering, copies, staleness, downgrades, rotation, legacy bypass, storage/env keys, session-tree binding, and the trusted report writer")
+  }
+
+  // ==========================================
+  // Part 13: control-plane tool authorization
+  // ==========================================
+  {
+    console.log("Testing control-plane tool authorization...")
+    const authzRoot = mkdtempSync(join(testDir, "authz-"))
+    const az = await makeToolsFor(authzRoot)
+    const call = (tool, input, sessionID) => az[tool].execute(input, { sessionID })
+    const authRefused = (res) =>
+      typeof res?.content === "string" &&
+      /restricted to|needs a trusted session identity|must be called from|requires the run's recorded rootSessionId|has no authorization rule/.test(res.content)
+    const unknown = "ses_authz_unknown"
+    const worker = "ses_fixture_worker"
+    const verifier = "ses_fixture_verifier"
+    const sentinel = FIXTURE_ROOT_SESSION
+    const runId = "20261123-000030-authz"
+    const planInput = { sessionId: runId, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "A1" }] }
+
+    // plan: sentinel/crafter only; an unknown identity and a worker are refused.
+    let res = await call("plan", { ...planInput, sessionId: "20261123-000030-authz-denied" }, unknown)
+    assert(authRefused(res), `unknown identity must not plan: ${res.content}`)
+    res = await call("plan", { ...planInput, sessionId: "20261123-000030-authz-worker" }, worker)
+    assert(authRefused(res), `team/worker must not plan: ${res.content}`)
+    res = await call("plan", planInput, sentinel)
+    assert(res.content.startsWith("Planned"), `the sentinel must plan: ${res.content}`)
+    const crafterPlan = await call("plan", { sessionId: "20261123-000030-authz-crafter", topology: "iterative-coding", skipInterview: true, tasks: [{ id: "C1" }] }, "ses_fixture_crafter")
+    assert(crafterPlan.content.startsWith("Planned"), `team/crafter must plan: ${crafterPlan.content}`)
+
+    // next/preflight/budget: sentinel/orchestrator only.
+    res = await call("next", { sessionId: runId }, worker)
+    assert(authRefused(res), `team/worker must not call next: ${res.content}`)
+    res = await call("next", { sessionId: runId }, sentinel)
+    assert(Array.isArray(res.readyForWorker), `the sentinel must call next: ${res.content}`)
+    const orchestratorNext = await call("next", { sessionId: runId }, "ses_fixture_orchestrator")
+    assert(!authRefused(orchestratorNext), `team/orchestrator must call next: ${orchestratorNext.content}`)
+    res = await call("preflight", { sessionId: runId }, worker)
+    assert(authRefused(res), `team/worker must not call preflight: ${res.content}`)
+    res = await call("preflight", { sessionId: runId }, sentinel)
+    assert(!authRefused(res), `the sentinel must call preflight: ${res.content}`)
+    res = await call("budget", {}, worker)
+    assert(authRefused(res), `team/worker must not call budget: ${res.content}`)
+    res = await call("budget", {}, sentinel)
+    assert(!authRefused(res), `the sentinel must call budget: ${res.content}`)
+
+    // status/resume/cost: read-only, available to every installed team role.
+    for (const tool of ["status", "resume", "cost"]) {
+      res = await call(tool, { sessionId: runId }, worker)
+      assert(!authRefused(res), `${tool} must stay available to team/worker: ${res.content}`)
+    }
+
+    // task_update: lifecycle roles only; the input.agent label is not authority.
+    res = await call("task_update", { sessionId: runId, taskId: "A1", status: "worker_active", agent: "team/worker" }, "ses_fixture_scout")
+    assert(authRefused(res), `team/scout must not mutate a task: ${res.content}`)
+    res = await call("task_update", { sessionId: runId, taskId: "A1", status: "worker_active", agent: "team/sentinel" }, worker)
+    assert(!authRefused(res), `team/worker must update its task: ${res.content}`)
+    res = await call("task_update", { sessionId: runId, taskId: "A1", status: "worker_done" }, verifier)
+    assert(!authRefused(res), `team/verifier must be able to update the lifecycle: ${res.content}`)
+
+    // security_audit: only a descendant team/security-auditor.
+    res = await call("security_audit", { sessionId: runId, status: "PASS", findings: [] }, worker)
+    assert(authRefused(res), `team/worker must not record a security audit: ${res.content}`)
+    res = await call("security_audit", { sessionId: runId, status: "PASS", findings: [] }, sentinel)
+    assert(authRefused(res), `the root sentinel must not record a security audit: ${res.content}`)
+    res = await call("security_audit", { sessionId: runId, status: "PASS", findings: [] }, "ses_fixture_security_auditor")
+    assert(!authRefused(res), `team/security-auditor must record the audit: ${res.content}`)
+
+    // final_verify: team/verifier or sentinel.
+    res = await call("final_verify", { sessionId: runId }, worker)
+    assert(authRefused(res), `team/worker must not finalize a run: ${res.content}`)
+    res = await call("final_verify", { sessionId: runId }, sentinel)
+    assert(!authRefused(res), `the sentinel must be able to finalize: ${res.content}`)
+
+    // pitfall: any installed team role, but not an unresolved identity.
+    res = await call("pitfall", { sessionId: runId, pitfall: "authorization fixture" }, "ses_fixture_scout")
+    assert(!authRefused(res), `team/scout may log a pitfall: ${res.content}`)
+    res = await call("pitfall", { sessionId: runId, pitfall: "unknown" }, unknown)
+    assert(authRefused(res), `an unresolved identity must not log a pitfall: ${res.content}`)
+
+    // document_triage / document_record: sentinel vs reviewer/synthesizer split.
+    res = await call("document_triage", { sessionId: "20261123-000030-authz-doc-denied", document: { content: "# A\n\nx\n\n# B\n\ny" }, skipInterview: true }, worker)
+    assert(authRefused(res), `team/worker must not triage a document: ${res.content}`)
+    const docRun = "20261123-000030-authz-doc"
+    const doc = await call("document_triage", { sessionId: docRun, document: { content: "# A\n\nx\n\n# B\n\ny" }, skipInterview: true }, sentinel)
+    assert.strictEqual(doc.topology, "document-review", `the sentinel must triage a document: ${doc.content}`)
+    const segId = doc.segments[0].id
+    res = await call("document_record", { sessionId: docRun, stage: "segment_analysis", segmentId: segId, level: 0, index: 0, summary: "node", findings: [], verdict: "PASS" }, "ses_fixture_synthesizer")
+    assert(authRefused(res), `team/synthesizer must not write segment nodes: ${res.content}`)
+    res = await call("document_record", { sessionId: docRun, stage: "segment_analysis", segmentId: segId, level: 0, index: 0, summary: "node", findings: [], verdict: "PASS" }, "ses_fixture_segment_reviewer")
+    assert(!authRefused(res), `team/segment-reviewer must write segment nodes: ${res.content}`)
+    res = await call("document_record", { sessionId: docRun, stage: "final_report", summary: "report", content: "# Report", verdict: "PASS" }, "ses_fixture_segment_reviewer")
+    assert(authRefused(res), `team/segment-reviewer must not write the final report: ${res.content}`)
+    res = await call("document_record", { sessionId: docRun, stage: "final_report", summary: "report", content: "# Report", verdict: "PASS" }, "ses_fixture_synthesizer")
+    assert(!authRefused(res), `team/synthesizer must write the final report: ${res.content}`)
+
+    // worktree: setup is sentinel-only; diff is sentinel/worker/verifier.
+    res = await call("worktree", { sessionId: runId, action: "setup", role: "sentinel" }, worker)
+    assert(authRefused(res), `team/worker must not provision worktrees: ${res.content}`)
+    res = await call("worktree", { sessionId: runId, action: "setup", role: "sentinel" }, sentinel)
+    assert(!authRefused(res), `the sentinel must provision worktrees: ${res.content}`)
+    res = await call("worktree", { sessionId: runId, action: "diff", taskId: "A1" }, worker)
+    assert(!authRefused(res), `team/worker must diff its worktree: ${res.content}`)
+
+    // LEMMA role split.
+    res = await call("lemma_probe", {}, worker)
+    assert(authRefused(res), `team/worker must not probe the LEMMA toolchain: ${res.content}`)
+    res = await call("lemma_probe", {}, sentinel)
+    assert(!authRefused(res), `the sentinel must probe the LEMMA toolchain: ${res.content}`)
+    res = await call("lemma_formalize", { sessionId: runId, action: "review_pre", verdict: "APPROVE" }, worker)
+    assert(authRefused(res), `team/worker must not review formalization: ${res.content}`)
+    res = await call("lemma_formalize", { sessionId: runId, action: "review_pre", verdict: "APPROVE" }, "ses_fixture_formalization_reviewer")
+    assert(!authRefused(res), `team/formalization-reviewer must review: ${res.content}`)
+    res = await call("lemma_node", { sessionId: runId, action: "create", lemmaId: "n1" }, sentinel)
+    assert(authRefused(res), `the sentinel must not mutate LEMMA nodes: ${res.content}`)
+    res = await call("lemma_node", { sessionId: runId, action: "create", lemmaId: "n1" }, "ses_fixture_proof_worker")
+    assert(!authRefused(res), `team/proof-worker must mutate LEMMA nodes: ${res.content}`)
+    res = await call("lemma_verify", { sessionId: runId, lemmaId: "n1" }, "ses_fixture_proof_worker")
+    assert(authRefused(res), `team/proof-worker must not self-verify LEMMA: ${res.content}`)
+    res = await call("lemma_verify", { sessionId: runId, lemmaId: "n1" }, verifier)
+    assert(!authRefused(res), `team/verifier must verify LEMMA: ${res.content}`)
+
+    // tournament: one role per action, no self-certifying agent label.
+    const tRun = "20261123-000030-authz-tourn"
+    res = await call("tournament", { action: "init", sessionId: tRun, massiveProofOptIn: true, budgetUsd: 20 }, worker)
+    assert(authRefused(res), `team/worker must not init a tournament: ${res.content}`)
+    res = await call("tournament", { action: "init", sessionId: tRun, massiveProofOptIn: true, budgetUsd: 20 }, sentinel)
+    assert(!authRefused(res), `the sentinel must init a tournament: ${res.content}`)
+    res = await call("tournament", { action: "propose", sessionId: tRun, candidateId: "c1", summary: "candidate" }, sentinel)
+    assert(authRefused(res), `the sentinel must not propose candidates: ${res.content}`)
+    res = await call("tournament", { action: "propose", sessionId: tRun, candidateId: "c1", summary: "candidate" }, "ses_fixture_proposer")
+    assert(!authRefused(res), `team/proposer must propose: ${res.content}`)
+    res = await call("tournament", { action: "falsify", sessionId: tRun, candidateId: "c1", verdict: "SURVIVES", reason: "holds" }, "ses_fixture_proposer")
+    assert(authRefused(res), `team/proposer must not falsify: ${res.content}`)
+    res = await call("tournament", { action: "falsify", sessionId: tRun, candidateId: "c1", verdict: "SURVIVES", reason: "holds" }, "ses_fixture_falsifier")
+    assert(!authRefused(res), `team/falsifier must falsify: ${res.content}`)
+    res = await call("tournament", { action: "merge", sessionId: tRun, candidateId: "m1", parentIds: ["c1"], summary: "merged", agent: "team/synthesizer" }, "ses_fixture_falsifier")
+    assert(authRefused(res), `team/falsifier must not merge: ${res.content}`)
+    res = await call("tournament", { action: "merge", sessionId: tRun, candidateId: "m1", parentIds: ["c1"], summary: "merged", agent: "team/synthesizer" }, "ses_fixture_synthesizer")
+    assert(!authRefused(res), `team/synthesizer must merge: ${res.content}`)
+    res = await call("tournament", { action: "score", sessionId: tRun, agent: "team/referee", scores: [{ candidateId: "c1", soundness: 80, completeness: 80, clarity: 80, verdict: "PASS" }] }, worker)
+    assert(authRefused(res), `team/worker must not score: ${res.content}`)
+    res = await call("tournament", { action: "score", sessionId: tRun, agent: "team/referee", scores: [{ candidateId: "c1", soundness: 80, completeness: 80, clarity: 80, verdict: "PASS" }] }, "ses_fixture_referee")
+    assert(!authRefused(res), `team/referee must score: ${res.content}`)
+    res = await call("tournament", { action: "audit", sessionId: tRun, agent: "team/referee", verdict: "PASS", winnerId: "c1", summary: "audit" }, worker)
+    assert(authRefused(res), `team/worker must not audit: ${res.content}`)
+    res = await call("tournament", { action: "audit", sessionId: tRun, agent: "team/referee", verdict: "PASS", winnerId: "c1", summary: "audit" }, "ses_fixture_referee")
+    assert(!authRefused(res), `team/referee must audit: ${res.content}`)
+    res = await call("tournament", { action: "cancel", sessionId: tRun, reason: "done" }, worker)
+    assert(authRefused(res), `team/worker must not cancel: ${res.content}`)
+    res = await call("tournament", { action: "cancel", sessionId: tRun, reason: "done" }, sentinel)
+    assert(!authRefused(res), `the sentinel must cancel: ${res.content}`)
+
+    assert(!existsSync(join(authzRoot, ".opencode", "teamwork", "20261123-000030-authz-denied")), "a refused plan must write nothing")
+    console.log("✓ control tools enforce the trusted role map; task_update/security_audit/final_verify, worktree, document, LEMMA, and tournament lanes verified")
+    rmSync(authzRoot, { recursive: true, force: true })
+  }
+
+  // ==========================================
+  // Part 14: URL SSRF guard
+  // ==========================================
+  {
+    console.log("Testing URL SSRF guard...")
+    const ssrfRoot = mkdtempSync(join(testDir, "ssrf-"))
+    const st = await makeToolsFor(ssrfRoot)
+    const previousAllowLocalhost = process.env[ALLOW_LOCALHOST_ENV]
+    delete process.env[ALLOW_LOCALHOST_ENV]
+    let srv
+    try {
+      const denied = async (url, runId) => {
+        const r = await st.document_triage.execute({ sessionId: runId, document: { url }, fetchUrl: true, skipInterview: true }, { sessionID: FIXTURE_ROOT_SESSION })
+        assert(r.content.startsWith("refused:"), `${url} must be refused: ${r.content}`)
+        assert(/blocked|SSRF/i.test(r.content), `${url} refusal must name the SSRF guard: ${r.content}`)
+        assert(!existsSync(join(ssrfRoot, ".opencode", "teamwork", runId)), `a blocked URL must not create ${runId}`)
+      }
+      await denied("http://127.0.0.1:9/secret", "20261123-000031-ssrf-loopback")
+      await denied("http://10.0.0.1/secret", "20261123-000031-ssrf-private")
+      await denied("http://169.254.169.254/latest/meta-data/", "20261123-000031-ssrf-metadata")
+      await denied("http://[::1]/secret", "20261123-000031-ssrf-ipv6")
+      await denied("http://localhost/secret", "20261123-000031-ssrf-hostname")
+      await denied("http://[::ffff:127.0.0.1]/secret", "20261123-000031-ssrf-mapped")
+
+      // A hostname that resolves to a private address is refused after DNS.
+      const dnsCheck = await assertSafeUrl("http://private.example/", {
+        resolveHost: async () => [{ address: "10.1.2.3", family: 4 }],
+      })
+      assert.strictEqual(dnsCheck.ok, false, "a hostname resolving private must be refused")
+      assert(/private/.test(dnsCheck.error), `the DNS refusal must name the range: ${dnsCheck.error}`)
+      assert.strictEqual(blockedAddressReason("0.0.0.0"), "unspecified", "0.0.0.0 must be blocked")
+      assert.strictEqual(blockedAddressReason("224.0.0.1"), "multicast", "multicast must be blocked")
+      assert.strictEqual(blockedAddressReason("fd00::1"), "unique-local", "fc00::/7 must be blocked")
+      assert.strictEqual(blockedAddressReason("fe80::1"), "link-local", "fe80::/10 must be blocked")
+      assert.strictEqual(blockedAddressReason("::ffff:10.0.0.1"), "private", "mapped IPv4 must be blocked")
+
+      // Preflight uses the same guard: a loopback or private URL refuses the plan.
+      for (const [label, url] of [
+        ["loopback", "http://127.0.0.1:9/preflight"],
+        ["private", "http://10.0.0.1/preflight"],
+        ["metadata", "http://169.254.169.254/latest/meta-data/"],
+      ]) {
+        const runId = `20261123-000031-ssrf-pf-${label}`
+        const r = await st.plan.execute(
+          { sessionId: runId, topology: "iterative-coding", skipInterview: true, request: `Fetch ${url} first`, checkUrls: true, tasks: [{ id: "S1" }] },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        assert(r.content.startsWith("refused:"), `preflight ${label} URL must refuse the plan: ${r.content}`)
+        assert(/blocked|SSRF/i.test(r.content), `preflight ${label} refusal must name the guard: ${r.content}`)
+        assert(!existsSync(join(ssrfRoot, ".opencode", "teamwork", runId)), `preflight ${label} refusal must write nothing`)
+      }
+
+      // Opt-in localhost fixtures keep working, and a redirect to a private
+      // address is still blocked after the redirect target is validated.
+      srv = createServer((req, res) => {
+        if (req.url === "/paper.md") {
+          res.writeHead(200, { "Content-Type": "text/markdown" })
+          res.end("# Local\n\nBody.\n\n# More\n\nBody.")
+        } else if (req.url === "/redir") {
+          res.writeHead(302, { Location: "http://10.0.0.1/secret" })
+          res.end()
+        } else {
+          res.writeHead(200)
+          res.end("ok")
+        }
+      })
+      await new Promise((resolve) => srv.listen(0, "127.0.0.1", resolve))
+      const port = srv.address().port
+      process.env[ALLOW_LOCALHOST_ENV] = "1"
+      const ok = await st.document_triage.execute(
+        { sessionId: "20261123-000031-ssrf-optin", document: { url: `http://127.0.0.1:${port}/paper.md` }, fetchUrl: true, skipInterview: true },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+      assert.strictEqual(ok.topology, "document-review", `the localhost opt-in must allow the fixture: ${ok.content}`)
+      const redir = await st.document_triage.execute(
+        { sessionId: "20261123-000031-ssrf-redirect", document: { url: `http://127.0.0.1:${port}/redir` }, fetchUrl: true, skipInterview: true },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+      assert(redir.content.startsWith("refused:"), `a redirect to a private address must be refused: ${redir.content}`)
+      assert(/redirect to a blocked address/i.test(redir.content), `the redirect refusal must name the blocked target: ${redir.content}`)
+      const pfOk = await st.plan.execute(
+        { sessionId: "20261123-000031-ssrf-pf-optin", topology: "iterative-coding", skipInterview: true, request: `Fetch http://127.0.0.1:${port}/ok first`, checkUrls: true, tasks: [{ id: "S1" }] },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+      assert(pfOk.content.startsWith("Planned"), `the localhost opt-in must allow preflight: ${pfOk.content}`)
+      console.log("✓ URL ingestion and preflight reject loopback/private/link-local/metadata/mapped hosts and private redirects; localhost opt-in remains explicit")
+    } finally {
+      if (previousAllowLocalhost === undefined) delete process.env[ALLOW_LOCALHOST_ENV]
+      else process.env[ALLOW_LOCALHOST_ENV] = previousAllowLocalhost
+      if (srv) await new Promise((resolve) => srv.close(resolve))
+      rmSync(ssrfRoot, { recursive: true, force: true })
+    }
   }
 }

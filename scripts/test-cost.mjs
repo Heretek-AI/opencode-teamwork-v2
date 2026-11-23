@@ -186,9 +186,15 @@ try {
     session: {
       get: async ({ sessionID }) => {
         if (sessionID === "ses_mock_root") {
-          return { cost: 0.15, tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 0, write: 0 } } }
+          return {
+            agent: "team/sentinel",
+            cost: 0.15,
+            tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 0, write: 0 } },
+          }
         }
-        return undefined
+        // Every fixture session is a trusted sentinel for control-plane auth;
+        // the cost assertions read the real DB/API instead of this stub.
+        return { agent: "team/sentinel" }
       },
     },
     storage: costStorage,
@@ -224,7 +230,9 @@ try {
   // 4. Test manual addUsd fallback when native client/tree is unavailable
   const mockOfflineCtx = {
     tool: mockCtx.tool,
-    session: { get: async () => undefined },
+    // A trusted identity is still required for mutating tools; the stub has no
+    // cost, so the cost tool falls back to manual addUsd as before.
+    session: { get: async () => ({ agent: "team/sentinel" }) },
     storage: costStorage,
   }
   let offlineTools = {}

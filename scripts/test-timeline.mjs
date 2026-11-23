@@ -887,12 +887,21 @@ async function engineTools(root) {
           await cb({
             namespace: () => {},
             add: (tool) => {
-              tools[tool.name] = tool
+              // Test fixture: every call is made by the trusted sentinel
+              // session unless a test supplies its own explicit context.
+              tools[tool.name] = {
+                ...tool,
+                execute: (input, context) =>
+                  tool.execute(input, {
+                    ...(context && typeof context === "object" ? context : {}),
+                    sessionID: context?.sessionID || "ses_timeline_root",
+                  }),
+              }
             },
           })
         },
       },
-      session: { get: async () => undefined },
+      session: { get: async () => ({ agent: "team/sentinel" }) },
     },
     root,
   )
@@ -904,8 +913,8 @@ function engineRun() {
   const root = makeRoot()
   const dir = runDirOf(root, SESSION)
   mkdirSync(dir, { recursive: true })
-  writeJson(join(dir, "state.json"), { sessionId: SESSION, phase: "DISPATCH", tasks: { alpha: { status: "pending", round: 0 } } })
-  writeJson(join(dir, "plan.dag.json"), { sessionId: SESSION, topology: "iterative-coding", tasks: [{ id: "alpha", dependsOn: [], maxRounds: 4, agent: "team/worker" }] })
+  writeJson(join(dir, "state.json"), { sessionId: SESSION, rootSessionId: "ses_timeline_root", phase: "DISPATCH", tasks: { alpha: { status: "pending", round: 0 } } })
+  writeJson(join(dir, "plan.dag.json"), { sessionId: SESSION, rootSessionId: "ses_timeline_root", topology: "iterative-coding", tasks: [{ id: "alpha", dependsOn: [], maxRounds: 4, agent: "team/worker" }] })
   return { root, dir }
 }
 
@@ -979,6 +988,7 @@ await check("R6.6 (4): control chars and newlines in every appended field cannot
     sessionId: SESSION,
     taskId: "alpha",
     status: "worker_active",
+    agent: plan.tasks[0].agent,
     branch: "teamwork/x\nINJECT",
     worktree: "/wt\r\nINJECT",
   })
