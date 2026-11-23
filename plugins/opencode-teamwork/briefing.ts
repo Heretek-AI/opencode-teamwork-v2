@@ -20,8 +20,9 @@
 //
 // Zero runtime dependencies. Erasable TypeScript only.
 
-import { lstatSync } from "node:fs"
-import { join } from "node:path"
+import { createHash } from "node:crypto"
+import { lstatSync, readdirSync, rmSync } from "node:fs"
+import { basename, join } from "node:path"
 import {
   clean,
   ensureSafeRunSubpath,
@@ -37,6 +38,12 @@ export const BRIEFING_FILE = "BRIEFING.md"
 export const MAX_BRIEFING_BYTES = 16 * 1024
 /** How much of the briefing is injected into <run>/context. */
 export const BRIEFING_EXCERPT_BYTES = 4 * 1024
+
+/** Per-agent briefings live under `<run>/agents/<slug>-<hash32>/BRIEFING.md`. */
+export const AGENT_BRIEFING_DIR = "agents"
+export const MAX_AGENT_BRIEFING_DIRS = 64
+const AGENT_BRIEFING_DIR_RE = /^[a-z][a-z0-9-]{0,31}-[0-9a-f]{32}$/
+const AGENT_SLUG_RE = /^[a-z][a-z0-9-]{0,31}$/
 
 const MAX_MISSION_CHARS = 2000
 const MAX_MISSION_READ_BYTES = 64 * 1024
@@ -247,7 +254,11 @@ function constraintsFor(verification: string, victoryMode: string): string[] {
  * Build the full briefing text. Reads only run-local artifacts through the
  * bounded, no-follow helpers, and sanitises every value it interpolates.
  */
-export function buildBriefing(run: string, timestamp = new Date().toISOString()): string {
+export function buildBriefing(
+  run: string,
+  timestamp = new Date().toISOString(),
+  extraIdentity: string[] = [],
+): string {
   const plan = readRunValue(run, "plan.dag.json", 8 * 1024 * 1024)
   const state = readRunValue(run, "state.json", 8 * 1024 * 1024)
   const costs = readRunValue(run, "costs.json", MAX_COSTS_READ_BYTES)
@@ -269,6 +280,7 @@ export function buildBriefing(run: string, timestamp = new Date().toISOString())
     "",
     "## Identity",
     `- Session: ${identity.sessionId}`,
+    ...extraIdentity,
     `- Topology: ${identity.topology}`,
     `- Integrity mode: ${identity.integrityMode}`,
     `- Verification mode: ${identity.verification}`,
@@ -333,4 +345,168 @@ export function readBriefingExcerpt(
   const bytes = Buffer.byteLength(safe, "utf8")
   if (bytes <= maxBytes) return { text: safe, truncated: false, bytes }
   return { text: truncateUtf8(safe, maxBytes), truncated: true, bytes }
+}
+
+// ---------------------------------------------------------------------------
+// Per-agent briefing
+//
+// The shared briefing stays exactly as it was; a caller that is known
+// (`session.context` has both `event.sessionID` and `event.agent`) also gets a
+// per-agent copy at:
+//
+//   <run>/agents/<agentSlug>-<sha256(sessionID).slice(0,32)>/BRIEFING.md
+//
+// The directory name never contains the raw (up to 68-character) OpenCode
+// session id, and both the slug and the hash shape are enforced on read and on
+// prune. The copy is written lazily by the context hook, never by the gates.
+// ---------------------------------------------------------------------------
+
+/** `team/worker` → `worker`; undefined for any other shape. */
+export function agentBriefingSlug(agent: unknown): string | undefined {
+  const raw = typeof agent === "string" ? agent.trim() : ""
+  const m = /^team\/([a-z][a-z0-9-]{0,31})$/.exec(raw)
+  return m && AGENT_SLUG_RE.test(m[1]) ? m[1] : undefined
+}
+
+/** Plain sha256 of the OpenCode session id, first 32 hex chars. */
+export function agentBriefingSessionHash(sessionID: unknown): string | undefined {
+  if (typeof sessionID !== "string" || !sessionID.trim()) return undefined
+  return createHash("sha256").update(sessionID, "utf8").digest("hex").slice(0, 32)
+}
+
+/** `<slug>-<hash32>`; the only directory name this feature writes. */
+export function agentBriefingDirName(agent: unknown, sessionID: unknown): string | undefined {
+  const slug = agentBriefingSlug(agent)
+  const hash = agentBriefingSessionHash(sessionID)
+  if (!slug || !hash) return undefined
+  return `${slug}-${hash}`
+}
+
+/** Run-relative per-agent briefing path (`agents/<slug>-<hash32>/BRIEFING.md`). */
+export function agentBriefingRelativePath(agent: unknown, sessionID: unknown): string | undefined {
+  const dir = agentBriefingDirName(agent, sessionID)
+  return dir ? `${AGENT_BRIEFING_DIR}/${dir}/${BRIEFING_FILE}` : undefined
+}
+
+/** Build the per-agent text from the shared briefing data + identity extras. */
+export function buildAgentBriefing(
+  run: string,
+  agent: string,
+  sessionID: string,
+  timestamp = new Date().toISOString(),
+): string {
+  const runId = basename(run)
+  const extras = [
+    `- Agent: ${clean(agent, 64)}`,
+    `- Agent session: ${clean(sessionID, 64)}`,
+    `- Run session: ${runId}`,
+  ]
+  return buildBriefing(run, timestamp, extras)
+}
+
+function lstatOrNull(file: string) {
+  try {
+    return lstatSync(file)
+  } catch (err: any) {
+    if (err?.code === "ENOENT") return null
+    throw err
+  }
+}
+
+function newestArtifactMtime(run: string): number {
+  let newest = 0
+  for (const rel of ["state.json", "plan.dag.json", "costs.json"]) {
+    try {
+      const st = lstatSync(join(run, rel))
+      if (st.isFile() && !st.isSymbolicLink()) newest = Math.max(newest, st.mtimeMs)
+    } catch {}
+  }
+  return newest
+}
+
+/**
+ * Keep at most 64 per-agent briefing directories. Only correctly named real
+ * directories are candidates; symlinks and any other entry are never touched.
+ */
+function pruneAgentBriefingDirs(run: string): void {
+  const dir = join(run, AGENT_BRIEFING_DIR)
+  let entries: { name: string }[]
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return
+  }
+  const candidates: { path: string; mtime: number }[] = []
+  for (const entry of entries) {
+    if (!AGENT_BRIEFING_DIR_RE.test(entry.name)) continue
+    const path = join(dir, entry.name)
+    let st
+    try {
+      st = lstatSync(path)
+    } catch {
+      continue
+    }
+    if (!st.isDirectory() || st.isSymbolicLink()) continue
+    let mtime = st.mtimeMs
+    try {
+      const brief = lstatSync(join(path, BRIEFING_FILE))
+      if (brief.isFile() && !brief.isSymbolicLink()) mtime = brief.mtimeMs
+    } catch {}
+    candidates.push({ path, mtime })
+  }
+  if (candidates.length <= MAX_AGENT_BRIEFING_DIRS) return
+  candidates.sort((a, b) => a.mtime - b.mtime)
+  for (const stale of candidates.slice(0, candidates.length - MAX_AGENT_BRIEFING_DIRS)) {
+    try {
+      rmSync(stale.path, { recursive: true, force: true })
+    } catch {}
+  }
+}
+
+/**
+ * Write/refresh one per-agent briefing. Lazy: a regular, non-symlink copy whose
+ * mtime is at least as new as state.json/plan.dag.json/costs.json is left alone.
+ * Throws on refusal (symlink/FIFO/containment/I/O); the hook swallows that and
+ * falls back to the shared briefing.
+ */
+export function refreshAgentBriefing(
+  run: string,
+  agent: string,
+  sessionID: string,
+): { changed: boolean; bytes: number; path?: string } {
+  const rel = agentBriefingRelativePath(agent, sessionID)
+  if (!rel) return { changed: false, bytes: 0 }
+  const file = join(run, rel)
+  const existing = lstatOrNull(file)
+  if (existing) {
+    if (existing.isSymbolicLink() || !existing.isFile()) {
+      throw new Error(`refused: per-agent briefing "${basename(file)}" is not a regular file`)
+    }
+    if (existing.mtimeMs >= newestArtifactMtime(run)) {
+      return { changed: false, bytes: existing.size, path: file }
+    }
+  }
+  const text = buildAgentBriefing(run, agent, sessionID)
+  const bytes = Buffer.byteLength(text, "utf8")
+  writeSafeRunFile(run, file, text)
+  pruneAgentBriefingDirs(run)
+  return { changed: true, bytes, path: file }
+}
+
+/** Bounded, no-follow per-agent excerpt; undefined when absent/refused. */
+export function readAgentBriefingExcerpt(
+  run: string,
+  agent: string,
+  sessionID: string,
+  maxBytes = BRIEFING_EXCERPT_BYTES,
+): { text: string; truncated: boolean; bytes: number; path: string } | undefined {
+  const rel = agentBriefingRelativePath(agent, sessionID)
+  if (!rel) return undefined
+  const file = join(run, rel)
+  const res = readBoundedRunFile(run, file, MAX_BRIEFING_BYTES)
+  if (res.status !== "ok" || !res.text.trim()) return undefined
+  const safe = sanitizeBriefingOutput(res.text, MAX_BRIEFING_BYTES)
+  const bytes = Buffer.byteLength(safe, "utf8")
+  if (bytes <= maxBytes) return { text: safe, truncated: false, bytes, path: file }
+  return { text: truncateUtf8(safe, maxBytes), truncated: true, bytes, path: file }
 }

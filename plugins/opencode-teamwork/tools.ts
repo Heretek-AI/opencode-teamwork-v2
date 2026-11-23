@@ -84,6 +84,8 @@ import {
   finalizeTournamentPartial,
   hasExplicitMassiveProofOptIn,
   initTournamentManifest,
+  isSafeTaskId,
+  TASK_ID,
   manifestPathOf,
   mergeCandidates,
   proposeCandidate,
@@ -135,7 +137,9 @@ import {
   type AuthFailure,
 } from "./auth.ts"
 import type { RequirementsFile, VictoryAuditMode } from "./victory.ts"
-import { readBriefingExcerpt, refreshRunBriefing } from "./briefing.ts"
+import { readAgentBriefingExcerpt, readBriefingExcerpt, refreshAgentBriefing, refreshRunBriefing } from "./briefing.ts"
+import { writeHandoff, resolveHandoffScope, handoffAgentSlug } from "./handoff.ts"
+import { withFileLock } from "./locks.ts"
 import { fdWithin, readWithinBounded, supportsFdContainment } from "./safe-fs.mjs"
 
 // ---------------------------------------------------------------------------
@@ -633,14 +637,9 @@ function safeSessionIds(ids: unknown[]): string[] {
 
 /**
  * A task id is used as a single filesystem path segment (worktree dir, verifier
- * dir, report/conflict file names) and inside git branch names. Only allow a
- * conservative single-segment token. `clean()` is NOT sufficient: it keeps `/`
- * and `..`, which let `../../x` escape the worktrees base (SEC-1).
+ * dir, report/conflict file names) and inside git branch names. The allowlist
+ * lives in tournament.ts so every writer (including handoffs) shares it.
  */
-const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
-function isSafeTaskId(id: string): boolean {
-  return TASK_ID.test(id) && id !== "." && id !== ".."
-}
 
 /**
  * Canonical terminal status is `verified_pass`; `pass` is the legacy alias.
@@ -1436,6 +1435,7 @@ async function appendEvent(
       | "tournament_step"
       | "tournament_cancelled"
       | "briefing_warning"
+      | "handoff_recorded"
     sessionId: string
     taskId?: string | null
     from?: string | null
@@ -1500,20 +1500,71 @@ async function appendEvent(
 
 // Serialise read-modify-write of a run's cost files within this process, so
 // concurrent agents (parallel workers calling teamwork_cost at once) cannot
-// clobber each other's attribution. Keyed by the file path; the whole async
-// section — including the client read — runs inside the lock.
-const fileLocks = new Map<string, Promise<unknown>>()
-function withFileLock<T>(key: string, fn: () => Promise<T> | T): Promise<T> {
-  const prev = fileLocks.get(key) ?? Promise.resolve()
-  const next = prev.then(fn, fn)
-  fileLocks.set(
-    key,
-    next.then(
-      () => undefined,
-      () => undefined,
-    ),
-  )
-  return next as Promise<T>
+// clobber each other's attribution. The lock primitive lives in locks.ts so the
+// handoff index uses the same one.
+
+/**
+ * Session→run resolution for the context hook.
+ *
+ * `teamwork_plan` records `run-by-root/<root session id>` in ctx.storage. A
+ * child agent session resolves its `parentID` chain to that root, then reads the
+ * mapping, so a fresh worker sees the run it actually belongs to instead of
+ * whichever run happens to be newest on disk. Every step is fail-open: an
+ * unavailable storage API, unknown session, or missing mapping returns
+ * undefined and the caller keeps the legacy newest-run behaviour.
+ */
+const RUN_BY_ROOT_PREFIX = "run-by-root/"
+const ROOT_CHAIN_MAX_DEPTH = 32
+
+function sessionKey(value: unknown): string {
+  return String(value ?? "").replace(/[^0-9A-Za-z._:-]/g, "").slice(0, 80)
+}
+
+async function rememberRunForRoot(ctx: any, rootSessionId: string, runId: string): Promise<void> {
+  if (!rootSessionId || !validSessionId(runId)) return
+  const key = sessionKey(rootSessionId)
+  if (!key) return
+  try {
+    if (typeof ctx?.storage?.set === "function") {
+      await ctx.storage.set(`${RUN_BY_ROOT_PREFIX}${key}`, runId)
+    }
+  } catch {}
+}
+
+async function rootSessionOf(ctx: any, sessionID: string | undefined): Promise<string | undefined> {
+  if (!sessionID || typeof ctx?.session?.get !== "function") return undefined
+  let current = sessionID
+  for (let depth = 0; depth < ROOT_CHAIN_MAX_DEPTH; depth++) {
+    let info: any
+    try {
+      info = await withTimeout(Promise.resolve(ctx.session.get({ sessionID: current })), 2000)
+    } catch {
+      return undefined
+    }
+    if (!info) return undefined
+    const parent = info.parentID ?? info.parentId ?? info.parent_id
+    if (typeof parent !== "string" || parent.trim() === "") return current
+    current = parent
+  }
+  return undefined
+}
+
+/** Resolve the run this caller belongs to through its root-session mapping. */
+async function runForSession(ctx: any, root: string, sessionID: string | undefined): Promise<string | undefined> {
+  const rootSessionId = await rootSessionOf(ctx, sessionID)
+  if (!rootSessionId) return undefined
+  let mapped: unknown
+  try {
+    if (typeof ctx?.storage?.get !== "function") return undefined
+    mapped = await ctx.storage.get(`${RUN_BY_ROOT_PREFIX}${sessionKey(rootSessionId)}`)
+  } catch {
+    return undefined
+  }
+  if (!validSessionId(mapped)) return undefined
+  const mappedRun = join(runsDir(root), mapped)
+  if (!existsSync(mappedRun)) return undefined
+  const resolved = resolveRun(root, mapped)
+  return resolved.error ? undefined : resolved.run
 }
 
 /**
@@ -1531,8 +1582,11 @@ function isUnsafePathDetail(msg: string): boolean {
   return UNSAFE_PATH_RE.test(msg)
 }
 
-export function describeRun(root: string): string | undefined {
-  const { run } = resolveRun(root)
+export function describeRun(
+  root: string,
+  opts: { sessionID?: string; agent?: string; runId?: string } = {},
+): string | undefined {
+  const { run } = resolveRun(root, opts.runId)
   if (!run) return undefined
   const state = readJson<any>(run, join(run, "state.json"), undefined)
   if (!state) return undefined
@@ -1552,7 +1606,7 @@ export function describeRun(root: string): string | undefined {
     `Tasks: ${pass}/${tasks.length} pass, ${fail} fail. Open pitfalls: ${pitfalls}${pitfallSuffix}.`,
     ...(tournamentLine ? [tournamentLine] : []),
     describeCostLine(run),
-    ...describeBriefingLines(root, id),
+    ...describeBriefingLines(run, opts.sessionID, opts.agent),
     `State: ${join(runsDir(root), id, "state.json")} (read it before dispatching).`,
   ].join("\n")
 }
@@ -1576,8 +1630,20 @@ function describeTournamentLine(run: string): string | undefined {
   return `Tournament: phase ${mPhase}, iter ${Number(m.iteration) || 0}/${Number(m.config?.maxIterations) || 0}, level ${Number(m.currentLevel) || 0}/${Number(m.config?.levels) || 0}, candidates ${candList.length} (${surviving} surviving).`
 }
 
-function describeBriefingLines(root: string, id: string): string[] {
-  const run = join(runsDir(root), id)
+function describeBriefingLines(run: string, sessionID?: string, agent?: string): string[] {
+  // Prefer the caller's per-agent briefing when its identity is known; fall
+  // back to the shared briefing exactly as before (legacy runs included).
+  const agentBriefing = sessionID && agent ? readAgentBriefingExcerpt(run, agent, sessionID) : undefined
+  if (agentBriefing) {
+    const header = agentBriefing.truncated
+      ? `[teamwork] agent briefing (${agentBriefing.path}) — first 4096 of ${agentBriefing.bytes} bytes:`
+      : `[teamwork] agent briefing (${agentBriefing.path}):`
+    const lines = [header, agentBriefing.text]
+    if (agentBriefing.truncated) {
+      lines.push(`[teamwork] agent briefing excerpt truncated at 4096 bytes; read ${agentBriefing.path} for the rest.`)
+    }
+    return lines
+  }
   const briefing = readBriefingExcerpt(run)
   if (!briefing) return []
   const file = join(run, "BRIEFING.md")
@@ -2623,6 +2689,9 @@ async function createPlanRun(
   await appendEvent(run, { event: "run_created", sessionId, taskId: null, from: null, to: "pending", round: 0, phase: "DAG_BUILD", specGate, ...(specGate === "satisfied" ? { specPath: specFile } : {}), ...(preflightNote ? { note: preflightNote } : {}) })
   // Shared continuity briefing: written after plan/state/costs, never fatal.
   await refreshBriefingSafe(run)
+  // Remember which root session owns this run, so a child context hook resolves
+  // its own run instead of whichever run was written most recently.
+  if (callSession) await rememberRunForRoot(ctx, rootSessionId, sessionId)
   // Backstop: if console credits apply but the budget wasn't derived from
   // them, warn (advisory — the sentinel is instructed to run the preflight).
   let creditWarning = ""
@@ -5312,6 +5381,92 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     })
 
     editor.add({
+      name: "handoff",
+      description:
+        "Record the five-section handoff (Observation, Logic Chain, Caveats, Conclusion, Verification Method) for this agent. Writes <run>/handoffs/<taskId|_run>-<agent>.md and updates the bounded handoffs/index.json. Identity comes from the trusted calling session; task-scoped roles must name an existing task, while victory-auditor/sentinel/orchestrator record run-level handoffs. The handoff is narrative/citation only and never changes a gate verdict.",
+      input: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string", description: "Run id (SESSION_ID returned by teamwork_plan), not the OpenCode session id." },
+          taskId: { type: "string", description: "Task id for worker/proof-worker/verifier/falsifier/security-auditor. Omit (or pass _run) for victory-auditor/sentinel/orchestrator." },
+          observation: { type: "string", description: "1. Observation — what you ran and saw." },
+          logicChain: { type: "string", description: "2. Logic Chain — observation → conclusion." },
+          caveats: { type: "string", description: "3. Caveats — unchecked/assumed/risky." },
+          conclusion: { type: "string", description: "4. Conclusion — done, blocked, or needs re-scope." },
+          verificationMethod: { type: "string", description: "5. Verification Method — how the next agent reproduces it." },
+          round: { type: "number", description: "Optional round number (default 0)." },
+        },
+        required: ["sessionId", "observation", "logicChain", "caveats", "conclusion", "verificationMethod"],
+        additionalProperties: false,
+      },
+      execute: async (input: any, context: any) => {
+        const resolved = resolveRun(root, input?.sessionId)
+        if (resolved.error) return { content: resolved.error }
+        const run = resolved.run as string
+        const authz = await authorizeToolAction(ctx, run, "handoff", undefined, context)
+        if (!authz.ok) return { content: authz.content }
+        const agent = authz.caller?.agent
+        if (!agent || !handoffAgentSlug(agent)) {
+          return { content: "refused: handoff needs a trusted team/<role> session identity; nothing was written" }
+        }
+        const scope = resolveHandoffScope(agent, input?.taskId)
+        if (!scope.ok) return { content: scope.error }
+
+        if (scope.taskId) {
+          const plan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
+          const state = readJson<any>(run, join(run, "state.json"), undefined)
+          const inPlan = Array.isArray(plan?.tasks) && plan.tasks.some((t: any) => t?.id === scope.taskId)
+          const inState = !!state?.tasks && Object.prototype.hasOwnProperty.call(state.tasks, scope.taskId)
+          if (!inPlan && !inState) {
+            return { content: `refused: task "${scope.taskId}" is not in plan.dag.json or state.json; nothing was written` }
+          }
+        }
+
+        try {
+          const written = await writeHandoff(run, {
+            sessionId: basename(run),
+            agent,
+            agentSessionId: authz.sessionID ?? "",
+            taskId: scope.taskId,
+            round: input?.round,
+            sections: {
+              observation: input?.observation,
+              logicChain: input?.logicChain,
+              caveats: input?.caveats,
+              conclusion: input?.conclusion,
+              verificationMethod: input?.verificationMethod,
+            },
+          })
+          await appendEvent(run, {
+            event: "handoff_recorded",
+            sessionId: basename(run),
+            taskId: scope.taskKey,
+            to: "HANDOFF",
+            round: written.entry.round,
+            agent,
+            agentSource: "session",
+            note: written.relativePath,
+          })
+          const citeLine = written.entry.cites.length
+            ? `\nCitations: ${written.entry.cites.map((c) => `${c.path} (sha256 ${c.sha256})`).join(", ")}`
+            : ""
+          return {
+            content: `Handoff recorded: ${written.relativePath} (${written.bytes} bytes, sha256 ${written.sha256}).${citeLine}`,
+            path: written.path,
+            relativePath: written.relativePath,
+            taskId: scope.taskKey,
+            agent,
+            sha256: written.sha256,
+            bytes: written.bytes,
+            cites: written.entry.cites,
+          }
+        } catch (err: any) {
+          return { content: clean(err?.message || "handoff write failed", 300) }
+        }
+      },
+    })
+
+    editor.add({
       name: "security_audit",
       description:
         "Record the findings of team/security-auditor and enforce the pre-merge security gate. Writes verify/security-audit.json. If Critical or High findings exist, or the auditor reports an integrity finding forbidden at the run's mode, marks status as FAIL and blocks final merge.",
@@ -6982,10 +7137,26 @@ export async function registerTeamworkHooks(ctx: any, root: string) {
   })
 
   // Inject the active run's (sanitised) state into every team agent's context.
-  await ctx.session?.hook?.("context", (event: any) => {
-    if (typeof event.agent === "string" && event.agent.startsWith("team/")) {
-      const text = describeRun(root)
-      if (text) event.system.push({ type: "text", text })
+  // The run is resolved from the caller's root-session mapping when possible;
+  // otherwise this keeps the legacy newest-run behaviour. The per-agent briefing
+  // is written lazily here and is fail-open: any refusal leaves the shared
+  // briefing (and the rest of the context) exactly as before.
+  await ctx.session?.hook?.("context", async (event: any) => {
+    if (!(typeof event.agent === "string" && event.agent.startsWith("team/"))) return
+    let runPath: string | undefined
+    try {
+      runPath = await runForSession(ctx, root, event.sessionID)
+    } catch {}
+    if (runPath && typeof event.sessionID === "string") {
+      try {
+        refreshAgentBriefing(runPath, event.agent, event.sessionID)
+      } catch {}
     }
+    const text = describeRun(root, {
+      runId: runPath ? basename(runPath) : undefined,
+      sessionID: typeof event.sessionID === "string" ? event.sessionID : undefined,
+      agent: event.agent,
+    })
+    if (text) event.system.push({ type: "text", text })
   })
 }

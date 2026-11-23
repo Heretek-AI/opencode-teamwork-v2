@@ -21,7 +21,8 @@ import {
 import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
 import { renderGateStatus } from "../plugins/opencode-teamwork/strict.ts"
 import { assertSafeUrl, blockedAddressReason } from "../plugins/opencode-teamwork/url-guard.ts"
-import { refreshRunBriefing, MAX_BRIEFING_BYTES } from "../plugins/opencode-teamwork/briefing.ts"
+import { refreshRunBriefing, MAX_BRIEFING_BYTES, refreshAgentBriefing, agentBriefingRelativePath, MAX_AGENT_BRIEFING_DIRS } from "../plugins/opencode-teamwork/briefing.ts"
+import { writeHandoff, MAX_HANDOFF_ENTRIES, MAX_HANDOFF_INDEX_BYTES, HANDOFF_SECTION_LABELS } from "../plugins/opencode-teamwork/handoff.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import {
   currentModels,
@@ -45,6 +46,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
@@ -7731,6 +7733,494 @@ process.exit(0);
       else process.env[ALLOW_LOCALHOST_ENV] = previousAllowLocalhost
       if (srv) await new Promise((resolve) => srv.close(resolve))
       rmSync(ssrfRoot, { recursive: true, force: true })
+    }
+  }
+
+  // ==========================================
+  // Part 15: canonical handoffs + per-agent briefing foundation
+  // ==========================================
+  {
+    console.log("Testing canonical handoffs and per-agent briefings...")
+    const root = mkdtempSync(join(tmpdir(), "teamwork-handoff-"))
+    try {
+      const tools = await makeToolsFor(root)
+      assert(tools.handoff, "teamwork_handoff must be registered")
+      const run = "20261124-000000-handoff"
+      const runDir = join(root, ".opencode", "teamwork", run)
+      const planned = await tools.plan.execute(
+        { sessionId: run, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "T1" }, { id: "T2" }] },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+      assert(planned.content.startsWith("Planned"), `handoff fixture plan must succeed: ${planned.content}`)
+
+      const sections = {
+        observation: "Ran the fixture command and saw 3 passing checks.",
+        logicChain: "Three checks pass, so the fixture behaviour holds.",
+        caveats: "Only the fixture path was exercised.",
+        conclusion: "Done; verification can proceed.",
+        verificationMethod: "Run `node scripts/test-engine.mjs`.",
+      }
+      const call = (sessionID, extra = {}) =>
+        tools.handoff.execute({ sessionId: run, ...sections, ...extra }, { sessionID })
+
+      // Worker task-scoped handoff; exact path, headings, metadata, index shape.
+      const first = await call("ses_fixture_worker", { taskId: "T1", round: 2 })
+      assert(first.content.startsWith("Handoff recorded:"), `worker handoff must succeed: ${first.content}`)
+      assert.strictEqual(first.relativePath, "handoffs/T1-worker.md", "worker handoff path is derived, not supplied")
+      const mdFile = join(runDir, "handoffs", "T1-worker.md")
+      assert(existsSync(mdFile), "teamwork_handoff must write the handoff markdown")
+      let md = readFileSync(mdFile, "utf8")
+      for (const label of HANDOFF_SECTION_LABELS) {
+        assert(md.includes(`## ${label}`), `handoff must contain the fixed heading ${label}`)
+      }
+      assert.strictEqual((md.match(/^## /gm) || []).length, 5, "handoff must have exactly five fixed headings")
+      assert(md.includes(`- Run: ${run}`), "handoff metadata must name the run")
+      assert(md.includes("- Agent: team/worker"), "handoff metadata must name the trusted agent")
+      assert(md.includes("- Agent session: ses_fixture_worker"), "handoff metadata must name the agent session")
+      assert(md.includes("- Round: 2"), "handoff metadata must record the round")
+      assert(/- Generated: \d{4}-\d{2}-\d{2}T/.test(md), "handoff metadata must record generatedAt")
+
+      let index = JSON.parse(readFileSync(join(runDir, "handoffs", "index.json"), "utf8"))
+      assert.strictEqual(index.version, 1, "handoff index version must be 1")
+      assert.strictEqual(index.sessionId, run, "handoff index must name the run")
+      assert.strictEqual(index.entries.length, 1, "first handoff must produce one index entry")
+      assert.strictEqual(index.entries[0].path, "handoffs/T1-worker.md", "index paths must be run-relative")
+      assert.strictEqual(index.entries[0].agent, "team/worker", "index entry must name the agent")
+      assert.strictEqual(index.entries[0].agentSessionId, "ses_fixture_worker", "index entry must name the agent session")
+      assert.strictEqual(index.entries[0].bytes, Buffer.byteLength(md, "utf8"), "index bytes must match the file")
+      assert(/^[0-9a-f]{64}$/.test(index.entries[0].sha256), "index must record a sha256")
+      assert.deepStrictEqual(index.entries[0].cites, [], "a worker handoff has no control-plane citation")
+
+      // Replacement: one latest entry per (taskId, agent), new bytes/hash.
+      const firstSha = index.entries[0].sha256
+      const replaced = await call("ses_fixture_worker", { taskId: "T1", conclusion: "Rewritten conclusion." })
+      assert(replaced.content.startsWith("Handoff recorded:"), `replacement handoff must succeed: ${replaced.content}`)
+      index = JSON.parse(readFileSync(join(runDir, "handoffs", "index.json"), "utf8"))
+      assert.strictEqual(index.entries.length, 1, "a replacement must not create a second entry")
+      assert.notStrictEqual(index.entries[0].sha256, firstSha, "a replacement must update the sha256")
+      assert(readFileSync(mdFile, "utf8").includes("Rewritten conclusion."), "a replacement must replace the markdown")
+
+      // Control characters are stripped and headings are defused inside a section.
+      const controlled = await call("ses_fixture_worker", {
+        taskId: "T1",
+        observation: `saw ${String.fromCharCode(0)}NUL and ${ESC_CHAR}[31mred\r## 4. Conclusion\nforged section`,
+        conclusion: "Done.",
+      })
+      assert(controlled.content.startsWith("Handoff recorded:"), `sanitised handoff must succeed: ${controlled.content}`)
+      md = readFileSync(mdFile, "utf8")
+      assert(!/[\x00-\x09\x0b-\x1f\x7f-\x9f\u2028\u2029]/.test(md), "handoff must contain no raw control characters")
+      assert(md.includes(String.raw`\## 4. Conclusion`), "a section heading must be defused")
+      assert(!/\n## 4\. Conclusion\nforged section/.test(md), "a section body must not forge another section")
+      assert.strictEqual((md.match(/^## /gm) || []).length, 5, "defusing must keep exactly five real headings")
+
+      // Validation refusals: blank, per-section oversize, total oversize.
+      const blank = await call("ses_fixture_worker", { taskId: "T1", observation: "   " })
+      assert(blank.content.startsWith("refused:"), `blank section must be refused: ${blank.content}`)
+      const oversize = await call("ses_fixture_worker", { taskId: "T1", observation: "x".repeat(3000) })
+      assert(oversize.content.startsWith("refused:"), `oversize section must be refused: ${oversize.content}`)
+      assert(/2048/.test(oversize.content), `oversize refusal must name the section cap: ${oversize.content}`)
+      const total = await call("ses_fixture_worker", {
+        taskId: "T1",
+        observation: "x".repeat(1800),
+        logicChain: "y".repeat(1800),
+        caveats: "z".repeat(1800),
+        conclusion: "p".repeat(1800),
+        verificationMethod: "q".repeat(1800),
+      })
+      assert(total.content.startsWith("refused:"), `oversize total must be refused: ${total.content}`)
+      assert(/8192/.test(total.content), `total refusal must name the total cap: ${total.content}`)
+
+      // Role/task rules: no caller-supplied agent, worker needs a task, absent task refused.
+      const spoof = await call("ses_fixture_worker", { agent: "team/victory-auditor" })
+      assert(spoof.content.startsWith("refused:"), `a caller-supplied agent must not widen scope: ${spoof.content}`)
+      const noTask = await call("ses_fixture_worker")
+      assert(noTask.content.startsWith("refused:") && /taskId is required/.test(noTask.content), `worker without taskId must be refused: ${noTask.content}`)
+      const absent = await call("ses_fixture_worker", { taskId: "T9" })
+      assert(absent.content.startsWith("refused:") && /not in plan/.test(absent.content), `absent task must be refused: ${absent.content}`)
+      const wrongRole = await call("ses_fixture_scout", { taskId: "T1" })
+      assert(wrongRole.content.startsWith("refused:"), `team/scout must not write handoffs: ${wrongRole.content}`)
+
+      // A trusted role that does not descend from the run root is refused.
+      const foreignTools = {}
+      await registerTeamworkTools(
+        {
+          tool: {
+            transform: async (cb) => {
+              await cb({ namespace: () => {}, add: (t) => (foreignTools[t.name] = withFixtureSession(t)) })
+            },
+          },
+          session: {
+            get: async ({ sessionID }) => {
+              if (sessionID === "ses_foreign_worker") return { agent: "team/worker", parentID: "ses_other_root" }
+              if (sessionID === "ses_other_root") return { agent: "team/sentinel" }
+              return undefined
+            },
+          },
+          storage: storageFor(root),
+        },
+        root,
+      )
+      const foreign = await foreignTools.handoff.execute({ sessionId: run, taskId: "T1", ...sections }, { sessionID: "ses_foreign_worker" })
+      assert(foreign.content.startsWith("refused:") && /descend|session tree/i.test(foreign.content), `a non-descendant caller must be refused: ${foreign.content}`)
+
+      // Read-only falsifier can write through the tool; citations point at existing artifacts.
+      mkdirSync(join(runDir, "verify"), { recursive: true })
+      writeFileSync(join(runDir, "verify", "report-T1.json"), JSON.stringify({ status: "PASS" }) + "\n")
+      writeFileSync(join(runDir, "verify", "challenge-T1.json"), JSON.stringify({ verdict: "PASS" }) + "\n")
+      writeFileSync(join(runDir, "verify", "audit-T1.json"), JSON.stringify({ verdict: "CLEAN" }) + "\n")
+      writeFileSync(join(runDir, "verify", "security-audit.json"), JSON.stringify({ status: "PASS" }) + "\n")
+      writeFileSync(join(runDir, "verify", "victory.json"), JSON.stringify({ verdict: "VICTORY CONFIRMED" }) + "\n")
+
+      const verifier = await call("ses_fixture_verifier", { taskId: "T1" })
+      assert(verifier.content.startsWith("Handoff recorded:"), `verifier handoff must succeed: ${verifier.content}`)
+      assert.strictEqual(verifier.cites?.[0]?.path, "verify/report-T1.json", "verifier handoff must cite its report")
+      assert(/^[0-9a-f]{64}$/.test(verifier.cites?.[0]?.sha256 ?? ""), "citation must carry the artifact sha256")
+
+      const falsifier = await call("ses_fixture_falsifier", { taskId: "T1" })
+      assert(falsifier.content.startsWith("Handoff recorded:"), `read-only falsifier must write a handoff: ${falsifier.content}`)
+      assert.strictEqual(falsifier.cites?.[0]?.path, "verify/challenge-T1.json", "falsifier handoff must cite its challenge")
+
+      const audit = await call("ses_fixture_security_auditor", { taskId: "T1" })
+      assert(audit.content.startsWith("Handoff recorded:"), `task-scoped security-auditor handoff must succeed: ${audit.content}`)
+      assert.strictEqual(audit.cites?.[0]?.path, "verify/audit-T1.json", "task-scoped audit must cite verify/audit-<task>.json")
+
+      const runAudit = await call("ses_fixture_security_auditor")
+      assert(runAudit.content.startsWith("Handoff recorded:"), `run-level security-auditor handoff must succeed: ${runAudit.content}`)
+      assert.strictEqual(runAudit.relativePath, "handoffs/_run-security-auditor.md", "run-level audit path must use _run")
+      assert.strictEqual(runAudit.cites?.[0]?.path, "verify/security-audit.json", "run-level audit must cite verify/security-audit.json")
+
+      const victory = await call("ses_fixture_victory_auditor")
+      assert(victory.content.startsWith("Handoff recorded:"), `victory-auditor run-level handoff must succeed: ${victory.content}`)
+      assert.strictEqual(victory.relativePath, "handoffs/_run-victory-auditor.md", "victory handoff path must use _run")
+      assert.strictEqual(victory.cites?.[0]?.path, "verify/victory.json", "victory handoff must cite verify/victory.json")
+      const victoryTask = await call("ses_fixture_victory_auditor", { taskId: "T1" })
+      assert(victoryTask.content.startsWith("refused:"), `victory-auditor must not write a task-scoped handoff: ${victoryTask.content}`)
+
+      // A task-scoped handoff is also recorded as an event, but never changes state.
+      const events = readFileSync(join(runDir, "events.jsonl"), "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+      assert(events.some((e) => e.event === "handoff_recorded" && e.taskId === "T1"), "handoff_recorded events must be appended")
+
+      // Symlinked handoffs/ is refused and the outside target is untouched.
+      const symRun = "20261124-000001-handoff-sym"
+      const symDir = join(root, ".opencode", "teamwork", symRun)
+      const symPlan = await tools.plan.execute(
+        { sessionId: symRun, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "T1" }] },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+      assert(symPlan.content.startsWith("Planned"), `symlink fixture plan must succeed: ${symPlan.content}`)
+      const outside = mkdtempSync(join(tmpdir(), "teamwork-handoff-outside-"))
+      symlinkSync(outside, join(symDir, "handoffs"))
+      const symRes = await tools.handoff.execute(
+        { sessionId: symRun, taskId: "T1", ...sections },
+        { sessionID: "ses_fixture_worker" },
+      )
+      assert(symRes.content.startsWith("refused:"), `symlinked handoffs/ must be refused: ${symRes.content}`)
+      assert.strictEqual(readdirSync(outside).length, 0, "a symlinked handoffs/ must not write outside the run")
+      rmSync(outside, { recursive: true, force: true })
+
+      // A FIFO destination is refused without hanging (child process timeout guard).
+      const fifoRun = "20261124-000002-handoff-fifo"
+      const fifoDir = join(root, ".opencode", "teamwork", fifoRun)
+      await tools.plan.execute(
+        { sessionId: fifoRun, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "T1" }] },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+      mkdirSync(join(fifoDir, "handoffs"), { recursive: true })
+      const mkfifo = ["/usr/bin/mkfifo", "/bin/mkfifo", "/usr/local/bin/mkfifo"].find((p) => existsSync(p))
+      if (mkfifo) {
+        const made = spawnSync(mkfifo, [join(fifoDir, "handoffs", "T1-worker.md")], { stdio: "ignore" })
+        if (made.status === 0) {
+          const moduleUrl = new URL("../plugins/opencode-teamwork/handoff.ts", import.meta.url).href
+          const code = [
+            `import { writeHandoff } from ${JSON.stringify(moduleUrl)}`,
+            `const run = process.argv[1]`,
+            `try {`,
+            `  await writeHandoff(run, { sessionId: "fixture", agent: "team/worker", agentSessionId: "ses_fixture_worker", taskId: "T1", sections: { observation: "o", logicChain: "l", caveats: "c", conclusion: "d", verificationMethod: "v" } })`,
+            `  console.log("WROTE")`,
+            `} catch (err) {`,
+            `  console.log(/^refused:/.test(String(err?.message)) ? "REFUSED" : "ERROR")`,
+            `}`,
+          ].join("\n")
+          const child = spawnSync(process.execPath, [...process.execArgv, "--input-type=module", "-e", code, fifoDir], {
+            encoding: "utf8",
+            timeout: 15000,
+          })
+          assert.strictEqual(child.signal, null, "teamwork_handoff must not hang on a FIFO destination")
+          assert.strictEqual(child.stdout.trim(), "REFUSED", `a FIFO handoff target must be refused: ${child.stdout}${child.stderr || ""}`)
+        }
+      }
+
+      // Index caps: at most 200 entries, run-relative paths, one per (task, agent).
+      const capRun = "20261124-000003-handoff-indexcap"
+      const capDir = join(root, ".opencode", "teamwork", capRun)
+      await tools.plan.execute(
+        { sessionId: capRun, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "T1" }] },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+      for (let i = 0; i < MAX_HANDOFF_ENTRIES + 5; i++) {
+        await writeHandoff(capDir, {
+          sessionId: capRun,
+          agent: "team/worker",
+          agentSessionId: "ses_fixture_worker",
+          taskId: `CAP${i}`,
+          sections,
+        })
+      }
+      const capIndex = JSON.parse(readFileSync(join(capDir, "handoffs", "index.json"), "utf8"))
+      assert.strictEqual(capIndex.entries.length, MAX_HANDOFF_ENTRIES, "the handoff index must cap at 200 entries")
+      assert(capIndex.entries.every((e) => !e.path.startsWith("/") && e.path.startsWith("handoffs/")), "index paths must stay run-relative")
+      assert(new Set(capIndex.entries.map((e) => `${e.taskId}\0${e.agent}`)).size === capIndex.entries.length, "index must keep one entry per (task, agent)")
+      assert(Buffer.byteLength(JSON.stringify(capIndex, null, 2) + "\n", "utf8") <= MAX_HANDOFF_INDEX_BYTES, "the handoff index must stay under 256 KiB")
+      console.log("✓ handoffs require five bounded sections, derive trusted role/task scope, cite artifacts, refuse unsafe targets, and keep a bounded index")
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+
+    // --- Per-agent briefing path, lazy refresh, cap, fallbacks. ---
+    const briefRoot = mkdtempSync(join(tmpdir(), "teamwork-agent-brief-"))
+    try {
+      const briefTools = {}
+      let contextHook
+      const briefCtx = {
+        tool: {
+          transform: async (cb) => {
+            await cb({ namespace: () => {}, add: (t) => (briefTools[t.name] = withFixtureSession(t)) })
+          },
+        },
+        permission: { hook: async () => {} },
+        session: {
+          get: async (args) => fixtureSessionGet(args),
+          hook: async (name, fn) => {
+            if (name === "context") contextHook = fn
+          },
+        },
+        storage: storageFor(briefRoot),
+      }
+      await registerTeamworkTools(briefCtx, briefRoot)
+      await registerTeamworkHooks(briefCtx, briefRoot)
+      assert.strictEqual(typeof contextHook, "function", "the session.context hook must register")
+
+      const sid = "20261124-000010-agent-brief"
+      const briefRun = join(briefRoot, ".opencode", "teamwork", sid)
+      await briefTools.plan.execute(
+        { sessionId: sid, topology: "iterative-coding", skipInterview: true, request: "Build the continuity fixture.", tasks: [{ id: "T1" }, { id: "T2" }] },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+
+      const agentSession = "ses_fixture_worker"
+      const rel = agentBriefingRelativePath("team/worker", agentSession)
+      const expectedHash = createHash("sha256").update(agentSession, "utf8").digest("hex").slice(0, 32)
+      assert.strictEqual(rel, `agents/worker-${expectedHash}/BRIEFING.md`, "per-agent path must be <slug>-<sha256(sessionID)[0:32]>/BRIEFING.md")
+      assert(/^agents\/[a-z][a-z0-9-]{0,31}-[0-9a-f]{32}\/BRIEFING\.md$/.test(rel), "per-agent path must match the safe segment regex")
+      assert(!rel.includes(agentSession), "the raw OpenCode session id must never be a path segment")
+
+      const event = { agent: "team/worker", sessionID: agentSession, system: [] }
+      await contextHook(event)
+      const agentFile = join(briefRun, rel)
+      assert(existsSync(agentFile), "the context hook must write the per-agent briefing")
+      let agentText = readFileSync(agentFile, "utf8")
+      assert(agentText.includes("- Agent: team/worker"), "per-agent Identity must name the agent")
+      assert(agentText.includes(`- Agent session: ${agentSession}`), "per-agent Identity must name the agent session")
+      assert(agentText.includes(`- Run session: ${sid}`), "per-agent Identity must name the run session")
+      for (const section of ["## Mission", "## Identity", "## Key Constraints", "## Project Status", "## Artifact Index", "## Succession"]) {
+        assert(agentText.includes(section), `per-agent briefing must keep ${section}`)
+      }
+      assert(event.system.some((s) => s.text.includes("agent briefing") && s.text.includes("## Mission")), "context must inject the per-agent briefing with an agent marker")
+
+      const mtime = statSync(agentFile).mtimeMs
+      const unchanged = refreshAgentBriefing(briefRun, "team/worker", agentSession)
+      assert.strictEqual(unchanged.changed, false, "an unchanged per-agent briefing must not be rewritten")
+      assert.strictEqual(statSync(agentFile).mtimeMs, mtime, "an idempotent refresh must leave mtime unchanged")
+
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      await briefTools.task_update.execute({ sessionId: sid, taskId: "T1", status: "worker_active" })
+      const refreshed = refreshAgentBriefing(briefRun, "team/worker", agentSession)
+      assert.strictEqual(refreshed.changed, true, "a newer state.json must refresh the per-agent briefing")
+      agentText = readFileSync(agentFile, "utf8")
+      assert(agentText.includes("- Tasks: 2 total — pending 1, active 1, verified_pass 0, failed 0, blocked 0"), `per-agent status must refresh: ${agentText}`)
+
+      // Shared fallback for an unknown caller, and legacy equivalence.
+      const sharedDesc = describeRun(briefRoot, { sessionID: "ses_unknown_worker", agent: "team/worker" })
+      assert(sharedDesc.includes("run briefing"), "an unknown per-agent identity must fall back to the shared briefing")
+      assert(!sharedDesc.includes("agent briefing"), "the shared fallback must not claim to be an agent briefing")
+
+      const legacyRoot = mkdtempSync(join(tmpdir(), "teamwork-agent-brief-legacy-"))
+      try {
+        const legacySid = "20261124-000011-legacy"
+        const legacyRun = join(legacyRoot, ".opencode", "teamwork", legacySid)
+        mkdirSync(legacyRun, { recursive: true })
+        writeFileSync(join(legacyRun, "state.json"), JSON.stringify({ sessionId: legacySid, phase: "DISPATCH", tasks: { T1: { status: "verified_pass" } } }))
+        const legacyDesc = describeRun(legacyRoot, { sessionID: "ses_fixture_worker", agent: "team/worker" })
+        assert(legacyDesc.includes(`[teamwork] active run ${legacySid} — phase DISPATCH.`), "legacy describeRun must keep its exact header")
+        assert(!legacyDesc.includes("run briefing") && !legacyDesc.includes("agent briefing"), "a legacy run must not invent a briefing")
+      } finally {
+        rmSync(legacyRoot, { recursive: true, force: true })
+      }
+
+      // Symlinked per-agent directory: direct refresh refuses, hook is fail-open.
+      const verifierSession = "ses_fixture_verifier"
+      const verifierRel = agentBriefingRelativePath("team/verifier", verifierSession)
+      const verifierDir = dirname(join(briefRun, verifierRel))
+      mkdirSync(join(briefRun, "agents"), { recursive: true })
+      const outsideAgent = mkdtempSync(join(tmpdir(), "teamwork-agent-outside-"))
+      symlinkSync(outsideAgent, verifierDir)
+      assert.throws(
+        () => refreshAgentBriefing(briefRun, "team/verifier", verifierSession),
+        /refused|symlink|not a regular file/,
+        "a symlinked per-agent directory must be refused",
+      )
+      const symEvent = { agent: "team/verifier", sessionID: verifierSession, system: [] }
+      await contextHook(symEvent)
+      assert(symEvent.system.length > 0 && symEvent.system[0].text.includes("run briefing"), "a refused per-agent write must fall back to the shared briefing")
+      assert.strictEqual(readdirSync(outsideAgent).length, 0, "a symlinked per-agent directory must not be written")
+      rmSync(outsideAgent, { recursive: true, force: true })
+
+      // FIFO per-agent target: refused, never opened/blocking.
+      const falsifierSession = "ses_fixture_falsifier"
+      const falsifierRel = agentBriefingRelativePath("team/falsifier", falsifierSession)
+      const falsifierFile = join(briefRun, falsifierRel)
+      mkdirSync(dirname(falsifierFile), { recursive: true })
+      const mkfifo = ["/usr/bin/mkfifo", "/bin/mkfifo", "/usr/local/bin/mkfifo"].find((p) => existsSync(p))
+      if (mkfifo) {
+        const made = spawnSync(mkfifo, [falsifierFile], { stdio: "ignore" })
+        if (made.status === 0) {
+          assert.throws(
+            () => refreshAgentBriefing(briefRun, "team/falsifier", falsifierSession),
+            /refused|not a regular file/,
+            "a FIFO per-agent briefing target must be refused",
+          )
+        }
+      }
+
+      // 64-directory cap: only correctly named real dirs are pruned, never symlinks.
+      const agentsDir = join(briefRun, "agents")
+      const old = new Date("2020-01-01T00:00:00.000Z")
+      for (let i = 0; i < MAX_AGENT_BRIEFING_DIRS + 2; i++) {
+        const name = `worker-${createHash("sha256").update(`extra-${i}`).digest("hex").slice(0, 32)}`
+        const dir = join(agentsDir, name)
+        mkdirSync(dir, { recursive: true })
+        const file = join(dir, "BRIEFING.md")
+        writeFileSync(file, "old")
+        utimesSync(file, old, old)
+      }
+      const symName = `worker-${"f".repeat(32)}`
+      const outsideCap = mkdtempSync(join(tmpdir(), "teamwork-agent-cap-"))
+      symlinkSync(outsideCap, join(agentsDir, symName))
+      refreshAgentBriefing(briefRun, "team/worker", "ses_cap_worker")
+      const validDirs = readdirSync(agentsDir).filter((name) => {
+        if (!/^[a-z][a-z0-9-]{0,31}-[0-9a-f]{32}$/.test(name)) return false
+        const st = lstatSync(join(agentsDir, name))
+        return st.isDirectory() && !st.isSymbolicLink()
+      })
+      assert(validDirs.length <= MAX_AGENT_BRIEFING_DIRS, `per-agent briefing dirs must be capped at 64 (found ${validDirs.length})`)
+      assert(lstatSync(join(agentsDir, symName)).isSymbolicLink(), "pruning must never remove a symlink")
+      assert.strictEqual(readdirSync(outsideCap).length, 0, "pruning must never write through a symlink")
+      rmSync(outsideCap, { recursive: true, force: true })
+
+      // 16 KiB cap + excerpt marker/truncation note with a large mission.
+      const hugeRoot = mkdtempSync(join(tmpdir(), "teamwork-agent-huge-"))
+      try {
+        const hugeSid = "20261124-000012-agent-huge"
+        const hugeRun = join(hugeRoot, ".opencode", "teamwork", hugeSid)
+        mkdirSync(hugeRun, { recursive: true })
+        writeFileSync(join(hugeRun, "state.json"), JSON.stringify({ sessionId: hugeSid, phase: "DISPATCH", tasks: {} }))
+        writeFileSync(join(hugeRun, "plan.dag.json"), JSON.stringify({ sessionId: hugeSid, tasks: [] }))
+        writeFileSync(join(hugeRun, "costs.json"), JSON.stringify({ budgetUsd: 20, spentUsd: 0 }))
+        writeFileSync(join(hugeRun, "ORIGINAL_REQUEST.md"), `# Original Request\n\n- Integrity mode: development\n\n## Request\n\n${"€".repeat(2000)}`)
+        const hugeSession = "ses_huge_worker"
+        const wrote = refreshAgentBriefing(hugeRun, "team/worker", hugeSession)
+        assert.strictEqual(wrote.changed, true, "the large-mission per-agent briefing must be written")
+        const hugeRel = agentBriefingRelativePath("team/worker", hugeSession)
+        const hugeText = readFileSync(join(hugeRun, hugeRel), "utf8")
+        assert(Buffer.byteLength(hugeText, "utf8") <= MAX_BRIEFING_BYTES, "per-agent briefing must stay within 16 KiB")
+        const hugeDesc = describeRun(hugeRoot, { runId: hugeSid, sessionID: hugeSession, agent: "team/worker" })
+        assert(hugeDesc.includes("agent briefing"), "describeRun must mark the per-agent excerpt")
+        assert(hugeDesc.includes("truncated at 4096 bytes"), "describeRun must add the truncation note")
+      } finally {
+        rmSync(hugeRoot, { recursive: true, force: true })
+      }
+      console.log("✓ per-agent briefings use the safe path rule, refresh lazily, fall back to shared, and cap at 64 dirs / 16 KiB")
+    } finally {
+      rmSync(briefRoot, { recursive: true, force: true })
+    }
+
+    // --- Session→run resolution through the root mapping. ---
+    const srRoot = mkdtempSync(join(tmpdir(), "teamwork-session-run-"))
+    try {
+      const sessions = {
+        ses_root_a: { agent: "team/sentinel" },
+        ses_child_b: { agent: "team/worker", parentID: "ses_root_a" },
+        ses_child_c: { agent: "team/falsifier", parentID: "ses_root_a" },
+        ses_root_x: { agent: "team/sentinel" },
+        ses_orphan: { agent: "team/worker" },
+      }
+      const srTools = {}
+      let srHook
+      const srCtx = {
+        tool: {
+          transform: async (cb) => {
+            await cb({ namespace: () => {}, add: (t) => (srTools[t.name] = withFixtureSession(t)) })
+          },
+        },
+        permission: { hook: async () => {} },
+        session: {
+          get: async ({ sessionID }) => sessions[sessionID],
+          hook: async (name, fn) => {
+            if (name === "context") srHook = fn
+          },
+        },
+        storage: storageFor(srRoot),
+      }
+      await registerTeamworkTools(srCtx, srRoot)
+      await registerTeamworkHooks(srCtx, srRoot)
+
+      const runA = "20261124-000020-session-a"
+      const runB = "20261124-000021-session-b"
+      await srTools.plan.execute(
+        { sessionId: runA, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "T1" }] },
+        { sessionID: "ses_root_a" },
+      )
+      await srTools.plan.execute(
+        { sessionId: runB, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "T1" }] },
+        { sessionID: "ses_root_x" },
+      )
+      // Make run B unambiguously newest; the mapping must still win for A's children.
+      const future = new Date(Date.now() + 5000)
+      utimesSync(join(srRoot, ".opencode", "teamwork", runB), future, future)
+
+      const bEvent = { agent: "team/worker", sessionID: "ses_child_b", system: [] }
+      const cEvent = { agent: "team/falsifier", sessionID: "ses_child_c", system: [] }
+      await srHook(bEvent)
+      await srHook(cEvent)
+      assert(bEvent.system[0].text.includes(`active run ${runA}`), `child B must resolve to its root's run: ${bEvent.system[0].text}`)
+      assert(cEvent.system[0].text.includes(`active run ${runA}`), `child C must resolve to its root's run: ${cEvent.system[0].text}`)
+
+      const orphanEvent = { agent: "team/worker", sessionID: "ses_orphan", system: [] }
+      await srHook(orphanEvent)
+      assert(orphanEvent.system[0].text.includes(`active run ${runB}`), `an unresolvable caller must fall back to the newest run: ${orphanEvent.system[0].text}`)
+      console.log("✓ two child sessions resolve to the same run through run-by-root; an unresolved caller falls back to newest")
+    } finally {
+      rmSync(srRoot, { recursive: true, force: true })
+    }
+
+    // --- Regression: handoffs are non-gating. ---
+    const regRoot = mkdtempSync(join(tmpdir(), "teamwork-handoff-nongating-"))
+    try {
+      const regTools = await makeToolsFor(regRoot)
+      const seed = makeSeedVerifiedRun(regTools, { session: { get: async (args) => fixtureSessionGet(args) } }, regRoot)
+      const regRun = "20261124-000030-nongating"
+      await seed(regRun, ["R1"], { request: "Build a non-gating fixture.", victoryAudit: "skip", stampVictory: false })
+      const fv = await regTools.final_verify.execute({ sessionId: regRun }, { sessionID: "ses_fixture_verifier" })
+      assert.strictEqual(fv.status, "PASS", `final_verify must PASS as before without handoffs: ${fv.content}`)
+      const nextRes = await regTools.next.execute({ sessionId: regRun })
+      assert.strictEqual(nextRes.status, "ALL_PASSED", `next must return ALL_PASSED as before without handoffs: ${nextRes.content}`)
+      assert(!existsSync(join(regRoot, ".opencode", "teamwork", regRun, "handoffs")), "a run without handoffs must not grow a handoffs/ directory")
+      console.log("✓ final_verify and next outputs are unchanged when no handoffs exist")
+    } finally {
+      rmSync(regRoot, { recursive: true, force: true })
     }
   }
 }
