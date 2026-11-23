@@ -5560,6 +5560,48 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           return { content: "Skipped worktree operation: current directory is not a git repository." }
         }
 
+        // Merge/resolve must only ever touch the run's sentinel worktree. There
+        // is deliberately no fallback to `root`: a missing, symlinked, escaping
+        // or non-git sentinel path is a hard refusal, never a merge into the
+        // user's checkout.
+        const verifiedSentinelWorktree = (): { path?: string; error?: string } => {
+          const sentinelDir = join(runWorktreesDir, "sentinel")
+          const escape = containmentError(runWorktreesDir, sentinelDir)
+          if (escape) return { error: `refused: sentinel worktree is not contained in ${runWorktreesDir}: ${escape}` }
+
+          let linkStat
+          try {
+            linkStat = lstatSync(sentinelDir)
+          } catch {
+            return {
+              error: `refused: sentinel worktree is missing at ${sentinelDir}; run worktree setup with role "sentinel" before merge/resolve (never falling back to the user repo).`,
+            }
+          }
+          if (linkStat.isSymbolicLink()) return { error: "refused: sentinel worktree path is a symlink" }
+          if (!linkStat.isDirectory()) return { error: "refused: sentinel worktree path is not a directory" }
+
+          try {
+            const baseReal = realpathSync(runWorktreesDir)
+            const sentinelReal = realpathSync(sentinelDir)
+            const relReal = relative(baseReal, sentinelReal)
+            if (!relReal || relReal.startsWith("..") || isAbsolute(relReal)) {
+              return { error: "refused: sentinel worktree escapes the worktrees base" }
+            }
+            const top = execGit(["rev-parse", "--show-toplevel"], sentinelDir)
+            if (top.code !== 0 || realpathSync(top.stdout) !== sentinelReal) {
+              return { error: "refused: sentinel worktree path is not the worktree root" }
+            }
+          } catch {
+            return { error: "refused: sentinel worktree path is not resolvable" }
+          }
+
+          const inside = execGit(["rev-parse", "--is-inside-work-tree"], sentinelDir)
+          if (inside.code !== 0 || inside.stdout !== "true") {
+            return { error: "refused: sentinel worktree path is not a git worktree" }
+          }
+          return { path: sentinelDir }
+        }
+
         if (action === "setup") {
           const role = clean(input.role || "worker", 16)
           let targetDir: string
@@ -5659,8 +5701,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (action === "merge") {
           if (!taskId) return { content: "Error: taskId is required for merge." }
           const branch = `teamwork/${runId}-${taskId}`
-          const sentinelDir = join(runWorktreesDir, "sentinel")
-          const targetCwd = existsSync(sentinelDir) ? sentinelDir : root
+          const sentinel = verifiedSentinelWorktree()
+          if (!sentinel.path) return { content: sentinel.error }
+          const targetCwd = sentinel.path
 
           const mergeRes = execGit(["merge", "--no-ff", branch, "-m", `Merge task ${taskId} (${branch})`], targetCwd)
           if (mergeRes.code !== 0) {
@@ -5707,11 +5750,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
         if (action === "resolve") {
           if (!taskId) return { content: "Error: taskId is required for resolve." }
-          const sentinelDir = join(runWorktreesDir, "sentinel")
-          const targetCwd = existsSync(sentinelDir) ? sentinelDir : root
+          const sentinel = verifiedSentinelWorktree()
+          if (!sentinel.path) return { content: sentinel.error }
+          const targetCwd = sentinel.path
           const statusRes = execGit(["status", "--porcelain"], targetCwd)
           if (!statusRes.stdout) {
-            return { content: `No modified files to commit for conflict resolution in ${sentinelDir}.` }
+            return { content: `No modified files to commit for conflict resolution in ${targetCwd}.` }
           }
           execGit(["add", "-A"], targetCwd)
           const commitMsg = clean(input.commitMessage || `Resolve merge conflict for task ${taskId}`, 200)
