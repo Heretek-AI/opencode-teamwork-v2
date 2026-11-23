@@ -100,7 +100,6 @@ import {
 import type { BudgetEstimate, TournamentConfig, TournamentManifest } from "./tournament.ts"
 import {
   DEFAULT_VERIFICATION_MODE,
-  evaluateStrictGate,
   evaluateStrictGateChecked,
   normalizeVerificationMode,
   normalizeWaveKind,
@@ -116,7 +115,6 @@ import {
   currentRequirementsHash,
   deriveRequirementsFromRequest,
   describeVictoryGate,
-  evaluateVictoryGate,
   evaluateVictoryGateChecked,
   normalizeVictoryAuditMode,
   originalRequestHash,
@@ -130,8 +128,6 @@ import {
   canonicalJson,
   createAuthContext,
   sha256Hex,
-  timingSafeEqualHex,
-  type ArtifactCheck,
   type AuthContext,
   type AuthEnvelope,
   type AuthFailure,
@@ -1834,6 +1830,19 @@ function manifestDrift(manifest: RunManifest, current: Omit<RunManifest, "versio
     if (a !== b) drift.push(`${key} drifted (manifest=${a ?? "null"} current=${b ?? "null"})`)
   }
   return drift
+}
+
+/** Recompute the signed-baseline comparison from the current run artifacts. */
+function currentManifestDrift(manifest: RunManifest, plan: any, state: any, run: string): string[] {
+  return manifestDrift(manifest, {
+    integrityMode: normalizeIntegrityMode(plan?.integrityMode ?? state?.integrityMode) ?? DEFAULT_INTEGRITY_MODE,
+    verification: resolveVerificationMode(plan, state).mode,
+    victoryAudit: resolveVictoryAuditMode(plan, state, run).mode,
+    requestHash: originalRequestHash(run),
+    requirementsHash: currentRequirementsHash(run),
+    planHash: planHashOf(plan),
+    lemmaPolicyHash: lemmaPolicyHashOf(run),
+  })
 }
 
 /**
@@ -4533,15 +4542,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
         }
         if (signedRun) {
-          const drift = manifestDrift(manifestCheck.manifest, {
-            integrityMode: normalizeIntegrityMode(plan?.integrityMode ?? state?.integrityMode) ?? DEFAULT_INTEGRITY_MODE,
-            verification: resolveVerificationMode(plan, state).mode,
-            victoryAudit: resolveVictoryAuditMode(plan, state, run).mode,
-            requestHash: originalRequestHash(run),
-            requirementsHash: currentRequirementsHash(run),
-            planHash: planHashOf(plan),
-            lemmaPolicyHash: lemmaPolicyHashOf(run),
-          })
+          const drift = currentManifestDrift(manifestCheck.manifest, plan, state, run)
           if (drift.length > 0) {
             return {
               status: "AUTH_STALE",
@@ -5864,15 +5865,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
           const requireSigned = signedRun
           if (signedRun) {
-            const drift = manifestDrift(manifestCheck.manifest, {
-              integrityMode: normalizeIntegrityMode(plan?.integrityMode ?? state?.integrityMode) ?? DEFAULT_INTEGRITY_MODE,
-              verification: resolveVerificationMode(plan, state).mode,
-              victoryAudit: resolveVictoryAuditMode(plan, state, run).mode,
-              requestHash: originalRequestHash(run),
-              requirementsHash: currentRequirementsHash(run),
-              planHash: planHashOf(plan),
-              lemmaPolicyHash: lemmaPolicyHashOf(run),
-            })
+            const drift = currentManifestDrift(manifestCheck.manifest, plan, state, run)
             if (drift.length > 0) {
               return {
                 status: "FAIL",

@@ -1,5 +1,5 @@
 import { registerTeamworkTools, registerTeamworkHooks, describeRun, touch, nextEventSeq } from "../plugins/opencode-teamwork/tools.ts"
-import { createAuthContext, canonicalJson } from "../plugins/opencode-teamwork/auth.ts"
+import { createAuthContext, canonicalJson, sha256Hex } from "../plugins/opencode-teamwork/auth.ts"
 import {
   analyzeLeanDeclarations,
   bindVerifiedDeclaration,
@@ -151,6 +151,59 @@ async function stampVictoryFor(tools, ctx, root, runId, { sessionID = "ses_victo
     return res
   } finally {
     if (ctx?.session) ctx.session.get = originalGet
+  }
+}
+
+// Build the standard "planned + verified_pass + security audit" fixture used
+// by the final/victory/authenticity suites. One implementation, bound to a
+// specific tools/ctx/root, so fixtures cannot drift apart.
+function makeSeedVerifiedRun(tools, ctx, root) {
+  return async (
+    runId,
+    taskIds,
+    { request, integrityMode, auditStatus = "PASS", stampVictory = request !== undefined, victoryAudit, verification, allowUnsignedLegacy } = {},
+  ) => {
+    await tools.plan.execute(
+      {
+        sessionId: runId,
+        topology: "iterative-coding",
+        skipInterview: true,
+        ...(request !== undefined ? { request, integrityMode } : {}),
+        ...(victoryAudit !== undefined ? { victoryAudit } : {}),
+        ...(verification !== undefined ? { verification } : {}),
+        ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
+        tasks: taskIds.map((id) => ({ id })),
+      },
+      { sessionID: FIXTURE_ROOT_SESSION },
+    )
+    for (const taskId of taskIds) {
+      for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+        await tools.task_update.execute({ sessionId: runId, taskId, status })
+      }
+      await tools.task_update.execute({
+        sessionId: runId,
+        taskId,
+        status: "verified_pass",
+        verification: { status: "PASS" },
+      })
+      const reportRes = await tools.report.execute(
+        {
+          sessionId: runId,
+          taskId,
+          status: "PASS",
+          summary: `Fixture PASS for ${taskId}.`,
+          checks: [{ name: "fixture", type: "check", passed: true }],
+        },
+        { sessionID: "ses_fixture_verifier" },
+      )
+      assert(!reportRes.content.startsWith("refused:"), `fixture report failed: ${reportRes.content}`)
+    }
+    await tools.security_audit.execute({
+      sessionId: runId,
+      status: auditStatus,
+      findings: auditStatus === "FAIL" ? [{ severity: "Critical", description: "hardcoded secret" }] : [],
+    })
+    if (stampVictory && request !== undefined) await stampVictoryFor(tools, ctx, root, runId)
   }
 }
 
@@ -926,61 +979,7 @@ try {
     mkdirSync(dirname(file), { recursive: true })
     writeFileSync(file, JSON.stringify({ taskId, status, timestamp: new Date().toISOString() }) + "\n")
   }
-  const seedVerifiedRun = async (
-    runId,
-    taskIds,
-    {
-      request,
-      integrityMode,
-      auditStatus = "PASS",
-      stampVictory = request !== undefined,
-      victoryAudit,
-      verification,
-      allowUnsignedLegacy,
-    } = {},
-  ) => {
-    await registeredTools.plan.execute(
-      {
-        sessionId: runId,
-        topology: "iterative-coding",
-        skipInterview: true,
-        ...(request !== undefined ? { request, integrityMode } : {}),
-        ...(victoryAudit !== undefined ? { victoryAudit } : {}),
-        ...(verification !== undefined ? { verification } : {}),
-        ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
-        tasks: taskIds.map((id) => ({ id })),
-      },
-      { sessionID: FIXTURE_ROOT_SESSION },
-    )
-    for (const taskId of taskIds) {
-      for (const status of ["worker_active", "worker_done", "verifier_active"]) {
-        await registeredTools.task_update.execute({ sessionId: runId, taskId, status })
-      }
-      await registeredTools.task_update.execute({
-        sessionId: runId,
-        taskId,
-        status: "verified_pass",
-        verification: { status: "PASS" },
-      })
-      const reportRes = await registeredTools.report.execute(
-        {
-          sessionId: runId,
-          taskId,
-          status: "PASS",
-          summary: `Fixture PASS for ${taskId}.`,
-          checks: [{ name: "fixture", type: "check", passed: true }],
-        },
-        { sessionID: "ses_fixture_verifier" },
-      )
-      assert(!reportRes.content.startsWith("refused:"), `fixture report failed: ${reportRes.content}`)
-    }
-    await registeredTools.security_audit.execute({
-      sessionId: runId,
-      status: auditStatus,
-      findings: auditStatus === "FAIL" ? [{ severity: "Critical", description: "hardcoded secret" }] : [],
-    })
-    if (stampVictory && request !== undefined) await stampVictoryFor(registeredTools, mockCtx, testDir, runId)
-  }
+  const seedVerifiedRun = makeSeedVerifiedRun(registeredTools, mockCtx, testDir)
   const finalFileOf = (runId) => runFile(testDir, runId, "verify/final.json")
 
   // (a) All tasks verified_pass + every report PASS + audit PASS -> PASS, stamped, event appended.
@@ -1404,7 +1403,6 @@ try {
   // A stamped PASS with no victory verdict is blocked at the dedicated gate.
   const vNextRun = "20261018-000000-v-next-gate"
   await seedVerifiedRun(vNextRun, ["V1"], { request: "Deliver the next-gate fixture.", stampVictory: false })
-  const vNextFinalFile = finalFileOf(vNextRun)
   await writeSignedFixture(testDir, vNextRun, "verify/final.json", {
     status: "PASS",
     generatedBy: { agent: "team/verifier", session: "ses_next_fixture" },
@@ -7027,53 +7025,7 @@ process.exit(0);
         mockCtx.session.get = previous
       }
     }
-    const seedVerifiedRun = async (
-      runId,
-      taskIds,
-      { request, integrityMode, auditStatus = "PASS", stampVictory = request !== undefined, victoryAudit, verification, allowUnsignedLegacy } = {},
-    ) => {
-      await registeredTools.plan.execute(
-        {
-          sessionId: runId,
-          topology: "iterative-coding",
-          skipInterview: true,
-          ...(request !== undefined ? { request, integrityMode } : {}),
-          ...(victoryAudit !== undefined ? { victoryAudit } : {}),
-          ...(verification !== undefined ? { verification } : {}),
-          ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
-          tasks: taskIds.map((id) => ({ id })),
-        },
-        { sessionID: FIXTURE_ROOT_SESSION },
-      )
-      for (const taskId of taskIds) {
-        for (const status of ["worker_active", "worker_done", "verifier_active"]) {
-          await registeredTools.task_update.execute({ sessionId: runId, taskId, status })
-        }
-        await registeredTools.task_update.execute({
-          sessionId: runId,
-          taskId,
-          status: "verified_pass",
-          verification: { status: "PASS" },
-        })
-        const reportRes = await registeredTools.report.execute(
-          {
-            sessionId: runId,
-            taskId,
-            status: "PASS",
-            summary: `Authenticity fixture PASS for ${taskId}.`,
-            checks: [{ name: "fixture", type: "check", passed: true }],
-          },
-          { sessionID: "ses_fixture_verifier" },
-        )
-        assert(!reportRes.content.startsWith("refused:"), `authenticity fixture report failed: ${reportRes.content}`)
-      }
-      await registeredTools.security_audit.execute({
-        sessionId: runId,
-        status: auditStatus,
-        findings: auditStatus === "FAIL" ? [{ severity: "Critical", description: "hardcoded secret" }] : [],
-      })
-      if (stampVictory && request !== undefined) await stampVictoryFor(registeredTools, mockCtx, testDir, runId)
-    }
+    const seedVerifiedRun = makeSeedVerifiedRun(registeredTools, mockCtx, testDir)
 
     const unsignedVictory = (runId) => {
       const baseline = requirementsOf(runId)
@@ -7083,8 +7035,8 @@ process.exit(0);
         verdict: "VICTORY CONFIRMED",
         auditor: "team/victory-auditor",
         auditorSessionId: "ses_victory_auditor",
-        requestHash: createHash("sha256").update(reqText(runId), "utf8").digest("hex"),
-        requirementsHash: createHash("sha256").update(canonicalJson(baseline), "utf8").digest("hex"),
+        requestHash: sha256Hex(reqText(runId)),
+        requirementsHash: sha256Hex(canonicalJson(baseline)),
         requirements: baseline.items.map((item) => ({ id: item.id, met: true, evidence: `Fixture evidence for ${item.id}` })),
         findings: [],
         summary: "unsigned fixture",
