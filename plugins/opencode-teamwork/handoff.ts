@@ -21,7 +21,7 @@ import { lstatSync, readdirSync } from "node:fs"
 import { basename, join } from "node:path"
 import { sha256Hex } from "./auth.ts"
 import { clean, isSafeTaskId, readBoundedRunFile, writeSafeRunFile } from "./tournament.ts"
-import { withFileLock } from "./locks.ts"
+import { withCrossProcessLock } from "./locks.ts"
 
 export const HANDOFF_SECTIONS = [
   "Observation",
@@ -457,7 +457,7 @@ export async function writeHandoff(run: string, opts: WriteHandoffOptions): Prom
   entry: HandoffIndexEntry
   index: HandoffIndex
 }> {
-  return withFileLock(join(run, handoffIndexRelativePath()), () => writeHandoffSync(run, opts))
+  return withCrossProcessLock(join(run, handoffIndexRelativePath()), () => writeHandoffSync(run, opts))
 }
 
 /** List valid handoff documents (used by tests/diagnostics); never follows links. */

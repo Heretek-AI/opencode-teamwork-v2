@@ -142,7 +142,7 @@ import type { RequirementsFile, VictoryAuditMode } from "./victory.ts"
 import { readAgentBriefingExcerpt, readBriefingExcerpt, refreshAgentBriefing, refreshRunBriefing } from "./briefing.ts"
 import { writeHandoff, resolveHandoffScope, handoffAgentSlug, evaluateHandoffGate, normalizeHandoffMode, resolveHandoffMode } from "./handoff.ts"
 import type { HandoffGate, HandoffMode, HandoffTaskRef } from "./handoff.ts"
-import { withFileLock } from "./locks.ts"
+import { withCrossProcessLock } from "./locks.ts"
 import { fdWithin, readWithinBounded, supportsFdContainment } from "./safe-fs.mjs"
 
 // ---------------------------------------------------------------------------
@@ -570,7 +570,53 @@ function accumulateTokenDelta(costs: any, bucket: string, cur: TokenTotals | und
   }
 }
 
-/** True when the opencode_console MCP server is connected for this location. */
+/**
+ * Stable digest of a usage observation. Applying the same observation twice
+ * must be a no-op: the digest is stored in costs.json and compared before any
+ * delta is added. Costs are rounded to 1e-4 so a JSON round-trip cannot change
+ * the digest.
+ */
+function costUsageDigest(sessions: SessionUsageItem[]): string {
+  const normalized = sessions
+    .map((s) => ({
+      id: String(s.id),
+      agent: typeof s.agent === "string" ? clean(s.agent, 64) : "",
+      cost: Math.round((Number(s.cost) || 0) * 1e4) / 1e4,
+      tokens: normalizeTokens(s.tokens),
+    }))
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+  return sha256Hex(canonicalJson(normalized))
+}
+
+function snapshotCursor(raw: any): SessionSnapshot | undefined {
+  if (!raw || typeof raw !== "object") return undefined
+  const lastCost = Number(raw.lastCost)
+  if (!Number.isFinite(lastCost)) return undefined
+  const cursor: any = { lastCost }
+  // A legacy snapshot without lastTokens cannot yield an honest token delta;
+  // preserve the old "skip token accounting" behaviour instead of inventing 0.
+  if (raw.lastTokens && typeof raw.lastTokens === "object") cursor.lastTokens = normalizeTokens(raw.lastTokens)
+  if (typeof raw.agent === "string") cursor.agent = clean(raw.agent, 64)
+  cursor.timestamp = typeof raw.timestamp === "string" ? raw.timestamp : ""
+  return cursor as SessionSnapshot
+}
+
+/**
+ * Write the single costs.json update. `lastCostUpdate` records whether this
+ * call applied a snapshot or skipped a duplicate digest, for operator
+ * diagnostics. The digest/cursors are the authoritative delta baseline; the
+ * legacy snapshots.json remains a compatibility view only.
+ */
+function writeCostsOnce(file: string, costs: any, update: { source: string; digest?: string; skippedDuplicate?: boolean }) {
+  costs.lastCostUpdate = {
+    at: new Date().toISOString(),
+    source: clean(update.source, 80),
+    ...(update.digest ? { digest: update.digest } : {}),
+    skippedDuplicate: update.skippedDuplicate === true,
+  }
+  writeJson(file, costs)
+}
+
 async function isConsoleMcpConnected(ctx: any): Promise<boolean> {
   try {
     if (typeof ctx?.mcp?.list !== "function") return false
@@ -1272,6 +1318,190 @@ function writeJson(file: string, value: unknown) {
   writeTextAtomicSafe(file, JSON.stringify(value, null, 2) + "\n")
 }
 
+// ---------------------------------------------------------------------------
+// Task claims / leases
+//
+// `teamwork_next` atomically stamps a short lease on every task it hands out.
+// The lease is advisory coordination, not an authorization boundary: role and
+// session-tree checks still live in authorize.ts. Its job is to stop two
+// Sentinel resumes from dispatching duplicate workers for the same ready task.
+// A claim is bounded (15 min) and reclaimable after expiry; the previous
+// claimant is retained for forensics.
+// ---------------------------------------------------------------------------
+
+const TASK_CLAIM_LEASE_MS = 15 * 60 * 1000
+
+function claimTime(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value) return undefined
+  const ms = Date.parse(value)
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : undefined
+}
+
+function normalizePreviousClaimant(raw: any): { by: string; at: string; leaseUntil: string } | undefined {
+  if (!raw || typeof raw !== "object") return undefined
+  const by = clean(raw.by, 80).trim()
+  const at = claimTime(raw.at)
+  const leaseUntil = claimTime(raw.leaseUntil)
+  if (!by || !at || !leaseUntil) return undefined
+  return { by, at, leaseUntil }
+}
+
+/** Sanitise an untrusted claim read from state.json. Invalid claims are absent. */
+function normalizeClaim(raw: any): any | undefined {
+  if (!raw || typeof raw !== "object") return undefined
+  const by = clean(raw.by, 80).trim()
+  const at = claimTime(raw.at)
+  const leaseUntil = claimTime(raw.leaseUntil)
+  if (!by || !at || !leaseUntil) return undefined
+  const claim: any = { by, at, leaseUntil }
+  const previous = normalizePreviousClaimant(raw.previousClaimant)
+  if (previous && previous.by !== by) claim.previousClaimant = previous
+  if (raw.override === "sentinel") claim.override = "sentinel"
+  return claim
+}
+
+function claimIsLive(claim: any, now = Date.now()): boolean {
+  const until = Date.parse(claim?.leaseUntil)
+  return Number.isFinite(until) && until > now
+}
+
+function makeTaskClaim(by: string, now: number, previous?: any): any {
+  const claim: any = {
+    by: clean(by, 80),
+    at: new Date(now).toISOString(),
+    leaseUntil: new Date(now + TASK_CLAIM_LEASE_MS).toISOString(),
+  }
+  const prev = normalizePreviousClaimant(previous)
+  if (prev && prev.by !== claim.by) claim.previousClaimant = prev
+  return claim
+}
+
+/** The claim shape returned to callers (never an untrusted raw object). */
+function publicClaim(raw: any): any | undefined {
+  const claim = normalizeClaim(raw)
+  if (!claim) return undefined
+  return {
+    by: claim.by,
+    at: claim.at,
+    leaseUntil: claim.leaseUntil,
+    ...(claim.previousClaimant ? { previousClaimant: claim.previousClaimant } : {}),
+    ...(claim.override ? { override: claim.override } : {}),
+  }
+}
+
+function isSentinelAgent(agent: string | undefined): boolean {
+  return agent === "team/sentinel" || agent === "team/orchestrator"
+}
+
+/** Re-read state under its cross-process lock, mutate it, and write it once. */
+async function mutateRunState<T>(
+  run: string,
+  mutator: (state: any) => T | Promise<T>,
+  opts: { write?: (state: any) => boolean } = {},
+): Promise<T | undefined> {
+  const stateFile = join(run, "state.json")
+  return withCrossProcessLock(stateFile, async () => {
+    const state = readJson<any>(run, stateFile, undefined)
+    if (!state || typeof state.tasks !== "object") return undefined
+    const result = await mutator(state)
+    if (!opts.write || opts.write(state)) {
+      state.updatedAt = new Date().toISOString()
+      writeJson(stateFile, state)
+    }
+    return result
+  })
+}
+
+async function setRunPhase(run: string, phase: string): Promise<void> {
+  let changed = false
+  await mutateRunState(
+    run,
+    (state) => {
+      changed = state.phase !== phase
+      state.phase = phase
+    },
+    { write: () => changed },
+  )
+}
+
+interface ClaimCandidate {
+  id: string
+  round?: number
+  claim?: any
+}
+
+/**
+ * Atomically claim the ready tasks handed out by `teamwork_next`.
+ *
+ * The first read of state.json happened before the (potentially expensive)
+ * gate checks. This function re-reads it under the cross-process lock and
+ * re-checks each task's current status, so a task another process started or
+ * claimed in the meantime is never returned as ready. Claims are renewed for
+ * the same caller; a different live claimant is skipped (and surfaced as
+ * in-progress); an expired claim is reclaimed with the previous claimant kept.
+ */
+async function claimReadyTasks(
+  run: string,
+  readyForWorker: ClaimCandidate[],
+  readyForVerifier: ClaimCandidate[],
+  callSession: string | undefined,
+): Promise<{ worker: ClaimCandidate[]; verifier: ClaimCandidate[]; skipped: any[] }> {
+  if (!callSession) return { worker: readyForWorker, verifier: readyForVerifier, skipped: [] }
+  const stateFile = join(run, "state.json")
+  return withCrossProcessLock(stateFile, async () => {
+    const state = readJson<any>(run, stateFile, undefined)
+    if (!state || typeof state.tasks !== "object") {
+      return { worker: [], verifier: [], skipped: [] }
+    }
+    state.tasks = nullMap(state.tasks)
+    const now = Date.now()
+    const worker: ClaimCandidate[] = []
+    const verifier: ClaimCandidate[] = []
+    const skipped: any[] = []
+    let changed = false
+
+    const claimOne = (candidate: ClaimCandidate, kind: "worker" | "verifier") => {
+      const st = state.tasks[candidate.id]
+      if (!st || typeof st !== "object") return
+      const status = typeof st.status === "string" ? st.status : "pending"
+      const eligible =
+        kind === "worker"
+          ? status === "pending" || status === "verified_fail" || status === "fail"
+          : status === "worker_done"
+      if (!eligible) {
+        skipped.push({ id: candidate.id, status, round: Number(st.round) || 0, claim: publicClaim(st.claim), reason: "status changed" })
+        return
+      }
+      const existing = normalizeClaim(st.claim)
+      if (existing && existing.by !== callSession && claimIsLive(existing, now)) {
+        skipped.push({ id: candidate.id, status: "claimed", round: Number(st.round) || 0, claim: publicClaim(existing) })
+        return
+      }
+      const previous = existing && existing.by !== callSession ? existing : undefined
+      const claim = makeTaskClaim(callSession, now, previous)
+      if (existing && existing.by === callSession) {
+        if (existing.previousClaimant) claim.previousClaimant = existing.previousClaimant
+        if (existing.override === "sentinel") claim.override = "sentinel"
+      }
+      st.claim = claim
+      st.updatedAt = new Date(now).toISOString()
+      changed = true
+      candidate.claim = publicClaim(claim)
+      ;(kind === "worker" ? worker : verifier).push(candidate)
+    }
+
+    for (const candidate of readyForWorker) claimOne(candidate, "worker")
+    for (const candidate of readyForVerifier) claimOne(candidate, "verifier")
+
+    if (changed) {
+      state.updatedAt = new Date(now).toISOString()
+      writeJson(stateFile, state)
+    }
+    return { worker, verifier, skipped }
+  })
+}
+
+
 /**
  * Create `file` with `content` only if it does not already exist.
  *
@@ -1463,7 +1693,7 @@ async function appendEvent(
 ) {
   try {
     const eventsFile = join(run, "events.jsonl")
-    await withFileLock(eventsFile, () => {
+    await withCrossProcessLock(eventsFile, () => {
       refuseSymlink(eventsFile)
       const opt = (v: unknown, max: number) => (v === null || v === undefined || v === "" ? null : clean(v, max))
       const agent = opt(ev.agent, 64)
@@ -2622,49 +2852,57 @@ async function createPlanRun(
     ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
   }
   writeJson(join(run, "plan.dag.json"), planObject)
-  if (!existsSync(join(run, "state.json"))) {
-    writeJson(join(run, "state.json"), {
-      version: 1,
-      sessionId,
-      rootSessionId,
-      integrityMode,
-      verification: verificationMode,
-      victoryAudit: victoryAuditMode,
-      requireHandoffs: requireHandoffsMode,
-      ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
-      ...(isLemma ? { lemmaMode: true, route: "lemma" } : {}),
-      phase: "DISPATCH",
-      tasks: nullMap(Object.fromEntries(tasks.map((t: any) => [t.id, { status: "pending", round: 0 }]))),
-      updatedAt: new Date().toISOString(),
+  const planStateFile = join(run, "state.json")
+  if (!existsSync(planStateFile)) {
+    await withCrossProcessLock(planStateFile, async () => {
+      if (existsSync(planStateFile)) return
+      writeJson(planStateFile, {
+        version: 1,
+        sessionId,
+        rootSessionId,
+        integrityMode,
+        verification: verificationMode,
+        victoryAudit: victoryAuditMode,
+        requireHandoffs: requireHandoffsMode,
+        ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
+        ...(isLemma ? { lemmaMode: true, route: "lemma" } : {}),
+        phase: "DISPATCH",
+        tasks: nullMap(Object.fromEntries(tasks.map((t: any) => [t.id, { status: "pending", round: 0 }]))),
+        updatedAt: new Date().toISOString(),
+      })
     })
   } else {
     // A re-plan keeps the run's checkpoint but must still carry the mode
     // the caller chose (defaults to development when omitted).
-    const stateFile = join(run, "state.json")
-    const state = readJson<any>(run, stateFile, undefined)
-    if (
-      state &&
-      (state.integrityMode !== integrityMode ||
-        state.verification !== verificationMode ||
-        state.victoryAudit !== victoryAuditMode ||
-        state.requireHandoffs !== requireHandoffsMode ||
-        state.rootSessionId !== rootSessionId ||
-        (allowUnsignedLegacy && state.allowUnsignedLegacy !== true) ||
-        (isLemma && !state.lemmaMode))
-    ) {
-      state.integrityMode = integrityMode
-      state.verification = verificationMode
-      state.victoryAudit = victoryAuditMode
-      state.requireHandoffs = requireHandoffsMode
-      state.rootSessionId = rootSessionId
-      if (allowUnsignedLegacy) state.allowUnsignedLegacy = true
-      if (isLemma) {
-        state.lemmaMode = true
-        state.route = "lemma"
-      }
-      state.updatedAt = new Date().toISOString()
-      writeJson(stateFile, state)
-    }
+    let changed = false
+    await mutateRunState(
+      run,
+      (state) => {
+        if (
+          state &&
+          (state.integrityMode !== integrityMode ||
+            state.verification !== verificationMode ||
+            state.victoryAudit !== victoryAuditMode ||
+            state.requireHandoffs !== requireHandoffsMode ||
+            state.rootSessionId !== rootSessionId ||
+            (allowUnsignedLegacy && state.allowUnsignedLegacy !== true) ||
+            (isLemma && !state.lemmaMode))
+        ) {
+          state.integrityMode = integrityMode
+          state.verification = verificationMode
+          state.victoryAudit = victoryAuditMode
+          state.requireHandoffs = requireHandoffsMode
+          state.rootSessionId = rootSessionId
+          if (allowUnsignedLegacy) state.allowUnsignedLegacy = true
+          if (isLemma) {
+            state.lemmaMode = true
+            state.route = "lemma"
+          }
+          changed = true
+        }
+      },
+      { write: () => changed },
+    )
   }
   if (isLemma && lemmaBounds && lemmaProbe) {
     const lemmaInit = initLemmaArtifacts(run, sessionId, lemmaBounds, lemmaProbe, lemmaPolicy ?? null)
@@ -2738,7 +2976,7 @@ async function createPlanRun(
   const budget = input.budgetUsd ?? (tournamentContextActive && existingBudget !== undefined ? existingBudget : 20)
   const costsFile = join(run, "costs.json")
   // Same lock as the cost tool so a re-plan cannot race a concurrent cost call.
-  await withFileLock(costsFile, async () => {
+  await withCrossProcessLock(costsFile, async () => {
     const existing = readJson<any>(run, costsFile, undefined)
     if (!existing) {
       writeJson(costsFile, {
@@ -2790,7 +3028,7 @@ async function createPlanRun(
   touch(join(run, "pitfalls.md"), "# Pitfalls\n\n_answer-agnostic failure modes; one per line_\n")
   if (validatedTournamentConfig && tournamentEstimate) {
     try {
-      await withFileLock(manifestPathOf(run), async () => {
+      await withCrossProcessLock(manifestPathOf(run), async () => {
         const current = readTournamentManifest(run)
         if (current.status === "absent") {
           initTournamentManifest({
@@ -3637,9 +3875,15 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (!authz.ok) return { content: authz.content }
         const state = readJson<any>(run, join(run, "state.json"), {})
         const tasks = state.tasks || {}
-        const lines = Object.entries(tasks).map(([id, t]: any) => `  ${clean(id, 64)}: ${clean(t?.status, 16)} (round ${Number(t?.round) || 0})`)
+        const lines = Object.entries(tasks).map(([id, t]: any) => {
+          const claim = publicClaim(t?.claim)
+          return `  ${clean(id, 64)}: ${clean(t?.status, 16)} (round ${Number(t?.round) || 0})${claim ? ` [claim ${claim.by} until ${claim.leaseUntil}]` : ""}`
+        })
+        const claims = Object.entries(tasks)
+          .map(([id, t]: any) => ({ id: clean(id, 64), claim: publicClaim(t?.claim) }))
+          .filter((entry) => entry.claim)
         const pass = Object.values(tasks).filter((t: any) => isPassStatus(t?.status)).length
-        return { content: `Run ${basename(run)} — phase ${PHASES.has(state.phase) ? state.phase : "UNKNOWN"}\n${pass}/${lines.length} pass\n${lines.join("\n")}` }
+        return { content: `Run ${basename(run)} — phase ${PHASES.has(state.phase) ? state.phase : "UNKNOWN"}\n${pass}/${lines.length} pass\n${lines.join("\n")}`, claims }
       },
     })
 
@@ -3683,9 +3927,29 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
         const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
 
-        // Serialise the whole read-modify-write (including the client read) so
-        // parallel workers cannot lose each other's attribution.
-        return await withFileLock(file, async () => {
+        // External usage reads happen OUTSIDE the lock: a database/API/client
+        // call can take seconds. The roots used for discovery are a hint; the
+        // locked section re-reads costs.json/snapshots.json before mutating.
+        const preCosts = readJson<any>(run, file, undefined)
+        const preSnaps = readSnapshots(run, snapshotsFile)
+        const preRoots: string[] = []
+        if (callSession) preRoots.push(callSession)
+        for (const value of [preCosts?.rootSessionIds, preSnaps?.rootSessionIds]) {
+          if (Array.isArray(value)) {
+            for (const id of value) {
+              if (typeof id === "string" && !preRoots.includes(id)) preRoots.push(id)
+            }
+          }
+        }
+        for (const id of Object.keys(preSnaps?.bySession ?? {})) {
+          if (!preRoots.includes(id)) preRoots.push(id)
+        }
+        const treeResult = await readSessionTreeUsage(ctx, preRoots, callSession)
+        const singleUsage = treeResult ? undefined : await readSessionUsage(ctx, callSession)
+
+        // Serialise the read-modify-write so parallel processes cannot lose
+        // each other's attribution.
+        return await withCrossProcessLock(file, async () => {
           const costs = readJson<any>(run, file, undefined)
           if (!costs || typeof costs !== "object") {
             return { content: `No costs.json for run ${basename(run)} — call teamwork_plan first.` }
@@ -3715,38 +3979,78 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             costs.byTask[bucketName] = Math.round(((costs.byTask[bucketName] || 0) + amount) * 1e4) / 1e4
           }
 
-          const treeResult = await readSessionTreeUsage(ctx, snaps.rootSessionIds, callSession)
           let source: string
+          let skippedDuplicate = false
+          let appliedDigest: string | undefined
 
-          if (treeResult && treeResult.sessions.length > 0) {
+          const bucketForTree = (s: SessionUsageItem): string => {
+            if (s.id === callSession && input.taskId) return clean(input.taskId, 64)
+            if (snaps.rootSessionIds.includes(s.id)) return input.taskId ? clean(input.taskId, 64) : "_sentinel"
+            if (s.agent) return input.taskId ? clean(input.taskId, 64) : clean(s.agent, 64)
+            return input.taskId ? clean(input.taskId, 64) : "_unattributed"
+          }
+
+          const applyUsage = (
+            sessions: SessionUsageItem[],
+            sourceLabel: string,
+            bucketOf: (s: SessionUsageItem) => string,
+          ) => {
+            const digest = costUsageDigest(sessions)
+            appliedDigest = digest
             const now = new Date().toISOString()
             const totalTokens: TokenUsage = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+            const duplicate =
+              typeof costs.appliedSnapshotDigest === "string" && costs.appliedSnapshotDigest === digest
 
-            for (const s of treeResult.sessions) {
-              const prev = snaps.bySession[s.id]
-              const delta = prev
-                ? Math.round((s.cost - prev.lastCost) * 1e4) / 1e4
+            if (duplicate) {
+              // A crash after the costs write but before snapshots.json must not
+              // double-count on retry. The digest is the idempotency key, and
+              // the per-session cursors below are the authoritative deltas, so
+              // the same observation is a no-op for every bucket and cursor.
+              for (const s of sessions) {
+                const cursor = { lastCost: s.cost, lastTokens: s.tokens, agent: s.agent, timestamp: now }
+                costs.snapshotCursors = nullMap(costs.snapshotCursors)
+                costs.snapshotCursors[s.id] = cursor
+                snaps.bySession[s.id] = cursor
+                totalTokens.input += s.tokens.input
+                totalTokens.output += s.tokens.output
+                totalTokens.reasoning += s.tokens.reasoning
+                totalTokens.cache.read += s.tokens.cache.read
+                totalTokens.cache.write += s.tokens.cache.write
+              }
+              costs.tokens = totalTokens
+              costs.rootSessionIds = snaps.rootSessionIds
+              skippedDuplicate = true
+              source = sourceLabel
+              writeCostsOnce(file, costs, { source: sourceLabel, digest, skippedDuplicate: true })
+              // Compatibility view only; costs.json remains sufficient for
+              // idempotency even if this second write crashes or is skipped.
+              writeSnapshots(snapshotsFile, snaps)
+              return
+            }
+
+            costs.snapshotCursors = nullMap(costs.snapshotCursors)
+            for (const s of sessions) {
+              // The cursor in costs.json is authoritative. Fall back to the
+              // legacy snapshots.json for runs written before cursors existed.
+              const cursor =
+                snapshotCursor(costs.snapshotCursors[s.id]) ?? snapshotCursor(snaps.bySession[s.id])
+              const delta = cursor
+                ? Math.round((s.cost - cursor.lastCost) * 1e4) / 1e4
                 : Math.round(s.cost * 1e4) / 1e4
 
-              snaps.bySession[s.id] = {
+              const nextCursor: SessionSnapshot = {
                 lastCost: s.cost,
                 lastTokens: s.tokens,
-                agent: s.agent,
+                ...(s.agent ? { agent: clean(s.agent, 64) } : {}),
                 timestamp: now,
               }
+              costs.snapshotCursors[s.id] = nextCursor
+              snaps.bySession[s.id] = nextCursor
 
-              let bucket: string
-              if (s.id === callSession && input.taskId) {
-                bucket = clean(input.taskId, 64)
-              } else if (snaps.rootSessionIds.includes(s.id)) {
-                bucket = input.taskId ? clean(input.taskId, 64) : "_sentinel"
-              } else if (s.agent) {
-                bucket = input.taskId ? clean(input.taskId, 64) : clean(s.agent, 64)
-              } else {
-                bucket = input.taskId ? clean(input.taskId, 64) : "_unattributed"
-              }
+              const bucket = bucketOf(s)
               if (delta > 0) addToBucket(bucket, delta)
-              accumulateTokenDelta(costs, bucket, s.tokens, prev)
+              accumulateTokenDelta(costs, bucket, s.tokens, cursor ? { lastTokens: cursor.lastTokens } : undefined)
 
               totalTokens.input += s.tokens.input
               totalTokens.output += s.tokens.output
@@ -3759,28 +4063,30 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               Math.round(Object.values(costs.byTask).reduce((a: number, b: any) => a + (Number(b) || 0), 0) * 1e4) / 1e4
             costs.tokens = totalTokens
             costs.rootSessionIds = snaps.rootSessionIds
+            costs.appliedSnapshotDigest = digest
+            costs.appliedSnapshotAt = now
             costs.updatedAt = now
-            writeJson(file, costs)
+            source = sourceLabel
+            // Costs is the authority and is written once. If the process dies
+            // before snapshots.json is refreshed, the digest + cursors in
+            // costs.json still make the retry idempotent.
+            writeCostsOnce(file, costs, { source: sourceLabel, digest })
             writeSnapshots(snapshotsFile, snaps)
-            source = `opencode session tree (${treeResult.sessions.length} sessions, via ${treeResult.source})`
+          }
+
+          if (treeResult && treeResult.sessions.length > 0) {
+            applyUsage(
+              treeResult.sessions,
+              `opencode session tree (${treeResult.sessions.length} sessions, via ${treeResult.source})`,
+              bucketForTree,
+            )
           } else if (callSession) {
-            const usage = await readSessionUsage(ctx, callSession)
-            if (usage) {
-              const now = new Date().toISOString()
-              const prev = snaps.bySession[callSession]
-              const delta = prev
-                ? Math.round((usage.cost - prev.lastCost) * 1e4) / 1e4
-                : Math.round(usage.cost * 1e4) / 1e4
-              snaps.bySession[callSession] = { lastCost: usage.cost, lastTokens: usage.tokens, timestamp: now }
-              const bucket = input.taskId ? clean(input.taskId, 64) : "_unattributed"
-              if (delta > 0) addToBucket(bucket, delta)
-              accumulateTokenDelta(costs, bucket, usage.tokens, prev)
-              costs.spentUsd =
-                Math.round(Object.values(costs.byTask).reduce((a: number, b: any) => a + (Number(b) || 0), 0) * 1e4) / 1e4
-              costs.updatedAt = now
-              writeJson(file, costs)
-              writeSnapshots(snapshotsFile, snaps)
-              source = `opencode session ${callSession}`
+            if (singleUsage) {
+              applyUsage(
+                [{ id: callSession, cost: singleUsage.cost, tokens: singleUsage.tokens }],
+                `opencode session ${callSession}`,
+                () => (input.taskId ? clean(input.taskId, 64) : "_unattributed"),
+              )
             } else if (typeof input?.addUsd === "number" && Number.isFinite(input.addUsd)) {
               if (input.addUsd < 0) return { content: "Error: addUsd must be non-negative" }
               const bucket = input.taskId ? clean(input.taskId, 64) : "_unattributed"
@@ -3788,7 +4094,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               costs.spentUsd =
                 Math.round(Object.values(costs.byTask).reduce((a: number, b: any) => a + (Number(b) || 0), 0) * 1e4) / 1e4
               costs.updatedAt = new Date().toISOString()
-              writeJson(file, costs)
+              writeCostsOnce(file, costs, { source: "manual (client unavailable)" })
               source = "manual (client unavailable)"
             } else {
               source = "manual (client unavailable)"
@@ -3800,7 +4106,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             costs.spentUsd =
               Math.round(Object.values(costs.byTask).reduce((a: number, b: any) => a + (Number(b) || 0), 0) * 1e4) / 1e4
             costs.updatedAt = new Date().toISOString()
-            writeJson(file, costs)
+            writeCostsOnce(file, costs, { source: "manual (client unavailable)" })
             source = "manual (client unavailable)"
           } else {
             source = "manual (client unavailable)"
@@ -3811,9 +4117,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // SEC-3: the bucket key is echoed to the caller, so it is sanitised too.
           const taskBreakdown = Object.entries(costs.byTask).map(([k, v]) => `    ${clean(k, 64)}: $${v}`).join("\n")
           return {
-            content: `Budget: $${budget} · spent: $${costs.spentUsd} (${pct}%)${warn}${taskBreakdown ? `\nPer-task:\n${taskBreakdown}` : ""}\n(source: ${source})`,
+            content: `Budget: $${budget} · spent: $${costs.spentUsd} (${pct}%)${warn}${taskBreakdown ? `\nPer-task:\n${taskBreakdown}` : ""}\n(source: ${source}${skippedDuplicate ? "; duplicate snapshot digest skipped" : ""})`,
             shouldHalt: pct >= 80,
             pct,
+            source,
+            skippedDuplicate,
+            ...(appliedDigest ? { appliedSnapshotDigest: appliedDigest } : {}),
           }
         })
       },
@@ -4015,7 +4324,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
 
-          return await withFileLock(manifestPathOf(run), async () => {
+          return await withCrossProcessLock(manifestPathOf(run), async () => {
           let existingPlan: any
           let existingCosts: any
           let runExistsOrSymlink = existsSync(run)
@@ -4086,14 +4395,18 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 tournament: { config: cfgRes.config, estimate },
               })
               if (!existsSync(join(run, "state.json"))) {
-                writeJson(join(run, "state.json"), {
-                  version: 1,
-                  sessionId,
-                  rootSessionId: callSession,
-                  integrityMode: DEFAULT_INTEGRITY_MODE,
-                  phase: "DISPATCH",
-                  tasks: nullMap(Object.fromEntries(tasks.map((t: any) => [t.id, { status: "pending", round: 0 }]))),
-                  updatedAt: new Date().toISOString(),
+                const initStateFile = join(run, "state.json")
+                await withCrossProcessLock(initStateFile, async () => {
+                  if (existsSync(initStateFile)) return
+                  writeJson(initStateFile, {
+                    version: 1,
+                    sessionId,
+                    rootSessionId: callSession,
+                    integrityMode: DEFAULT_INTEGRITY_MODE,
+                    phase: "DISPATCH",
+                    tasks: nullMap(Object.fromEntries(tasks.map((t: any) => [t.id, { status: "pending", round: 0 }]))),
+                    updatedAt: new Date().toISOString(),
+                  })
                 })
               }
               touch(join(run, "pitfalls.md"), "# Pitfalls\n\n_answer-agnostic failure modes; one per line_\n")
@@ -4117,7 +4430,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             // exist), and persist the budget this init approved while preserving
             // accumulated spend and buckets.
             const costsFile = join(run, "costs.json")
-            await withFileLock(costsFile, async () => {
+            await withCrossProcessLock(costsFile, async () => {
               const current = readJson<any>(run, costsFile, undefined)
               if (!current) {
                 writeJson(costsFile, {
@@ -4220,7 +4533,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
         const mFile = manifestPathOf(run)
         try {
-          return await withFileLock(mFile, async () => {
+          return await withCrossProcessLock(mFile, async () => {
             const mRes = readTournamentManifest(run)
             if (mRes.status === "absent") return { content: `No tournament/manifest.json found for run ${sessionId}.` }
             if (mRes.status === "error") {
@@ -4597,7 +4910,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
           let tOutcome: any
           try {
-            tOutcome = await withFileLock(manifestPathOf(run), async () => {
+            tOutcome = await withCrossProcessLock(manifestPathOf(run), async () => {
               const mRes = readTournamentManifest(run)
               if (mRes.status === "error") {
                 return {
@@ -4955,7 +5268,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             const auditFailed = audit && audit.status === "FAIL"
             if (state.phase !== "SECURITY_AUDIT" && !auditFailed) {
               state.phase = "SECURITY_AUDIT"
-              writeJson(join(run, "state.json"), state)
+              await setRunPhase(run, "SECURITY_AUDIT")
               await refreshBriefingSafe(run)
             }
 
@@ -5107,7 +5420,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (!finalReport || typeof finalReport !== "object" || typeof finalReport.status !== "string") {
             if (state.phase !== "FINAL_VERIFICATION") {
               state.phase = "FINAL_VERIFICATION"
-              writeJson(join(run, "state.json"), state)
+              await setRunPhase(run, "FINAL_VERIFICATION")
               await refreshBriefingSafe(run)
             }
             return {
@@ -5135,7 +5448,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (!stamped && !allowUnstamped) {
             if (state.phase !== "FINAL_VERIFICATION") {
               state.phase = "FINAL_VERIFICATION"
-              writeJson(join(run, "state.json"), state)
+              await setRunPhase(run, "FINAL_VERIFICATION")
               await refreshBriefingSafe(run)
             }
             return {
@@ -5160,7 +5473,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (!nextVictoryGate.ok) {
             if (state.phase !== "FINAL_VERIFICATION") {
               state.phase = "FINAL_VERIFICATION"
-              writeJson(join(run, "state.json"), state)
+              await setRunPhase(run, "FINAL_VERIFICATION")
               await refreshBriefingSafe(run)
             }
             const rejected = nextVictoryGate.status === "REJECTED"
@@ -5214,7 +5527,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const wasAlreadyMerge = state.phase === "MERGE" || state.phase === "DONE"
           if (!wasAlreadyMerge) {
             state.phase = "MERGE"
-            writeJson(join(run, "state.json"), state)
+            await setRunPhase(run, "MERGE")
             await refreshBriefingSafe(run)
           }
 
@@ -5274,6 +5587,28 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
         }
 
+        // Atomic dispatch claims. Every ready task gets a bounded lease before
+        // it is returned; a different live claimant is surfaced as in-progress
+        // instead of being dispatched twice.
+        const claimCallSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+        if (claimCallSession) {
+          const claimed = await claimReadyTasks(run, readyForWorker, readyForVerifier, claimCallSession)
+          readyForWorker.length = 0
+          readyForWorker.push(...claimed.worker)
+          readyForVerifier.length = 0
+          readyForVerifier.push(...claimed.verifier)
+          for (const skip of claimed.skipped) {
+            inProgress.push({
+              id: skip.id,
+              status: skip.status === "claimed" ? "claimed" : skip.status,
+              round: skip.round,
+              branch: taskStates[skip.id]?.branch,
+              claim: skip.claim,
+              ...(skip.reason ? { reason: skip.reason } : {}),
+            })
+          }
+        }
+
         if (!readyForWorker.length && !readyForVerifier.length && !inProgress.length) {
           return {
             content: `DEADLOCK_OR_BLOCKED: No tasks can proceed.\nBlocked tasks (${blockedTasks.length}):\n` +
@@ -5289,6 +5624,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           for (const t of readyForWorker) {
             lines.push(`  - Task: ${t.id} (Agent: ${t.agent}, Round: ${t.round}/${t.maxRounds})`)
             lines.push(`    Branch: ${t.branch}`)
+            if (t.claim) lines.push(`    Claim: ${t.claim.by} until ${t.claim.leaseUntil}${t.claim.previousClaimant ? ` (reclaimed from ${t.claim.previousClaimant.by})` : ""}`)
             if (t.feedback) lines.push(`    Verifier Feedback: ${clean(t.feedback, 120)}`)
             if (t.avoidPitfalls?.length) {
               lines.push(`    ⚠ Avoid Known Pitfalls: ${t.avoidPitfalls.slice(0, 3).map((p: string) => clean(p, 80)).join("; ")}`)
@@ -5299,12 +5635,14 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           lines.push(`\n▶ READY FOR VERIFIER (${readyForVerifier.length}): Dispatch verifier subagent against worker branch:`)
           for (const t of readyForVerifier) {
             lines.push(`  - Task: ${t.id} (Verifier: ${t.agent}, Branch: ${t.branch})`)
+            if (t.claim) lines.push(`    Claim: ${t.claim.by} until ${t.claim.leaseUntil}`)
           }
         }
         if (inProgress.length) {
           lines.push(`\n⏳ IN PROGRESS (${inProgress.length}):`)
           for (const t of inProgress) {
-            lines.push(`  - ${t.id}: ${t.status} (round ${t.round})`)
+            const claim = t.claim ? `; claim ${t.claim.by} until ${t.claim.leaseUntil}` : ""
+            lines.push(`  - ${t.id}: ${t.status} (round ${t.round})${claim}`)
           }
         }
         lines.push(`\nProgress: ${passedTasks.length}/${taskDefs.size} passed, ${blockedTasks.length} blocked.`)
@@ -5369,15 +5707,24 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const taskId = clean(input.taskId, 64)
         if (!taskId) return { content: "Error: taskId is required" }
 
-        return await withFileLock(stateFile, async () => {
+        // Read plan + actor identity before taking the state lock. Resolving the
+        // caller can await the session API; the critical section must stay a
+        // short read-modify-write.
+        const plan = readJson<any>(run, planFile, undefined)
+        const def = Array.isArray(plan?.tasks) ? plan.tasks.find((t: any) => t.id === taskId) : undefined
+        const explicitAgent = typeof input.agent === "string" ? clean(input.agent, 64).trim() : ""
+        const caller = explicitAgent ? undefined : await deriveCallerAgent(ctx, run, callSession)
+        const planAgent = def?.agent ? clean(def.agent, 64) : undefined
+        const recordedAgent = explicitAgent || caller?.agent || planAgent || null
+        const agentSource = explicitAgent ? "explicit" : caller?.agent ? "session" : planAgent ? "plan" : undefined
+
+        const outcome = await withCrossProcessLock(stateFile, async () => {
           const state = readJson<any>(run, stateFile, undefined)
           if (!state || typeof state.tasks !== "object") {
             return { content: `Error: No state.json found for run ${basename(run)}.` }
           }
           // SEC-1: null-prototype task map; existence is an OWN-property check, never truthiness.
           state.tasks = nullMap(state.tasks)
-          const plan = readJson<any>(run, planFile, undefined)
-          const def = Array.isArray(plan?.tasks) ? plan.tasks.find((t: any) => t.id === taskId) : undefined
           if (!def && !Object.prototype.hasOwnProperty.call(state.tasks, taskId)) {
             return { content: `Error: Task "${taskId}" not found in plan or state.` }
           }
@@ -5440,6 +5787,44 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
 
+          // Dispatch claims: `teamwork_next` is the only tool that hands out a
+          // ready task, so a worker_active transition must match a live claim
+          // (or an explicit Sentinel start, which is recorded). A claim from a
+          // different live session cannot start a second worker for the task.
+          const existingClaim = normalizeClaim((current as any).claim)
+          const nowMs = Date.now()
+          const claimLive = claimIsLive(existingClaim, nowMs)
+          const claimOwnedByCaller = !!existingClaim && !!callSession && existingClaim.by === callSession
+          const sentinelCaller = isSentinelAgent(authz.caller?.agent)
+          let claimNote: string | undefined
+          let claimForState: any | undefined
+          if (status === "worker_active" && canonicalFrom !== "worker_active") {
+            if (existingClaim && claimLive && !claimOwnedByCaller && !sentinelCaller) {
+              return {
+                content: `Error: Task "${taskId}" is claimed by ${existingClaim.by} until ${existingClaim.leaseUntil}; call teamwork_next to obtain a claim (or ask the Sentinel for an explicit override).`,
+              }
+            }
+            if (existingClaim && claimLive && !claimOwnedByCaller && sentinelCaller) {
+              claimNote = `sentinel override: ${authz.caller?.agent} started a task claimed by ${existingClaim.by}`
+              claimForState = { ...makeTaskClaim(callSession!, nowMs, existingClaim), override: "sentinel" }
+            } else if (existingClaim && !claimLive && !claimOwnedByCaller) {
+              claimNote = `reclaimed expired claim from ${existingClaim.by}`
+              claimForState = makeTaskClaim(callSession!, nowMs, existingClaim)
+            } else if (existingClaim && claimOwnedByCaller) {
+              claimForState = makeTaskClaim(callSession!, nowMs)
+              if (existingClaim.previousClaimant) claimForState.previousClaimant = existingClaim.previousClaimant
+              if (existingClaim.override === "sentinel") claimForState.override = "sentinel"
+            } else if (!existingClaim) {
+              if (!sentinelCaller) {
+                return {
+                  content: `Error: Refusing worker_active for task "${taskId}" without a claim. Call teamwork_next first; only team/sentinel or team/orchestrator may start an unclaimed task, and that override is recorded.`,
+                }
+              }
+              claimNote = `sentinel override: ${authz.caller?.agent} started task without a teamwork_next claim`
+              claimForState = { ...makeTaskClaim(callSession!, nowMs), override: "sentinel" }
+            }
+          }
+
           // `verified_pass` needs evidence: either an inline PASS verdict or an
           // on-disk verifier report for THIS task. `verified_fail` needs none.
           if (status === "verified_pass") {
@@ -5476,7 +5861,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
           const feedbackLog = priorLog.slice(-20)
 
-          state.tasks[taskId] = {
+          const nextTask: any = {
             ...current,
             status,
             round,
@@ -5490,6 +5875,17 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             ...(input.verification ? { verification: input.verification } : {}),
             updatedAt: new Date().toISOString(),
           }
+          // Terminal states and a returned worker release the dispatch claim.
+          // `worker_active` keeps (or creates) the claim for this round.
+          const keepClaim =
+            status === "worker_active"
+              ? claimForState ?? existingClaim
+              : ["pending", "worker_done", "verified_pass", "verified_fail", "blocked"].includes(status)
+                ? undefined
+                : claimForState ?? existingClaim
+          if (keepClaim) nextTask.claim = keepClaim
+          else delete nextTask.claim
+          state.tasks[taskId] = nextTask
 
           const allTasks = Object.values(state.tasks) as any[]
           const allPassed = allTasks.every((t) => t.status === "verified_pass")
@@ -5505,38 +5901,47 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           state.updatedAt = new Date().toISOString()
           writeJson(stateFile, state)
 
-          // Actor precedence (best-effort, fail-open): explicit input.agent, then the
-          // calling session's agent, then the plan-declared agent. clean() runs in appendEvent too.
-          const explicitAgent = typeof input.agent === "string" ? clean(input.agent, 64).trim() : ""
-          const caller = explicitAgent ? undefined : await deriveCallerAgent(ctx, run, callSession)
-          const planAgent = def?.agent ? clean(def.agent, 64) : undefined
-          const recordedAgent = explicitAgent || caller?.agent || planAgent || null
-          const agentSource = explicitAgent ? "explicit" : caller?.agent ? "session" : planAgent ? "plan" : undefined
-
-          // Log what actually landed in state.json (post-normalisation, post-coercion).
-          await appendEvent(run, {
-            event: "task_transition",
-            sessionId: basename(run),
-            taskId,
-            from: fromStatus,
-            to: status,
-            round,
-            agent: recordedAgent,
-            agentSource,
-            branch: input.branch ?? current.branch ?? null,
-            worktree: input.worktree ?? current.worktree ?? null,
-            phase: state.phase ?? null,
-          })
-          await refreshBriefingSafe(run)
-
           return {
-            // SEC-3: the branch is echoed to the caller, so it is sanitised like every other field.
-            content: `Task ${taskId} updated: status=${status}, round=${round}${input.branch ? `, branch=${clean(input.branch, 120)}` : ""}${status === "blocked" ? " (BLOCKED: max rounds reached)" : ""}`,
             taskId,
             status,
             round,
+            fromStatus,
+            phase: state.phase ?? null,
+            branch: input.branch ?? current.branch ?? null,
+            worktree: input.worktree ?? current.worktree ?? null,
+            keepClaim,
+            claimNote,
           }
         })
+
+        if ("content" in outcome) return outcome
+
+        // Log what actually landed in state.json (post-normalisation, post-coercion).
+        await appendEvent(run, {
+          event: "task_transition",
+          sessionId: basename(run),
+          taskId,
+          from: outcome.fromStatus,
+          to: outcome.status,
+          round: outcome.round,
+          agent: recordedAgent,
+          agentSource,
+          branch: outcome.branch ?? null,
+          worktree: outcome.worktree ?? null,
+          phase: outcome.phase ?? null,
+          ...(outcome.claimNote ? { note: outcome.claimNote } : {}),
+        })
+        await refreshBriefingSafe(run)
+
+        return {
+          // SEC-3: the branch is echoed to the caller, so it is sanitised like every other field.
+          content: `Task ${outcome.taskId} updated: status=${outcome.status}, round=${outcome.round}${input.branch ? `, branch=${clean(input.branch, 120)}` : ""}${outcome.status === "blocked" ? " (BLOCKED: max rounds reached)" : ""}${outcome.keepClaim ? `, claim=${outcome.keepClaim.by} until ${outcome.keepClaim.leaseUntil}` : ""}`,
+          taskId: outcome.taskId,
+          status: outcome.status,
+          round: outcome.round,
+          ...(outcome.keepClaim ? { claim: publicClaim(outcome.keepClaim) } : {}),
+          ...(outcome.claimNote ? { claimNote: outcome.claimNote } : {}),
+        }
       },
     })
 
@@ -5768,9 +6173,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         }
         writeJson(auditFile, auditToWrite)
 
-        const stateFile = join(run, "state.json")
-        const state = readJson<any>(run, stateFile, undefined)
-        if (state) {
+        let stateForEvent: any
+        await mutateRunState(run, (state) => {
+          stateForEvent = state
           if (status === "PASS") {
             state.phase = "MERGE"
           } else {
@@ -5782,15 +6187,13 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               }
             }
           }
-          state.updatedAt = new Date().toISOString()
-          writeJson(stateFile, state)
-        }
+        })
 
         await appendEvent(run, {
           event: "security_audit",
           sessionId: basename(run),
           to: status,
-          phase: state?.phase ?? null,
+          phase: stateForEvent?.phase ?? null,
         })
         await refreshBriefingSafe(run)
 
@@ -6146,7 +6549,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const finalFile = join(run, "verify", "final.json")
         const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
 
-        return await withFileLock(finalFile, async () => {
+        return await withCrossProcessLock(finalFile, async () => {
           const caller = await deriveCallerAgent(ctx, run, callSession)
           const state = readJson<any>(run, join(run, "state.json"), undefined)
           if (!state || typeof state.tasks !== "object") {
@@ -6399,7 +6802,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (tournamentPresent) {
             const mFile = manifestPathOf(run)
             try {
-              await withFileLock(mFile, async () => {
+              await withCrossProcessLock(mFile, async () => {
                 const mRes = readTournamentManifest(run)
                 if (mRes.status === "ok" && TOURNAMENT_ACTIVE_PHASES.has(mRes.manifest.phase) && context?.signal?.aborted) {
                   const callerAbort = await deriveCallerAgent(ctx, run, callSession)
@@ -7134,7 +7537,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const manifestFile = join(run, "lemma", "manifest.json")
         const callSession = authz.sessionID
 
-        return await withFileLock(manifestFile, async () => {
+        return await withCrossProcessLock(manifestFile, async () => {
           if (action === "draft") {
             const modeRaw = input?.mode ? clean(input.mode, 32) : "lean"
             if (modeRaw !== "lean" && modeRaw !== "lake-env-lean") {
@@ -7225,7 +7628,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           return { content: `refused: unknown action "${action}" (allowed: create | update | blueprint | attempt)` }
         }
         const manifestFile = join(run, "lemma", "manifest.json")
-        return await withFileLock(manifestFile, async () => {
+        return await withCrossProcessLock(manifestFile, async () => {
           const res = mutateLemmaNode(run, {
             action,
             lemmaId: String(input?.lemmaId ?? ""),
@@ -7284,7 +7687,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (!cwdRes.ok) return { content: cwdRes.error }
         const verifiedCwd = cwdRes.cwd
         const manifestFile = join(run, "lemma", "manifest.json")
-        return await withFileLock(manifestFile, async () => {
+        return await withCrossProcessLock(manifestFile, async () => {
           const res = verifyLemmaNodeAttempt(run, {
             lemmaId: String(input?.lemmaId ?? ""),
             round: typeof input?.round === "number" ? input.round : undefined,
