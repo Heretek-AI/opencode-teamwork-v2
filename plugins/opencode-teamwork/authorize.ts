@@ -97,6 +97,12 @@ const RULES: Record<string, RoleSpec> = {
     requireRoot: true,
   },
   report: { actions: { "*": ["team/verifier"] }, descendantOnly: true, requireRoot: true },
+  recover: {
+    actions: {
+      "*": ["team/sentinel", "team/orchestrator"],
+    },
+    requireRoot: true,
+  },
   handoff: {
     actions: {
       "*": [

@@ -34,7 +34,7 @@ import {
   statSync,
 } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
-import { homedir } from "node:os"
+import { homedir, hostname } from "node:os"
 import { execFileSync } from "node:child_process"
 import { createHash, randomBytes } from "node:crypto"
 import {
@@ -147,7 +147,7 @@ import type { RequirementsFile, VictoryAuditMode } from "./victory.ts"
 import { readAgentBriefingExcerpt, readBriefingExcerpt, refreshAgentBriefing, refreshRunBriefing } from "./briefing.ts"
 import { writeHandoff, resolveHandoffScope, handoffAgentSlug, evaluateHandoffGateChecked, normalizeHandoffMode, resolveHandoffMode } from "./handoff.ts"
 import type { HandoffGate, HandoffMode, HandoffTaskRef } from "./handoff.ts"
-import { withCrossProcessLock } from "./locks.ts"
+import { withCrossProcessLock, recentLockDiagnostics } from "./locks.ts"
 import { fdWithin, readWithinBounded, supportsFdContainment } from "./safe-fs.mjs"
 
 // ---------------------------------------------------------------------------
@@ -1336,17 +1336,51 @@ function writeJson(file: string, value: unknown) {
 }
 
 // ---------------------------------------------------------------------------
-// Task claims / leases
+// Task claims / leases / fencing (claim protocol 2)
 //
-// `teamwork_next` atomically stamps a short lease on every task it hands out.
+// `teamwork_next` atomically stamps a bounded lease on every task it hands out.
 // The lease is advisory coordination, not an authorization boundary: role and
 // session-tree checks still live in authorize.ts. Its job is to stop two
 // Sentinel resumes from dispatching duplicate workers for the same ready task.
-// A claim is bounded (15 min) and reclaimable after expiry; the previous
-// claimant is retained for forensics.
+//
+// Protocol 2 (0.10.0) adds, additively:
+//   * a per-run lease (`claimLeaseMs`) and `host`, plus a per-task `fence`;
+//   * `claim.host/epoch/heartbeatAt/baseline/history` and a bounded heartbeat;
+//   * a side-effect baseline captured at `worker_active` so a crashed claim can
+//     only be reclaimed when nothing changed;
+//   * a single-use, hashed inspection token for explicit recovery.
+//
+// A legacy state.json without `claimProtocol` is protocol 1 and behaves exactly
+// as 0.9.0: the 15-minute advisory lease, expired-claim reclaim, and no fence
+// enforcement.
 // ---------------------------------------------------------------------------
 
-const TASK_CLAIM_LEASE_MS = 15 * 60 * 1000
+const DEFAULT_CLAIM_LEASE_MS = 5 * 60 * 1000
+const MIN_CLAIM_LEASE_MS = 60 * 1000
+const MAX_CLAIM_LEASE_MS = 60 * 60 * 1000
+const CLAIM_GRACE_MS = 5 * 60 * 1000
+const CLAIM_MAX_TENURE_MS = 60 * 60 * 1000
+const CLAIM_MAX_RENEWALS = 20
+const INSPECTION_TOKEN_TTL_MS = 10 * 60 * 1000
+const CLAIM_HISTORY_MAX = 5
+const CLAIM_PROTOCOL = 2
+const LEGACY_CLAIM_LEASE_MS = 15 * 60 * 1000
+const MAX_UNTRACKED_FILES = 1000
+const MAX_UNTRACKED_BYTES = 8 * 1024 * 1024
+const SELF_HOST = hostname()
+
+interface ClaimBaseline {
+  scope: string
+  baseSha?: string
+  headSha?: string
+  diffHash?: string
+  statusHash?: string
+  artifactHash?: string
+  untracked?: { count: number; digest: string; truncated: boolean }
+  fingerprint: string
+  at?: string
+  reason?: string
+}
 
 function claimTime(value: unknown): string | undefined {
   if (typeof value !== "string" || !value) return undefined
@@ -1363,6 +1397,54 @@ function normalizePreviousClaimant(raw: any): { by: string; at: string; leaseUnt
   return { by, at, leaseUntil }
 }
 
+function normalizeUntracked(raw: any): { count: number; digest: string; truncated: boolean } | undefined {
+  if (!raw || typeof raw !== "object") return undefined
+  const digest = typeof raw.digest === "string" ? clean(raw.digest, 128).trim() : ""
+  if (!digest) return undefined
+  return {
+    count: Math.max(0, Math.trunc(Number(raw.count) || 0)),
+    digest,
+    truncated: raw.truncated === true,
+  }
+}
+
+/** Sanitise an untrusted side-effect baseline read from state.json. */
+function normalizeBaseline(raw: any): ClaimBaseline | undefined {
+  if (!raw || typeof raw !== "object") return undefined
+  const fingerprint = typeof raw.fingerprint === "string" ? clean(raw.fingerprint, 128).trim() : ""
+  if (!fingerprint) return undefined
+  const baseline: ClaimBaseline = {
+    scope: clean(raw.scope, 32).trim() || "unknown",
+    fingerprint,
+  }
+  for (const key of ["baseSha", "headSha", "diffHash", "statusHash", "artifactHash"] as const) {
+    if (typeof raw[key] === "string" && raw[key]) baseline[key] = clean(raw[key], 128).trim()
+  }
+  const untracked = normalizeUntracked(raw.untracked)
+  if (untracked) baseline.untracked = untracked
+  const at = claimTime(raw.at)
+  if (at) baseline.at = at
+  if (typeof raw.reason === "string" && raw.reason) baseline.reason = clean(raw.reason, 200)
+  return baseline
+}
+
+function normalizeHistory(raw: any): any[] {
+  if (!Array.isArray(raw)) return []
+  const out: any[] = []
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue
+    const by = clean(entry.by, 80).trim()
+    const at = claimTime(entry.at)
+    if (!by || !at) continue
+    const normalized: any = { by, at, event: clean(entry.event, 32).trim() || "claim" }
+    const leaseUntil = claimTime(entry.leaseUntil)
+    if (leaseUntil) normalized.leaseUntil = leaseUntil
+    if (typeof entry.reason === "string" && entry.reason) normalized.reason = clean(entry.reason, 200)
+    out.push(normalized)
+  }
+  return out.slice(-CLAIM_HISTORY_MAX)
+}
+
 /** Sanitise an untrusted claim read from state.json. Invalid claims are absent. */
 function normalizeClaim(raw: any): any | undefined {
   if (!raw || typeof raw !== "object") return undefined
@@ -1374,6 +1456,21 @@ function normalizeClaim(raw: any): any | undefined {
   const previous = normalizePreviousClaimant(raw.previousClaimant)
   if (previous && previous.by !== by) claim.previousClaimant = previous
   if (raw.override === "sentinel") claim.override = "sentinel"
+  if (typeof raw.host === "string" && raw.host.trim()) claim.host = clean(raw.host, 80).trim()
+  const epoch = Number(raw.epoch)
+  if (Number.isFinite(epoch) && epoch >= 0) claim.epoch = Math.trunc(epoch)
+  const heartbeatAt = claimTime(raw.heartbeatAt)
+  if (heartbeatAt) claim.heartbeatAt = heartbeatAt
+  const tenureStartAt = claimTime(raw.tenureStartAt)
+  if (tenureStartAt) claim.tenureStartAt = tenureStartAt
+  const renewals = Number(raw.renewals)
+  if (Number.isFinite(renewals) && renewals >= 0) claim.renewals = Math.trunc(renewals)
+  const baseline = normalizeBaseline(raw.baseline)
+  if (baseline) claim.baseline = baseline
+  const history = normalizeHistory(raw.history)
+  if (history.length) claim.history = history
+  if (raw.needsInspection === true) claim.needsInspection = true
+  if (raw.maxTenureReached === true) claim.maxTenureReached = true
   return claim
 }
 
@@ -1382,15 +1479,115 @@ function claimIsLive(claim: any, now = Date.now()): boolean {
   return Number.isFinite(until) && until > now
 }
 
-function makeTaskClaim(by: string, now: number, previous?: any): any {
+function nextFence(task: any): number {
+  const raw = Number(task?.fence)
+  return Number.isFinite(raw) && raw > 0 ? Math.trunc(raw) : 0
+}
+
+function claimProtocolOf(state: any): number {
+  const raw = Number(state?.claimProtocol)
+  return Number.isFinite(raw) && raw >= CLAIM_PROTOCOL ? CLAIM_PROTOCOL : 1
+}
+
+function claimLeaseOf(state: any): number {
+  if (claimProtocolOf(state) < CLAIM_PROTOCOL) return LEGACY_CLAIM_LEASE_MS
+  const raw = Number(state?.claimLeaseMs)
+  if (!Number.isFinite(raw)) return DEFAULT_CLAIM_LEASE_MS
+  return Math.min(MAX_CLAIM_LEASE_MS, Math.max(MIN_CLAIM_LEASE_MS, Math.trunc(raw)))
+}
+
+function runHostOf(state: any, plan?: any): string {
+  if (typeof state?.host === "string" && state.host.trim()) return clean(state.host, 80).trim()
+  if (typeof plan?.host === "string" && plan.host.trim()) return clean(plan.host, 80).trim()
+  return SELF_HOST
+}
+
+function appendClaimHistory(history: any[], entry: any): any[] {
+  const next = [...(Array.isArray(history) ? history : []), entry]
+  return next.slice(-CLAIM_HISTORY_MAX)
+}
+
+/** The exact 0.9.0 claim shape, for a claimProtocol 1 run. */
+function makeLegacyTaskClaim(by: string, now: number, previous?: any): any {
   const claim: any = {
     by: clean(by, 80),
     at: new Date(now).toISOString(),
-    leaseUntil: new Date(now + TASK_CLAIM_LEASE_MS).toISOString(),
+    leaseUntil: new Date(now + LEGACY_CLAIM_LEASE_MS).toISOString(),
   }
   const prev = normalizePreviousClaimant(previous)
   if (prev && prev.by !== claim.by) claim.previousClaimant = prev
   return claim
+}
+
+function makeTaskClaim(
+  by: string,
+  now: number,
+  previous: any,
+  opts: { host: string; leaseMs: number; epoch: number; event?: string; reason?: string },
+): any {  const at = new Date(now).toISOString()
+  const claim: any = {
+    by: clean(by, 80),
+    at,
+    leaseUntil: new Date(now + opts.leaseMs).toISOString(),
+    host: opts.host,
+    epoch: Math.max(1, Math.trunc(opts.epoch) || 1),
+    heartbeatAt: at,
+    tenureStartAt: at,
+    renewals: 0,
+  }
+  const prev = normalizePreviousClaimant(previous)
+  if (prev && prev.by !== claim.by) {
+    claim.previousClaimant = prev
+    claim.history = appendClaimHistory(normalizeHistory(previous?.history), {
+      by: prev.by,
+      at: prev.at,
+      leaseUntil: prev.leaseUntil,
+      event: opts.event ?? "reclaimed",
+      ...(opts.reason ? { reason: clean(opts.reason, 200) } : {}),
+    })
+  } else if (previous) {
+    const history = normalizeHistory(previous.history)
+    if (history.length) claim.history = history
+  }
+  return claim
+}
+
+/**
+ * Renew an owned claim without changing its fence. Tenure is bounded: after
+ * CLAIM_MAX_TENURE_MS or CLAIM_MAX_RENEWALS the claim is forced expired and the
+ * caller must recover it explicitly.
+ */
+function renewClaimObject(
+  claim: any,
+  now: number,
+  leaseMs: number,
+): { claim: any; renewed: boolean; reason?: string } {
+  const at = new Date(now).toISOString()
+  const tenureStart = Date.parse(claim?.tenureStartAt ?? claim?.at)
+  const start = Number.isFinite(tenureStart) ? tenureStart : now
+  const renewals = Math.max(0, Math.trunc(Number(claim?.renewals) || 0)) + 1
+  if (now - start > CLAIM_MAX_TENURE_MS || renewals > CLAIM_MAX_RENEWALS) {
+    return {
+      claim: {
+        ...claim,
+        heartbeatAt: at,
+        leaseUntil: at,
+        renewals,
+        maxTenureReached: true,
+      },
+      renewed: false,
+      reason: `max claim tenure reached (${Math.round((now - start) / 60000)} min, ${renewals - 1} renewals); claim forced expired`,
+    }
+  }
+  return {
+    claim: {
+      ...claim,
+      heartbeatAt: at,
+      leaseUntil: new Date(now + leaseMs).toISOString(),
+      renewals,
+    },
+    renewed: true,
+  }
 }
 
 /** The claim shape returned to callers (never an untrusted raw object). */
@@ -1401,9 +1598,507 @@ function publicClaim(raw: any): any | undefined {
     by: claim.by,
     at: claim.at,
     leaseUntil: claim.leaseUntil,
+    ...(claim.host ? { host: claim.host } : {}),
+    ...(claim.epoch !== undefined ? { epoch: claim.epoch } : {}),
+    ...(claim.heartbeatAt ? { heartbeatAt: claim.heartbeatAt } : {}),
+    ...(claim.renewals !== undefined ? { renewals: claim.renewals } : {}),
     ...(claim.previousClaimant ? { previousClaimant: claim.previousClaimant } : {}),
     ...(claim.override ? { override: claim.override } : {}),
+    ...(claim.needsInspection ? { needsInspection: true } : {}),
+    ...(claim.maxTenureReached ? { maxTenureReached: true } : {}),
+    ...(claim.history ? { history: claim.history } : {}),
+    ...(claim.baseline ? { baseline: claim.baseline } : {}),
   }
+}
+
+type DerivedClaimState = "none" | "live" | "expired" | "stale" | "needs-inspection" | "cross-host"
+
+function deriveClaimState(
+  task: any,
+  now = Date.now(),
+): {
+  state: DerivedClaimState
+  remainingMs: number
+  heartbeatAgeMs?: number
+  crossHost: boolean
+  needsInspection: boolean
+} {
+  const claim = normalizeClaim(task?.claim)
+  if (!claim) return { state: "none", remainingMs: 0, crossHost: false, needsInspection: false }
+  const until = Date.parse(claim.leaseUntil)
+  const remainingMs = Number.isFinite(until) ? until - now : 0
+  const hb = claim.heartbeatAt ? Date.parse(claim.heartbeatAt) : NaN
+  const heartbeatAgeMs = Number.isFinite(hb) ? Math.max(0, now - hb) : undefined
+  const crossHost = !!claim.host && claim.host !== SELF_HOST
+  const flagged = task?.claim?.needsInspection === true
+  let state: DerivedClaimState
+  if (remainingMs > 0) state = crossHost ? "cross-host" : "live"
+  else if (crossHost) state = "cross-host"
+  else if (flagged) state = "needs-inspection"
+  else if (Number.isFinite(until) && now < until + CLAIM_GRACE_MS) state = "expired"
+  else state = "stale"
+  return { state, remainingMs, heartbeatAgeMs, crossHost, needsInspection: state === "needs-inspection" }
+}
+
+// ---------------------------------------------------------------------------
+// Side-effect baselines (git worktree or scoped artifacts)
+// ---------------------------------------------------------------------------
+
+function execGitCapture(cwd: string, args: string[]): string | undefined {
+  try {
+    return execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      timeout: 15000,
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim()
+  } catch {
+    return undefined
+  }
+}
+
+function worktreesBaseDir(root: string): string {
+  return process.env.TEAMWORK_WORKTREES_DIR
+    ? process.env.TEAMWORK_WORKTREES_DIR
+    : join(root, "..", ".teamwork-worktrees")
+}
+
+function runWorktreesPath(root: string, runId: string): string {
+  return join(worktreesBaseDir(root), runId)
+}
+
+function findTaskWorktree(
+  root: string,
+  runId: string,
+  task: any,
+  taskId: string,
+): { path: string } | undefined {
+  const candidates: string[] = []
+  if (typeof task?.worktree === "string" && task.worktree.trim()) {
+    const raw = task.worktree.trim()
+    candidates.push(isAbsolute(raw) ? raw : resolve(root, raw))
+  }
+  const base = runWorktreesPath(root, runId)
+  for (const name of [taskId, `verifier-${taskId}`, `worker-${taskId}`]) candidates.push(join(base, name))
+  for (const candidate of candidates) {
+    try {
+      const st = lstatSync(candidate)
+      if (st.isSymbolicLink() || !st.isDirectory()) continue
+      if (execGitCapture(candidate, ["rev-parse", "--is-inside-work-tree"]) !== "true") continue
+      return { path: candidate }
+    } catch {
+      continue
+    }
+  }
+  return undefined
+}
+
+function scanUntracked(cwd: string): { count: number; digest: string; truncated: boolean } | undefined {
+  const raw = execGitCapture(cwd, ["ls-files", "--others", "--exclude-standard", "-z"])
+  if (raw === undefined) return undefined
+  const names = raw
+    .split("\u0000")
+    .filter(Boolean)
+    .sort()
+  if (names.length > MAX_UNTRACKED_FILES) {
+    return { count: names.length, digest: "unknown", truncated: true }
+  }
+  const hash = createHash("sha256")
+  let bytes = 0
+  for (const name of names) {
+    hash.update(name)
+    hash.update("\u0000")
+    const file = join(cwd, name)
+    try {
+      const st = lstatSync(file)
+      if (st.isSymbolicLink()) {
+        hash.update("symlink")
+        continue
+      }
+      if (!st.isFile()) {
+        hash.update("nonregular")
+        continue
+      }
+      bytes += st.size
+      if (bytes > MAX_UNTRACKED_BYTES) return { count: names.length, digest: "unknown", truncated: true }
+      hash.update(readFileSync(file))
+    } catch {
+      hash.update("unreadable")
+    }
+  }
+  return { count: names.length, digest: hash.digest("hex"), truncated: false }
+}
+
+function captureGitBaseline(cwd: string, baseRef: string): ClaimBaseline | undefined {
+  const headSha = execGitCapture(cwd, ["rev-parse", "HEAD"])
+  if (!headSha) return undefined
+  const baseSha = execGitCapture(cwd, ["rev-parse", "--verify", baseRef])
+  const diff = baseSha ? execGitCapture(cwd, ["diff", "--no-color", `${baseSha}..${headSha}`]) : ""
+  const status = execGitCapture(cwd, ["status", "--porcelain"])
+  if (diff === undefined || status === undefined) return undefined
+  const untracked = scanUntracked(cwd)
+  if (!untracked) return undefined
+  const diffHash = sha256Hex(diff)
+  const statusHash = sha256Hex(status)
+  const fingerprint = sha256Hex(
+    canonicalJson({
+      scope: "git",
+      baseSha: baseSha ?? null,
+      headSha,
+      diffHash,
+      statusHash,
+      untracked,
+    }),
+  )
+  return {
+    scope: "git",
+    ...(baseSha ? { baseSha } : {}),
+    headSha,
+    diffHash,
+    statusHash,
+    untracked,
+    fingerprint,
+    at: new Date().toISOString(),
+  }
+}
+
+function collectArtifactFiles(
+  run: string,
+  target: string,
+  out: Array<{ path: string; sha256: string; bytes: number }>,
+  budget: { bytes: number },
+): "ok" | "truncated" {
+  let st
+  try {
+    st = lstatSync(target)
+  } catch {
+    return "ok"
+  }
+  if (st.isSymbolicLink()) return "ok"
+  if (st.isFile()) {
+    if (out.length >= MAX_UNTRACKED_FILES) return "truncated"
+    try {
+      const data = readFileSync(target)
+      budget.bytes += data.byteLength
+      if (budget.bytes > MAX_UNTRACKED_BYTES) return "truncated"
+      out.push({ path: relative(run, target), sha256: sha256Hex(data), bytes: data.byteLength })
+    } catch {
+      out.push({ path: relative(run, target), sha256: "unreadable", bytes: 0 })
+    }
+    return "ok"
+  }
+  if (!st.isDirectory()) return "ok"
+  let entries: string[]
+  try {
+    entries = readdirSync(target).sort()
+  } catch {
+    return "ok"
+  }
+  for (const entry of entries) {
+    if (collectArtifactFiles(run, join(target, entry), out, budget) === "truncated") return "truncated"
+  }
+  return "ok"
+}
+
+function captureArtifactBaseline(run: string, targets: string[]): ClaimBaseline | undefined {
+  const files: Array<{ path: string; sha256: string; bytes: number }> = []
+  const budget = { bytes: 0 }
+  let truncated = false
+  for (const target of targets) {
+    if (collectArtifactFiles(run, target, files, budget) === "truncated") {
+      truncated = true
+      break
+    }
+  }
+  const sorted = files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+  if (truncated) {
+    return {
+      scope: "artifact",
+      artifactHash: "unknown",
+      fingerprint: "unknown",
+      at: new Date().toISOString(),
+      reason: "artifact scan exceeded the bounded file/byte cap",
+    }
+  }
+  const artifactHash = sha256Hex(canonicalJson(sorted))
+  return {
+    scope: "artifact",
+    artifactHash,
+    fingerprint: sha256Hex(canonicalJson({ scope: "artifact", artifactHash })),
+    at: new Date().toISOString(),
+  }
+}
+
+/**
+ * Capture the side-effect baseline for a task: the git worktree fingerprint
+ * when one exists, otherwise the artifact scope for the route.
+ */
+function captureClaimBaseline(
+  root: string,
+  run: string,
+  task: any,
+  taskId: string,
+  status: string,
+  plan: any,
+): ClaimBaseline | undefined {
+  const runId = basename(run)
+  const topology = plan?.topology
+  const documentScope = topology === "document-review" || /^doc-/.test(taskId) || /^seg-/.test(taskId)
+  const lemmaScope = plan?.lemmaMode === true || plan?.route === "lemma"
+  const verifierScope =
+    !documentScope && !lemmaScope && (status === "worker_done" || status === "verifier_active" || status === "verified_pass")
+  if (verifierScope) {
+    return captureArtifactBaseline(run, [
+      join(run, "verify", `report-${taskId}.json`),
+      join(run, "verify", `challenge-${taskId}.json`),
+      join(run, "verify", `audit-${taskId}.json`),
+    ])
+  }
+
+  const worktree = findTaskWorktree(root, runId, task, taskId)
+  if (worktree) return captureGitBaseline(worktree.path, `teamwork/base-${runId}`)
+
+  const targets: string[] = []
+  if (documentScope) {
+    targets.push(join(run, "document-review", "segments", taskId))
+    if (taskId === "doc-synthesis") targets.push(join(run, "document-review", "synthesis"))
+    targets.push(join(run, "DOCUMENT_REVIEW_REPORT.md"))
+  } else if (lemmaScope) {
+    targets.push(join(run, "lemma", "nodes", taskId))
+    targets.push(join(run, "lemma"))
+  }
+  if (!targets.length) return undefined
+  return captureArtifactBaseline(run, targets)
+}
+
+interface WorktreeInspection {
+  available: boolean
+  worktree?: string
+  headSha?: string
+  baseSha?: string
+  diffHash?: string
+  diffstat?: string
+  commitCount: number
+  commits: Array<{ sha: string; subject: string }>
+  dirty: boolean
+  dirtyPaths: string[]
+  untracked?: { count: number; digest: string; truncated: boolean }
+  baselineAncestor?: boolean
+}
+
+/** Read-only git evidence used by `teamwork_recover` and `teamwork_status`. */
+function inspectWorktreeState(
+  root: string,
+  run: string,
+  task: any,
+  taskId: string,
+  baseline?: ClaimBaseline,
+): WorktreeInspection {
+  const runId = basename(run)
+  const worktree = findTaskWorktree(root, runId, task, taskId)
+  const branch = `teamwork/${runId}-${taskId}`
+  const baseBranch = `teamwork/base-${runId}`
+  const headSha = execGitCapture(root, ["rev-parse", "--verify", branch])
+  const baseSha = execGitCapture(root, ["rev-parse", "--verify", baseBranch]) ?? baseline?.baseSha
+  const empty: WorktreeInspection = {
+    available: !!headSha,
+    ...(worktree ? { worktree: worktree.path } : {}),
+    ...(headSha ? { headSha } : {}),
+    ...(baseSha ? { baseSha } : {}),
+    commitCount: 0,
+    commits: [],
+    dirty: false,
+    dirtyPaths: [],
+  }
+  if (!headSha) return empty
+  const diff = baseSha ? execGitCapture(root, ["diff", "--no-color", `${baseSha}..${headSha}`]) ?? "" : ""
+  const diffstat = baseSha ? execGitCapture(root, ["diff", "--stat", `${baseSha}..${headSha}`]) : undefined
+  const log = execGitCapture(root, ["log", "--oneline", "--no-decorate", baseSha ? `${baseSha}..${headSha}` : "HEAD"])
+  const commits = (log ? log.split("\n") : [])
+    .filter(Boolean)
+    .slice(0, 20)
+    .map((line) => {
+      const [sha, ...rest] = line.split(" ")
+      return { sha, subject: clean(rest.join(" "), 120) }
+    })
+  const commitCount = log ? log.split("\n").filter(Boolean).length : 0
+  let dirty = false
+  let dirtyPaths: string[] = []
+  let untracked: WorktreeInspection["untracked"]
+  if (worktree) {
+    const status = execGitCapture(worktree.path, ["status", "--porcelain"]) ?? ""
+    dirtyPaths = status.split("\n").filter(Boolean).slice(0, 50).map((line) => clean(line, 200))
+    dirty = dirtyPaths.length > 0
+    untracked = scanUntracked(worktree.path)
+  }
+  let baselineAncestor: boolean | undefined
+  if (baseline?.headSha) {
+    baselineAncestor =
+      execGitCapture(root, ["merge-base", "--is-ancestor", baseline.headSha, headSha]) !== undefined
+  }
+  return {
+    available: true,
+    ...(worktree ? { worktree: worktree.path } : {}),
+    headSha,
+    ...(baseSha ? { baseSha } : {}),
+    diffHash: sha256Hex(diff),
+    ...(diffstat ? { diffstat } : {}),
+    commitCount,
+    commits,
+    dirty,
+    dirtyPaths,
+    ...(untracked ? { untracked } : {}),
+    ...(baselineAncestor !== undefined ? { baselineAncestor } : {}),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session ownership and inspection tokens
+// ---------------------------------------------------------------------------
+
+const CLAIM_SESSION_MAX_DEPTH = 32
+
+/** `same` owner, `descendant` of the owner, or `none`. Fails closed. */
+async function claimRelation(
+  ctx: any,
+  sessionID: string | undefined,
+  owner: string | undefined,
+): Promise<"same" | "descendant" | "none"> {
+  if (!sessionID || !owner) return "none"
+  if (sessionID === owner) return "same"
+  if (typeof ctx?.session?.get !== "function") return "none"
+  let current = sessionID
+  for (let depth = 0; depth < CLAIM_SESSION_MAX_DEPTH; depth++) {
+    let info: any
+    try {
+      info = await ctx.session.get({ sessionID: current })
+    } catch {
+      return "none"
+    }
+    const parent = info?.parentID ?? info?.parentId ?? info?.parent_id
+    if (typeof parent !== "string" || parent.trim() === "") return "none"
+    if (parent === owner) return "descendant"
+    current = parent
+  }
+  return "none"
+}
+
+function normalizeInspection(raw: any): any | undefined {
+  if (!raw || typeof raw !== "object") return undefined
+  const tokenHash = typeof raw.tokenHash === "string" ? clean(raw.tokenHash, 128).trim() : ""
+  const at = claimTime(raw.at)
+  const expiresAt = claimTime(raw.expiresAt)
+  const fingerprint = typeof raw.fingerprint === "string" ? clean(raw.fingerprint, 128).trim() : ""
+  if (!tokenHash || !at || !expiresAt || !fingerprint) return undefined
+  return {
+    tokenHash,
+    at,
+    expiresAt,
+    fingerprint,
+    round: Math.max(0, Math.trunc(Number(raw.round) || 0)),
+    fence: Math.max(0, Math.trunc(Number(raw.fence) || 0)),
+    ...(typeof raw.baseSha === "string" ? { baseSha: clean(raw.baseSha, 64) } : {}),
+    ...(typeof raw.headSha === "string" ? { headSha: clean(raw.headSha, 64) } : {}),
+    ...(typeof raw.diffHash === "string" ? { diffHash: clean(raw.diffHash, 64) } : {}),
+  }
+}
+
+function issueInspectionToken(task: any, observed: ClaimBaseline | undefined, now: number): string {
+  const token = randomBytes(24).toString("base64url")
+  task.inspection = {
+    tokenHash: sha256Hex(token),
+    at: new Date(now).toISOString(),
+    expiresAt: new Date(now + INSPECTION_TOKEN_TTL_MS).toISOString(),
+    fingerprint: observed?.fingerprint ?? "unknown",
+    round: Math.max(0, Math.trunc(Number(task?.round) || 0)),
+    fence: nextFence(task),
+    ...(observed?.baseSha ? { baseSha: observed.baseSha } : {}),
+    ...(observed?.headSha ? { headSha: observed.headSha } : {}),
+    ...(observed?.diffHash ? { diffHash: observed.diffHash } : {}),
+  }
+  return token
+}
+
+function validateInspectionToken(
+  task: any,
+  token: unknown,
+  now: number,
+): { ok: true; inspection: any } | { ok: false; code: string; reason: string } {
+  const inspection = normalizeInspection(task?.inspection)
+  if (!inspection) {
+    return { ok: false, code: "INSPECTION_TOKEN_REQUIRED", reason: "run teamwork_recover with action \"inspect\" first" }
+  }
+  if (Date.parse(inspection.expiresAt) <= now) {
+    return { ok: false, code: "INSPECTION_EXPIRED", reason: "the inspection token expired; inspect again" }
+  }
+  const presented = typeof token === "string" ? token.trim() : ""
+  if (!presented || sha256Hex(presented) !== inspection.tokenHash) {
+    return { ok: false, code: "INSPECTION_TOKEN_INVALID", reason: "the inspection token does not match" }
+  }
+  return { ok: true, inspection }
+}
+
+interface ReportBindingCheck {
+  ok: boolean
+  code?: string
+  reason?: string
+  warning?: string
+}
+
+/**
+ * Validate a verifier report against the live round/fence/branch. A report that
+ * predates the binding fields is accepted with a `legacy_unbound_report`
+ * warning; it is never silently treated as bound to the current round.
+ */
+function validateVerifierReportBinding(
+  report: any,
+  opts: { taskId: string; round: number; fence: number; root: string; runId: string },
+): ReportBindingCheck {
+  if (!report || typeof report !== "object") {
+    return { ok: false, code: "REPORT_MISSING", reason: "no verifier report was found" }
+  }
+  const warnings = new Set<string>()
+  if (report.round === undefined || report.round === null) {
+    warnings.add("legacy_unbound_report")
+  } else if (Number(report.round) !== opts.round) {
+    return {
+      ok: false,
+      code: "REPORT_ROUND_STALE",
+      reason: `report round ${Number(report.round)} does not match the current round ${opts.round}`,
+    }
+  }
+  if (report.fence !== undefined && report.fence !== null && Number(report.fence) !== opts.fence) {
+    return {
+      ok: false,
+      code: "REPORT_FENCE_STALE",
+      reason: `report fence ${Number(report.fence)} does not match the current fence ${opts.fence}`,
+    }
+  }
+  const branch = `teamwork/${opts.runId}-${opts.taskId}`
+  const headSha = execGitCapture(opts.root, ["rev-parse", "--verify", branch])
+  if (typeof report.headSha === "string" && report.headSha && headSha && report.headSha !== headSha) {
+    return {
+      ok: false,
+      code: "BRANCH_MOVED",
+      reason: `the branch head moved after the report (report ${report.headSha.slice(0, 12)}, head ${headSha.slice(0, 12)})`,
+    }
+  }
+  if (typeof report.diffHash === "string" && report.diffHash) {
+    const baseSha = execGitCapture(opts.root, ["rev-parse", "--verify", `teamwork/base-${opts.runId}`])
+    const head = headSha ?? execGitCapture(opts.root, ["rev-parse", "HEAD"])
+    if (baseSha && head) {
+      const diff = execGitCapture(opts.root, ["diff", "--no-color", `${baseSha}..${head}`]) ?? ""
+      if (sha256Hex(diff) !== report.diffHash) {
+        return {
+          ok: false,
+          code: "BRANCH_MOVED",
+          reason: "the branch diff changed after the verifier report",
+        }
+      }
+    }
+  }
+  if (report.headSha === undefined || report.diffHash === undefined) warnings.add("legacy_unbound_report")
+  return { ok: true, ...(warnings.size ? { warning: Array.from(warnings).join(",") } : {}) }
 }
 
 function isSentinelAgent(agent: string | undefined): boolean {
@@ -1441,10 +2136,89 @@ async function setRunPhase(run: string, phase: string): Promise<void> {
   )
 }
 
+/**
+ * Renew a claim when the caller is its owner or descends from the owner.
+ * Never changes the fence. Failures are silent: a heartbeat is an optimisation
+ * for a live owner, not a mutation the calling tool depends on.
+ */
+async function renewClaimFor(
+  run: string,
+  taskId: string | undefined,
+  sessionID: string | undefined,
+  ctx: any,
+  note: string,
+): Promise<{ renewed: boolean; reason?: string }> {
+  if (!taskId || !sessionID) return { renewed: false }
+  const pre = readJson<any>(run, join(run, "state.json"), undefined)
+  // Protocol 1 keeps the 0.9.0 shape: no heartbeat fields are added.
+  if (claimProtocolOf(pre) < CLAIM_PROTOCOL) return { renewed: false }
+  const preClaim = normalizeClaim(pre?.tasks?.[taskId]?.claim)
+  if (!preClaim) return { renewed: false }
+  const relation = await claimRelation(ctx, sessionID, preClaim.by)
+  if (relation !== "same" && relation !== "descendant") return { renewed: false }
+
+  const now = Date.now()
+  let result: { renewed: boolean; reason?: string } = { renewed: false }
+  let forceExpired = false
+  await mutateRunState(
+    run,
+    (state) => {
+      const task = state.tasks?.[taskId]
+      const claim = normalizeClaim(task?.claim)
+      if (!claim || claim.by !== preClaim.by) return
+      const leaseMs = claimLeaseOf(state)
+      const renewal = renewClaimObject(claim, now, leaseMs)
+      task.claim = renewal.claim
+      if (!renewal.renewed) {
+        forceExpired = true
+        task.claim.needsInspection = true
+        result = { renewed: false, reason: renewal.reason }
+      } else {
+        result = { renewed: true }
+      }
+    },
+    { write: () => true },
+  )
+  if (result.renewed) {
+    await appendEvent(run, {
+      event: "claim_renewed",
+      sessionId: basename(run),
+      taskId,
+      to: "CLAIM_RENEWED",
+      round: 0,
+      note: `${note}: heartbeat renewed for ${preClaim.by}`,
+    })
+  } else if (forceExpired) {
+    await appendEvent(run, {
+      event: "claim_inspection_required",
+      sessionId: basename(run),
+      taskId,
+      to: "NEEDS_INSPECTION",
+      round: 0,
+      note: `${note}: ${result.reason ?? "claim forced expired"}`,
+    })
+  }
+  return result
+}
+
 interface ClaimCandidate {
   id: string
   round?: number
   claim?: any
+  fence?: number
+}
+
+interface ClaimEvent {
+  event:
+    | "claim_renewed"
+    | "claim_reclaimed"
+    | "claim_released"
+    | "claim_inspection_required"
+    | "claim_recovered"
+    | "claim_override"
+  taskId: string
+  round: number
+  note: string
 }
 
 /**
@@ -1453,29 +2227,60 @@ interface ClaimCandidate {
  * The first read of state.json happened before the (potentially expensive)
  * gate checks. This function re-reads it under the cross-process lock and
  * re-checks each task's current status, so a task another process started or
- * claimed in the meantime is never returned as ready. Claims are renewed for
- * the same caller; a different live claimant is skipped (and surfaced as
- * in-progress); an expired claim is reclaimed with the previous claimant kept.
+ * claimed in the meantime is never returned as ready.
+ *
+ * Protocol 2 requires a side-effect baseline before an expired claim from
+ * another session can be reclaimed. A missing, unknown, or changed fingerprint
+ * marks the claim `needs-inspection` and excludes the task from the ready list;
+ * it is never silently re-dispatched. A cross-host claim is never reclaimed.
  */
 async function claimReadyTasks(
+  root: string,
   run: string,
+  plan: any,
   readyForWorker: ClaimCandidate[],
   readyForVerifier: ClaimCandidate[],
   callSession: string | undefined,
-): Promise<{ worker: ClaimCandidate[]; verifier: ClaimCandidate[]; skipped: any[] }> {
-  if (!callSession) return { worker: readyForWorker, verifier: readyForVerifier, skipped: [] }
+): Promise<{
+  worker: ClaimCandidate[]
+  verifier: ClaimCandidate[]
+  skipped: any[]
+  events: ClaimEvent[]
+  protocol: number
+}> {
+  if (!callSession) return { worker: readyForWorker, verifier: readyForVerifier, skipped: [], events: [], protocol: 1 }
   const stateFile = join(run, "state.json")
   return withCrossProcessLock(stateFile, async () => {
     const state = readJson<any>(run, stateFile, undefined)
     if (!state || typeof state.tasks !== "object") {
-      return { worker: [], verifier: [], skipped: [] }
+      return { worker: [], verifier: [], skipped: [], events: [], protocol: 1 }
     }
     state.tasks = nullMap(state.tasks)
+    const protocol = claimProtocolOf(state)
+    const leaseMs = claimLeaseOf(state)
+    const host = runHostOf(state, plan)
     const now = Date.now()
     const worker: ClaimCandidate[] = []
     const verifier: ClaimCandidate[] = []
     const skipped: any[] = []
+    const events: ClaimEvent[] = []
     let changed = false
+
+    const markNeedsInspection = (taskId: string, task: any, reason: string) => {
+      const raw = task?.claim && typeof task.claim === "object" ? task.claim : undefined
+      if (!raw) return
+      const first = raw.needsInspection !== true
+      raw.needsInspection = true
+      if (first) {
+        events.push({
+          event: "claim_inspection_required",
+          taskId,
+          round: Number(task.round) || 0,
+          note: reason,
+        })
+      }
+      changed = true
+    }
 
     const claimOne = (candidate: ClaimCandidate, kind: "worker" | "verifier") => {
       const st = state.tasks[candidate.id]
@@ -1491,30 +2296,176 @@ async function claimReadyTasks(
       }
       const existing = normalizeClaim(st.claim)
       if (existing && existing.by !== callSession && claimIsLive(existing, now)) {
-        skipped.push({ id: candidate.id, status: "claimed", round: Number(st.round) || 0, claim: publicClaim(existing) })
+        skipped.push({
+          id: candidate.id,
+          status: "claimed",
+          round: Number(st.round) || 0,
+          claim: publicClaim(existing),
+          claimState: deriveClaimState(st, now).state,
+          fence: nextFence(st),
+          reason: `live claim held by ${existing.by}`,
+        })
         return
       }
-      const previous = existing && existing.by !== callSession ? existing : undefined
-      const claim = makeTaskClaim(callSession, now, previous)
+
       if (existing && existing.by === callSession) {
-        if (existing.previousClaimant) claim.previousClaimant = existing.previousClaimant
-        if (existing.override === "sentinel") claim.override = "sentinel"
+        if (protocol < CLAIM_PROTOCOL) {
+          const claim = makeLegacyTaskClaim(callSession, now, undefined)
+          if (existing.previousClaimant) claim.previousClaimant = existing.previousClaimant
+          if (existing.override === "sentinel") claim.override = "sentinel"
+          st.claim = claim
+          changed = true
+          candidate.claim = publicClaim(claim)
+          ;(kind === "worker" ? worker : verifier).push(candidate)
+          return
+        }
+        const renewal = renewClaimObject(existing, now, leaseMs)
+        st.claim = renewal.claim
+        changed = true
+        candidate.fence = nextFence(st)
+        candidate.claim = publicClaim(renewal.claim)
+        if (!renewal.renewed) {
+          skipped.push({
+            id: candidate.id,
+            status: "claimed",
+            round: Number(st.round) || 0,
+            claim: publicClaim(renewal.claim),
+            claimState: "expired",
+            fence: candidate.fence,
+            reason: renewal.reason ?? "max claim tenure reached",
+          })
+          events.push({
+            event: "claim_inspection_required",
+            taskId: candidate.id,
+            round: Number(st.round) || 0,
+            note: renewal.reason ?? "max claim tenure reached",
+          })
+          return
+        }
+        ;(kind === "worker" ? worker : verifier).push(candidate)
+        return
       }
+
+      if (existing && protocol >= CLAIM_PROTOCOL) {
+        const derived = deriveClaimState(st, now)
+        if (derived.crossHost) {
+          skipped.push({
+            id: candidate.id,
+            status: "claimed",
+            round: Number(st.round) || 0,
+            claim: publicClaim(existing),
+            claimState: "cross-host",
+            fence: nextFence(st),
+            reason: `claim was made on host ${existing.host ?? "unknown"}; cross-host claims are never auto-reclaimed`,
+          })
+          return
+        }
+        const baseline = normalizeBaseline(st.claim?.baseline)
+        if (derived.state === "expired") {
+          skipped.push({
+            id: candidate.id,
+            status: "claimed",
+            round: Number(st.round) || 0,
+            claim: publicClaim(existing),
+            claimState: "expired",
+            fence: nextFence(st),
+            reason: "the claim is past its lease but inside the grace window; not reclaimable yet",
+          })
+          return
+        }
+        if (!baseline || baseline.fingerprint === "unknown") {
+          markNeedsInspection(candidate.id, st, "expired claim has no usable side-effect baseline")
+          skipped.push({
+            id: candidate.id,
+            status: "claimed",
+            round: Number(st.round) || 0,
+            claim: publicClaim(st.claim),
+            claimState: "needs-inspection",
+            fence: nextFence(st),
+            reason: "needs-inspection: missing or unknown baseline",
+          })
+          return
+        }
+        const current = captureClaimBaseline(root, run, st, candidate.id, status, plan)
+        if (!current || current.fingerprint === "unknown" || current.fingerprint !== baseline.fingerprint) {
+          markNeedsInspection(candidate.id, st, "side effects changed since the claim baseline")
+          skipped.push({
+            id: candidate.id,
+            status: "claimed",
+            round: Number(st.round) || 0,
+            claim: publicClaim(st.claim),
+            claimState: "needs-inspection",
+            fence: nextFence(st),
+            reason:
+              !current || current.fingerprint === "unknown"
+                ? "needs-inspection: the current side effects cannot be observed"
+                : "needs-inspection: side effects changed since the baseline",
+          })
+          return
+        }
+      }
+
+      const previous = existing && existing.by !== callSession ? existing : undefined
+      const fence = nextFence(st) + 1
+      const claim =
+        protocol >= CLAIM_PROTOCOL
+          ? makeTaskClaim(callSession, now, previous, {
+              host,
+              leaseMs,
+              epoch: (Number(existing?.epoch) || 0) + 1,
+              event: previous ? "reclaimed" : "claimed",
+            })
+          : makeLegacyTaskClaim(callSession, now, previous)
       st.claim = claim
+      if (protocol >= CLAIM_PROTOCOL) st.fence = fence
       st.updatedAt = new Date(now).toISOString()
       changed = true
       candidate.claim = publicClaim(claim)
+      if (protocol >= CLAIM_PROTOCOL) candidate.fence = fence
+      if (previous && protocol >= CLAIM_PROTOCOL) {
+        events.push({
+          event: "claim_reclaimed",
+          taskId: candidate.id,
+          round: Number(st.round) || 0,
+          note: `reclaimed an expired claim from ${previous.by}; fingerprint unchanged`,
+        })
+      }
       ;(kind === "worker" ? worker : verifier).push(candidate)
     }
 
     for (const candidate of readyForWorker) claimOne(candidate, "worker")
     for (const candidate of readyForVerifier) claimOne(candidate, "verifier")
 
+    // Auto-renew a live claim the same session already owns on an in-progress
+    // task (a Sentinel that calls `next` again keeps its own worker alive).
+    // Protocol 1 keeps the 0.9.0 behaviour: an in-progress claim is untouched.
+    if (protocol >= CLAIM_PROTOCOL) {
+      for (const [taskId, task] of Object.entries(state.tasks) as Array<[string, any]>) {
+        if (!task || typeof task !== "object") continue
+        const status = typeof task.status === "string" ? task.status : ""
+        if (status !== "worker_active" && status !== "verifier_active") continue
+        const claim = normalizeClaim(task.claim)
+        if (!claim || claim.by !== callSession) continue
+        const renewal = renewClaimObject(claim, now, leaseMs)
+        task.claim = renewal.claim
+        changed = true
+        if (!renewal.renewed) {
+          task.claim.needsInspection = true
+          events.push({
+            event: "claim_inspection_required",
+            taskId,
+            round: Number(task.round) || 0,
+            note: renewal.reason ?? "max claim tenure reached",
+          })
+        }
+      }
+    }
+
     if (changed) {
       state.updatedAt = new Date(now).toISOString()
       writeJson(stateFile, state)
     }
-    return { worker, verifier, skipped }
+    return { worker, verifier, skipped, events, protocol }
   })
 }
 
@@ -1686,6 +2637,12 @@ async function appendEvent(
       | "tournament_cancelled"
       | "briefing_warning"
       | "handoff_recorded"
+      | "claim_renewed"
+      | "claim_reclaimed"
+      | "claim_released"
+      | "claim_inspection_required"
+      | "claim_recovered"
+      | "claim_override"
     sessionId: string
     taskId?: string | null
     from?: string | null
@@ -2067,6 +3024,7 @@ function planBaselineHash(plan: any): string {
         : {}),
       route: plan?.route ?? null,
       lemmaBounds: plan?.lemmaBounds ?? null,
+      ...(plan?.requireSameHost === true ? { requireSameHost: true } : {}),
       tasks: Array.isArray(plan?.tasks) ? plan.tasks : [],
     }),
   )
@@ -3205,6 +4163,33 @@ async function createPlanRun(
     maxRounds: Number.isFinite(t.maxRounds) ? t.maxRounds : 4,
   }))
   const routingReason = typeof input.routingReason === "string" ? clean(input.routingReason, 200).trim() : ""
+  // Claim protocol baseline (0.10.0). A brand-new run records protocol 2, its
+  // lease, host and lock-storage diagnostics. A re-plan of a legacy run leaves
+  // an absent claimProtocol alone, so that run keeps behaving exactly as 0.9.0.
+  const existingStateForClaims = readJson<any>(run, join(run, "state.json"), undefined)
+  const clampLease = (value: unknown): number => {
+    const raw = Number(value)
+    if (!Number.isFinite(raw)) return DEFAULT_CLAIM_LEASE_MS
+    return Math.min(MAX_CLAIM_LEASE_MS, Math.max(MIN_CLAIM_LEASE_MS, Math.trunc(raw)))
+  }
+  const persistedLease = Number(existingStateForClaims?.claimLeaseMs)
+  const claimLeaseMs =
+    input.claimLeaseMs !== undefined && input.claimLeaseMs !== null
+      ? clampLease(input.claimLeaseMs)
+      : Number.isFinite(persistedLease)
+        ? clampLease(persistedLease)
+        : DEFAULT_CLAIM_LEASE_MS
+  const requireSameHost = input.requireSameHost === true || existingStateForClaims?.requireSameHost === true
+  const planHost =
+    typeof existingStateForClaims?.host === "string" && existingStateForClaims.host.trim()
+      ? clean(existingStateForClaims.host, 80).trim()
+      : SELF_HOST
+  const claimStorage = {
+    lockProtocol: "atomic-link",
+    fallback: "mkdir",
+    hardlinkSupport: "auto",
+    diagnostics: recentLockDiagnostics(5),
+  }
   const planObject = {
     sessionId,
     rootSessionId,
@@ -3218,6 +4203,11 @@ async function createPlanRun(
     ...(victorySkipReason ? { victorySkipReason } : {}),
     requireHandoffs: requireHandoffsMode,
     requireHandoffsSource,
+    claimProtocol: CLAIM_PROTOCOL,
+    claimLeaseMs,
+    host: planHost,
+    storage: claimStorage,
+    ...(requireSameHost ? { requireSameHost: true } : {}),
     ...(requirementsBaseline ? { requirementsSource: requirementsBaseline.source, requirementsCount: requirementsBaseline.items.length } : {}),
     preflight,
     ...(isLemma ? { lemmaMode: true, route: "lemma", lemmaBounds } : rawRoute ? { route: rawRoute } : {}),
@@ -3244,6 +4234,11 @@ async function createPlanRun(
         requireWitness,
         ...(victorySkipReason ? { victorySkipReason } : {}),
         requireHandoffs: requireHandoffsMode,
+        claimProtocol: CLAIM_PROTOCOL,
+        claimLeaseMs,
+        host: planHost,
+        storage: claimStorage,
+        ...(requireSameHost ? { requireSameHost: true } : {}),
         ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
         ...(isLemma ? { lemmaMode: true, route: "lemma" } : {}),
         phase: "DISPATCH",
@@ -3269,6 +4264,8 @@ async function createPlanRun(
             state.requireHandoffs !== requireHandoffsMode ||
             state.rootSessionId !== rootSessionId ||
             (allowUnsignedLegacy && state.allowUnsignedLegacy !== true) ||
+            (state.claimProtocol >= CLAIM_PROTOCOL &&
+              (state.claimLeaseMs !== claimLeaseMs || state.host !== planHost || (requireSameHost && state.requireSameHost !== true))) ||
             (isLemma && !state.lemmaMode))
         ) {
           state.integrityMode = integrityMode
@@ -3281,6 +4278,11 @@ async function createPlanRun(
           state.requireHandoffs = requireHandoffsMode
           state.rootSessionId = rootSessionId
           if (allowUnsignedLegacy) state.allowUnsignedLegacy = true
+          if (state.claimProtocol >= CLAIM_PROTOCOL) {
+            state.claimLeaseMs = claimLeaseMs
+            state.host = planHost
+            if (requireSameHost) state.requireSameHost = true
+          }
           if (isLemma) {
             state.lemmaMode = true
             state.route = "lemma"
@@ -3540,6 +4542,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             type: "boolean",
             description:
               "Default false. When true, final_verify requires a recorded witness receipt for the run manifest (OPENCODE_TEAMWORK_WITNESS=command:<path> or http(s)://<url>). A configured witness is appended on every signed artifact write; an unavailable/malformed witness fails closed with AUTH_WITNESS_UNAVAILABLE. A local file witness is detection-only.",
+          },
+          requireSameHost: {
+            type: "boolean",
+            description:
+              "Default false. When true, git worktree setup/merge/resolve/cleanup refuse when the run's recorded host differs from the current host, even with allowSharedWorktrees. Benchmark and strict operators may set it to make a shared-filesystem mix-up a hard error instead of a warning.",
+          },
+          claimLeaseMs: {
+            type: "number",
+            description:
+              "Optional claim lease in milliseconds for the claim protocol (default 300000 = 5 min, bounded to 60s..60m). A separate 5-minute grace period follows the lease before a claim is stale and eligible for fingerprint-checked reclaim.",
           },
           budgetUsd: { type: "number", description: "Run budget in USD. When using opencode/ models + opencode_console, derive this from credits (full or partial, per the user's choice)." },
           budgetSource: { type: "string", description: "Where the budget came from: credits | default | manual." },
@@ -4293,16 +5305,73 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const authz = await authorizeToolAction(ctx, run, "status", undefined, context)
         if (!authz.ok) return { content: authz.content }
         const state = readJson<any>(run, join(run, "state.json"), {})
+        const plan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
         const tasks = state.tasks || {}
+        const protocol = claimProtocolOf(state)
+        const leaseMs = claimLeaseOf(state)
+        const host = runHostOf(state, plan)
+        const now = Date.now()
+        const warnings: string[] = []
+        if (host !== SELF_HOST) {
+          warnings.push(`FOREIGN_HOST: this run was recorded on ${clean(host, 80)}; the current host is ${clean(SELF_HOST, 80)}.`)
+          warnings.push("SHARED_FS_SUSPECTED: cross-host claims are never auto-reclaimed; use teamwork_recover with an explicit decision.")
+        }
+        const needsInspection: string[] = []
+        const claims: any[] = []
         const lines = Object.entries(tasks).map(([id, t]: any) => {
           const claim = publicClaim(t?.claim)
-          return `  ${clean(id, 64)}: ${clean(t?.status, 16)} (round ${Number(t?.round) || 0})${claim ? ` [claim ${claim.by} until ${claim.leaseUntil}]` : ""}`
+          const derived = deriveClaimState(t, now)
+          let claimState: string = derived.state
+          let fingerprintChanged = false
+          if (
+            claim &&
+            protocol >= CLAIM_PROTOCOL &&
+            t?.claim?.baseline &&
+            (t?.status === "worker_active" || t?.status === "verifier_active") &&
+            (derived.state === "stale" || derived.state === "needs-inspection")
+          ) {
+            const current = captureClaimBaseline(root, run, t, id, String(t.status), plan)
+            const baselineFingerprint = normalizeBaseline(t.claim.baseline)?.fingerprint
+            fingerprintChanged =
+              !current || current.fingerprint === "unknown" || (!!baselineFingerprint && current.fingerprint !== baselineFingerprint)
+            if (fingerprintChanged && claimState !== "cross-host") claimState = "needs-inspection"
+          }
+          if (claim) {
+            claims.push({
+              id: clean(id, 64),
+              claim,
+              state: claimState,
+              remainingMs: derived.remainingMs,
+              ...(derived.heartbeatAgeMs !== undefined ? { heartbeatAgeMs: derived.heartbeatAgeMs } : {}),
+              fence: nextFence(t),
+              ...(fingerprintChanged ? { fingerprintChanged: true } : {}),
+            })
+            if (claimState === "needs-inspection" || t?.claim?.needsInspection === true) needsInspection.push(clean(id, 64))
+          }
+          const claimText = claim
+            ? ` [claim ${claim.by} state=${claimState} until ${claim.leaseUntil}${
+                Number.isFinite(derived.remainingMs) ? ` remaining=${Math.max(0, derived.remainingMs)}ms` : ""
+              }${claim.previousClaimant ? ` reclaimed-from=${claim.previousClaimant.by}` : ""}]`
+            : ""
+          return `  ${clean(id, 64)}: ${clean(t?.status, 16)} (round ${Number(t?.round) || 0})${claimText}`
         })
-        const claims = Object.entries(tasks)
-          .map(([id, t]: any) => ({ id: clean(id, 64), claim: publicClaim(t?.claim) }))
-          .filter((entry) => entry.claim)
         const pass = Object.values(tasks).filter((t: any) => isPassStatus(t?.status)).length
-        return { content: `Run ${basename(run)} — phase ${PHASES.has(state.phase) ? state.phase : "UNKNOWN"}\n${pass}/${lines.length} pass\n${lines.join("\n")}`, claims }
+        const warningText = warnings.length ? `\n${warnings.join("\n")}` : ""
+        const inspectionText = needsInspection.length
+          ? `\nNeeds inspection (${needsInspection.length}): ${needsInspection.join(", ")} — run teamwork_recover { action: "inspect", taskId } before reclaiming.`
+          : ""
+        return {
+          content: `Run ${basename(run)} — phase ${PHASES.has(state.phase) ? state.phase : "UNKNOWN"} (claim protocol ${protocol}, lease ${
+            protocol >= CLAIM_PROTOCOL ? leaseMs : LEGACY_CLAIM_LEASE_MS
+          }ms, host ${clean(host, 80)})\n${pass}/${lines.length} pass\n${lines.join("\n")}${warningText}${inspectionText}`,
+          claims,
+          needsInspection,
+          claimProtocol: protocol,
+          claimLeaseMs: protocol >= CLAIM_PROTOCOL ? leaseMs : LEGACY_CLAIM_LEASE_MS,
+          host,
+          warnings,
+          ...(protocol >= CLAIM_PROTOCOL ? { storage: state.storage ?? null, lockDiagnostics: recentLockDiagnostics(5) } : {}),
+        }
       },
     })
 
@@ -4317,10 +5386,24 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const authz = await authorizeToolAction(ctx, run, "resume", undefined, context)
         if (!authz.ok) return { content: authz.content }
         const state = readJson<any>(run, join(run, "state.json"), {})
+        const protocol = claimProtocolOf(state)
+        const now = Date.now()
         const open = Object.entries(state.tasks || {}).filter(([, t]: any) => !isPassStatus(t?.status))
         if (!open.length) return { content: `Run ${basename(run)} is complete (all tasks pass).` }
+        const openDetails = open.map(([id, t]: any) => {
+          const claim = publicClaim(t?.claim)
+          const derived = deriveClaimState(t, now)
+          const claimText = claim
+            ? ` claim=${claim.by}/${derived.state}${derived.remainingMs > 0 ? ` (${Math.max(0, derived.remainingMs)}ms left)` : ` (${claim.leaseUntil})`}`
+            : ""
+          return { id: clean(id, 64), status: clean(t?.status, 16), round: Number(t?.round) || 0, claim, claimState: derived.state }
+        })
         return {
-          content: `Resume ${basename(run)} at phase ${PHASES.has(state.phase) ? state.phase : "UNKNOWN"}. Open tasks:\n` + open.map(([id, t]: any) => `  ${clean(id, 64)}: ${clean(t?.status, 16)} round ${Number(t?.round) || 0}`).join("\n"),
+          content:
+            `Resume ${basename(run)} at phase ${PHASES.has(state.phase) ? state.phase : "UNKNOWN"} (claim protocol ${protocol}). Open tasks:\n` +
+            openDetails.map((t) => `  ${t.id}: ${t.status} round ${t.round}${t.claim ? ` [claim ${t.claim.by} state=${t.claimState}]` : ""}`).join("\n"),
+          open: openDetails,
+          claimProtocol: protocol,
         }
       },
     })
@@ -5528,6 +6611,18 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
         const taskDefs = new Map<string, any>(plan.tasks.map((t: any) => [t.id, t]))
         const taskStates = nullMap<any>(state.tasks)
+        const claimProtocol = claimProtocolOf(state)
+        const claimCallSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+        // Protocol 2 fails closed when the caller cannot be resolved: returning
+        // ready tasks unclaimed is exactly the duplicate-dispatch hole the
+        // protocol exists to close. Protocol 1 keeps the 0.9.0 behaviour.
+        if (claimProtocol >= CLAIM_PROTOCOL && !claimCallSession) {
+          return {
+            status: "CLAIM_PROTOCOL_UNRESOLVED",
+            content:
+              "refused: this run uses claim protocol 2, but the calling session id could not be resolved. An unclaimed dispatch could duplicate a worker, so no ready task was returned. Call teamwork_next from an identified session.",
+          }
+        }
 
         let docManifest: any
         if (plan.topology === "document-review") {
@@ -6022,10 +7117,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
         // Atomic dispatch claims. Every ready task gets a bounded lease before
         // it is returned; a different live claimant is surfaced as in-progress
-        // instead of being dispatched twice.
-        const claimCallSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
+        // instead of being dispatched twice. Protocol 2 requires a baseline
+        // match (or an explicit recovery) before an expired claim is reclaimed.
         if (claimCallSession) {
-          const claimed = await claimReadyTasks(run, readyForWorker, readyForVerifier, claimCallSession)
+          const claimed = await claimReadyTasks(root, run, plan, readyForWorker, readyForVerifier, claimCallSession)
           readyForWorker.length = 0
           readyForWorker.push(...claimed.worker)
           readyForVerifier.length = 0
@@ -6037,7 +7132,19 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               round: skip.round,
               branch: taskStates[skip.id]?.branch,
               claim: skip.claim,
+              ...(skip.claimState ? { claimState: skip.claimState } : {}),
+              ...(skip.fence !== undefined ? { fence: skip.fence } : {}),
               ...(skip.reason ? { reason: skip.reason } : {}),
+            })
+          }
+          for (const ev of claimed.events) {
+            await appendEvent(run, {
+              event: ev.event,
+              sessionId: basename(run),
+              taskId: ev.taskId,
+              to: ev.event === "claim_renewed" ? "CLAIM_RENEWED" : "NEEDS_INSPECTION",
+              round: ev.round,
+              note: ev.note,
             })
           }
         }
@@ -6057,6 +7164,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           for (const t of readyForWorker) {
             lines.push(`  - Task: ${t.id} (Agent: ${t.agent}, Round: ${t.round}/${t.maxRounds})`)
             lines.push(`    Branch: ${t.branch}`)
+            if (t.fence !== undefined) lines.push(`    Fence: ${t.fence} (pass it back on teamwork_task_update)`)
             if (t.claim) lines.push(`    Claim: ${t.claim.by} until ${t.claim.leaseUntil}${t.claim.previousClaimant ? ` (reclaimed from ${t.claim.previousClaimant.by})` : ""}`)
             if (t.feedback) lines.push(`    Verifier Feedback: ${clean(t.feedback, 120)}`)
             if (t.avoidPitfalls?.length) {
@@ -6068,14 +7176,17 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           lines.push(`\n▶ READY FOR VERIFIER (${readyForVerifier.length}): Dispatch verifier subagent against worker branch:`)
           for (const t of readyForVerifier) {
             lines.push(`  - Task: ${t.id} (Verifier: ${t.agent}, Branch: ${t.branch})`)
+            if (t.fence !== undefined) lines.push(`    Fence: ${t.fence} (pass it back on teamwork_task_update)`)
             if (t.claim) lines.push(`    Claim: ${t.claim.by} until ${t.claim.leaseUntil}`)
           }
         }
         if (inProgress.length) {
           lines.push(`\n⏳ IN PROGRESS (${inProgress.length}):`)
           for (const t of inProgress) {
-            const claim = t.claim ? `; claim ${t.claim.by} until ${t.claim.leaseUntil}` : ""
-            lines.push(`  - ${t.id}: ${t.status} (round ${t.round})${claim}`)
+            const claim = t.claim
+              ? `; claim ${t.claim.by}${t.claimState ? ` state=${t.claimState}` : ""} until ${t.claim.leaseUntil}`
+              : ""
+            lines.push(`  - ${t.id}: ${t.status} (round ${t.round})${claim}${t.reason ? ` — ${clean(t.reason, 120)}` : ""}`)
           }
         }
         lines.push(`\nProgress: ${passedTasks.length}/${taskDefs.size} passed, ${blockedTasks.length} blocked.`)
@@ -6114,6 +7225,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           worktree: { type: "string" },
           summary: { type: "string", description: "Short summary of what worker implemented." },
           feedback: { type: "string", description: "Feedback from verifier for the next worker round." },
+          fence: {
+            type: "number",
+            description:
+              "Optional claim-protocol fence token returned by teamwork_next/teamwork_task_update/teamwork_status. When supplied it must match the task's current fence or the call is refused with STALE_FENCE and nothing is written.",
+          },
+          reason: {
+            type: "string",
+            description:
+              "Required when team/sentinel or team/orchestrator explicitly overrides a claim held by another session. Recorded in events.jsonl (claim_override) and in the claim history; it does not apply to starting an unclaimed task.",
+          },
           verification: {
             type: "object",
             properties: {
@@ -6136,6 +7257,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const stateFile = join(run, "state.json")
         const planFile = join(run, "plan.dag.json")
         const callSession = authz.sessionID
+        const runId = basename(run)
 
         const taskId = clean(input.taskId, 64)
         if (!taskId) return { content: "Error: taskId is required" }
@@ -6150,6 +7272,29 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const planAgent = def?.agent ? clean(def.agent, 64) : undefined
         const recordedAgent = explicitAgent || caller?.agent || planAgent || null
         const agentSource = explicitAgent ? "explicit" : caller?.agent ? "session" : planAgent ? "plan" : undefined
+        const sentinelCaller = isSentinelAgent(authz.caller?.agent)
+        const reasonText = typeof input.reason === "string" ? clean(input.reason, 200).trim() : ""
+
+        // Protocol-aware pre-read: ownership ancestry and the side-effect
+        // baseline are resolved before the lock so the critical section stays a
+        // short read-modify-write.
+        const preState = readJson<any>(run, stateFile, undefined)
+        const preProtocol = claimProtocolOf(preState)
+        const preTask = preState?.tasks && typeof preState.tasks === "object" ? preState.tasks[taskId] : undefined
+        const preClaim = normalizeClaim(preTask?.claim)
+        const preRelation = preClaim ? await claimRelation(ctx, callSession, preClaim.by) : "none"
+        let preBaseline: ClaimBaseline | undefined
+        if (preProtocol >= CLAIM_PROTOCOL) {
+          const rawStatus = clean(input.status, 32)
+          const preStatus = rawStatus === "pass" ? "verified_pass" : rawStatus === "fail" ? "verified_fail" : rawStatus === "running" ? "worker_active" : rawStatus
+          if (preStatus === "worker_active" || preStatus === "verifier_active") {
+            const captureTask = {
+              ...(preTask ?? {}),
+              ...(input.worktree ? { worktree: clean(input.worktree, 200) } : {}),
+            }
+            preBaseline = captureClaimBaseline(root, run, captureTask, taskId, preStatus, plan)
+          }
+        }
 
         const outcome = await withCrossProcessLock(stateFile, async () => {
           const state = readJson<any>(run, stateFile, undefined)
@@ -6220,31 +7365,115 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
 
-          // Dispatch claims: `teamwork_next` is the only tool that hands out a
-          // ready task, so a worker_active transition must match a live claim
-          // (or an explicit Sentinel start, which is recorded). A claim from a
-          // different live session cannot start a second worker for the task.
+          const protocol = claimProtocolOf(state)
+          const leaseMs = claimLeaseOf(state)
+          const host = runHostOf(state, plan)
+          const currentFence = nextFence(current)
+
+          // Fence: an optional caller-supplied token must match the task's
+          // current fence on every transition. A mismatch means the caller saw
+          // an older claim/release/round and must re-read the DAG.
+          if (protocol >= CLAIM_PROTOCOL && input.fence !== undefined && input.fence !== null) {
+            const presented = Number(input.fence)
+            if (!Number.isFinite(presented) || Math.trunc(presented) !== currentFence) {
+              return {
+                status: "STALE_FENCE",
+                content: `STALE_FENCE: task "${taskId}" is at fence ${currentFence}, but the call carried fence ${clean(input.fence, 16)}. Re-read teamwork_next/teamwork_status before transitioning; state was not changed.`,
+                fence: currentFence,
+              }
+            }
+          }
+
+          // Claim ownership is enforced on EVERY transition, not only
+          // worker_active. A live claim held by a non-owner cannot be mutated;
+          // an expired claim the caller does not own needs an explicit Sentinel
+          // override with a recorded reason.
           const existingClaim = normalizeClaim((current as any).claim)
           const nowMs = Date.now()
           const claimLive = claimIsLive(existingClaim, nowMs)
-          const claimOwnedByCaller = !!existingClaim && !!callSession && existingClaim.by === callSession
-          const sentinelCaller = isSentinelAgent(authz.caller?.agent)
+          const relation =
+            !existingClaim || !callSession
+              ? "none"
+              : existingClaim.by === callSession
+                ? "same"
+                : preClaim && preClaim.by === existingClaim.by
+                  ? preRelation
+                  : "none"
+          const claimOwnedByCaller = relation === "same" || relation === "descendant"
           let claimNote: string | undefined
           let claimForState: any | undefined
+          let claimEvent: "claim_override" | "claim_reclaimed" | undefined
+          let override = false
+          if (protocol >= CLAIM_PROTOCOL && existingClaim && !claimOwnedByCaller) {
+            if (sentinelCaller && reasonText) {
+              override = true
+              claimNote = `sentinel override (${reasonText}): ${authz.caller?.agent} transitioned a task claimed by ${existingClaim.by}`
+            } else if (claimLive) {
+              return {
+                status: "CLAIM_OWNED_BY_OTHER",
+                content: `CLAIM_OWNED_BY_OTHER: task "${taskId}" is claimed by ${existingClaim.by} until ${existingClaim.leaseUntil}. Call teamwork_next for a claim, or use teamwork_recover (or a Sentinel override with a reason); state was not changed.`,
+                claim: publicClaim(existingClaim),
+                fence: currentFence,
+              }
+            } else {
+              return {
+                status: "CLAIM_EXPIRED",
+                content: `CLAIM_EXPIRED: task "${taskId}" has an expired claim from ${existingClaim.by} that this caller does not own. Use teamwork_recover { action: "inspect" } then adopt/requeue/block, or a Sentinel override with a reason; state was not changed.`,
+                claim: publicClaim(existingClaim),
+                fence: currentFence,
+              }
+            }
+          }
+
           if (status === "worker_active" && canonicalFrom !== "worker_active") {
-            if (existingClaim && claimLive && !claimOwnedByCaller && !sentinelCaller) {
+            if (protocol >= CLAIM_PROTOCOL) {
+              if (!existingClaim) {
+                if (!sentinelCaller) {
+                  return {
+                    status: "CLAIM_REQUIRED",
+                    content: `Error: Refusing worker_active for task "${taskId}" without a claim. Call teamwork_next first; only team/sentinel or team/orchestrator may start an unclaimed task, and that override is recorded.`,
+                  }
+                }
+                claimNote = `sentinel override: ${authz.caller?.agent} started task without a teamwork_next claim`
+                claimForState = {
+                  ...makeTaskClaim(callSession!, nowMs, undefined, { host, leaseMs, epoch: 1, event: "override" }),
+                  override: "sentinel",
+                }
+              } else if (claimOwnedByCaller) {
+                const renewal = renewClaimObject(existingClaim, nowMs, leaseMs)
+                claimForState = renewal.claim
+                if (existingClaim.override === "sentinel") claimForState.override = "sentinel"
+                if (!renewal.renewed) {
+                  claimForState.needsInspection = true
+                  claimNote = renewal.reason ?? "max claim tenure reached"
+                }
+              } else if (override) {
+                claimForState = {
+                  ...makeTaskClaim(callSession!, nowMs, existingClaim, {
+                    host,
+                    leaseMs,
+                    epoch: (Number(existingClaim.epoch) || 0) + 1,
+                    event: "override",
+                    reason: reasonText,
+                  }),
+                  override: "sentinel",
+                }
+                claimEvent = "claim_override"
+              }
+            } else if (existingClaim && claimLive && !claimOwnedByCaller && !sentinelCaller) {
               return {
                 content: `Error: Task "${taskId}" is claimed by ${existingClaim.by} until ${existingClaim.leaseUntil}; call teamwork_next to obtain a claim (or ask the Sentinel for an explicit override).`,
               }
-            }
-            if (existingClaim && claimLive && !claimOwnedByCaller && sentinelCaller) {
+            } else if (existingClaim && claimLive && !claimOwnedByCaller && sentinelCaller) {
               claimNote = `sentinel override: ${authz.caller?.agent} started a task claimed by ${existingClaim.by}`
-              claimForState = { ...makeTaskClaim(callSession!, nowMs, existingClaim), override: "sentinel" }
+              claimForState = { ...makeLegacyTaskClaim(callSession!, nowMs, existingClaim), override: "sentinel" }
+              claimEvent = "claim_override"
             } else if (existingClaim && !claimLive && !claimOwnedByCaller) {
               claimNote = `reclaimed expired claim from ${existingClaim.by}`
-              claimForState = makeTaskClaim(callSession!, nowMs, existingClaim)
+              claimForState = makeLegacyTaskClaim(callSession!, nowMs, existingClaim)
+              claimEvent = "claim_reclaimed"
             } else if (existingClaim && claimOwnedByCaller) {
-              claimForState = makeTaskClaim(callSession!, nowMs)
+              claimForState = makeLegacyTaskClaim(callSession!, nowMs)
               if (existingClaim.previousClaimant) claimForState.previousClaimant = existingClaim.previousClaimant
               if (existingClaim.override === "sentinel") claimForState.override = "sentinel"
             } else if (!existingClaim) {
@@ -6254,20 +7483,40 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 }
               }
               claimNote = `sentinel override: ${authz.caller?.agent} started task without a teamwork_next claim`
-              claimForState = { ...makeTaskClaim(callSession!, nowMs), override: "sentinel" }
+              claimForState = { ...makeLegacyTaskClaim(callSession!, nowMs), override: "sentinel" }
             }
           }
 
           // `verified_pass` needs evidence: either an inline PASS verdict or an
           // on-disk verifier report for THIS task. `verified_fail` needs none.
+          // Protocol 2 also binds the report to the current round/fence/branch;
+          // a bound report whose branch moved is refused with BRANCH_MOVED.
+          let reportWarning: string | undefined
           if (status === "verified_pass") {
             const inlinePass = input.verification?.status === "PASS"
             const reportFile = isSafeTaskId(taskId) ? join(run, "verify", `report-${taskId}.json`) : undefined
             const report = reportFile && existsSync(reportFile) ? readJson<any>(run, reportFile, undefined) : undefined
             if (!inlinePass && report?.status !== "PASS") {
               return {
+                status: "REPORT_MISSING",
                 content: `Error: Refusing verified_pass for task "${taskId}" without PASS evidence. Provide input.verification.status = "PASS", or write a verifier report at ${reportFile ?? "verify/report-<taskId>.json"} with "status": "PASS".`,
               }
+            }
+            if (protocol >= CLAIM_PROTOCOL && report?.status === "PASS") {
+              const binding = validateVerifierReportBinding(report, {
+                taskId,
+                round,
+                fence: currentFence,
+                root,
+                runId,
+              })
+              if (!binding.ok) {
+                return {
+                  status: binding.code,
+                  content: `${binding.code}: refusing verified_pass for task "${taskId}" — ${binding.reason}. Re-run the verifier against the current branch and write a fresh report.`,
+                }
+              }
+              reportWarning = binding.warning
             }
           }
 
@@ -6316,8 +7565,44 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               : ["pending", "worker_done", "verified_pass", "verified_fail", "blocked"].includes(status)
                 ? undefined
                 : claimForState ?? existingClaim
-          if (keepClaim) nextTask.claim = keepClaim
-          else delete nextTask.claim
+          if (keepClaim) {
+            // Any other owner-authorized transition renews the heartbeat too.
+            if (protocol >= CLAIM_PROTOCOL && status !== "worker_active" && existingClaim && claimOwnedByCaller && !override) {
+              const renewal = renewClaimObject(existingClaim, nowMs, leaseMs)
+              nextTask.claim = renewal.claim
+              if (!renewal.renewed) {
+                nextTask.claim.needsInspection = true
+                claimNote = renewal.reason ?? "max claim tenure reached"
+              }
+            } else {
+              nextTask.claim = keepClaim
+            }
+          } else {
+            delete nextTask.claim
+          }
+
+          if (protocol >= CLAIM_PROTOCOL) {
+            // Fence increments once per protocol event: claim/reclaim/override,
+            // release, and round change. A heartbeat does not.
+            const roundChanged = round !== (Number(current.round) || 0)
+            const claimChanged = !!(claimForState || override)
+            const claimReleased = !!existingClaim && !keepClaim
+            let fence = currentFence
+            if (roundChanged) fence++
+            if (claimChanged) fence++
+            if (claimReleased) fence++
+            nextTask.fence = fence
+            // Capture the side-effect baseline after the worktree exists, at the
+            // worker_active (and verifier_active) transition — not at `next`.
+            if ((status === "worker_active" || status === "verifier_active") && nextTask.claim) {
+              const haveBaseline = normalizeBaseline(nextTask.claim.baseline)
+              if (!haveBaseline) {
+                const captureTask = { ...nextTask, worktree: nextTask.worktree ?? preTask?.worktree }
+                const baseline = preBaseline ?? captureClaimBaseline(root, run, captureTask, taskId, status, plan)
+                if (baseline && baseline.fingerprint !== "unknown") nextTask.claim.baseline = baseline
+              }
+            }
+          }
           state.tasks[taskId] = nextTask
 
           const allTasks = Object.values(state.tasks) as any[]
@@ -6342,8 +7627,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             phase: state.phase ?? null,
             branch: input.branch ?? current.branch ?? null,
             worktree: input.worktree ?? current.worktree ?? null,
-            keepClaim,
+            keepClaim: nextTask.claim,
             claimNote,
+            claimEvent,
+            fence: protocol >= CLAIM_PROTOCOL ? nextTask.fence : undefined,
+            protocol,
+            reportWarning,
           }
         })
 
@@ -6364,22 +7653,369 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           phase: outcome.phase ?? null,
           ...(outcome.claimNote ? { note: outcome.claimNote } : {}),
         })
+        if (outcome.claimEvent && outcome.protocol >= 2) {
+          await appendEvent(run, {
+            event: outcome.claimEvent,
+            sessionId: basename(run),
+            taskId,
+            to: outcome.status,
+            round: outcome.round,
+            agent: recordedAgent,
+            agentSource,
+            note: outcome.claimNote ?? outcome.claimEvent,
+          })
+        }
         await refreshBriefingSafe(run)
 
         return {
           // SEC-3: the branch is echoed to the caller, so it is sanitised like every other field.
-          content: `Task ${outcome.taskId} updated: status=${outcome.status}, round=${outcome.round}${input.branch ? `, branch=${clean(input.branch, 120)}` : ""}${outcome.status === "blocked" ? " (BLOCKED: max rounds reached)" : ""}${outcome.keepClaim ? `, claim=${outcome.keepClaim.by} until ${outcome.keepClaim.leaseUntil}` : ""}`,
+          content: `Task ${outcome.taskId} updated: status=${outcome.status}, round=${outcome.round}${outcome.fence !== undefined ? `, fence=${outcome.fence}` : ""}${input.branch ? `, branch=${clean(input.branch, 120)}` : ""}${outcome.status === "blocked" ? " (BLOCKED: max rounds reached)" : ""}${outcome.keepClaim ? `, claim=${outcome.keepClaim.by} until ${outcome.keepClaim.leaseUntil}` : ""}${outcome.reportWarning ? ` (${outcome.reportWarning})` : ""}`,
           taskId: outcome.taskId,
           status: outcome.status,
           round: outcome.round,
+          ...(outcome.fence !== undefined ? { fence: outcome.fence } : {}),
           ...(outcome.keepClaim ? { claim: publicClaim(outcome.keepClaim) } : {}),
           ...(outcome.claimNote ? { claimNote: outcome.claimNote } : {}),
+          ...(outcome.reportWarning ? { warning: outcome.reportWarning } : {}),
+        }
+      },
+    })
+
+    editor.add({
+      name: "recover",
+      description:
+        "Explicit crash recovery for a claim (claim protocol 2). team/sentinel or team/orchestrator, from the run root or a descendant. Inspect the live and baseline fingerprints, then heartbeat, release, block, requeue or adopt the claim. inspect returns a single-use 10-minute token (stored hashed); adopt/requeue/block refuse without it and re-check the fingerprint, so a worktree that changed after inspection is INSPECTION_STALE. adopt marks a clean committed branch worker_done with a checkpoint and makes NO commit. requeue only when nothing changed, unless force+confirm explicitly discards the unverified changes. Nothing is ever auto-committed.",
+      input: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string", description: "Teamwork session id (defaults to the active run)." },
+          taskId: { type: "string", description: "Task id from plan.dag.json." },
+          action: {
+            type: "string",
+            description: "heartbeat | inspect | release | block | requeue | adopt | discard",
+          },
+          reason: { type: "string", description: "Operator reason, recorded in events.jsonl. Required for a Sentinel release/override of another session's claim." },
+          token: { type: "string", description: "The plaintext token returned by action: \"inspect\". Required for adopt/requeue/block." },
+          force: { type: "boolean", description: "With confirm: true, allow requeue/discard even when the side-effect fingerprint changed. Never deletes files or commits." },
+          confirm: { type: "boolean", description: "Explicit second confirmation for force/discard and cross-host release." },
+          allowCrossHost: { type: "boolean", description: "Explicitly allow releasing a claim recorded on another host (TEAMWORK_ALLOW_CROSS_HOST=1 is the env equivalent). Default refuse." },
+          note: { type: "string", description: "Optional checkpoint note recorded by adopt/discard." },
+        },
+        required: ["taskId", "action"],
+        additionalProperties: false,
+      },
+      execute: async (input: any, context: any) => {
+        const resolved = resolveRun(root, input?.sessionId)
+        if (resolved.error) return { content: resolved.error }
+        const run = resolved.run as string
+        const rawAction = clean(input.action, 24).toLowerCase()
+        const authz = await authorizeToolAction(ctx, run, "recover", rawAction, context)
+        if (!authz.ok) return { content: authz.content }
+        const callSession = authz.sessionID
+        if (!callSession) {
+          return { content: "refused: teamwork_recover needs a resolvable session identity (fail closed); nothing was written" }
+        }
+        const taskId = input?.taskId
+        if (!isSafeTaskId(taskId)) {
+          return { content: `refused: invalid task id "${clean(taskId, 32)}"; nothing was written` }
+        }
+        const ACTIONS = new Set(["heartbeat", "inspect", "release", "block", "requeue", "adopt", "discard"])
+        if (!ACTIONS.has(rawAction)) {
+          return { content: `refused: unknown recover action "${clean(input.action, 24)}" (allowed: ${Array.from(ACTIONS).join(" | ")})` }
+        }
+        const plan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
+        const state = readJson<any>(run, join(run, "state.json"), undefined)
+        if (!state || typeof state.tasks !== "object" || !Object.prototype.hasOwnProperty.call(state.tasks, taskId)) {
+          return { content: `refused: task "${taskId}" is not in state.json; nothing was written` }
+        }
+        const task = state.tasks[taskId] ?? {}
+        const claim = normalizeClaim(task.claim)
+        if (!claim) {
+          return { content: `refused: task "${taskId}" has no claim to recover; nothing was written` }
+        }
+        const relation = await claimRelation(ctx, callSession, claim.by)
+        const owned = relation === "same" || relation === "descendant"
+        const sentinel = isSentinelAgent(authz.caller?.agent)
+        const reasonText = typeof input.reason === "string" ? clean(input.reason, 200).trim() : ""
+        const now = Date.now()
+        const runId = basename(run)
+        const derived = deriveClaimState(task, now)
+        const baseline = normalizeBaseline(task.claim?.baseline)
+        const observed = captureClaimBaseline(root, run, task, taskId, String(task.status ?? "pending"), plan)
+        const inspectionState = inspectWorktreeState(root, run, task, taskId, baseline)
+        const observedFingerprint = observed?.fingerprint ?? "unknown"
+        const checkpoint = {
+          at: new Date(now).toISOString(),
+          by: claim.by,
+          round: Math.max(0, Math.trunc(Number(task.round) || 0)),
+          fence: nextFence(task),
+          ...(inspectionState.headSha ? { headSha: inspectionState.headSha } : {}),
+          ...(inspectionState.baseSha ? { baseSha: inspectionState.baseSha } : {}),
+          ...(inspectionState.diffHash ? { diffHash: inspectionState.diffHash } : {}),
+          fingerprint: observedFingerprint,
+          commits: inspectionState.commitCount,
+          ...(typeof input.note === "string" && input.note.trim() ? { note: clean(input.note, 300).trim() } : {}),
+        }
+
+        if (rawAction === "heartbeat") {
+          if (!owned) {
+            return {
+              content: `refused: CLAIM_NOT_OWNED: task "${taskId}" is claimed by ${claim.by}; only the owner or a session descended from it may heartbeat. Nothing was written.`,
+              status: "CLAIM_NOT_OWNED",
+            }
+          }
+          const renewed = await renewClaimFor(run, taskId, callSession, ctx, "recover heartbeat")
+          return {
+            content: renewed.renewed
+              ? `Claim heartbeat renewed: ${taskId} (owner ${claim.by}, fence ${nextFence(task)} unchanged).`
+              : `Claim not renewed: ${taskId} — ${renewed.reason ?? "not owned by the caller"}. The claim is now expired and needs inspection.`,
+            status: renewed.renewed ? "RENEWED" : "EXPIRED",
+            renewed: renewed.renewed,
+            fence: nextFence(task),
+          }
+        }
+
+        if (rawAction === "inspect") {
+          let token = ""
+          let wrote = false
+          await mutateRunState(
+            run,
+            (current) => {
+              const t = current.tasks?.[taskId]
+              if (!t || typeof t !== "object") return
+              const currentClaim = normalizeClaim(t.claim)
+              if (!currentClaim) return
+              const ownedNow = currentClaim.by === callSession || (owned && currentClaim.by === claim.by)
+              if (!ownedNow && !sentinel) return
+              token = issueInspectionToken(t, observed, now)
+              wrote = true
+            },
+            { write: () => wrote },
+          )
+          if (!wrote) {
+            return { content: `refused: task "${taskId}" cannot be inspected by this caller (claim changed or not owned). Nothing was written.` }
+          }
+          await appendEvent(run, {
+            event: "claim_inspection_required",
+            sessionId: runId,
+            taskId,
+            to: "INSPECTED",
+            round: Number(task.round) || 0,
+            note: `inspection token issued by ${authz.caller?.agent ?? callSession}`,
+          })
+          const fingerprintMatch = !!baseline && baseline.fingerprint === observedFingerprint && observedFingerprint !== "unknown"
+          return {
+            content: `INSPECTION for ${taskId} (claim ${claim.by}, state ${derived.state}, fence ${nextFence(task)}).\nFingerprint: ${
+              fingerprintMatch ? "unchanged since the baseline" : "changed/unknown since the baseline"
+            }.\nBaseline: ${baseline ? `${baseline.scope} ${baseline.fingerprint.slice(0, 16)}` : "none"}.\nObserved: ${observed ? `${observed.scope} ${observedFingerprint.slice(0, 16)}` : "unavailable"}.\nCommits since base: ${inspectionState.commitCount}. Dirty: ${inspectionState.dirty ? inspectionState.dirtyPaths.length : 0}; untracked: ${
+              inspectionState.untracked?.count ?? 0
+            }.\nTOKEN (single use, 10 minutes): ${token}\nNext: adopt (clean committed branch), requeue (fingerprint unchanged or force+confirm), block, or release.`,
+            status: "INSPECTED",
+            token,
+            taskId,
+            claim: publicClaim(claim),
+            claimState: derived.state,
+            baseline: baseline ?? null,
+            observed: observed ?? null,
+            fingerprintMatch,
+            checkpoint,
+            diffstat: inspectionState.diffstat ?? "",
+            commits: inspectionState.commits,
+            dirty: inspectionState.dirty,
+            dirtyPaths: inspectionState.dirtyPaths,
+            untracked: inspectionState.untracked ?? null,
+            baselineAncestor: inspectionState.baselineAncestor ?? null,
+            expiresAt: new Date(now + INSPECTION_TOKEN_TTL_MS).toISOString(),
+          }
+        }
+
+        // Every mutating action below revalidates ownership and, where the spec
+        // requires it, the inspection token and the live fingerprint.
+        let wrote = false
+        const outcome = await mutateRunState(
+          run,
+          (current) => {
+            const t = current.tasks?.[taskId]
+            if (!t || typeof t !== "object") return { code: "TASK_MISSING", content: `refused: task "${taskId}" disappeared; nothing was written` }
+            const currentClaim = normalizeClaim(t.claim)
+            if (!currentClaim) return { code: "NO_CLAIM", content: `refused: task "${taskId}" no longer has a claim; nothing was written` }
+            const ownedNow = currentClaim.by === callSession || (owned && currentClaim.by === claim.by)
+            if (!ownedNow && !sentinel) {
+              return { code: "CLAIM_NOT_OWNED", content: `refused: CLAIM_NOT_OWNED: task "${taskId}" is claimed by ${currentClaim.by}; nothing was written` }
+            }
+            if (!ownedNow && sentinel && !reasonText) {
+              return {
+                code: "OVERRIDE_REASON_REQUIRED",
+                content: `refused: OVERRIDE_REASON_REQUIRED: a Sentinel recovery of another session's claim needs input.reason; nothing was written`,
+              }
+            }
+            const releaseCrossHost = rawAction === "release" && currentClaim.host && currentClaim.host !== SELF_HOST
+            if (releaseCrossHost) {
+              const allowed = input.allowCrossHost === true || process.env.TEAMWORK_ALLOW_CROSS_HOST === "1"
+              if (!allowed) {
+                return {
+                  code: "CROSS_HOST_RELEASE_REFUSED",
+                  content: `refused: CROSS_HOST_RELEASE_REFUSED: the claim was recorded on ${clean(currentClaim.host!, 80)}; set allowCrossHost: true or TEAMWORK_ALLOW_CROSS_HOST=1 only after confirming the host is gone. Nothing was written.`,
+                }
+              }
+              if (input.confirm !== true) {
+                return {
+                  code: "CONFIRM_REQUIRED",
+                  content: `refused: CONFIRM_REQUIRED: a cross-host release needs confirm: true; nothing was written`,
+                }
+              }
+            }
+
+            const needsToken = rawAction === "adopt" || rawAction === "requeue" || rawAction === "block"
+            if (needsToken) {
+              const check = validateInspectionToken(t, input.token, now)
+              if (!check.ok) {
+                return { code: check.code, content: `refused: ${check.code}: ${check.reason}; nothing was written` }
+              }
+              if (check.inspection.fingerprint !== observedFingerprint) {
+                return {
+                  code: "INSPECTION_STALE",
+                  content: `refused: INSPECTION_STALE: the side-effect fingerprint changed after inspection (inspected ${check.inspection.fingerprint.slice(
+                    0,
+                    16,
+                  )}, now ${observedFingerprint.slice(0, 16)}). Inspect again; nothing was written.`,
+                }
+              }
+            }
+
+            if (rawAction === "release") {
+              t.fence = nextFence(t) + 1
+              delete t.claim
+              delete t.inspection
+              wrote = true
+              return {
+                code: "OK",
+                event: "claim_released",
+                note: `released claim ${currentClaim.by}${reasonText ? `: ${reasonText}` : ""}`,
+                content: `Claim released for ${taskId} (fence ${t.fence}).`,
+              }
+            }
+
+            if (rawAction === "block") {
+              t.status = "blocked"
+              t.fence = nextFence(t) + 1
+              delete t.claim
+              delete t.inspection
+              wrote = true
+              return {
+                code: "OK",
+                event: "claim_recovered",
+                note: `blocked claim ${currentClaim.by}${reasonText ? `: ${reasonText}` : ""}`,
+                content: `Task ${taskId} blocked and claim released (fence ${t.fence}).`,
+              }
+            }
+
+            if (rawAction === "adopt") {
+              const base = normalizeBaseline(currentClaim.baseline)
+              if (!base || !base.headSha) {
+                return {
+                  code: "BASELINE_MISSING",
+                  content: `refused: BASELINE_MISSING: adopt needs a committed branch baseline with a head SHA; inspect exists only as an artifact/progress handoff. Nothing was written.`,
+                }
+              }
+              if (!observed || observedFingerprint === "unknown") {
+                return { code: "OBSERVATION_UNAVAILABLE", content: `refused: OBSERVATION_UNAVAILABLE: the worktree fingerprint cannot be read; nothing was written` }
+              }
+              if (inspectionState.dirty || (inspectionState.untracked?.count ?? 0) > 0) {
+                return {
+                  code: "DIRTY_WORKTREE",
+                  content: `refused: DIRTY_WORKTREE: adopt requires a clean committed branch (${inspectionState.dirtyPaths.length} dirty path(s), ${
+                    inspectionState.untracked?.count ?? 0
+                  } untracked). Commit or discard the changes first; nothing was written.`,
+                }
+              }
+              if (inspectionState.baselineAncestor !== true) {
+                return {
+                  code: "BASELINE_NOT_ANCESTOR",
+                  content: `refused: BASELINE_NOT_ANCESTOR: the baseline head ${base.headSha.slice(0, 12)} is not an ancestor of the current head. The branch was rewritten; do not adopt it. Nothing was written.`,
+                }
+              }
+              // Adopt makes NO commit: it records the existing committed state
+              // as worker_done with a checkpoint for the verifier.
+              t.status = "worker_done"
+              t.fence = nextFence(t) + 1
+              t.checkpoint = checkpoint
+              delete t.claim
+              delete t.inspection
+              wrote = true
+              return {
+                code: "OK",
+                event: "claim_recovered",
+                note: `adopted committed branch ${inspectionState.headSha?.slice(0, 12)} as worker_done (no new commit)`,
+                content: `Adopted ${taskId} as worker_done at ${inspectionState.headSha?.slice(0, 12)} (fence ${t.fence}). No commit was made; the verifier can review the existing branch.`,
+                headSha: inspectionState.headSha,
+                commits: inspectionState.commitCount,
+              }
+            }
+
+            // requeue / discard
+            const explicitDiscard = rawAction === "discard" || (input.force === true && input.confirm === true)
+            if (rawAction === "discard" && (input.force !== true || input.confirm !== true)) {
+              return {
+                code: "DISCARD_CONFIRM_REQUIRED",
+                content: `refused: DISCARD_CONFIRM_REQUIRED: discard needs force: true and confirm: true; nothing was written`,
+              }
+            }
+            const unchanged =
+              !!baseline && baseline.fingerprint === observedFingerprint && observedFingerprint !== "unknown"
+            if (!unchanged && !explicitDiscard) {
+              return {
+                code: "SIDE_EFFECTS_PRESENT",
+                content: `refused: SIDE_EFFECTS_PRESENT: requeue is only safe when the side-effect fingerprint equals the baseline (or with force+confirm discard). Inspect, then decide; nothing was written.`,
+              }
+            }
+            t.status = "pending"
+            t.fence = nextFence(t) + 1
+            if (explicitDiscard) t.checkpoint = { ...checkpoint, discarded: true }
+            delete t.claim
+            delete t.inspection
+            wrote = true
+            return {
+              code: "OK",
+              event: "claim_recovered",
+              note: `${explicitDiscard ? "requeued and discarded unverified changes" : "requeued with an unchanged fingerprint"}${reasonText ? `: ${reasonText}` : ""}`,
+              content: `Task ${taskId} requeued as pending (fence ${t.fence}).${
+                explicitDiscard ? " Unverified changes were left in place and marked discarded; nothing was committed or deleted." : ""
+              }`,
+            }
+          },
+          { write: () => wrote },
+        )
+
+        if (!outcome || outcome.code !== "OK") {
+          return { content: outcome?.content ?? `refused: recovery state could not be read; nothing was written`, status: outcome?.code ?? "REFUSED" }
+        }
+
+        await appendEvent(run, {
+          event: outcome.event as any,
+          sessionId: runId,
+          taskId,
+          to: rawAction.toUpperCase(),
+          round: Number(task.round) || 0,
+          agent: authz.caller?.agent ?? null,
+          agentSource: authz.caller?.agent ? "session" : undefined,
+          note: outcome.note,
+        })
+        await refreshBriefingSafe(run)
+        return {
+          content: outcome.content,
+          status: "OK",
+          action: rawAction,
+          taskId,
+          ...(outcome.headSha ? { headSha: outcome.headSha } : {}),
+          ...(outcome.commits !== undefined ? { commits: outcome.commits } : {}),
         }
       },
     })
 
     editor.add({
       name: "handoff",
+
       description:
         "Record the five-section handoff (Observation, Logic Chain, Caveats, Conclusion, Verification Method) for this agent. Writes <run>/handoffs/<taskId|_run>-<agent>.md and updates the bounded handoffs/index.json. Identity comes from the trusted calling session; task-scoped roles must name an existing task, while victory-auditor/sentinel/orchestrator record run-level handoffs. When the plan records requireHandoffs: \"required\", final_verify/next require the derived matrix and reject missing/stale/tampered handoffs, but the prose is never parsed as a PASS/FAIL verdict.",
       input: {
@@ -6430,6 +8066,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (!inPlan && !inState) {
             return { content: `refused: task "${scope.taskId}" is not in plan.dag.json or state.json; nothing was written` }
           }
+        }
+
+        if (scope.taskId) {
+          await renewClaimFor(run, scope.taskId, authz.sessionID, ctx, "handoff")
         }
 
         try {
@@ -6858,6 +8498,29 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           },
           feedbackForWorker: { type: "string", description: "Optional remediation notes (max 4000 chars)." },
           evidence: { type: "string", description: "Optional evidence pointer (max 2000 chars)." },
+          round: {
+            type: "number",
+            description:
+              "Optional. The task round this report covers. Must equal the task's current round; a stale round is refused with REPORT_ROUND_STALE. The written report always carries the observed round.",
+          },
+          fence: {
+            type: "number",
+            description:
+              "Optional claim fence the verifier observed. Must equal the task's current fence or the report is refused with REPORT_FENCE_STALE. The written report carries the observed fence.",
+          },
+          branch: { type: "string", description: "Optional branch name; when supplied it must match the task branch." },
+          baseSha: { type: "string", description: "Optional base commit the report was computed against; a mismatch is BRANCH_MOVED." },
+          headSha: { type: "string", description: "Optional branch head the report was computed against; a mismatch is BRANCH_MOVED." },
+          diffHash: { type: "string", description: "Optional sha256 of the branch diff the report was computed against; a mismatch is BRANCH_MOVED." },
+          checkpoint: {
+            type: "object",
+            description: "Optional worker checkpoint to bind into the report (for example a commit/diff summary). Sanitised and bounded.",
+            properties: {
+              note: { type: "string" },
+              headSha: { type: "string" },
+            },
+            additionalProperties: false,
+          },
         },
         required: ["sessionId", "taskId", "status"],
         additionalProperties: false,
@@ -6900,6 +8563,71 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           return { content: `refused: ${authFailureText(manifestCheck.failure)}; nothing was written` }
         }
         const state = readJson<any>(run, join(run, "state.json"), undefined)
+        const taskState = state?.tasks && typeof state.tasks === "object" ? state.tasks[taskId] ?? {} : {}
+        const protocol = claimProtocolOf(state)
+        const currentRound = Math.max(0, Math.trunc(Number(taskState.round) || 0))
+        const currentFence = nextFence(taskState)
+        if (protocol >= CLAIM_PROTOCOL) {
+          if (input?.round !== undefined && input?.round !== null) {
+            const presented = Number(input.round)
+            if (!Number.isFinite(presented) || Math.trunc(presented) !== currentRound) {
+              return {
+                status: "REPORT_ROUND_STALE",
+                content: `REPORT_ROUND_STALE: task "${taskId}" is on round ${currentRound}, but the report was submitted for round ${clean(input.round, 16)}; nothing was written.`,
+              }
+            }
+          }
+          if (input?.fence !== undefined && input?.fence !== null) {
+            const presented = Number(input.fence)
+            if (!Number.isFinite(presented) || Math.trunc(presented) !== currentFence) {
+              return {
+                status: "REPORT_FENCE_STALE",
+                content: `REPORT_FENCE_STALE: task "${taskId}" is at fence ${currentFence}, but the report carried fence ${clean(input.fence, 16)}; nothing was written.`,
+              }
+            }
+          }
+        }
+        const runId = basename(run)
+        const reportBranch = `teamwork/${runId}-${taskId}`
+        const observedHead = execGitCapture(root, ["rev-parse", "--verify", reportBranch])
+        const observedBase = execGitCapture(root, ["rev-parse", "--verify", `teamwork/base-${runId}`])
+        const observedDiff =
+          observedHead && observedBase ? execGitCapture(root, ["diff", "--no-color", `${observedBase}..${observedHead}`]) ?? "" : undefined
+        const observedDiffHash = observedDiff === undefined ? undefined : sha256Hex(observedDiff)
+        const branchInput = typeof input?.branch === "string" ? clean(input.branch, 120).trim() : ""
+        if (branchInput && branchInput !== reportBranch) {
+          return {
+            status: "BRANCH_MOVED",
+            content: `BRANCH_MOVED: task "${taskId}" is on branch "${reportBranch}", but the report named "${branchInput}"; nothing was written.`,
+          }
+        }
+        if (typeof input?.headSha === "string" && observedHead && input.headSha.trim() !== observedHead) {
+          return {
+            status: "BRANCH_MOVED",
+            content: `BRANCH_MOVED: the branch head is ${observedHead.slice(0, 12)}, but the report named ${clean(input.headSha, 64).slice(0, 12)}; nothing was written.`,
+          }
+        }
+        if (typeof input?.baseSha === "string" && observedBase && input.baseSha.trim() !== observedBase) {
+          return {
+            status: "BRANCH_MOVED",
+            content: `BRANCH_MOVED: the base is ${observedBase.slice(0, 12)}, but the report named ${clean(input.baseSha, 64).slice(0, 12)}; nothing was written.`,
+          }
+        }
+        if (typeof input?.diffHash === "string" && observedDiffHash && input.diffHash.trim() !== observedDiffHash) {
+          return {
+            status: "BRANCH_MOVED",
+            content: `BRANCH_MOVED: the branch diff changed since the submitted diffHash; nothing was written.`,
+          }
+        }
+        const checkpointNote =
+          input?.checkpoint && typeof input.checkpoint === "object" && typeof input.checkpoint.note === "string"
+            ? cleanBlock(input.checkpoint.note, 500).trim()
+            : ""
+        const checkpointHead =
+          input?.checkpoint && typeof input.checkpoint === "object" && typeof input.checkpoint.headSha === "string"
+            ? clean(input.checkpoint.headSha, 64).trim()
+            : ""
+        await renewClaimFor(run, taskId, authz.sessionID, ctx, "report")
         const fatalFindings = Array.isArray(input?.fatalFindings)
           ? input.fatalFindings.slice(0, 50).map((f: any) => ({
               where: clean(f?.where, 200),
@@ -6919,6 +8647,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           feedbackForWorker: typeof input?.feedbackForWorker === "string" ? cleanBlock(input.feedbackForWorker, 4000).trim() : "",
           evidence: typeof input?.evidence === "string" ? cleanBlock(input.evidence, 2000).trim() : "",
           requirementsHash: currentRequirementsHash(run),
+          round: currentRound,
+          fence: currentFence,
+          branch: reportBranch,
+          ...(observedBase ? { baseSha: observedBase } : {}),
+          ...(observedHead ? { headSha: observedHead } : {}),
+          ...(observedDiffHash ? { diffHash: observedDiffHash } : {}),
+          bound: !!(observedHead && observedDiffHash),
+          ...(checkpointNote || checkpointHead
+            ? { checkpoint: { ...(checkpointNote ? { note: checkpointNote } : {}), ...(checkpointHead ? { headSha: checkpointHead } : {}) } }
+            : {}),
         }
         const relativePath = `verify/report-${taskId}.json`
         let toWrite: any = report
@@ -6943,7 +8681,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           sessionId: basename(run),
           taskId,
           to: status,
-          round: 0,
+          round: currentRound,
           agent: "team/verifier",
           agentSource: "session",
           phase: state?.phase ?? null,
@@ -7635,6 +9373,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             type: "string",
             description: "Commit message for resolve action",
           },
+          allowSharedWorktrees: {
+            type: "boolean",
+            description:
+              "Default false. When the run was recorded on a different host, setup/merge/resolve/cleanup refuse unless this is explicitly true (and the plan did not set requireSameHost). Recorded in the tool result; never changes the run's host baseline.",
+          },
         },
         required: ["action"],
         additionalProperties: false,
@@ -7657,9 +9400,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         }
         const taskId = rawTaskId
 
-        const worktreesBase = process.env.TEAMWORK_WORKTREES_DIR
-          ? process.env.TEAMWORK_WORKTREES_DIR
-          : join(root, "..", ".teamwork-worktrees")
+        const worktreesBase = worktreesBaseDir(root)
         const runWorktreesDir = join(worktreesBase, runId)
         const baseBranch = `teamwork/base-${runId}`
 
@@ -7681,6 +9422,33 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const isGit = execGit(["rev-parse", "--is-inside-work-tree"])
         if (isGit.code !== 0) {
           return { content: "Skipped worktree operation: current directory is not a git repository." }
+        }
+
+        // Cross-host policy: a run records the host it was planned on. A
+        // different host may be a shared filesystem where the lock/claim
+        // primitives are not a reliable mutex, so destructive worktree actions
+        // refuse unless the operator explicitly allows it (and the plan did not
+        // require the same host).
+        const worktreeState = readJson<any>(run, join(run, "state.json"), undefined)
+        const worktreePlan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
+        const worktreeHost = runHostOf(worktreeState, worktreePlan)
+        const sameHostRequired =
+          worktreePlan?.requireSameHost === true || worktreeState?.requireSameHost === true
+        if (
+          ["setup", "merge", "resolve", "cleanup"].includes(action) &&
+          worktreeHost !== SELF_HOST &&
+          (sameHostRequired || input.allowSharedWorktrees !== true)
+        ) {
+          return {
+            content: `refused: FOREIGN_HOST: this run was recorded on ${clean(worktreeHost, 80)} but the current host is ${clean(SELF_HOST, 80)}.${
+              sameHostRequired
+                ? " The plan sets requireSameHost: true, so the shared-worktree override is unavailable."
+                : " Re-call with allowSharedWorktrees: true only after confirming both hosts see the same filesystem."
+            } Nothing was changed.`,
+            refused: "FOREIGN_HOST",
+            host: worktreeHost,
+            currentHost: SELF_HOST,
+          }
         }
 
         // Merge/resolve must only ever touch the run's sentinel worktree. There
@@ -7793,11 +9561,39 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 return { content: `Error creating ${role} worktree: ${res.stderr || res.stdout}` }
               }
             }
+            // Record the side-effect baseline at setup (before the worker edits)
+            // and renew the claim that `teamwork_next` handed to the caller.
+            let baselineRecorded = false
+            await mutateRunState(run, (state) => {
+              if (claimProtocolOf(state) < CLAIM_PROTOCOL) return
+              const task = state.tasks?.[taskId]
+              if (!task || typeof task !== "object") return
+              const claim = normalizeClaim(task.claim)
+              if (!claim) return
+              const candidate = { ...task, worktree: targetDir }
+              const baseline = captureClaimBaseline(
+                root,
+                run,
+                candidate,
+                taskId,
+                role === "verifier" ? "worker_done" : "worker_active",
+                worktreePlan,
+              )
+              if (baseline && baseline.fingerprint !== "unknown") {
+                task.claim = { ...task.claim, baseline }
+                baselineRecorded = true
+              }
+            })
+            const renewal = await renewClaimFor(run, taskId, authz.sessionID, ctx, `worktree setup (${role})`)
             return {
-              content: `${role} worktree ready at: ${targetDir}\nBranch: ${branch}\nBase: ${startPoint}`,
+              content: `${role} worktree ready at: ${targetDir}\nBranch: ${branch}\nBase: ${startPoint}${
+                baselineRecorded ? "\nClaim baseline recorded (side-effect fingerprint)." : ""
+              }${renewal.renewed ? "\nClaim lease renewed." : ""}`,
               worktreePath: targetDir,
               branch,
               baseBranch: startPoint,
+              baselineRecorded,
+              claimRenewed: renewal.renewed,
             }
           }
         }
@@ -7813,11 +9609,20 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const baseRef = hasBase ? baseBranch : "HEAD"
           const diffRes = execGit(["diff", `${baseRef}..${branch}`])
           const statRes = execGit(["diff", "--stat", `${baseRef}..${branch}`])
+          const headSha = execGit(["rev-parse", branch]).code === 0 ? execGit(["rev-parse", branch]).stdout : undefined
+          const baseSha = execGit(["rev-parse", baseRef]).code === 0 ? execGit(["rev-parse", baseRef]).stdout : undefined
+          const diffHash = sha256Hex(diffRes.stdout)
+          await renewClaimFor(run, taskId, authz.sessionID, ctx, "worktree diff")
 
           return {
             content: `Diff for ${taskId} (${baseRef}..${branch}):\n${statRes.stdout || "No changes."}\n\n${diffRes.stdout || ""}`,
             hasChanges: diffRes.stdout.length > 0,
             stat: statRes.stdout,
+            branch,
+            baseRef,
+            ...(headSha ? { headSha } : {}),
+            ...(baseSha ? { baseSha } : {}),
+            diffHash,
           }
         }
 
@@ -7827,6 +9632,35 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const sentinel = verifiedSentinelWorktree()
           if (!sentinel.path) return { content: sentinel.error }
           const targetCwd = sentinel.path
+
+          // The verified report is bound to the branch it was computed against.
+          // A branch that moved after PASS must be re-verified, not merged.
+          const reportPath = join(run, "verify", `report-${taskId}.json`)
+          const verifiedReport = existsSync(reportPath) ? readJson<any>(run, reportPath, undefined) : undefined
+          const branchHead = execGit(["rev-parse", "--verify", branch])
+          if (verifiedReport?.status === "PASS" && branchHead.code === 0) {
+            const headNow = branchHead.stdout
+            if (typeof verifiedReport.headSha === "string" && verifiedReport.headSha && verifiedReport.headSha !== headNow) {
+              return {
+                status: "BRANCH_MOVED",
+                content: `BRANCH_MOVED: refusing to merge ${branch}. The verified report was computed at ${verifiedReport.headSha.slice(0, 12)}, but the branch head is now ${headNow.slice(0, 12)}. Re-run verification and write a fresh report. Nothing was merged.`,
+                verifiedHead: verifiedReport.headSha,
+                currentHead: headNow,
+              }
+            }
+            if (typeof verifiedReport.diffHash === "string" && verifiedReport.diffHash) {
+              const hasBase = execGit(["rev-parse", "--verify", baseBranch]).code === 0
+              if (hasBase) {
+                const diffNow = execGit(["diff", "--no-color", `${baseBranch}..${branch}`]).stdout
+                if (sha256Hex(diffNow) !== verifiedReport.diffHash) {
+                  return {
+                    status: "BRANCH_MOVED",
+                    content: `BRANCH_MOVED: refusing to merge ${branch}. The branch diff changed since the verified report. Re-run verification. Nothing was merged.`,
+                  }
+                }
+              }
+            }
+          }
 
           const mergeRes = execGit(["merge", "--no-ff", branch, "-m", `Merge task ${taskId} (${branch})`], targetCwd)
           if (mergeRes.code !== 0) {
@@ -7890,6 +9724,22 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         }
 
         if (action === "cleanup") {
+          // Never remove a worktree another live claim (local or foreign) is
+          // still using. Expired/stale claims are recoverable; live ones are not.
+          const cleanupState = readJson<any>(run, join(run, "state.json"), undefined)
+          const nowMs = Date.now()
+          const liveClaims = Object.entries(cleanupState?.tasks ?? {})
+            .map(([id, task]: [string, any]) => ({ id, claim: normalizeClaim(task?.claim) }))
+            .filter((entry) => entry.claim && claimIsLive(entry.claim, nowMs))
+          if (liveClaims.length) {
+            return {
+              content: `refused: cleanup is blocked by live claim(s): ${liveClaims
+                .map((entry) => `${clean(entry.id, 64)} (${entry.claim!.by} until ${entry.claim!.leaseUntil})`)
+                .join(", ")}. Wait for release, or use teamwork_recover to release/requeue explicitly. Nothing was removed.`,
+              refused: "LIVE_CLAIM",
+              liveClaims: liveClaims.map((entry) => ({ id: entry.id, claim: publicClaim(entry.claim) })),
+            }
+          }
           if (existsSync(runWorktreesDir)) {
             execGit(["worktree", "prune"])
             try {
