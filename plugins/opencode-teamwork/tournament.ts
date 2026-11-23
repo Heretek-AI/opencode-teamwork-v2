@@ -232,6 +232,18 @@ export function isSafeCandidateId(id: unknown): id is string {
   return typeof id === "string" && !RESERVED_KEYS.has(id) && CANDIDATE_ID.test(id)
 }
 
+/**
+ * Task ids are used as single filesystem path segments (worktree dirs, report
+ * filenames, handoff filenames) and inside git branch names. This is the one
+ * allowlist every writer uses: a conservative single-segment token, with `.`
+ * and `..` explicitly refused.
+ */
+export const TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+
+export function isSafeTaskId(id: unknown): id is string {
+  return typeof id === "string" && TASK_ID.test(id) && id !== "." && id !== ".."
+}
+
 function ownHas(obj: unknown, key: string): boolean {
   return !!obj && typeof obj === "object" && Object.prototype.hasOwnProperty.call(obj, key)
 }

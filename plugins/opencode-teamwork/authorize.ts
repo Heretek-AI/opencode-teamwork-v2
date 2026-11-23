@@ -97,6 +97,21 @@ const RULES: Record<string, RoleSpec> = {
     requireRoot: true,
   },
   report: { actions: { "*": ["team/verifier"] }, descendantOnly: true, requireRoot: true },
+  handoff: {
+    actions: {
+      "*": [
+        "team/worker",
+        "team/proof-worker",
+        "team/verifier",
+        "team/falsifier",
+        "team/security-auditor",
+        "team/victory-auditor",
+        "team/sentinel",
+        "team/orchestrator",
+      ],
+    },
+    requireRoot: true,
+  },
 
   // Git worktrees.
   worktree: {
