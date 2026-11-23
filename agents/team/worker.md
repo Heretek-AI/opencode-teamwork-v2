@@ -85,4 +85,5 @@ Pass exactly these five section strings (one short paragraph each):
 `## 4. Conclusion` (done, blocked, or needs re-scope), and
 `## 5. Verification Method` (how the next agent reproduces it). The tool derives
 your trusted identity, writes `handoffs/<taskId>-worker.md`, and updates the
-bounded index. Never write an unqualified `handoff.md` by hand.
+bounded index. This handoff is required before completion when the run records
+`requireHandoffs: "required"`; never write an unqualified `handoff.md` by hand.

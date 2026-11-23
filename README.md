@@ -73,7 +73,7 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 | `teamwork_pitfall` | append to the pitfall registry (dynamically injected into workers) |
 | `teamwork_next` | evaluates DAG dependencies, lifecycle states, and ready tasks; strict runs stop at `NEEDS_STRICT_WAVE` until both wave verdicts exist |
 | `teamwork_task_update` | deterministic task state machine transitions (`pending` → `worker_active` → `worker_done` → `verifier_active` → `verified_pass` / `verified_fail` / `blocked`) |
-| `teamwork_handoff` | trusted five-section handoff writer (`handoffs/<taskId\|_run>-<role>.md` + bounded `handoffs/index.json`); narrative/citation only, never a gate verdict |
+| `teamwork_handoff` | trusted five-section handoff writer (`handoffs/<taskId\|_run>-<role>.md` + bounded `handoffs/index.json`); continuity evidence required by `final_verify`/`next` when `requireHandoffs: "required"`, never a gate verdict |
 | `teamwork_report` | trusted writer for a signed `verify/report-<taskId>.json`: caller must be `team/verifier`, descend from the run root, and name an existing task; a `PASS` needs a summary or check |
 | `teamwork_security_audit` | mandatory pre-merge security gate (`verify/security-audit.json`; signed on a signed run) |
 | `teamwork_victory_audit` | record the independent `team/victory-auditor` acceptance verdict, bound to the current `ORIGINAL_REQUEST.md` and `requirements.json` hashes (`verify/victory.json`); caller must descend from the run root |
@@ -141,11 +141,12 @@ topologies, and the JSON schemas (`spec.json`, `plan.dag.json`, `state.json`,
 
 - `verified_pass` requires a legal lifecycle transition and PASS evidence (an inline PASS verdict or a `PASS` per-task report).
 - A plan writes a signed `run.manifest.json` (the default). Verifier reports, security audit, strict-wave verdicts, victory verdict, and final verdict carry an HMAC `_auth` envelope and a `ctx.storage` digest-index entry. `final_verify`/`next` fail as `AUTH_MISSING`, `AUTH_INVALID`, `AUTH_UNKNOWN_KEY`, `AUTH_INDEX_MISSING`, or `AUTH_STALE` when an artifact is forged, copied, edited, or the signed plan/requirements/policy baseline drifts. See [`docs/adr/0005-artifact-authenticity.md`](docs/adr/0005-artifact-authenticity.md).
-- A run completes only with a `PASS` `verify/final.json` stamped by `teamwork_final_verify`; an unstamped report needs the recorded `allowUnstamped` bypass. An unsigned legacy run returns `AUTH_LEGACY` until the recorded `allowUnsignedLegacy` bypass is passed at the completion gate; `benchmark` refuses that bypass and `victoryAudit: "skip"`.
+- A run completes only with a `PASS` `verify/final.json` stamped by `teamwork_final_verify`; an unstamped report needs the recorded `allowUnstamped` bypass. An unsigned legacy run returns `AUTH_LEGACY` until the recorded `allowUnsignedLegacy` bypass is passed at the completion gate; `benchmark` refuses that bypass, `victoryAudit: "skip"`, and `requireHandoffs: "skip"`.
 - `teamwork_victory_audit`, `teamwork_wave_record`, and `teamwork_report` require the caller session to descend from the plan-time `rootSessionId`, so a top-level `opencode run --agent team/victory-auditor` cannot self-authorize.
 - That PASS also needs a `verify/victory.json` from the independent `team/victory-auditor` reporting `VICTORY CONFIRMED` for every requirement and the current `ORIGINAL_REQUEST.md` hash, unless the plan explicitly recorded `victoryAudit: "skip"` (then `final_verify` records `victory: "SKIPPED (explicit)"`).
 - The security audit fails on integrity-rule violations for the run's mode, and that blocks the merge.
-- Opt-in `verification: "strict"` adds exactly one `team/falsifier` challenge (`PASS`) and one `team/security-auditor` audit (`CLEAN`) per task after its verifier report. Missing, stale, or non-PASS/CLEAN verdicts block `teamwork_next` (`NEEDS_STRICT_WAVE`) and `teamwork_final_verify`; a strict PASS writes `GATE_STATUS.md` with worker/verifier/challenger/auditor rows. The default `standard` mode is unchanged, and the wave reuses the existing agents rather than adding roles.
+- Opt-in `verification: "strict"` adds exactly one `team/falsifier` challenge (`PASS`) and one `team/security-auditor` audit (`CLEAN`) per task after its verifier report. Missing, stale, or non-PASS/CLEAN verdicts block `teamwork_next` (`NEEDS_STRICT_WAVE`) and `teamwork_final_verify`; a strict PASS writes `GATE_STATUS.md` with worker/verifier/challenger/auditor rows and a `## Continuity` handoff table. The default `standard` mode is unchanged, and the wave reuses the existing agents rather than adding roles.
+- `requireHandoffs: "required"` (the default for a new run with a request or requirements baseline) makes `final_verify` and `next` demand continuity handoffs derived from the plan: the assigned worker and `team/verifier` per task, `team/falsifier` + `team/security-auditor` per task in strict mode, one `team/sentinel`/`team/orchestrator` run-level handoff, and the `team/victory-auditor` run-level handoff after a confirmed victory audit. Each entry must match `handoffs/index.json` (regular non-symlink file, sha256/byte length) and cite the current report/wave/audit/victory; a changed cited artifact makes it stale. Missing pairs return `NEEDS_HANDOFFS`, stale/duplicate/unknown/tampered evidence returns `BLOCKED_BY_HANDOFFS`, and a passing gate records `handoffs` plus `evidence.handoffs` in `verify/final.json`. An explicit `requireHandoffs: "skip"` is recorded as `handoffs: "SKIPPED (explicit)"` and never reads the index; handoff prose is never a verdict.
 - Planning refuses to start when blocking inputs are missing or unreachable unless `allowMissingInputs` is recorded.
 - Legacy topology aliases are normalised on write; an unknown topology is refused before anything is written.
 
@@ -440,14 +441,19 @@ The 15 shipped agents are installed as markdown files under `~/.config/opencode/
 Model assignments live in each agent's frontmatter (`model:`); see
 [Model assignment](#model-assignment) for how to set them.
 
-**Continuity roster note.** The five roles that publish handoffs
-(`team/worker`, `team/verifier`, `team/falsifier`, `team/security-auditor`,
-`team/victory-auditor`) call `teamwork_handoff`; the sentinel/orchestrator pass
-the run id to every child and ask for a handoff before it reports. A handoff is
-narrative/citation evidence for the next agent, not a verdict: `final_verify`
-and `next` ignore `handoffs/`, and the per-agent briefing under `agents/` is a
-context convenience that falls back to the shared `BRIEFING.md` (see
-`docs/ARTIFACTS.md`).
+**Continuity roster note.** The roles that publish handoffs (`team/worker`,
+`team/proof-worker`, `team/segment-reviewer`, `team/synthesizer`,
+`team/verifier`, `team/falsifier`, `team/security-auditor`,
+`team/victory-auditor`, and the run-level `team/sentinel`/`team/orchestrator`)
+call `teamwork_handoff`; the sentinel/orchestrator pass the run id and task id
+to every child and require a handoff before it reports. A handoff is
+narrative/citation evidence for the next agent, not a verdict. When the plan
+records `requireHandoffs: "required"` (the default with a request/requirements
+baseline), `final_verify` and `next` reject missing, stale, duplicate, unknown,
+or tampered handoffs (`NEEDS_HANDOFFS` / `BLOCKED_BY_HANDOFFS`), but never parse
+their prose. An explicit `requireHandoffs: "skip"` is recorded and non-gating.
+The per-agent briefing under `agents/` is a context convenience that falls back
+to the shared `BRIEFING.md` (see `docs/ARTIFACTS.md`).
 
 ### LEMMA (Lean 4 formal-proof route)
 

@@ -78,7 +78,10 @@ these five section strings: `## 1. Observation` (artifacts/tests inspected and
 observed results), `## 2. Logic Chain` (evidence → requirement outcomes →
 verdict), `## 3. Caveats` (unchecked requirements or assumptions),
 `## 4. Conclusion` (CONFIRMED, REJECTED, or blocked with the gap), and
-`## 5. Verification Method` (how to reproduce the audit). Never soften a
+`## 5. Verification Method` (how to reproduce the audit). The tool records the
+citation to `verify/victory.json` automatically; record this handoff only after
+`teamwork_victory_audit` succeeded, because a required victory handoff with a
+stale or missing citation fails `final_verify`. Never soften a
 rejection in the handoff, and never write an unqualified `handoff.md` by hand.
 
 ## Hard rules

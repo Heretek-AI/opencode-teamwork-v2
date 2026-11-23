@@ -110,7 +110,9 @@ outputs seen), `## 2. Logic Chain` (observation → verdict), `## 3. Caveats`
 (unchecked/assumed/risky), `## 4. Conclusion` (PASS, FAIL, or blocked), and
 `## 5. Verification Method` (how to reproduce the verdict). Keep it
 evidence-first and short. The tool derives your trusted identity and writes
-`handoffs/<taskId>-verifier.md`; never write an unqualified `handoff.md` by hand.
+`handoffs/<taskId>-verifier.md` (citing `verify/report-<taskId>.json`); never
+write an unqualified `handoff.md` by hand. If the report changes after a
+rework, re-record the handoff so its citation is not stale.
 
 ## Hard rules
 

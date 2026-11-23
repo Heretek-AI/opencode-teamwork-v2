@@ -108,7 +108,9 @@ Pass exactly these five section strings: `## 1. Observation` (attack classes
 tried and what happened), `## 2. Logic Chain` (evidence → challenge verdict),
 `## 3. Caveats` (what you could not test), `## 4. Conclusion` (PASS, fatal flaw,
 or blocked), and `## 5. Verification Method` (how to reproduce the attack or the
-PASS). Your `edit`/`shell` denial does not block this: `teamwork_handoff` is a
+PASS). The handoff cites `verify/challenge-<taskId>.json`; if the verifier report
+is reworked and re-challenged, re-record it so the citation is not stale. Your
+`edit`/`shell` denial does not block this: `teamwork_handoff` is a
 trusted tool and writes the run-scoped file for you. Never write an unqualified
 `handoff.md` by hand.
 
