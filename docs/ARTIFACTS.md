@@ -388,6 +388,7 @@ Failure vocabulary: `AUTH_UNAVAILABLE`, `AUTH_KEY_CORRUPT`, `AUTH_MISSING`,
         "at": "2026-01-12T10:14:58Z",
         "leaseUntil": "2026-01-12T10:19:58Z",
         "host": "workstation",
+        "runHost": "workstation",
         "epoch": 2,
         "heartbeatAt": "2026-01-12T10:16:10Z",
         "renewals": 1,
@@ -416,7 +417,8 @@ Failure vocabulary: `AUTH_UNAVAILABLE`, `AUTH_KEY_CORRUPT`, `AUTH_MISSING`,
         "expiresAt": "2026-01-12T10:30:00Z",
         "fingerprint": "<64 hex>",
         "round": 1,
-        "fence": 3
+        "fence": 3,
+        "by": "ses_abc123"
       },
       "checkpoint": {
         "at": "2026-01-12T10:24:00Z",
@@ -425,6 +427,9 @@ Failure vocabulary: `AUTH_UNAVAILABLE`, `AUTH_KEY_CORRUPT`, `AUTH_MISSING`,
         "fingerprint": "<64 hex>",
         "commits": 1
       },
+      "claimHistory": [
+        { "by": "ses_abc123", "at": "2026-01-12T10:14:58Z", "leaseUntil": "2026-01-12T10:19:58Z", "event": "released" }
+      ],
       "branch": "teamwork/20260112-101500-a1b2-R1-impl",
       "worktree": "../.teamwork-worktrees/20260112-101500-a1b2/R1-impl",
       "summary": "Implemented core validation logic",
@@ -471,29 +476,41 @@ expired claims reclaimable without a fingerprint, no fence enforcement).
 ```json
 "claim": {
   "by": "<calling session id>", "at": "ISO8601", "leaseUntil": "ISO8601",
-  "host": "workstation", "epoch": 2, "heartbeatAt": "ISO8601", "renewals": 1,
+  "host": "<claiming process host>", "runHost": "<run's recorded host>",
+  "epoch": 2, "heartbeatAt": "ISO8601", "renewals": 1,
   "baseline": { "scope": "git|artifact", "fingerprint": "<64 hex>", "...": "..." },
   "history": [ { "by": "ses_old", "at": "ISO8601", "event": "reclaimed" } ]
 }
 ```
 
+`claim.host` is the **claiming process**, not necessarily the host that planned
+the run (`claim.runHost`). Cross-host checks compare `claim.host`; a protocol-2
+claim written by 0.10.0 with the run host is read as local on a local run and is
+never rewritten.
+
 * **Derived state** (`teamwork_status`, `teamwork_resume`, `teamwork_next`):
   * `live` — the lease is still in the future.
   * `expired` — past the lease, inside the grace window. **Not reclaimable.**
   * `stale` — past lease + grace. Reclaimable only by the rules below.
-  * `needs-inspection` — a stale claim whose side effects changed, or whose
-    baseline is missing/unknown. Excluded from `readyForWorker`/`readyForVerifier`
-    and listed in `status.needsInspection`.
-  * `cross-host` — `claim.host` is not this host. **Never auto-reclaimed.**
+  * `needs-inspection` — a stale claim whose side effects changed, whose
+    baseline is missing/unknown, or a claim explicitly flagged by a forced
+    expiry. It **always wins**: excluded from
+    `readyForWorker`/`readyForVerifier`, never reclaimed even when the
+    fingerprint is unchanged, and listed in `status.needsInspection`.
+  * `cross-host` — `claim.host` (the claiming process) is not this host.
+    **Never auto-reclaimed.**
   `status.claims[]` carries `remainingMs`, `heartbeatAgeMs`, `fence` and
   `fingerprintChanged`; `status.warnings` names `FOREIGN_HOST` /
   `SHARED_FS_SUSPECTED` when the run host differs.
-* **Fence.** Every task has a monotonic `fence` that increments on claim,
-  reclaim, release, explicit Sentinel override, and round change. `teamwork_next`
+* **Fence.** Every task has a monotonic `fence` that increments on a claim,
+  reclaim, release, explicit Sentinel override, or round change — and only when
+  the owner/epoch actually changes, so the fence returned by `next` is valid for
+  the immediate `task_update`. `teamwork_next`
   returns it; `teamwork_task_update` accepts an optional `fence` and refuses a
   mismatch with `STALE_FENCE` **without changing state**. A live claim held by a
   non-owner/non-descendant is `CLAIM_OWNED_BY_OTHER`; an expired claim the caller
-  does not own is `CLAIM_EXPIRED`. Ownership is the claim's session or a session
+  does not own is `CLAIM_EXPIRED`; a flagged claim cannot be resumed
+  (`CLAIM_NEEDS_INSPECTION`). Ownership is the claim's session or a session
   descended from it. The checks run on **every** transition, not only
   `worker_active`.
 * **Sentinel override.** `team/sentinel`/`team/orchestrator` may override another
@@ -516,13 +533,18 @@ expired claims reclaimable without a fingerprint, no fence enforcement).
   when exceeded. `unknown` or a missing baseline is `needs-inspection`, never a
   clean reclaim.
 * **Reclaim decision.** Unchanged fingerprint → clean reclaim with `fence++` and
-  `previousClaimant`/`history` recorded. Changed / unknown / missing →
-  `needs-inspection`. A cross-host claim is never reclaimed automatically.
+  `previousClaimant`/`history` recorded. Changed / unknown / missing /
+  `needs-inspection` → `needs-inspection`. A cross-host claim is never reclaimed
+  automatically. Released/adopted/requeued/blocked claims keep a bounded
+  task-level `claimHistory`, and a terminal `teamwork_task_update` emits
+  `claim_released`.
 * **Recovery (`teamwork_recover`).** `team/sentinel` or `team/orchestrator`,
   from the run root or a descendant. `inspect` returns claim, baseline and
   observed fingerprints, diffstat, commits, dirty/untracked paths, and writes a
   **single-use 10-minute token, stored only as a SHA-256 hash**, in
-  `task.inspection`. `adopt`/`requeue`/`block` require that token and re-check
+  `task.inspection`. The token is bound to `(round, fence, claim.by)`; `recover`
+  also accepts an optional `fence`, and any mismatch is `INSPECTION_STALE`.
+  `adopt`/`requeue`/`block` require that token and re-check
   the fingerprint; a change is `INSPECTION_STALE`. `adopt` only accepts a clean
   committed branch whose baseline head is an ancestor, marks `worker_done` with a
   `checkpoint`, and **makes no commit**. `requeue` needs the fingerprint to equal
@@ -549,7 +571,8 @@ expired claims reclaimable without a fingerprint, no fence enforcement).
   `legacy_unbound_report` warning; it is never silently treated as current.
 * **Worktree host/claim guards.** `setup` records the baseline and renews the
   claim; `diff` returns `HEAD`/`baseSha`/`diffHash`; `cleanup` refuses while any
-  task has a live claim (local or foreign). `setup`/`merge`/`resolve`/`cleanup`
+  claim is `live`, `expired` (inside grace), `needs-inspection`, or `cross-host`
+  (only a stale claim is recoverable). `setup`/`merge`/`resolve`/`cleanup`
   refuse when `state.host` differs from this host, unless
   `allowSharedWorktrees: true` — and never when the plan set
   `requireSameHost: true`. `TEAMWORK_ALLOW_CROSS_HOST` stays `0` by default for
@@ -1142,13 +1165,21 @@ plugin process. The lock is a sibling artifact named `<artifact>.lock`:
   half-written lock; `EEXIST` means the lock is held. The temp name is always
   unlinked (best effort). On filesystems without hard links (`EPERM`/`ENOTSUP`/
   `ENOSYS`/…), the primitive falls back to an atomic `mkdir(2)` plus
-  `<lock>.lock/owner.json`; the capability is detected once and cached for the
-  process and recorded as a `hardlink_unsupported` diagnostic.
+  `<lock>/owner.json`, published with the same temp + `rename(2)` discipline; if
+  the owner write fails the directory is removed and acquisition fails closed
+  (it never reports `"created"` without a readable owner). The capability is
+  detected once, cached for the process, and recorded as a
+  `hardlink_unsupported` diagnostic.
 * **Atomic reclaim.** A stale lock is quarantined with a single
   `rename(2)` to `<artifact>.lock.stale.<observedNonce>`, then deleted. Of N
   concurrent reclaimers exactly one rename wins. The observation's inode and
   nonce are re-checked before the rename, so a lock that was replaced in the
   meantime is never removed; the live path is **never** unlinked by nonce.
+* **Nonce-checked release.** Release also quarantines first: it renames the lock
+  to `<artifact>.lock.release.<ownNonce>`, reads the moved artifact, and removes
+  only the quarantine whose nonce is ours. A lock published immediately after
+  release survives. A foreign/replaced artifact is restored with `link(2)` +
+  `unlink(2)`, never a clobbering rename.
 * **Age comes from the filesystem.** Staleness uses
   `lstat(lockPath).mtimeMs`, never the owner's self-reported `at`, so a falsified
   future `at` cannot defeat the lease and an old `at` cannot make a fresh lock
@@ -1161,13 +1192,23 @@ plugin process. The lock is a sibling artifact named `<artifact>.lock`:
   alive. A lock from another host is never guessed at. A symlink at the lock
   path (or its directory) is refused, never followed.
 * Acquisition retries with bounded exponential backoff plus jitter and fails
-  closed with an explicit `lock timeout` error. A caller that cannot get the
-  lock writes nothing.
+  closed with an explicit `lock timeout` error. The default timeout is **30 s**,
+  equal to (never above) the 30 s lock lease; worst-case recovery latency is one
+  lease plus one timeout. A caller that cannot get the lock writes nothing.
 * The on-disk lock is always acquired after an in-process queue keyed by the
   same path, so a process cannot deadlock against its own lock file. Only the
   short read-modify-write is held; external cost/session reads happen before
-  the lock. Locks stay short (30 s lease); claims carry the longer 5 min + 5 min
+  the lock, and full side-effect baselines (including the bounded untracked scan)
+  and verifier-report base/head/diff reads happen before the `state.json` lock.
+  Inside the lock the claim path re-reads only `HEAD`, `status --porcelain` and
+  the tracked-diff hash, so a multi-MiB untracked scan never extends the critical
+  section. Locks stay short (30 s lease); claims carry the longer 5 min + 5 min
   grace semantics.
+* **Hosts without `/proc/self/fd`.** macOS/Windows use the path-based lock with
+  a stable in-process key, a parent-realpath check before acquisition and after
+  release, and a `detective-lock` anomaly/diagnostic. A failed check fails
+  closed; Linux without usable procfs still fails closed and never degrades to
+  the detective path.
 * **NFS/multi-host limit:** `link(2)`, `rename(2)` and `mkdir(2)` are not a
   reliable distributed mutex on every NFS deployment (client-side caching,
   delayed visibility, no atomic rename in some configurations). On a shared

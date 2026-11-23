@@ -4,6 +4,67 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-11-23
+
+Patch release for defects shipped in 0.10.0. No protocol bump: state written by
+0.10.0 is read as-is, with no migration write.
+
+### Fixed
+
+- **macOS/Windows are no longer wholly broken.** `withPinnedCrossProcessLock`
+  had no `detective` branch and threw whenever `pinParent` was unavailable. It
+  now uses the path-based lock with a stable in-process key, verifies the lock
+  parent's realpath under the run realpath before acquisition and after release,
+  records a `detective-lock` anomaly/diagnostic, and still fails closed when the
+  check fails or the host is `fail-closed`. `appendLineDetective` opens with
+  `O_NOFOLLOW` where defined and otherwise refuses a final-component symlink
+  immediately before the open, then compares the post-write `(dev, ino)` with the
+  opened descriptor (`detective-append` anomaly). `createDirWithin`/
+  `unlinkWithin` add parent/target realpath post-checks; a delete never creates
+  parent directories. This closes the deterministic `pitfalls.md -> ~/.bashrc`
+  append escape. Full platform parity remains scheduled for 0.13.
+- **Identity and lexical hardening.** `sameIdentity` refuses `dev === 0 ||
+  ino === 0` as a named `identity-unavailable` refusal instead of claiming
+  detection; `detectiveTarget` applies the `rel.startsWith("..")` policy and
+  refuses a symlinked run root; Windows segment validation refuses trailing
+  dots/spaces, reserved device names, `:`, and non-round-trip names (test seam
+  covers it on every platform; Linux behaviour is unchanged).
+- **Lock release is a nonce-checked quarantine.** `releaseLock` renames to
+  `<lock>.release.<nonce>`, reads the moved artifact, removes only our nonce, and
+  restores a foreign artifact with `link(2)` + `unlink(2)`. A lock published
+  immediately after release survives. The `mkdir` fallback publishes
+  `owner.json` via temp + rename; an owner-write failure removes the directory
+  and fails closed instead of returning `"created"`.
+- **Claim correctness.** A `needs-inspection` claim is never auto-reclaimed, even
+  with an unchanged fingerprint, and `task_update` to `worker_active` returns
+  `CLAIM_NEEDS_INSPECTION`. `claim.host` is the claiming process and
+  `claim.runHost` the run host; cross-host checks compare `claim.host`.
+  `worktree cleanup` blocks on `live`, `expired` (grace), `needs-inspection` and
+  `cross-host` through `deriveClaimState`; `next`/`task_update`/`recover` use the
+  same predicate. Inspection tokens bind `(round, fence, claim.by)` and `recover`
+  accepts a `fence` (`INSPECTION_STALE`). The fence increments only when the
+  owner/epoch changes, so `next`'s fence is valid for the immediate update.
+  Release/adopt/requeue/block preserve a bounded task-level `claimHistory`, and a
+  terminal `task_update` emits `claim_released`.
+- **Shorter critical section, documented recovery latency.** Full side-effect
+  baselines (including the bounded untracked scan) and verifier-report
+  base/head/diff evidence are captured before the `state.json` lock; inside it
+  only `HEAD`, `status --porcelain` and the tracked-diff hash are re-read. The
+  default lock timeout is 30 s, equal to (never above) the 30 s lease:
+  worst-case recovery latency is one lease plus one timeout.
+
+### Tests
+
+- Detective/lock: detective-mode lock acquire/run/release plus anomaly;
+  `fail-closed` still throws; detective append static-symlink and post-write
+  identity refusal; `fdContainment` override for the non-Linux branch;
+  `createDir`/`unlink` post-check refusals; `dev`/`ino` 0 refusal; the Windows
+  lexical table; release-TOCTOU survival; mkdir owner-write failure.
+- Claim engine: `needs-inspection` is not reclaimed on an unchanged fingerprint;
+  grace blocks cleanup; a token from fence N is refused at N+1; `next`'s fence is
+  accepted by the immediate `task_update`; `claim.host` is the process host; a
+  simulated foreign claim is cross-host and not reclaimed.
+
 ## [0.10.0] - 2026-11-23
 
 ### Added

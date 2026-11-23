@@ -3005,8 +3005,12 @@ try {
     await f.tools.task_update.execute({ sessionId: RUN, taskId: "alpha", status: "worker_done", agent: "team/worker" })
     await f.tools.task_update.execute({ sessionId: RUN, taskId: "alpha", status: "verifier_active", agent: "team/verifier" })
     const events = readEvents(f.root, RUN)
-    assert.strictEqual(events.length, before + 3, "exactly one event per transition")
-    const [wa, wd, va] = events.slice(-3)
+    const newEvents = events.slice(before)
+    const transitions = newEvents.filter((e) => e.event === "task_transition")
+    assert.strictEqual(transitions.length, 3, "exactly one task_transition event per transition")
+    // worker_done releases the claim, which is recorded as its own event.
+    assert(newEvents.some((e) => e.event === "claim_released"), "a terminal release must record claim_released")
+    const [wa, wd, va] = transitions
     assert.strictEqual(wa.agent, "team/worker", "explicit team/worker must be the recorded actor")
     assert.strictEqual(wd.agent, "team/worker")
     assert.strictEqual(va.agent, "team/verifier", "explicit team/verifier must be the recorded actor")
@@ -3054,11 +3058,13 @@ try {
     await f.tools.task_update.execute({ sessionId: RUN, taskId: "alpha", status: "worker_active", agent: "team/worker" })
     await f.tools.task_update.execute({ sessionId: RUN, taskId: "alpha", status: "worker_done", agent: "team/worker" })
     const events = readEvents(f.root, RUN)
+    const transitions = events.filter((e) => e.event === "task_transition")
     assert.deepStrictEqual(
-      events.map((e) => [e.event, e.seq]),
+      transitions.map((e) => [e.event, e.seq]),
       [["task_transition", 1], ["task_transition", 2]],
-      "two consecutive appends must get seq 1 and 2",
+      "two consecutive task_transition appends must get seq 1 and 2",
     )
+    assert.deepStrictEqual(events.map((e) => e.seq), [1, 2, 3], "the claim_released line continues the same sequence")
     console.log("✓ consecutive task_transition lines get seq 1 and 2")
   }
 
@@ -9815,6 +9821,119 @@ process.exit(0);
       const xEvents = readFileSync(runFile(xRun, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l))
       assert(xEvents.some((e) => e.event === "claim_released"), "the release must be recorded as claim_released")
       console.log("✓ cross-host claims are never auto-reclaimed; status warns FOREIGN_HOST/SHARED_FS_SUSPECTED; cross-host release refuses by default and is recorded when explicitly allowed")
+    }
+
+    // --- 11j2: needs-inspection, grace, process-host, fence, and token binding.
+    {
+      const hardRun = "20261122-000018-claims-hardening"
+      const hard = await makeClaimsGitRun(hardRun, "N1")
+      try {
+        const { gt, repo, worker, taskId } = hard
+        const stateFile = statePathIn(repo, hardRun)
+        const readState = () => JSON.parse(readFileSync(stateFile, "utf8"))
+        const writeState = (value) => writeStateFile(stateFile, value)
+
+        await gt.task_update.execute(
+          { sessionId: hardRun, taskId, status: "worker_active", worktree: worker.worktreePath },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        let st = readState()
+        assert.strictEqual(st.tasks[taskId].claim.host, hostname(), "claim.host must be the claiming process host")
+        assert.strictEqual(st.tasks[taskId].claim.runHost, hostname(), "claim.runHost records the run host")
+
+        // Fence returned by `next` is valid for the immediate task_update.
+        await gt.task_update.execute(
+          { sessionId: hardRun, taskId, status: "worker_done" },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        st = readState()
+        assert(Array.isArray(st.tasks[taskId].claimHistory), "release must preserve a bounded claim history")
+        assert(st.tasks[taskId].claimHistory.some((e) => e.by === FIXTURE_ROOT_SESSION), "the released claimant must be recorded")
+        const hardEvents = readFileSync(join(repo, ".opencode", "teamwork", hardRun, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l))
+        assert(hardEvents.some((e) => e.event === "claim_released"), "a task_update release must emit claim_released")
+
+        st.tasks[taskId].status = "pending"
+        writeState(st)
+        const ready = await gt.next.execute({ sessionId: hardRun, allowUnsignedLegacy: true }, { sessionID: FIXTURE_ROOT_SESSION })
+        const claimed = (ready.readyForWorker || []).find((t) => t.id === taskId)
+        assert(claimed && typeof claimed.fence === "number", "next must return the claim fence")
+        const immediate = await gt.task_update.execute(
+          { sessionId: hardRun, taskId, status: "worker_active", fence: claimed.fence },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        assert.strictEqual(immediate.status, "worker_active", `the fence from next must be accepted immediately: ${immediate.content}`)
+
+        // A needs-inspection claim is not reclaimed even with an unchanged
+        // fingerprint (the fingerprint is exactly what needs a human decision).
+        st = readState()
+        st.tasks[taskId].status = "pending"
+        st.tasks[taskId].claim.leaseUntil = new Date(Date.now() - 20 * 60000).toISOString()
+        st.tasks[taskId].claim.needsInspection = true
+        writeState(st)
+        const fenceBefore = st.tasks[taskId].fence
+        const inspectedSkip = await gt.next.execute({ sessionId: hardRun, allowUnsignedLegacy: true }, { sessionID: FIXTURE_ROOT_SESSION })
+        assert.strictEqual((inspectedSkip.readyForWorker || []).length, 0, "a needs-inspection claim must not be reclaimed")
+        const flaggedProgress = (inspectedSkip.inProgress || []).find((t) => t.id === taskId)
+        assert.strictEqual(flaggedProgress.claimState, "needs-inspection")
+        assert.strictEqual(readState().tasks[taskId].fence, fenceBefore, "skipping needs-inspection must not change the fence")
+
+        // task_update to worker_active on a flagged claim is refused by name.
+        const flaggedUpdate = await gt.task_update.execute(
+          { sessionId: hardRun, taskId, status: "worker_active" },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        assert.strictEqual(flaggedUpdate.status, "CLAIM_NEEDS_INSPECTION", `a flagged claim must not resume: ${flaggedUpdate.content}`)
+
+        // A simulated claim stamped by another host is cross-host, never reclaimed.
+        st = readState()
+        delete st.tasks[taskId].claim.needsInspection
+        st.tasks[taskId].claim.host = "foreign-host"
+        st.tasks[taskId].claim.by = "ses_foreign"
+        st.tasks[taskId].claim.leaseUntil = new Date(Date.now() - 20 * 60000).toISOString()
+        writeState(st)
+        const foreign = await gt.next.execute({ sessionId: hardRun, allowUnsignedLegacy: true }, { sessionID: FIXTURE_ROOT_SESSION })
+        assert.strictEqual((foreign.readyForWorker || []).length, 0, "a foreign claim.host must never be auto-reclaimed")
+        assert.strictEqual((foreign.inProgress || []).find((t) => t.id === taskId).claimState, "cross-host")
+
+        // Grace (expired, inside the window) blocks worktree cleanup.
+        st = readState()
+        st.tasks[taskId].status = "worker_active"
+        st.tasks[taskId].claim.host = hostname()
+        st.tasks[taskId].claim.leaseUntil = new Date(Date.now() - 60000).toISOString()
+        writeState(st)
+        const cleanup = await gt.worktree.execute({ sessionId: hardRun, action: "cleanup" }, { sessionID: FIXTURE_ROOT_SESSION })
+        assert.strictEqual(cleanup.refused, "LIVE_CLAIM", `an expired claim in grace must block cleanup: ${cleanup.content}`)
+        assert.strictEqual((cleanup.liveClaims || []).find((c) => c.id === taskId)?.claimState, "expired")
+
+        // Inspection tokens are bound to (fence, round, claim.by): a token from
+        // fence N is INSPECTION_STALE at fence N+1.
+        st = readState()
+        st.tasks[taskId].claim.leaseUntil = new Date(Date.now() - 20 * 60000).toISOString()
+        delete st.tasks[taskId].claim.needsInspection
+        writeState(st)
+        const inspected = await gt.recover.execute(
+          { sessionId: hardRun, taskId, action: "inspect" },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        assert.strictEqual(inspected.status, "INSPECTED", `inspect must succeed: ${inspected.content}`)
+        const fenceAtInspect = readState().tasks[taskId].fence
+        const wrongFence = await gt.recover.execute(
+          { sessionId: hardRun, taskId, action: "inspect", fence: fenceAtInspect - 1 },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        assert.strictEqual(wrongFence.status, "INSPECTION_STALE", "a mismatched recover fence must be refused")
+        st = readState()
+        st.tasks[taskId].fence = fenceAtInspect + 1
+        writeState(st)
+        const staleToken = await gt.recover.execute(
+          { sessionId: hardRun, taskId, action: "requeue", token: inspected.token, reason: "stale token test" },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        assert.strictEqual(staleToken.status, "INSPECTION_STALE", `a token from fence ${fenceAtInspect} must be stale at fence ${fenceAtInspect + 1}: ${staleToken.content}`)
+        console.log("✓ needs-inspection is never reclaimed, grace/needs-inspection block cleanup, claim.host is the process host, next's fence works immediately, and tokens are bound to fence/round/claimant")
+      } finally {
+        rmSync(hard.repo, { recursive: true, force: true })
+      }
     }
 
     // --- 11k: inspection tokens, INSPECTION_STALE, and adopt with no new commit.

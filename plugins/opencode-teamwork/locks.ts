@@ -35,15 +35,16 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs"
 import { hostname } from "node:os"
-import { basename, dirname, isAbsolute, join } from "node:path"
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { randomBytes, randomInt } from "node:crypto"
-import { assertSingleSegment, pinParent } from "./safe-fs.mjs"
+import { assertSingleSegment, fdTraversalMode, pinParent, recordWriteAnomaly } from "./safe-fs.mjs"
 
 const PROC_SELF_FD = "/proc/self/fd"
 
@@ -78,6 +79,8 @@ export interface CrossProcessLockOptions {
   isProcessAlive?: (pid: number) => boolean
   /** Test seam: pretend this filesystem has no hard links. */
   disableHardlinks?: boolean
+  /** Test seam: fail the `mkdir` fallback owner-file publication. */
+  failOwnerWrite?: boolean
   /**
    * Internal: the lock path is already `/proc/self/fd/<dirfd>/<name>` from a
    * pinned run directory. Skips the path-level directory checks (which would see
@@ -101,6 +104,7 @@ export type LockDiagnosticEvent =
   | "unreadable_lock_reclaimed"
   | "stale_reclaim_raced"
   | "hardlink_unsupported"
+  | "detective_lock"
 
 export interface LockDiagnostic {
   at: string
@@ -122,7 +126,10 @@ export interface LockArtifactObservation {
 }
 
 const DEFAULT_LEASE_MS = 30_000
-const DEFAULT_TIMEOUT_MS = 10_000
+// ADR 0010's state.json critical section can include a short git read on a cold
+// worktree. 30 s is the maximum default: it equals the lease and never exceeds
+// it, so a waiter cannot outlive the artifact it is waiting for.
+const DEFAULT_TIMEOUT_MS = 30_000
 const DEFAULT_RETRY_BASE_MS = 10
 const DEFAULT_RETRY_MAX_MS = 100
 const MAX_DIAGNOSTICS = 100
@@ -407,11 +414,26 @@ function tryCreateLock(
     if (err?.code === "EEXIST") return "exists"
     throw new Error(`refused: could not create lock directory "${lockPath}" (${err?.code ?? err?.message ?? "unknown error"})`)
   }
+  // Publish the owner inside the directory with the same temp-then-rename
+  // discipline as the file path. A directory with no valid owner is a broken
+  // mutex, not a "created" lock: remove it and fail closed so the caller never
+  // writes an artifact it does not actually hold.
   try {
-    writeFileSync(join(lockPath, "owner.json"), JSON.stringify(owner), { flag: "wx", mode: 0o600 })
-  } catch {
-    // An empty lock directory is a recoverable state: it ages out as an
-    // unreadable lock after the lease instead of stranding the artifact.
+    if (options.failOwnerWrite === true) {
+      throw Object.assign(new Error("injected owner-write failure"), { code: "EIO" })
+    }
+    const tempOwner = join(lockPath, `owner.${owner.nonce}.tmp`)
+    writeFileSync(tempOwner, JSON.stringify(owner), { flag: "wx", mode: 0o600 })
+    renameSync(tempOwner, join(lockPath, "owner.json"))
+  } catch (err: any) {
+    try {
+      rmSync(lockPath, { recursive: true, force: true })
+    } catch {
+      // Best effort: the directory is inert and the next attempt will see it.
+    }
+    throw new Error(
+      `refused: could not publish the lock owner in "${lockPath}" (${err?.code ?? err?.message ?? "unknown error"}); the lock directory was removed and no artifact was written`,
+    )
   }
   return "created"
 }
@@ -451,18 +473,60 @@ function staleVerdict(
 }
 
 /**
- * Release our lock artifact. Cleanup is deliberately best-effort: an unlink
- * error (EACCES, ENOENT after a racing reclaimer, etc.) must never mask the
- * primary error from `fn`. The nonce check ensures a lock that replaced ours
- * (after a stale reclaim) is never removed.
+ * Release our lock artifact. A single atomic `rename(2)` moves the lock into a
+ * nonce-named quarantine: the path becomes free in one step, so a process that
+ * acquires a new lock immediately after release can never be unlinked by this
+ * caller. Only the quarantined artifact whose nonce matches ours is removed. If
+ * the moved artifact is not ours (a replacement raced the rename), it is put
+ * back with `link(2)` + `unlink(2)` — never a clobbering rename — and a new lock
+ * already at the path is left untouched.
+ *
+ * Cleanup is deliberately best-effort: an unlink error must never mask the
+ * primary error from `fn`.
  */
 function releaseLock(lockPath: string, nonce: string): void {
+  const quarantinePath = `${lockPath}.release.${safeName(nonce) || "unknown"}`
+  let moved: LockArtifactObservation | undefined
   try {
-    const observed = observeLockArtifact(lockPath)
-    if (observed?.nonce === nonce) removeArtifact(lockPath, observed.kind)
+    rmSync(quarantinePath, { recursive: true, force: true })
+    renameSync(lockPath, quarantinePath)
   } catch {
-    // Best-effort cleanup only; never throw from finally.
+    return
   }
+  try {
+    releaseHookForTest?.({ lockPath, quarantinePath, nonce })
+  } catch {
+    // A test seam must never break release.
+  }
+  try {
+    moved = observeLockArtifact(quarantinePath)
+  } catch {
+    moved = undefined
+  }
+  if ((moved?.nonce ?? "") !== nonce) {
+    // Not our artifact. Restore it without clobbering anything published since.
+    try {
+      if (observeLockArtifact(lockPath) === undefined) {
+        if ((moved?.kind ?? "file") === "directory") {
+          renameSync(quarantinePath, lockPath)
+        } else {
+          linkSync(quarantinePath, lockPath)
+          unlinkSync(quarantinePath)
+        }
+      }
+    } catch {
+      // Best-effort restore; the caller will time out rather than write.
+    }
+    return
+  }
+  removeArtifact(quarantinePath, moved?.kind ?? "file")
+}
+
+let releaseHookForTest: ((info: { lockPath: string; quarantinePath: string; nonce: string }) => void) | null = null
+
+/** Test seam: observe (and race) the release quarantine rename. */
+export function setReleaseHookForTest(fn: ((info: { lockPath: string; quarantinePath: string; nonce: string }) => void) | null): void {
+  releaseHookForTest = typeof fn === "function" ? fn : null
 }
 
 /**
@@ -493,6 +557,16 @@ export async function withCrossProcessLock<T>(
   return withFileLock(lockPath, () => acquireAndRun(lockPath, fn, options))
 }
 
+function pathWithinOrEqual(root: string, target: string): boolean {
+  let rel: string
+  try {
+    rel = relative(root, target)
+  } catch {
+    return false
+  }
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
+}
+
 /**
  * Cross-process lock for `run/relTargetPath` whose lock file is created inside
  * the already-pinned parent directory (ADR 0010). The in-process queue key is a
@@ -503,6 +577,12 @@ export async function withCrossProcessLock<T>(
  *
  * The directory descriptor is held for the whole acquire/run/release sequence
  * and closed in `finally`; it is never closed while the lock is being used.
+ *
+ * On a host without fd traversal (macOS/Windows) the lock is path-based but not
+ * unguarded: the target parent's realpath must stay under the run realpath
+ * before acquisition and after release, a `detective-lock` diagnostic/anomaly
+ * is recorded, and a failed containment check fails closed. Linux without a
+ * usable `/proc/self/fd` still fails closed; it never silently falls back.
  */
 export async function withPinnedCrossProcessLock<T>(
   run: string,
@@ -510,6 +590,79 @@ export async function withPinnedCrossProcessLock<T>(
   fn: () => Promise<T> | T,
   options: CrossProcessLockOptions = {},
 ): Promise<T> {
+  const mode = fdTraversalMode()
+  if (mode === "detective") {
+    let runReal: string
+    try {
+      const st = lstatSync(run)
+      if (st.isSymbolicLink()) throw new Error("the run directory is a symlink")
+      if (!st.isDirectory()) throw new Error("the run path is not a directory")
+      runReal = realpathSync(run)
+    } catch (err: any) {
+      throw new Error(`refused: cannot lock inside "${run}" (${err?.code ?? err?.message ?? "unavailable"}); nothing was written`)
+    }
+    const lockPath = crossProcessLockPath(join(run, relTargetPath))
+    const lexicalRel = relative(resolve(run), resolve(run, relTargetPath))
+    if (!lexicalRel || lexicalRel.startsWith("..") || isAbsolute(lexicalRel)) {
+      throw new Error(`refused: lock target "${relTargetPath}" escapes "${run}"; nothing was written`)
+    }
+    const key = `detective|${runReal}|${resolve(relTargetPath)}`
+    const verifyParent = (phase: string): void => {
+      let parentReal: string
+      try {
+        parentReal = realpathSync(dirname(lockPath))
+      } catch (err: any) {
+        recordWriteAnomaly({
+          kind: "detective-lock",
+          detail: `${phase}: the lock parent cannot be resolved (${err?.code ?? "unavailable"})`,
+        })
+        throw new Error(`refused: ${phase} containment check failed for "${lockPath}"; nothing was written`)
+      }
+      if (!pathWithinOrEqual(runReal, parentReal)) {
+        recordWriteAnomaly({
+          kind: "detective-lock",
+          detail: `${phase}: lock parent "${parentReal}" is outside the run realpath "${runReal}"`,
+        })
+        recordDiagnostic(
+          {
+            at: new Date().toISOString(),
+            path: lockPath,
+            event: "detective_lock",
+            nonce: null,
+            detail: `${phase}: lock parent escaped the run realpath`,
+          },
+          options.onDiagnostic,
+        )
+        throw new Error(`refused: ${phase} containment check failed for "${lockPath}"; nothing was written`)
+      }
+    }
+    try {
+      mkdirSync(dirname(lockPath), { recursive: true })
+    } catch (err: any) {
+      throw new Error(`refused: cannot create the lock parent for "${lockPath}" (${err?.code ?? "unavailable"}); nothing was written`)
+    }
+    verifyParent("pre-acquire")
+    try {
+      return await withFileLock(key, () => acquireAndRun(lockPath, fn, options))
+    } finally {
+      verifyParent("post-release")
+      // Detective, not preventive: the path-based lock itself is the residual.
+      recordWriteAnomaly({
+        kind: "detective-lock",
+        detail: `path-based cross-process lock for "${lockPath}" (no fd traversal on this host)`,
+      })
+      recordDiagnostic(
+        {
+          at: new Date().toISOString(),
+          path: lockPath,
+          event: "detective_lock",
+          nonce: null,
+          detail: "released a path-based lock after verifying the parent realpath",
+        },
+        options.onDiagnostic,
+      )
+    }
+  }
   const pin = pinParent(run, relTargetPath, { create: true })
   if (pin.status !== "ok") {
     // A brand-new run root does not exist yet (teamwork_plan/teamwork_tournament
