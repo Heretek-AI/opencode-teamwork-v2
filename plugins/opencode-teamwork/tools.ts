@@ -115,6 +115,7 @@ import {
 import type { VerificationMode } from "./strict.ts"
 import {
   VICTORY_AUDITOR_AGENT,
+  VICTORY_CONFIRMED,
   callerRequirementsFile,
   currentRequirementsHash,
   deriveRequirementsFromRequest,
@@ -124,6 +125,7 @@ import {
   originalRequestHash,
   persistRequirementsBaseline,
   readRequirementsBaseline,
+  readVictoryVerdict,
   recordVictoryAudit,
   resolveVictoryAuditMode,
   validateRequirementsBaseline,
@@ -138,7 +140,8 @@ import {
 } from "./auth.ts"
 import type { RequirementsFile, VictoryAuditMode } from "./victory.ts"
 import { readAgentBriefingExcerpt, readBriefingExcerpt, refreshAgentBriefing, refreshRunBriefing } from "./briefing.ts"
-import { writeHandoff, resolveHandoffScope, handoffAgentSlug } from "./handoff.ts"
+import { writeHandoff, resolveHandoffScope, handoffAgentSlug, evaluateHandoffGate, normalizeHandoffMode, resolveHandoffMode } from "./handoff.ts"
+import type { HandoffGate, HandoffMode, HandoffTaskRef } from "./handoff.ts"
 import { withFileLock } from "./locks.ts"
 import { fdWithin, readWithinBounded, supportsFdContainment } from "./safe-fs.mjs"
 
@@ -1776,6 +1779,7 @@ type RunManifest = {
   integrityMode: IntegrityMode
   verification: VerificationMode
   victoryAudit: VictoryAuditMode
+  requireHandoffs: HandoffMode
   requestHash: string | null
   requirementsHash: string | null
   planHash: string
@@ -1796,6 +1800,10 @@ function planBaselineHash(plan: any): string {
       integrityMode: plan?.integrityMode ?? null,
       verification: plan?.verification ?? null,
       victoryAudit: plan?.victoryAudit ?? null,
+      // Omitted for legacy plans so their pre-continuity planHash stays valid.
+      ...(plan?.requireHandoffs !== undefined && plan?.requireHandoffsSource !== "legacy"
+        ? { requireHandoffs: plan.requireHandoffs }
+        : {}),
       route: plan?.route ?? null,
       lemmaBounds: plan?.lemmaBounds ?? null,
       tasks: Array.isArray(plan?.tasks) ? plan.tasks : [],
@@ -1882,6 +1890,9 @@ function manifestDriftReason(drift: string): string {
   if (drift.startsWith("victoryAudit")) {
     return `[AUTH_STALE] victory audit downgrade/change refused (${drift})`
   }
+  if (drift.startsWith("requireHandoffs")) {
+    return `[AUTH_STALE] handoff gate downgrade/change refused (${drift})`
+  }
   if (drift.startsWith("planHash")) {
     return `[AUTH_STALE] plan baseline changed (${drift})`
   }
@@ -1902,6 +1913,10 @@ function manifestDrift(manifest: RunManifest, current: Omit<RunManifest, "versio
   if (manifest.victoryAudit !== current.victoryAudit) {
     drift.push(`victoryAudit drifted: manifest=${manifest.victoryAudit} current=${current.victoryAudit}`)
   }
+  const baselineHandoffs = normalizeHandoffMode(manifest.requireHandoffs) ?? "skip"
+  if (baselineHandoffs !== current.requireHandoffs) {
+    drift.push(`requireHandoffs drifted: manifest=${baselineHandoffs} current=${current.requireHandoffs}`)
+  }
   for (const key of ["requestHash", "requirementsHash", "planHash", "lemmaPolicyHash"] as const) {
     const a = manifest[key]
     const b = current[key]
@@ -1916,10 +1931,45 @@ function currentManifestDrift(manifest: RunManifest, plan: any, state: any, run:
     integrityMode: normalizeIntegrityMode(plan?.integrityMode ?? state?.integrityMode) ?? DEFAULT_INTEGRITY_MODE,
     verification: resolveVerificationMode(plan, state).mode,
     victoryAudit: resolveVictoryAuditMode(plan, state, run).mode,
+    requireHandoffs: resolveHandoffMode(plan, state).mode,
     requestHash: originalRequestHash(run),
     requirementsHash: currentRequirementsHash(run),
     planHash: planHashOf(plan),
     lemmaPolicyHash: lemmaPolicyHashOf(run),
+  })
+}
+
+/** Every task that must have continuity handoffs (plan first, state as fallback). */
+function handoffTaskRefs(plan: any, state: any): HandoffTaskRef[] {
+  const refs = new Map<string, HandoffTaskRef>()
+  if (Array.isArray(plan?.tasks)) {
+    for (const task of plan.tasks) {
+      if (typeof task?.id !== "string" || !isSafeTaskId(task.id)) continue
+      refs.set(task.id, { id: task.id, agent: typeof task.agent === "string" ? task.agent : "team/worker" })
+    }
+  }
+  if (state?.tasks && typeof state.tasks === "object") {
+    for (const id of Object.keys(state.tasks)) {
+      if (!isSafeTaskId(id) || refs.has(id)) continue
+      refs.set(id, { id, agent: "team/worker" })
+    }
+  }
+  return [...refs.values()]
+}
+
+/** Resolve the run's persisted modes and recompute the continuity gate. */
+function evaluateHandoffGateFor(run: string, plan: any, state: any): HandoffGate {
+  const mode = resolveHandoffMode(plan, state).mode
+  // The victory handoff is defined as recorded after teamwork_victory_audit.
+  // Until a confirmed verdict exists, the victory gate (not the handoff gate)
+  // owns the next action, so it is not counted as missing.
+  const victoryConfirmed =
+    resolveVictoryAuditMode(plan, state, run).mode === "required" &&
+    readVictoryVerdict(run)?.verdict === VICTORY_CONFIRMED
+  return evaluateHandoffGate(run, handoffTaskRefs(plan, state), {
+    mode,
+    strict: resolveVerificationMode(plan, state).mode === "strict",
+    victoryAudit: victoryConfirmed,
   })
 }
 
@@ -2172,6 +2222,7 @@ async function createPlanRun(
     }
   }
   let persistedVerification: VerificationMode | undefined
+  let persistedHandoffs: HandoffMode | undefined
   if (existsSync(run)) {
     const planRes = readBoundedRunJson<any>(run, join(run, "plan.dag.json"), MAX_MANIFEST_BYTES)
     if (planRes.status === "error") {
@@ -2205,6 +2256,34 @@ async function createPlanRun(
       }
     }
     persistedVerification = fromPlan ?? fromState
+    const fromPlanHandoffsRaw = planRes.status === "ok" ? planRes.value?.requireHandoffs : undefined
+    const fromStateHandoffsRaw = stateRes.status === "ok" ? stateRes.value?.requireHandoffs : undefined
+    const fromPlanHandoffs =
+      fromPlanHandoffsRaw === undefined || fromPlanHandoffsRaw === null
+        ? undefined
+        : normalizeHandoffMode(fromPlanHandoffsRaw)
+    const fromStateHandoffs =
+      fromStateHandoffsRaw === undefined || fromStateHandoffsRaw === null
+        ? undefined
+        : normalizeHandoffMode(fromStateHandoffsRaw)
+    if (
+      (fromPlanHandoffsRaw !== undefined && fromPlanHandoffsRaw !== null && !fromPlanHandoffs) ||
+      (fromStateHandoffsRaw !== undefined && fromStateHandoffsRaw !== null && !fromStateHandoffs)
+    ) {
+      return {
+        ok: false,
+        content:
+          "refused: plan.dag.json or state.json records an invalid requireHandoffs mode; repair the run or start a new session. Nothing was written.",
+      }
+    }
+    if (fromPlanHandoffs && fromStateHandoffs && fromPlanHandoffs !== fromStateHandoffs) {
+      return {
+        ok: false,
+        content:
+          "refused: plan.dag.json and state.json disagree about requireHandoffs; repair the run or start a new session. Nothing was written.",
+      }
+    }
+    persistedHandoffs = fromPlanHandoffs ?? fromStateHandoffs
   }
   if (persistedVerification && requestedVerification && persistedVerification !== requestedVerification) {
     return {
@@ -2278,6 +2357,42 @@ async function createPlanRun(
         "refused: benchmark mode requires the independent victory audit; victoryAudit: \"skip\" is not permitted with integrityMode: \"benchmark\". Nothing was written.",
     }
   }
+  // Continuity handoff gate: required by default when the run records a
+  // request/requirements baseline. An unsigned legacy baseline cannot require
+  // it (recorded as skip), and benchmark mode never permits the skip.
+  const requestedHandoffs =
+    input.requireHandoffs === undefined || input.requireHandoffs === null
+      ? undefined
+      : normalizeHandoffMode(input.requireHandoffs)
+  if (input.requireHandoffs !== undefined && input.requireHandoffs !== null && !requestedHandoffs) {
+    return {
+      ok: false,
+      content: `refused: invalid requireHandoffs "${clean(input.requireHandoffs, 32)}" (accepted: required | skip); nothing was written.`,
+    }
+  }
+  if (persistedHandoffs && requestedHandoffs && persistedHandoffs !== requestedHandoffs) {
+    return {
+      ok: false,
+      content: `refused: requireHandoffs is already persisted as "${persistedHandoffs}" for this run and cannot be changed by a re-plan; omit it to keep the mode or start a new session. Nothing was written.`,
+    }
+  }
+  let requireHandoffsMode: HandoffMode =
+    persistedHandoffs ?? requestedHandoffs ?? (runHasPlan ? "skip" : requirementsBaseline ? "required" : "skip")
+  let requireHandoffsSource: "caller" | "default" | "legacy" | "unsigned" =
+    persistedHandoffs ? "default" : requestedHandoffs ? "caller" : runHasPlan ? "legacy" : "default"
+  if (requireHandoffsMode === "required" && !existingManifest && allowUnsignedLegacy) {
+    // A run that cannot be signed cannot satisfy the signed continuity
+    // baseline; the baseline records the effective skip explicitly.
+    requireHandoffsMode = "skip"
+    requireHandoffsSource = "unsigned"
+  }
+  if (integrityMode === "benchmark" && requireHandoffsMode === "skip") {
+    return {
+      ok: false,
+      content:
+        "refused: benchmark mode requires the continuity handoff gate; requireHandoffs: \"skip\" is not permitted with integrityMode: \"benchmark\". Nothing was written.",
+    }
+  }
   if (existingManifest) {
     const modeDrift: string[] = []
     if (existingManifest.integrityMode !== integrityMode) {
@@ -2288,6 +2403,10 @@ async function createPlanRun(
     }
     if (existingManifest.victoryAudit !== victoryAuditMode) {
       modeDrift.push(`victoryAudit (${existingManifest.victoryAudit} -> ${victoryAuditMode})`)
+    }
+    const baselineHandoffs = normalizeHandoffMode(existingManifest.requireHandoffs) ?? "skip"
+    if (baselineHandoffs !== requireHandoffsMode) {
+      modeDrift.push(`requireHandoffs (${baselineHandoffs} -> ${requireHandoffsMode})`)
     }
     if (modeDrift.length > 0) {
       return {
@@ -2490,6 +2609,8 @@ async function createPlanRun(
     verification: verificationMode,
     victoryAudit: victoryAuditMode,
     victoryAuditSource,
+    requireHandoffs: requireHandoffsMode,
+    requireHandoffsSource,
     ...(requirementsBaseline ? { requirementsSource: requirementsBaseline.source, requirementsCount: requirementsBaseline.items.length } : {}),
     preflight,
     ...(isLemma ? { lemmaMode: true, route: "lemma", lemmaBounds } : rawRoute ? { route: rawRoute } : {}),
@@ -2509,6 +2630,7 @@ async function createPlanRun(
       integrityMode,
       verification: verificationMode,
       victoryAudit: victoryAuditMode,
+      requireHandoffs: requireHandoffsMode,
       ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
       ...(isLemma ? { lemmaMode: true, route: "lemma" } : {}),
       phase: "DISPATCH",
@@ -2525,6 +2647,7 @@ async function createPlanRun(
       (state.integrityMode !== integrityMode ||
         state.verification !== verificationMode ||
         state.victoryAudit !== victoryAuditMode ||
+        state.requireHandoffs !== requireHandoffsMode ||
         state.rootSessionId !== rootSessionId ||
         (allowUnsignedLegacy && state.allowUnsignedLegacy !== true) ||
         (isLemma && !state.lemmaMode))
@@ -2532,6 +2655,7 @@ async function createPlanRun(
       state.integrityMode = integrityMode
       state.verification = verificationMode
       state.victoryAudit = victoryAuditMode
+      state.requireHandoffs = requireHandoffsMode
       state.rootSessionId = rootSessionId
       if (allowUnsignedLegacy) state.allowUnsignedLegacy = true
       if (isLemma) {
@@ -2560,6 +2684,7 @@ async function createPlanRun(
       integrityMode,
       verification: verificationMode,
       victoryAudit: victoryAuditMode,
+      requireHandoffs: requireHandoffsMode,
       requestHash: baselineRequestHash,
       requirementsHash: baselineRequirementsHash,
       planHash: baselinePlanHash,
@@ -2590,6 +2715,7 @@ async function createPlanRun(
         integrityMode,
         verification: verificationMode,
         victoryAudit: victoryAuditMode,
+        requireHandoffs: requireHandoffsMode,
         requestHash: baselineRequestHash,
         requirementsHash: baselineRequirementsHash,
         planHash: baselinePlanHash,
@@ -2705,7 +2831,7 @@ async function createPlanRun(
     tasks,
     topology,
     integrityMode,
-    content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\n${preflightLine}\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.\nVerification: ${verificationMode}${verificationMode === "strict" ? " (one falsifier challenge + one security-auditor audit per task)" : ""}.\nVictory audit: ${victoryAuditMode}${victoryAuditSource === "caller" ? " (explicit)" : ""}${requirementsBaseline ? `; requirements baseline ${requirementsBaseline.items.length} item(s) from ${requirementsBaseline.source} (requirements.json)` : "; no requirements baseline"}.\nAuthenticity: ${signedRun ? `signed baseline (run.manifest.json; key ${clean(authReady.ok ? authReady.keyId : "unknown", 64)})` : "UNSIGNED LEGACY (allowUnsignedLegacy: true; final_verify/next require the recorded bypass)"}.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${preflight.bypassed ? `\n⚠ Input preflight bypassed (allowMissingInputs: true): ${preflight.status}.` : ""}${creditWarning}`,
+    content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\n${preflightLine}\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.\nVerification: ${verificationMode}${verificationMode === "strict" ? " (one falsifier challenge + one security-auditor audit per task)" : ""}.\nVictory audit: ${victoryAuditMode}${victoryAuditSource === "caller" ? " (explicit)" : ""}${requirementsBaseline ? `; requirements baseline ${requirementsBaseline.items.length} item(s) from ${requirementsBaseline.source} (requirements.json)` : "; no requirements baseline"}.\nHandoff gate: ${requireHandoffsMode}${requireHandoffsSource === "caller" ? " (explicit)" : requireHandoffsSource === "unsigned" ? " (unsigned legacy baseline records skip)" : ""}.\nAuthenticity: ${signedRun ? `signed baseline (run.manifest.json; key ${clean(authReady.ok ? authReady.keyId : "unknown", 64)})` : "UNSIGNED LEGACY (allowUnsignedLegacy: true; final_verify/next require the recorded bypass)"}.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${preflight.bypassed ? `\n⚠ Input preflight bypassed (allowMissingInputs: true): ${preflight.status}.` : ""}${creditWarning}`,
   }
 }
 
@@ -2752,6 +2878,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           victoryAudit: {
             type: "string",
             description: "required | skip. Default required when a request or requirements baseline exists. A skip is recorded in plan.dag.json/state.json and final_verify then records \"SKIPPED (explicit)\".",
+          },
+          requireHandoffs: {
+            type: "string",
+            description:
+              "required | skip. Default required for a new run with a request/requirements baseline, skip for a legacy/unsigned run. Required makes final_verify and next demand the continuity handoff matrix (assigned worker + verifier per task, falsifier + security-auditor per task in strict mode, one sentinel/orchestrator run-level, and the victory-auditor handoff when victoryAudit is required). Persisted in plan.dag.json, state.json and the signed manifest; a re-plan may repeat but not change it. Benchmark mode refuses skip.",
           },
           budgetUsd: { type: "number", description: "Run budget in USD. When using opencode/ models + opencode_console, derive this from credits (full or partial, per the user's choice)." },
           budgetSource: { type: "string", description: "Where the budget came from: credits | default | manual." },
@@ -4406,7 +4537,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     editor.add({
       name: "next",
       description:
-        "Determine the next actionable tasks in the DAG based on dependencies and current lifecycle states. Returns tasks ready for worker dispatch, tasks ready for verifier dispatch, in-progress tasks, or signals completion/deadlock. In strict mode it returns NEEDS_STRICT_WAVE (or BLOCKED_BY_STRICT_WAVE) until every task has its falsifier challenge and security-auditor audit, and never ALL_PASSED before them.",
+        "Determine the next actionable tasks in the DAG based on dependencies and current lifecycle states. Returns tasks ready for worker dispatch, tasks ready for verifier dispatch, in-progress tasks, or signals completion/deadlock. In strict mode it returns NEEDS_STRICT_WAVE (or BLOCKED_BY_STRICT_WAVE) until every task has its falsifier challenge and security-auditor audit, and never ALL_PASSED before them. When the plan requires handoffs, it returns NEEDS_HANDOFFS (missing taskId:agent pairs) or BLOCKED_BY_HANDOFFS (stale/duplicate/unknown/tampered) before ALL_PASSED.",
       input: {
         type: "object",
         properties: {
@@ -4944,6 +5075,35 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
 
+          // Continuity gate: every required handoff must exist and cite the
+          // current artifacts before completion. This runs after the stamped
+          // final report's own auth/drift checks so AUTH_STALE still wins, but
+          // before the final status branch so a handoff failure is actionable.
+          const nextHandoffs = evaluateHandoffGateFor(run, plan, state)
+          if (!nextHandoffs.skipped && !nextHandoffs.ok) {
+            const status =
+              nextHandoffs.status === "MISSING" ? "NEEDS_HANDOFFS" : "BLOCKED_BY_HANDOFFS"
+            const pairs = nextHandoffs.missing.map((m) => `${m.taskId}:${m.agent}`)
+            return {
+              content: `${status}: continuity handoffs are incomplete. ${
+                pairs.length
+                  ? `Missing handoff(s): ${pairs.join(", ")}.`
+                  : "Every required handoff exists but at least one is stale, duplicated, unknown, or tampered."
+              }\nDispatch each agent with the run id and task id; the agent must call teamwork_handoff before reporting. Then run teamwork_final_verify.\n${nextHandoffs.reasons.map((r) => `  - ${r}`).join("\n")}`,
+              status,
+              handoffs: {
+                mode: "required",
+                status: nextHandoffs.status,
+                missing: nextHandoffs.missing,
+                required: nextHandoffs.required,
+                reasons: nextHandoffs.reasons,
+              },
+              missing: nextHandoffs.missing,
+              reasons: nextHandoffs.reasons,
+              passedCount: passedTasks.length,
+            }
+          }
+
           if (!finalReport || typeof finalReport !== "object" || typeof finalReport.status !== "string") {
             if (state.phase !== "FINAL_VERIFICATION") {
               state.phase = "FINAL_VERIFICATION"
@@ -5383,7 +5543,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     editor.add({
       name: "handoff",
       description:
-        "Record the five-section handoff (Observation, Logic Chain, Caveats, Conclusion, Verification Method) for this agent. Writes <run>/handoffs/<taskId|_run>-<agent>.md and updates the bounded handoffs/index.json. Identity comes from the trusted calling session; task-scoped roles must name an existing task, while victory-auditor/sentinel/orchestrator record run-level handoffs. The handoff is narrative/citation only and never changes a gate verdict.",
+        "Record the five-section handoff (Observation, Logic Chain, Caveats, Conclusion, Verification Method) for this agent. Writes <run>/handoffs/<taskId|_run>-<agent>.md and updates the bounded handoffs/index.json. Identity comes from the trusted calling session; task-scoped roles must name an existing task, while victory-auditor/sentinel/orchestrator record run-level handoffs. When the plan records requireHandoffs: \"required\", final_verify/next require the derived matrix and reject missing/stale/tampered handoffs, but the prose is never parsed as a PASS/FAIL verdict.",
       input: {
         type: "object",
         properties: {
@@ -5950,7 +6110,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     editor.add({
       name: "final_verify",
       description:
-        "Compute and stamp the run's final verdict from artifacts. PASS requires every task to be verified_pass, every verify/report-<taskId>.json to be PASS, verify/security-audit.json to be PASS, and (unless the plan explicitly skipped it) a CONFIRMED independent victory audit bound to the current ORIGINAL_REQUEST.md. In strict mode it also requires verify/challenge-<taskId>.json (team/falsifier, PASS) and verify/audit-<taskId>.json (team/security-auditor, CLEAN) for every task, both bound by reportHash to the current verifier report, and writes GATE_STATUS.md. Writes verify/final.json atomically and appends a final_verification event. The verdict is computed from evidence and cannot be overridden by input.",
+        "Compute and stamp the run's final verdict from artifacts. PASS requires every task to be verified_pass, every verify/report-<taskId>.json to be PASS, verify/security-audit.json to be PASS, and (unless the plan explicitly skipped it) a CONFIRMED independent victory audit bound to the current ORIGINAL_REQUEST.md. In strict mode it also requires verify/challenge-<taskId>.json (team/falsifier, PASS) and verify/audit-<taskId>.json (team/security-auditor, CLEAN) for every task, both bound by reportHash to the current verifier report, and writes GATE_STATUS.md. When requireHandoffs is required it also requires the continuity matrix (worker + verifier per task, falsifier + security-auditor per task in strict mode, one sentinel/orchestrator run-level, and the victory-auditor run-level handoff after a confirmed audit), rejecting missing/stale/duplicate/unknown/tampered handoffs without parsing their prose. Writes verify/final.json atomically and appends a final_verification event. The verdict is computed from evidence and cannot be overridden by input.",
       input: {
         type: "object",
         properties: {
@@ -6131,6 +6291,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             { auth, requireSigned },
           )
           if (!strictGate.skipped) reasons.push(...strictGate.reasons)
+
+          // Continuity handoffs are required (or explicitly skipped) by the
+          // plan baseline. The matrix is derived from plan/state; handoff prose
+          // is never read as a verdict.
+          const handoffGate = evaluateHandoffGateFor(run, plan, state)
+          if (!handoffGate.skipped) reasons.push(...handoffGate.reasons)
 
           let documentReviewEvidence:
             | { checked: boolean; segmentReportsComplete: boolean; finalReportPresent: boolean }
@@ -6389,6 +6555,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                   finalStatus: status,
                   gate: strictGate,
                   reasons: cappedReasons,
+                  handoffs: {
+                    mode: handoffGate.skipped ? "skip" : "required",
+                    status: handoffGate.status,
+                    entries: handoffGate.entries.map((e) => ({
+                      taskId: e.taskId,
+                      agent: e.agent,
+                      path: e.path,
+                      sha256: e.sha256,
+                    })),
+                  },
                 }),
               )
             } catch (err: any) {
@@ -6404,6 +6580,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                     finalStatus: "FAIL",
                     gate: strictGate,
                     reasons: cappedReasons,
+                    handoffs: {
+                      mode: handoffGate.skipped ? "skip" : "required",
+                      status: handoffGate.status,
+                      entries: handoffGate.entries.map((e) => ({
+                        taskId: e.taskId,
+                        agent: e.agent,
+                        path: e.path,
+                        sha256: e.sha256,
+                      })),
+                    },
                   }),
                 )
               } catch {}
@@ -6421,6 +6607,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             generatedAt: new Date().toISOString(),
             integrityMode: integrity.mode,
             victory: victoryRecord,
+            handoffs: handoffGate.skipped ? "SKIPPED (explicit)" : handoffGate.status,
             requirementsHash: currentRequirementsHash(run),
             evidence: {
               tasks,
@@ -6443,6 +6630,15 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               ...(documentReviewEvidence ? { documentReview: documentReviewEvidence } : {}),
               ...(lemmaEvidence ? { lemma: lemmaEvidence } : {}),
               ...(tournamentEvidence ? { tournament: tournamentEvidence } : {}),
+              handoffs: handoffGate.skipped
+                ? { mode: "skip", status: "SKIPPED", required: [], entries: [], reasons: [] }
+                : {
+                    mode: "required",
+                    status: handoffGate.status,
+                    required: handoffGate.required,
+                    entries: handoffGate.entries,
+                    reasons: handoffGate.reasons,
+                  },
               ...(verificationMode === "strict"
                 ? {
                     strict: {
@@ -6510,7 +6706,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             integrity.source === "artifact"
               ? `Integrity mode: ${integrity.mode} (from ORIGINAL_REQUEST.md).`
               : `Integrity mode: ${integrity.mode} (default applied; no ORIGINAL_REQUEST.md for this run).`
-          const evidenceLine = `Evidence: ${tasks.length} task(s), allTasksVerifiedPass=${allTasksVerifiedPass}, security audit ${securityAudit.status}, ${verificationMode === "strict" ? `strict wave ${strictGate.status}, ` : ""}${describeVictoryGate(victoryGate)}`
+          const evidenceLine = `Evidence: ${tasks.length} task(s), allTasksVerifiedPass=${allTasksVerifiedPass}, security audit ${securityAudit.status}, ${verificationMode === "strict" ? `strict wave ${strictGate.status}, ` : ""}handoffs ${handoffGate.skipped ? "SKIPPED (explicit)" : handoffGate.status}, ${describeVictoryGate(victoryGate)}`
 
           if (status === "FAIL") {
             return {
@@ -6519,6 +6715,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               finalReport: finalFile,
               integrityMode: integrity.mode,
               victory: victoryRecord,
+              handoffs: handoffGate.skipped ? "SKIPPED (explicit)" : handoffGate.status,
               ...(legacyUnsignedBlock ? { auth: "AUTH_LEGACY" } : {}),
               ...(verificationMode === "strict" ? { strictGate: strictGate.status, strictMissing: strictGate.missing } : {}),
               reasons: cappedReasons,
@@ -6531,6 +6728,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             finalReport: finalFile,
             integrityMode: integrity.mode,
             victory: victoryRecord,
+            handoffs: handoffGate.skipped ? "SKIPPED (explicit)" : handoffGate.status,
             ...(verificationMode === "strict" ? { strictGate: strictGate.status } : {}),
           }
         })
