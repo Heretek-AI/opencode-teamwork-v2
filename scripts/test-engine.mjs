@@ -2226,6 +2226,47 @@ try {
 
   console.log("✓ waves cite hashed verify/ evidence; a changed/missing cite is STALE and a legacy wave warns")
 
+  console.log("Testing verifier → worker handoff citation...")
+
+  const verifierChainRun = "20261018-000000-ev-handoff-chain"
+  await seedVerifiedRun(verifierChainRun, ["H1"], {
+    request: "Deliver the verifier-chain fixture.",
+    victoryAudit: "skip",
+    victorySkipReason: "fixture: verifier-chain test does not run the victory gate",
+    stampVictory: false,
+  })
+  const verifierIndex = JSON.parse(
+    readFileSync(join(testDir, ".opencode", "teamwork", verifierChainRun, "handoffs", "index.json"), "utf8"),
+  )
+  const verifierEntry = verifierIndex.entries.find((e) => e.taskId === "H1" && e.agent === "team/verifier")
+  assert(verifierEntry, "the fixture must record a verifier handoff")
+  const verifierCitePaths = verifierEntry.cites.map((c) => c.path)
+  assert(verifierCitePaths.includes("verify/report-H1.json"), `the verifier must cite its report: ${verifierCitePaths}`)
+  assert(verifierCitePaths.includes("handoffs/H1-worker.md"), `the verifier must cite the worker handoff: ${verifierCitePaths}`)
+  const chainFirst = await registeredTools.final_verify.execute({ sessionId: verifierChainRun })
+  assert.strictEqual(chainFirst.status, "PASS", `the verifier chain must PASS: ${chainFirst.content}`)
+
+  // Re-recording the worker handoff changes its bytes → the verifier handoff is stale.
+  await recordHandoffFor(registeredTools, verifierChainRun, {
+    agent: "team/worker",
+    taskId: "H1",
+    conclusion: "The worker rewrote its narrative after the verifier handoff.",
+  })
+  const chainStale = await registeredTools.final_verify.execute({ sessionId: verifierChainRun })
+  assert.strictEqual(chainStale.status, "FAIL", "a changed worker handoff must stale the verifier handoff")
+  assert(
+    chainStale.reasons.some((r) => r.includes("handoffs/H1-verifier.md is stale: handoffs/H1-worker.md changed")),
+    `the verifier→worker staleness must be named: ${JSON.stringify(chainStale.reasons)}`,
+  )
+  const chainNext = await registeredTools.next.execute({ sessionId: verifierChainRun })
+  assert.strictEqual(chainNext.status, "BLOCKED_BY_HANDOFFS", `next must explain the stale chain: ${chainNext.content}`)
+  assert(
+    chainNext.reasons.some((r) => r.includes("H1-verifier.md is stale") && r.includes("H1-worker.md")),
+    `next must name why the verifier handoff is stale: ${JSON.stringify(chainNext.reasons)}`,
+  )
+
+  console.log("✓ a verifier handoff cites worker + report; a changed worker handoff makes it stale")
+
   // ==========================================
   // Part 1c-ter-strict: opt-in strict verification wave
   // ==========================================

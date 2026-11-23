@@ -58,7 +58,9 @@ const CONTROL_CHARS = /[\x00-\x09\x0b-\x1f\x7f-\x9f\u2028\u2029]/g
 const AGENT_SLUG = /^[a-z][a-z0-9-]{0,31}$/
 const SHA256_HEX = /^[0-9a-f]{64}$/
 const RUN_HANDOFF_PATH = /^handoffs\/[A-Za-z0-9._-]+\.md$/
-const CITE_PATH = /^verify\/[A-Za-z0-9._-]+\.json$/
+// A handoff may cite a control-plane verdict (verify/*.json) or, for a
+// verifier handoff, the worker handoff it follows (handoffs/*.md, 0.12.0).
+const CITE_PATH = /^(?:verify\/[A-Za-z0-9._-]+\.json|handoffs\/[A-Za-z0-9._-]+\.md)$/
 
 export const TASK_SCOPED_HANDOFF_ROLES = [
   "team/worker",
@@ -280,6 +282,18 @@ function collectCites(run: string, agent: string, taskId?: string): HandoffCite[
   if (rel) {
     const res = readBoundedRunFile(run, join(run, rel), 8 * 1024 * 1024)
     if (res.status === "ok") cites.push({ path: rel, sha256: sha256Hex(res.text) })
+  }
+  // 0.12.0: a verifier handoff also cites the worker handoff it follows, so a
+  // re-recorded worker narrative stales the verifier handoff (verifier →
+  // worker → report). The assigned agent comes from plan.dag.json, never input.
+  if (agent === "team/verifier" && taskId) {
+    const worker = assignedWorkerAgent(run, taskId)
+    const workerSlug = handoffAgentSlug(worker)
+    if (workerSlug) {
+      const workerRel = handoffRelativePath(taskId, workerSlug)
+      const res = readBoundedRunFile(run, join(run, workerRel), MAX_HANDOFF_MARKDOWN_READ)
+      if (res.status === "ok") cites.push({ path: workerRel, sha256: sha256Hex(res.text) })
+    }
   }
   return cites
 }
