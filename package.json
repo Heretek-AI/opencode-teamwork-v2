@@ -1,6 +1,6 @@
 {
   "name": "@heretek-ai/opencode-teamwork-v2",
-  "version": "0.10.2",
+  "version": "0.11.0",
   "description": "Antigravity-style multi-agent orchestration for OpenCode V2 — 15 agents, 7 commands, interactive model assignment on install.",
   "keywords": [
     "opencode",
@@ -55,8 +55,9 @@
     "test:safe-fs-write": "node ./scripts/test-safe-fs-write.mjs",
     "test:export": "node ./scripts/test-export.mjs",
     "test:auth": "node ./scripts/test-auth.mjs",
+    "test:approval": "node ./scripts/test-approval.mjs",
     "test:security": "node ./scripts/test-security.mjs",
-    "test": "npm run lint:prompts && npm run lint:security && npm run test:cost && npm run test:engine && npm run test:doctor && npm run test:timeline && npm run test:safe-fs && npm run test:safe-fs-write && npm run test:export && npm run test:auth && npm run test:security",
+    "test": "npm run lint:prompts && npm run lint:security && npm run test:cost && npm run test:engine && npm run test:doctor && npm run test:timeline && npm run test:safe-fs && npm run test:safe-fs-write && npm run test:export && npm run test:auth && npm run test:approval && npm run test:security",
     "init": "node ./bin/opencode-teamwork.mjs init",
     "models": "node ./bin/opencode-teamwork.mjs models",
     "status": "node ./bin/opencode-teamwork.mjs status",
