@@ -21,7 +21,7 @@ import {
 import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
 import { renderGateStatus } from "../plugins/opencode-teamwork/strict.ts"
 import { assertSafeUrl, blockedAddressReason } from "../plugins/opencode-teamwork/url-guard.ts"
-import { refreshRunBriefing, MAX_BRIEFING_BYTES, refreshAgentBriefing, agentBriefingRelativePath, MAX_AGENT_BRIEFING_DIRS } from "../plugins/opencode-teamwork/briefing.ts"
+import { refreshRunBriefing, MAX_BRIEFING_BYTES, refreshAgentBriefing, readAgentBriefingExcerpt, agentBriefingRelativePath, MAX_AGENT_BRIEFING_DIRS } from "../plugins/opencode-teamwork/briefing.ts"
 import { writeHandoff, MAX_HANDOFF_ENTRIES, MAX_HANDOFF_INDEX_BYTES, HANDOFF_SECTION_LABELS } from "../plugins/opencode-teamwork/handoff.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import {
@@ -8020,8 +8020,11 @@ process.exit(0);
       const event = { agent: "team/worker", sessionID: agentSession, system: [] }
       await contextHook(event)
       const agentFile = join(briefRun, rel)
-      assert(existsSync(agentFile), "the context hook must write the per-agent briefing")
-      let agentText = readFileSync(agentFile, "utf8")
+      // Read through the module's bounded, no-follow context reader instead of
+      // re-opening the path directly after the hook's write.
+      const firstBrief = readAgentBriefingExcerpt(briefRun, "team/worker", agentSession)
+      assert(firstBrief, "the context hook must write the per-agent briefing")
+      let agentText = firstBrief.text
       assert(agentText.includes("- Agent: team/worker"), "per-agent Identity must name the agent")
       assert(agentText.includes(`- Agent session: ${agentSession}`), "per-agent Identity must name the agent session")
       assert(agentText.includes(`- Run session: ${sid}`), "per-agent Identity must name the run session")
@@ -8039,7 +8042,9 @@ process.exit(0);
       await briefTools.task_update.execute({ sessionId: sid, taskId: "T1", status: "worker_active" })
       const refreshed = refreshAgentBriefing(briefRun, "team/worker", agentSession)
       assert.strictEqual(refreshed.changed, true, "a newer state.json must refresh the per-agent briefing")
-      agentText = readFileSync(agentFile, "utf8")
+      const refreshedBrief = readAgentBriefingExcerpt(briefRun, "team/worker", agentSession)
+      assert(refreshedBrief, "the refreshed per-agent briefing must remain readable")
+      agentText = refreshedBrief.text
       assert(agentText.includes("- Tasks: 2 total — pending 1, active 1, verified_pass 0, failed 0, blocked 0"), `per-agent status must refresh: ${agentText}`)
 
       // Shared fallback for an unknown caller, and legacy equivalence.
@@ -8133,9 +8138,10 @@ process.exit(0);
         const hugeSession = "ses_huge_worker"
         const wrote = refreshAgentBriefing(hugeRun, "team/worker", hugeSession)
         assert.strictEqual(wrote.changed, true, "the large-mission per-agent briefing must be written")
-        const hugeRel = agentBriefingRelativePath("team/worker", hugeSession)
-        const hugeText = readFileSync(join(hugeRun, hugeRel), "utf8")
-        assert(Buffer.byteLength(hugeText, "utf8") <= MAX_BRIEFING_BYTES, "per-agent briefing must stay within 16 KiB")
+        const hugeRead = readAgentBriefingExcerpt(hugeRun, "team/worker", hugeSession, MAX_BRIEFING_BYTES)
+        assert(hugeRead, "the per-agent briefing must be readable within the 16 KiB cap")
+        assert.strictEqual(hugeRead.truncated, false, "per-agent briefing must stay within 16 KiB")
+        assert(hugeRead.bytes <= MAX_BRIEFING_BYTES, "per-agent briefing must stay within 16 KiB")
         const hugeDesc = describeRun(hugeRoot, { runId: hugeSid, sessionID: hugeSession, agent: "team/worker" })
         assert(hugeDesc.includes("agent briefing"), "describeRun must mark the per-agent excerpt")
         assert(hugeDesc.includes("truncated at 4096 bytes"), "describeRun must add the truncation note")
