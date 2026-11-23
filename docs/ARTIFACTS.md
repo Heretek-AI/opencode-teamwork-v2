@@ -44,6 +44,7 @@ Every run writes under one root:
 ├── verify/security-audit.json # pre-merge security gate report
 ├── verify/victory.json        # independent final acceptance verdict (team/victory-auditor)
 ├── verify/final.json          # stamped final verification verdict
+├── verify/evidence/<name>     # optional bounded evidence artifacts cited by wave verdicts (0.12.0)
 ├── GATE_STATUS.md             # strict mode: final verification gate table
 ├── lemma/                     # optional: LEMMA (Lean 4) formal-proof state when lemmaMode=true
 │   ├── manifest.json          # bounds, toolchain snapshot, phase, node index
@@ -1509,6 +1510,12 @@ to derived mode, with start and duration unknown.
   ],
   "evidence": "npm test tail + src/api.ts:42",
   "requirementsHash": "<sha256 of canonical requirements.json>",
+  "workerHandoff": {
+    "taskId": "R1-impl",
+    "agent": "team/worker",
+    "path": "handoffs/R1-impl-worker.md",
+    "sha256": "<sha256 of the worker handoff body>"
+  },
   "_auth": { "v": 1, "alg": "hmac-sha256", "keyId": "k_...", "path": "verify/report-R1-impl.json", "digest": "sha256", "mac": "sha256", "at": "ISO8601" }
 }
 ```
@@ -1518,6 +1525,16 @@ descend from the run's `rootSessionId`, and name a task that exists in
 `plan.dag.json`. A `PASS` needs a non-empty summary or at least one check. On a
 signed run the report is signed and indexed; `final_verify` requires that
 signature. A hand-written unsigned report is `AUTH_MISSING`.
+
+**Worker-handoff binding (0.12.0).** The engine fills `workerHandoff` from
+`plan.dag.json` and `handoffs/index.json` (never from caller input): the task's
+assigned agent (default `team/worker`), the indexed path, and the hash of the
+handoff body. When the plan records `requireHandoffs: "required"`, a `PASS`
+report is refused as `REPORT_HANDOFF_MISSING` when the handoff is absent and
+`REPORT_HANDOFF_STALE` when the indexed hash no longer matches the file.
+`final_verify` re-checks the binding; re-recording the worker handoff changes
+its body hash and makes the old report stale, so write the worker handoff before
+the report.
 
 ### `verify/challenge-<taskId>.json` (strict challenge verdict)
 
@@ -1531,6 +1548,7 @@ signature. A hand-written unsigned report is `AUTH_MISSING`.
   "agent": "team/falsifier",
   "agentSessionId": "ses_abc123",
   "reportHash": "<sha256 of verify/report-R1-impl.json>",
+  "cites": [{ "path": "verify/evidence/trace.txt", "sha256": "<sha256>", "bytes": 1234 }],
   "notes": "Tried empty input, overflow, TOCTOU; no fatal or serious flaw.",
   "evidence": "verify/report-R1-impl.json + src/api.ts:42",
   "generatedAt": "ISO8601",
@@ -1550,6 +1568,7 @@ signature. A hand-written unsigned report is `AUTH_MISSING`.
   "agent": "team/security-auditor",
   "agentSessionId": "ses_def456",
   "reportHash": "<sha256 of verify/report-R1-impl.json>",
+  "cites": [{ "path": "verify/evidence/audit.log", "sha256": "<sha256>", "bytes": 2048 }],
   "notes": "No Critical/High findings; no forbidden integrity rule.",
   "evidence": "npm test tail + git diff base..task",
   "generatedAt": "ISO8601",
@@ -1578,6 +1597,15 @@ verdict replaces it with the new hash. A missing hash is a named
 `strict challenge/audit <task>: reportHash missing or invalid` failure; a hash
 mismatch is a named `strict challenge/audit for <task> is stale (report changed
 since it was recorded)` failure. `GATE_STATUS.md` renders either row as `FAIL`.
+
+**Cited evidence (0.12.0).** A wave verdict may cite up to 16 paths inside
+`verify/` (a single control-plane file or a `verify/evidence/<name>` artifact).
+The engine hashes each file at record time and stores
+`cites: [{path, sha256, bytes}]`. `readWaveEvidence` re-hashes every cite: a
+missing, edited, or resized artifact makes the verdict `STALE` (the strict gate
+status becomes `STALE`, and `final_verify` reports `[AUTH_STALE]`). A
+pre-0.12.0 verdict with no `cites` still reads, but carries a
+`legacy_unbound_wave` warning in `final.json` and is never silently current.
 
 ### `verify/security-audit.json` (pre-merge security gate output)
 
@@ -1608,6 +1636,14 @@ since it was recorded)` failure. `GATE_STATUS.md` renders either row as `FAIL`.
       "forbiddenFrom": "benchmark"
     }
   ],
+  "ruleChecks": [
+    { "rule": "fabricated_output", "result": "clean" },
+    { "rule": "external_dependency_used", "result": "clean" }
+  ],
+  "reviewedDigests": {
+    "reports": { "R1-impl": "<sha256 of verify/report-R1-impl.json>" },
+    "final": null
+  },
   "_auth": { "v": 1, "alg": "hmac-sha256", "keyId": "k_...", "path": "verify/security-audit.json", "digest": "sha256", "mac": "sha256", "at": "ISO8601" }
 }
 ```
@@ -1625,6 +1661,14 @@ forbidden at the recorded mode; each entry also carries the rule's
 `forbiddenFrom` threshold (see [Integrity rules](#integrity-rules)). Any
 violation forces `status` to `FAIL`, independently of severity counts.
 
+**Coverage and reviewed digests (0.12.0).** The engine (not the caller) writes
+`ruleChecks` with exactly one entry for every rule forbidden at the run's
+integrity mode, plus `reviewedDigests {reports, final}` hashed from disk at
+audit time. A `PASS` is refused at `final_verify` if a forbidden rule is missing,
+appears twice, records a `violation`, or if a reviewed report changed
+(`AUTH_STALE`). `next` surfaces the same drift as `AUTH_STALE`. A
+`verify/final.json` written after the audit is not treated as a reviewed final.
+
 If `critical` > 0 or `high` > 0, `status` is forced to `FAIL` and `teamwork_next` blocks final merge (`BLOCKED_BY_SECURITY`).
 
 ### `verify/victory.json` (independent final acceptance verdict)
@@ -1638,6 +1682,11 @@ If `critical` > 0 or `high` > 0, `status` is forced to `FAIL` and `teamwork_next
   "auditorSessionId": "ses_abc123",
   "requestHash": "<sha256 of ORIGINAL_REQUEST.md>",
   "requirementsHash": "<sha256 of canonical requirements.json>",
+  "evidenceDigests": {
+    "reports": { "R1": "<sha256 of verify/report-R1.json>" },
+    "securityAudit": "<sha256 of verify/security-audit.json>",
+    "final": null
+  },
   "requirements": [
     { "id": "R1", "met": true, "evidence": "npm test tail + src/api.ts:42" }
   ],
@@ -1662,6 +1711,14 @@ On a signed run the verdict is signed and indexed. `final_verify`/`next` fail
 with `AUTH_MISSING` (no envelope), `AUTH_INVALID` (edited field), `AUTH_UNKNOWN_KEY`,
 `AUTH_INDEX_MISSING` (copied from another run), or `AUTH_STALE` (requirements
 baseline changed) rather than trusting it.
+
+**Reviewed evidence (0.12.0).** The tool also records `evidenceDigests`
+computed from disk: the sha256 of every `verify/report-<taskId>.json` present,
+the security audit, and a pre-existing `PASS` final. `CONFIRMED` with an empty
+`reports` map is refused. The gate recomputes the set; any drift is `AUTH_STALE`
+and `next` returns status `AUTH_STALE`. A legacy verdict without
+`evidenceDigests` is stale (never silently current). The verdict is still an
+audit input: PASS/FAIL is recomputed from task/report/audit semantics.
 
 ### `verify/final.json` (final verification verdict)
 
@@ -1723,6 +1780,9 @@ baseline changed) rather than trusting it.
     }
   },
   "reasons": [],
+  "contradictions": [
+    { "code": "INCONSISTENT_AUDIT_HIGH", "detail": "security audit reports PASS with 1 High finding" }
+  ],
   "summary": "Independent final check passed.",
   "findings": [
     { "where": "src/api.ts:42", "why": "...", "fix": "..." }
@@ -1758,8 +1818,11 @@ required) a `team/victory-auditor` run-level handoff recorded after the audit.
 Each required entry must exist once in `handoffs/index.json`, name a regular
 non-symlink markdown file whose sha256/byte length match the index, carry the
 canonical header for that task/agent, and cite the current report/challenge/
-audit/victory where the role has one. A changed cited artifact makes the
-handoff **stale**; duplicate, unknown, or mismatched index entries fail. The
+audit/victory where the role has one. A verifier handoff additionally cites
+`handoffs/<taskId>-<worker>.md` (0.12.0), so a re-recorded worker narrative
+makes the verifier handoff stale (`verifier → worker → report`). A changed
+cited artifact makes the handoff **stale**; duplicate, unknown, or mismatched
+index entries fail. The
 gate result is recorded as `handoffs` and under `evidence.handoffs` (path,
 sha256, agent, task). A plan that recorded `requireHandoffs: "skip"` does not
 read the index and records `handoffs: "SKIPPED (explicit)"` instead.
@@ -1784,6 +1847,15 @@ session id (or the run id when no caller session is available). `generatedAt` is
 the write time. `integrityMode` is read from `ORIGINAL_REQUEST.md` and defaults
 to `development`. `summary` and `findings` are optional (the verifier's prose and
 up to 50 `{where, why, fix}` entries).
+
+**Contradictions (0.12.0).** `final_verify` and `next` name four cross-artifact
+conflicts instead of silently passing them: `INCONSISTENT_VICTORY_TASK`
+(CONFIRMED over a failing task), `INCONSISTENT_REPORT_BRANCH` (a PASS report's
+`headSha`/`diffHash` no longer matches the verified branch),
+`INCONSISTENT_AUDIT_HIGH` (a PASS audit with a High/Critical finding), and
+`INCONSISTENT_WAVE_REPORT` (a wave bound to the current hash of a FAIL report).
+`final_verify` writes `contradictions` and FAILs; `next` returns
+`INCONSISTENT_EVIDENCE` before any readiness path. Nothing is auto-fixed.
 
 **Stamped requirement.** `teamwork_next` treats a report as *stamped* only when
 it has a non-empty `generatedBy` object containing a non-empty `session`, a
@@ -1827,6 +1899,20 @@ predate `teamwork_final_verify`; every new run should complete through a stamped
 verdict. `FINAL_VERIFICATION_UNVERIFIED` results carry `finalReport`,
 `passedCount` and `integrityMode`, and the message names both remedies (run the
 tool, or re-call with the bypass).
+
+### `verify/evidence/<name>` (optional bounded evidence artifact, 0.12.0)
+
+Written only by `teamwork_evidence` through the pinned run writer. `name` is one
+safe segment (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`), the file is at most 64 KiB,
+and a run holds at most 32 of them. The tool returns:
+
+```json
+{ "path": "verify/evidence/trace.txt", "sha256": "<plain sha256>", "bytes": 1234 }
+```
+
+Cite the path from `teamwork_wave_record`; the strict gate re-hashes the file
+and FAILs if it is missing, resized, or edited. This records bytes, not a
+verdict.
 
 ### `GATE_STATUS.md` (strict verification gate table)
 

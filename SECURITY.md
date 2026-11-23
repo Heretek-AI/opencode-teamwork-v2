@@ -6,7 +6,9 @@ protect, and how to choose a trust level. The implementation decisions are in
 [ADR 0006](docs/adr/0006-artifact-trust-isolation.md) and
 [ADR 0008](docs/adr/0008-signer-spi-and-trust-levels.md). Handoff provenance is
 a sibling extension of ADR 0005, specified in
-[ADR 0007](docs/adr/0007-signed-handoff-provenance.md).
+[ADR 0007](docs/adr/0007-signed-handoff-provenance.md). Evidence binding and
+contradiction detection are specified in
+[ADR 0012](docs/adr/0012-evidence-binding-and-contradiction-detection.md).
 
 ## What is protected
 
@@ -37,6 +39,35 @@ does not need the private key, and does not need to trust the signer's claimed
 algorithm or key id: the envelope algorithm is fixed to `ed25519`, the key id is
 pinned by the manifest, and the signature is checked against the configured
 public key before the artifact is accepted.
+
+### Evidence binding: bytes, facts, observation
+
+0.12.0 makes each verdict name the evidence it reviewed and the gate recompute
+that relation from disk ([ADR 0012](docs/adr/0012-evidence-binding-and-contradiction-detection.md)):
+
+- **Bytes.** A victory binds `evidenceDigests {reports, securityAudit, final}`;
+  a verifier report binds the worker handoff body (`workerHandoff`); a security
+  audit binds its `reviewedDigests` and its `ruleChecks`; a wave binds cited
+  `verify/` files; `verify/evidence/<name>` artifacts are bounded (64 KiB, 32
+  per run) and re-hashed. Editing, deleting, resizing, or swapping any of those
+  makes the dependent verdict `AUTH_STALE`/`STALE`.
+- **Facts.** The engine derives the relations from `plan.dag.json`,
+  `handoffs/index.json`, and the files themselves — coverage of every rule
+  forbidden at the run's integrity mode, the verifier → worker → report chain,
+  and four cross-artifact contradictions
+  (`INCONSISTENT_VICTORY_TASK`, `INCONSISTENT_REPORT_BRANCH`,
+  `INCONSISTENT_AUDIT_HIGH`, `INCONSISTENT_WAVE_REPORT`). These can make a run
+  fail; they cannot make a dishonest claim true.
+- **Observation.** The reviewer's judgment (a requirement is met, a rule is
+  clean) is recorded, not proven. The engine never parses prose as PASS/FAIL.
+
+> a same-UID writer can still author false content; the engine guarantees the
+> false claim is specific, signed, path-bound and digest-chained, so a
+> privileged verifier can falsify it.
+
+That sentence is the whole claim. Binding makes a lie **specific and
+falsifiable**; it does not detect a false statement at creation, prove that a
+reviewer read the artifact, or replace re-execution.
 
 ## What is not protected
 
