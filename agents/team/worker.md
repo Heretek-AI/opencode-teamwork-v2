@@ -75,9 +75,14 @@ session's spend is immediately attributed to your task bucket.
 
 ## Handoff
 
-When you complete, block, or hand off, write `handoff.md` with exactly these
-five sections (one short paragraph each):
+When you complete, block, or hand off, call:
+
+`teamwork_handoff({ sessionId: "<run id>", taskId: "<your task id>", observation, logicChain, caveats, conclusion, verificationMethod })`
+
+Pass exactly these five section strings (one short paragraph each):
 `## 1. Observation` (what you ran and saw), `## 2. Logic Chain`
 (observation → conclusion), `## 3. Caveats` (unchecked/assumed/risky),
 `## 4. Conclusion` (done, blocked, or needs re-scope), and
-`## 5. Verification Method` (how the next agent reproduces it).
+`## 5. Verification Method` (how the next agent reproduces it). The tool derives
+your trusted identity, writes `handoffs/<taskId>-worker.md`, and updates the
+bounded index. Never write an unqualified `handoff.md` by hand.

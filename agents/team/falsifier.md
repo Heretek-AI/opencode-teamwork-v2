@@ -100,11 +100,17 @@ another round. You remain read-only: no `edit`, no `shell`.
 
 ## Handoff
 
-If you complete, block, or hand off, write `handoff.md` with exactly these five
-sections: `## 1. Observation` (attack classes tried and what happened),
-`## 2. Logic Chain` (evidence → challenge verdict), `## 3. Caveats` (what you
-could not test), `## 4. Conclusion` (PASS, fatal flaw, or blocked), and
-`## 5. Verification Method` (how to reproduce the attack or the PASS).
+If you complete, block, or hand off, call:
+
+`teamwork_handoff({ sessionId: "<run id>", taskId: "<task id>", observation, logicChain, caveats, conclusion, verificationMethod })`
+
+Pass exactly these five section strings: `## 1. Observation` (attack classes
+tried and what happened), `## 2. Logic Chain` (evidence → challenge verdict),
+`## 3. Caveats` (what you could not test), `## 4. Conclusion` (PASS, fatal flaw,
+or blocked), and `## 5. Verification Method` (how to reproduce the attack or the
+PASS). Your `edit`/`shell` denial does not block this: `teamwork_handoff` is a
+trusted tool and writes the run-scoped file for you. Never write an unqualified
+`handoff.md` by hand.
 
 ## Anti-patterns
 

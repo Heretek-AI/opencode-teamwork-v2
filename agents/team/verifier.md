@@ -101,11 +101,16 @@ write those files and must not call that tool. Standard runs are unchanged.
 
 ## Handoff
 
-If you complete, block, or hand off, write `handoff.md` with exactly these five
-sections: `## 1. Observation` (commands run and outputs seen), `## 2. Logic Chain`
-(observation → verdict), `## 3. Caveats` (unchecked/assumed/risky),
-`## 4. Conclusion` (PASS, FAIL, or blocked), and `## 5. Verification Method`
-(how to reproduce the verdict). Keep it evidence-first and short.
+If you complete, block, or hand off, call:
+
+`teamwork_handoff({ sessionId: "<run id>", taskId: "<task id>", observation, logicChain, caveats, conclusion, verificationMethod })`
+
+Pass exactly these five section strings: `## 1. Observation` (commands run and
+outputs seen), `## 2. Logic Chain` (observation → verdict), `## 3. Caveats`
+(unchecked/assumed/risky), `## 4. Conclusion` (PASS, FAIL, or blocked), and
+`## 5. Verification Method` (how to reproduce the verdict). Keep it
+evidence-first and short. The tool derives your trusted identity and writes
+`handoffs/<taskId>-verifier.md`; never write an unqualified `handoff.md` by hand.
 
 ## Hard rules
 

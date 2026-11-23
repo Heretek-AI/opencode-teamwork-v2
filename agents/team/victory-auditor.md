@@ -69,12 +69,17 @@ denied). `webfetch` is denied; work from the local artifacts and the repository.
 
 ## Handoff
 
-After recording the verdict, write `handoff.md` with exactly these five sections:
-`## 1. Observation` (artifacts/tests inspected and observed results),
-`## 2. Logic Chain` (evidence → requirement outcomes → verdict),
-`## 3. Caveats` (unchecked requirements or assumptions), `## 4. Conclusion`
-(CONFIRMED, REJECTED, or blocked with the gap), and `## 5. Verification Method`
-(how to reproduce the audit). Never soften a rejection in the handoff.
+After recording the verdict, call:
+
+`teamwork_handoff({ sessionId: "<run id>", observation, logicChain, caveats, conclusion, verificationMethod })`
+
+The victory audit is run-level: omit `taskId` (or pass `_run`). Pass exactly
+these five section strings: `## 1. Observation` (artifacts/tests inspected and
+observed results), `## 2. Logic Chain` (evidence → requirement outcomes →
+verdict), `## 3. Caveats` (unchecked requirements or assumptions),
+`## 4. Conclusion` (CONFIRMED, REJECTED, or blocked with the gap), and
+`## 5. Verification Method` (how to reproduce the audit). Never soften a
+rejection in the handoff, and never write an unqualified `handoff.md` by hand.
 
 ## Hard rules
 

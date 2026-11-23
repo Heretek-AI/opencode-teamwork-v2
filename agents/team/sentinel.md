@@ -78,6 +78,7 @@ AD
    - Dispatch verifier subagent with `agent: "team/verifier"` in read-only mode (never `"general"`).
    - The verifier produces `verify/report-<task>.json`.
    - **Strict mode only (`plan.dag.json` has `verification: "strict"`):** once that report is `PASS`, dispatch one `team/falsifier` (`kind: "challenge"`, verdict `PASS`) and one `team/security-auditor` (`kind: "audit"`, verdict `CLEAN`) in parallel for the task. Each calls `teamwork_wave_record`; the trusted session identity authorizes the call, so never pass an agent override. This is exactly one challenge + one audit per task — the wave scales by adding tasks and iterations, never by hardcoding extra fixed rows. Standard runs skip this step unchanged.
+    - **Every dispatch:** include the run id (`SESSION_ID`) and task id in the prompt, and require the agent to call `teamwork_handoff({ sessionId: SESSION_ID, taskId, observation, logicChain, caveats, conclusion, verificationMethod })` before it reports back. Read `handoffs/<taskId>-<role>.md` (or the index) instead of replaying the child session.
    - On verifier report, attribute its spend: `teamwork_cost({ taskId })`.
    - Update task status with verification results:
      `teamwork_task_update({ taskId, status: "verified_pass" | "verified_fail", verification: { status, passedChecks, totalChecks, fatalFindings }, feedback, agent: "team/verifier" })`.

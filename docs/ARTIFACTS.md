@@ -19,7 +19,9 @@ Every run writes under one root:
 ├── state.json               # resumable coordinator state
 ├── costs.json               # coordinator-maintained budget tracker
 ├── BRIEFING.md              # shared run briefing: mission, identity, constraints, status, artifacts, succession
-├── handoff.md               # five-section agent handoff (completion, block, or handoff)
+├── handoffs/                # canonical agent handoffs: <taskId|_run>-<agent>.md + index.json
+├── agents/                  # per-agent briefings: <agentSlug>-<sha256(sessionID)[0:32]>/BRIEFING.md
+├── handoff.md               # legacy unqualified handoff (read-only; new writes go through teamwork_handoff)
 ├── events.jsonl             # append-only lifecycle event log (JSON Lines)
 ├── pitfalls.md              # answer-agnostic failure registry
 ├── document-review/         # present for document-review runs
@@ -442,13 +444,32 @@ refresh never fails the primary tool call; it is recorded as a
 explicitly marked as the run briefing and truncated when longer. Legacy runs
 without a briefing behave exactly as before.
 
-### `handoff.md` — five-section agent handoff
+### `handoffs/` — canonical five-section agent handoffs
 
-Required whenever an agent **completes, blocks, or hands off**. The next agent
-(or the Sentinel) reads it instead of replaying the session, so it must stand on
-its own and use exactly these five sections:
+Written only through `teamwork_handoff`. A handoff is the narrative record one
+agent leaves for the next one, and it always stands on its own. The path is
+derived from the trusted caller and the scope — never supplied by the agent:
+
+| Caller role | Scope | Artifact |
+| --- | --- | --- |
+| `team/worker`, `team/proof-worker`, `team/verifier`, `team/falsifier` | task (`taskId` required, must exist in plan/state) | `<run>/handoffs/<taskId>-<role>.md` |
+| `team/security-auditor` | task (strict per-task audit) or run-level (pre-merge audit) | `handoffs/<taskId>-security-auditor.md` / `handoffs/_run-security-auditor.md` |
+| `team/victory-auditor`, `team/sentinel`, `team/orchestrator` | run-level only (`taskId` omitted or `_run`) | `<run>/handoffs/_run-<role>.md` |
+
+The tool has no `agent` input: it uses `deriveCallerAgent` plus descent from the
+plan-time `rootSessionId`. Every handoff has exactly these five headings:
 
 ```markdown
+# HANDOFF — <taskId|_run> — team/<role>
+
+- Run: <run id>
+- Agent: team/<role>
+- Agent session: <OpenCode session id>
+- Task: <taskId|_run (run-level)>
+- Round: <n>
+- Generated: <ISO 8601>
+- Citations: <path (sha256 …) | none>
+
 ## 1. Observation
 What you actually saw and ran: concrete paths, commands, outputs, diffs, failures.
 
@@ -465,7 +486,88 @@ The decision or run state the next agent must act on (done, blocked, needs re-sc
 How to reproduce or independently check the conclusion: the exact command, test, or artifact.
 ```
 
-Keep it short and evidence-first; never assert a PASS you did not observe.
+Every section is required and non-empty after sanitisation. Control characters
+are stripped and line-leading ATX headings are defused, so a section body cannot
+forge another section. Caps are **2 KiB per section** and **8 KiB for the five
+bodies**; oversize is refused, never silently truncated. Writes are atomic
+(`O_EXCL` temp + rename), refuse symlinks/FIFOs, and stay inside the run dir.
+
+`cites` is derived from the caller role when the artifact exists, and is a
+citation only — it is never read as a verdict:
+
+| Role | Cited artifact |
+| --- | --- |
+| verifier (task) | `verify/report-<taskId>.json` |
+| falsifier (task) | `verify/challenge-<taskId>.json` |
+| security-auditor (task) | `verify/audit-<taskId>.json` |
+| security-auditor (run-level) | `verify/security-audit.json` |
+| victory-auditor (run-level) | `verify/victory.json` |
+
+`handoffs/index.json` is the bounded index, serialised through the same
+process-wide file lock as the cost/state writers. It keeps one latest entry per
+`(taskId, agent)` (a rewrite replaces in place), at most **200 entries** and
+**256 KiB**, with run-relative paths only:
+
+```json
+{
+  "version": 1,
+  "sessionId": "20260112-101500-a1b2",
+  "updatedAt": "2026-01-12T10:20:00.000Z",
+  "entries": [
+    {
+      "taskId": "T1",
+      "agent": "team/worker",
+      "agentSessionId": "ses_…",
+      "round": 2,
+      "path": "handoffs/T1-worker.md",
+      "sha256": "<64 hex of the exact file bytes>",
+      "bytes": 1234,
+      "generatedAt": "2026-01-12T10:20:00.000Z",
+      "cites": [{ "path": "verify/report-T1.json", "sha256": "<64 hex>" }]
+    }
+  ]
+}
+```
+
+`teamwork_handoff` appends a `handoff_recorded` event. Handoffs are continuity
+and citation records: `teamwork_final_verify` and `teamwork_next` do not read
+them, so recording one can never turn a failing run into `PASS`.
+
+### `agents/` — per-agent briefings
+
+The `session.context` hook writes a per-agent copy of the shared briefing when
+the caller is known (`event.agent` + `event.sessionID`):
+
+```
+<run>/agents/<agentSlug>-<sha256(sessionID).slice(0,32)>/BRIEFING.md
+```
+
+The directory name must match `^[a-z][a-z0-9-]{0,31}-[0-9a-f]{32}$`; the raw
+OpenCode session id (up to 68 chars) is never used as a path. The file is built
+from the same briefing data as `BRIEFING.md`, with these extra Identity lines:
+
+```markdown
+## Identity
+- Session: 20260112-101500-a1b2
+- Agent: team/worker
+- Agent session: ses_…
+- Run session: 20260112-101500-a1b2
+- Topology: distributed-coding
+…
+```
+
+It is capped at **16 KiB**, written atomically with symlink/FIFO refusal, and
+refreshed lazily: a regular, non-symlink copy whose mtime is at least as new as
+`state.json`, `plan.dag.json`, and `costs.json` is left untouched. At most **64**
+correctly named real directories are kept (oldest pruned; symlinks and other
+entries are never touched). Any write/read failure is fail-open: the hook falls
+back to the shared briefing, and legacy runs without `agents/` behave exactly as
+before. `describeRun` marks the per-agent excerpt as an “agent briefing” and the
+shared one as a “run briefing”; both inject the first 4 KiB with a truncation
+note. `teamwork_plan` records `run-by-root/<root session id>` in `ctx.storage`;
+the hook walks the caller's bounded `parentID` chain to that root, then uses the
+mapping. An unresolvable mapping keeps the legacy newest-run behaviour.
+
 
 ### Engine Tools
 
@@ -479,6 +581,7 @@ The plugin provides deterministic orchestration tools for the Sentinel coordinat
 - `teamwork_report`: Trusted writer for `verify/report-<taskId>.json`. Only a session whose trusted agent resolves to `team/verifier` and that descends from the run's `rootSessionId` may call it; the task must exist in `plan.dag.json`, and a `PASS` needs a summary or at least one check. The report is signed for a signed run; `final_verify` requires that signature. A wrong agent, missing task, or evidence-free PASS is refused.
 - `teamwork_victory_audit`: Records the independent final acceptance verdict from `team/victory-auditor`. Only a trusted session whose agent resolves to `team/victory-auditor` **and that descends from the run's `rootSessionId`** may call it; there is no caller-supplied `agent` label. Every `requirements.json` id must appear exactly once, `met: true` needs non-empty evidence, and `VICTORY CONFIRMED` needs a current `ORIGINAL_REQUEST.md` (the verdict stores its sha256 and the `requirementsHash`). Writes signed `verify/victory.json`; a confirmed verdict is write-once.
 - `teamwork_wave_record`: Strict mode only. Records one wave verdict: `kind: "challenge"` / `verdict: "PASS"` may only be written by a trusted session whose agent resolves to `team/falsifier`; `kind: "audit"` / `verdict: "CLEAN"` only by `team/security-auditor`. There is no caller-supplied `agent` label. It refuses a task absent from `plan.dag.json`, a missing/non-PASS `verify/report-<taskId>.json`, any other verdict, and a repeat recording for the same report hash. It stores the sha256 of the exact report bytes (the gate requires a match) and writes `verify/challenge-<taskId>.json` or `verify/audit-<taskId>.json` atomically, then appends a `verification_wave` event. A changed report is the only overwrite path (the previous verdict is stale).
+- `teamwork_handoff`: Trusted writer for the canonical five-section handoff (`handoffs/<taskId|_run>-<role>.md`). The trusted session agent and run-root descent decide the role; there is no caller-supplied `agent`. Task-scoped roles must name an existing task, while `team/victory-auditor`, `team/sentinel`, and `team/orchestrator` record run-level handoffs (`taskId` omitted or `_run`). Every section is required and bounded (2 KiB/section, 8 KiB total), control characters are stripped and headings defused, and the bounded `handoffs/index.json` keeps one latest entry per `(taskId, agent)`. Citations to existing verifier/audit/victory artifacts are recorded, never treated as verdicts, so this tool never changes `final_verify`/`next` outcomes.
 - `teamwork_final_verify`: Computes the run's final verdict from the artifacts on disk — every task must be `verified_pass`, every `verify/report-<taskId>.json` must be `PASS`, `verify/security-audit.json` must be `PASS`, the victory audit must be `CONFIRMED` (unless explicitly skipped), and when `document-review/manifest.json` exists, every segment's `unit-report.md` and `DOCUMENT_REVIEW_REPORT.md` must exist as non-empty regular files. On a signed run each report, audit, wave verdict, and victory verdict must verify against `_auth` + the digest index, and the current plan/request/requirements/policy hashes must match `run.manifest.json` (`AUTH_STALE` on drift). In strict mode it also requires `verify/challenge-<taskId>.json` (`team/falsifier`, `PASS`) and `verify/audit-<taskId>.json` (`team/security-auditor`, `CLEAN`) for every task, then writes `GATE_STATUS.md`. It writes signed `verify/final.json` (including `requirementsHash`, per-report digests, and the audit digest) atomically and appends a `final_verification` event. The verdict is computed from evidence; no input can turn a failing run into `PASS` (a caller-supplied `failReason` can only force `FAIL`). An unsigned legacy run returns `AUTH_LEGACY` unless `allowUnsignedLegacy: true` is explicitly passed. See [`verify/final.json`](#verifyfinaljson-final-verification-verdict).
 - `teamwork_worktree`: Isolates git worktrees outside the project repo (`setup` for sentinel and worker), inspects branch diffs (`diff`), performs clean merges into `teamwork/base-$SESSION_ID` with automatic conflict abort (`merge`), and prunes worktrees (`cleanup`).
 - `teamwork_preflight`: Re-checks the inputs named by an existing run's `ORIGINAL_REQUEST.md` (plus optional `inputs`), writes `<run>/preflight.json`, and appends a `preflight` event. It never throws and never blocks; it reports.
