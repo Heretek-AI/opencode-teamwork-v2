@@ -1,6 +1,6 @@
 # Spike: One Shared Safe-FS Module for Bounded Reads and Contained Writes
 
-- **Status:** Proposed (research complete; no code written)
+- **Status:** Implemented for reads (ADR 0004) and Linux writes (ADR 0010)
 - **Date:** 2026-11-22
 - **Workstream:** Sprint 2, S4a
 - **Related:** `docs/adr/0004-intermediate-symlink-races.md`
@@ -204,7 +204,7 @@ export function writeFileAtomicWithin(run: string, target: string, content: stri
 - `readRegularBounded` always uses `O_NOFOLLOW | O_NONBLOCK` when available and the explicit `lstat` fallback when not. It performs `fstat`, the regular-file check, the size check, the bounded read, and the fail-closed error mapping.
 - `readWithinBounded` adds ADR 0004's post-open fd containment check where `/proc/self/fd` exists. It accepts a precomputed `runReal` so the caller does not re-resolve the root on every read. A bare `readRegularBounded(file, maxBytes)` call cannot enforce containment because it has no root; callers that need containment must use `readWithinBounded`.
 - `fdWithin` is exported for the deterministic unit test in ADR 0004 §5.5.
-- `writeFileAtomic` is the random-suffix `wx` + rename primitive. `writeFileAtomicWithin` adds `ensureSafeRunSubpath` and the run-directory mkdir. It does **not** claim to fix the write-path intermediate race; that remains an ADR 0004 follow-up.
+- `writeFileAtomic` is the random-suffix `wx` + rename primitive. `writeFileAtomicWithin` now pins the destination parent directory and performs the create/rename/lstat relative to `/proc/self/fd/<dirfd>` (ADR 0010), so it **does** close the write-path intermediate race on Linux. On macOS/Windows it falls back to the path-based atomic write plus a detective post-check.
 
 ### 5.3 Adapters
 
@@ -277,7 +277,7 @@ Use `fdWithin` from the shared module:
 
 1. **Layering.** `lib -> plugins` is unusual. If the team considers that unacceptable, fall back to option (b), not to `lib/safe-fs.mjs`. Document the leaf-module rule: `safe-fs.mjs` must never import `lib`, `bin`, or another plugin file.
 2. **Type declarations.** `safe-fs.d.mts` is a hand-maintained file. If it drifts from the `.mjs`, TypeScript users see the wrong API. Keep it small and add a type-only import test, or use JSDoc types in the `.mjs` and `// @ts-check`.
-3. **Write-path containment is not solved.** The shared writer unifies atomicity and removes the predictable `.tmp` path, but a raced intermediate directory can still redirect a write. That needs the same component-wise primitive as ADR 0004; do not let the shared module imply a guarantee it does not provide.
+3. **Write-path containment (resolved on Linux by ADR 0010).** The shared writer unifies atomicity, removes the predictable `.tmp` path, and pins the parent directory so a raced intermediate cannot redirect the write on Linux. Linux without procfs fails closed; macOS/Windows keep a detective post-check only. Do not imply the Linux guarantee on platforms that lack it.
 4. **`ensureSafeRunSubpath` duplication.** `tools.ts:1335-1361` and `tournament.ts:251-323` differ in traversal direction and error semantics. Unifying them is a separate, test-heavy change; the shared module should not silently replace one with the other.
 5. **Windows.** `O_NOFOLLOW`/`O_NONBLOCK` are unavailable; the shared module must keep the explicit `lstat` fallback from `tournament.ts:354-362`. The current `lib` readers use `?? 0` and would follow a symlink on Windows after the `lstat` pre-check; the shared module should standardize the fail-closed fallback.
 6. **macOS.** No `/proc/self/fd`; ADR 0004's post-open check is unavailable. The shared module should still centralize the existing checks and document the residual.
@@ -285,7 +285,7 @@ Use `fdWithin` from the shared module:
 
 ## 8. Recommendation Summary
 
-**Use one leaf module at `plugins/opencode-teamwork/safe-fs.mjs`, imported by the plugin TypeScript and by `lib`/`bin`, with per-caller adapters and a new `scripts/test-safe-fs.mjs` conformance/race suite; reject a `lib/safe-fs.mjs` placement because the documented manual install copies only `plugins/opencode-teamwork`.** This is Proposed; no code has been changed.
+**Use one leaf module at `plugins/opencode-teamwork/safe-fs.mjs`, imported by the plugin TypeScript and by `lib`/`bin`, with per-caller adapters and the `scripts/test-safe-fs.mjs` read suite plus `scripts/test-safe-fs-write.mjs`; reject a `lib/safe-fs.mjs` placement because the documented manual install copies only `plugins/opencode-teamwork`.** The read path and the Linux write path are implemented; macOS/Windows writes are detective-only.
 
 ## 9. References
 
