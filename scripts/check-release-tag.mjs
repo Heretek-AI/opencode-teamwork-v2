@@ -13,10 +13,14 @@
 // Refuses (exit 1) when the tag's commit is not an ancestor of origin/main.
 // Ignores refs that are not `v*` release tags (for example workflow_dispatch).
 
+import { existsSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 
+// Resolve git to an absolute path once; never fall back to PATH lookup.
+const GIT_BIN = ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"].find(existsSync) ?? "/usr/bin/git"
+
 function git(args) {
-  const res = spawnSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
+  const res = spawnSync(GIT_BIN, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
   return {
     ok: res.status === 0,
     stdout: String(res.stdout ?? "").trim(),
@@ -38,6 +42,19 @@ if (!tag.startsWith("v")) {
   process.exit(0)
 }
 
+// Strict allowlist before any git process starts: a release tag is one path
+// segment, so nothing argv/GITHUB_REF_NAME supplies reaches git as an option,
+// revision expression, or ref outside refs/tags/.
+const TAG_RE = /^v[0-9A-Za-z][0-9A-Za-z._-]{0,63}$/
+if (!TAG_RE.test(tag)) {
+  console.error(
+    "check-release-tag: refusing to publish: invalid release tag name " +
+      JSON.stringify(tag) +
+      " (expected v[0-9A-Za-z][0-9A-Za-z._-]{0,63}).",
+  )
+  process.exit(1)
+}
+
 // Fetch first so the check is against the current remote main, not a stale
 // local clone. Both fetches fail closed: without the refs we cannot prove
 // ancestry, so publishing must stop.
@@ -55,13 +72,13 @@ if (!fetchMain.ok) {
 }
 
 const tagRef = `refs/tags/${tag}`
-const tagCommit = git(["rev-parse", "--verify", "--quiet", `${tagRef}^{commit}`])
+const tagCommit = git(["rev-parse", "--verify", "--quiet", "--end-of-options", `${tagRef}^{commit}`])
 if (!tagCommit.ok) {
   console.error(`check-release-tag: refusing to publish: tag ${tag} does not exist (expected ${tagRef}).`)
   process.exit(1)
 }
 
-const ancestry = git(["merge-base", "--is-ancestor", tagCommit.stdout, "origin/main"])
+const ancestry = git(["merge-base", "--is-ancestor", "--", tagCommit.stdout, "origin/main"])
 if (!ancestry.ok) {
   console.error(
     [
