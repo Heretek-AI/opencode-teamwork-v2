@@ -6,9 +6,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-23
+
 ### Added
 
-- **Signed handoff index entries (0.9.0 workstream B, ADR 0007).**
+- **Ed25519 artifact envelopes and a signer SPI (ADR 0008).** `_auth` now
+  supports `alg: "ed25519"` alongside `hmac-sha256`; an Ed25519 envelope
+  (`{v, alg, keyId, path, digest, sig, nonce, at}`) signs
+  `teamwork-artifact-v1\0alg\0keyId\0path\0nonce\0canonicalJson(payload)` and
+  verifies with the SPKI public key alone, so a verifier never needs the secret.
+  Key-ring entries accept PKCS#8 and/or SPKI material, with
+  `OPENCODE_TEAMWORK_ED25519_PRIVATE_KEY` / `_PUBLIC_KEY` overrides, and HMAC
+  envelopes remain the default and stay verifiable.
+- **Per-run nonce and key-id pinning.** Each new signed run generates a 128-bit
+  `runNonce`, pinned with `runKeyId` in the signed `run.manifest.json` and in
+  storage, bound into every `_auth` and checked at verification. Cross-run
+  copies fail on nonce, path, and index; a rotated key that re-signs fails the
+  key-id equality.
+- **External signer adapter.** `OPENCODE_TEAMWORK_SIGNER=command:<absolute path>`
+  spawns the signer with fixed argv (no shell), sends a JSON request on stdin,
+  and accepts a JSON `{alg,keyId,sig,receipt?}` response only after verifying it
+  against the configured public key, with a timeout. Unavailable, malformed,
+  timed-out, or non-verifying signers fail closed as
+  `AUTH_SIGNER_UNAVAILABLE`; there is no silent HMAC fallback.
+- **Trust levels.** `teamwork_plan` accepts
+  `trustLevel: "local-hmac" | "external-signer" | "human-approved" |
+  "ci-attested"` (default `local-hmac`), persisted and re-plan locked.
+  `final_verify` refuses HMAC envelopes under `external-signer` and requires a
+  run-bound signed `approvals/<run>.json` for the approval levels.
+- **Optional witness receipts.** `OPENCODE_TEAMWORK_WITNESS=command:<path>` or
+  `http(s)://<url>` records `{runId, path, digest, keyId, nonce, at}` and returns
+  a receipt; `requireWitness` makes a missing receipt
+  `AUTH_WITNESS_UNAVAILABLE`. A local-file witness is detection-only.
+- **`doctor --security`.** Reports key source/alg, signer/witness config,
+  `ptrace_scope`, root-equivalent groups (`docker`/`wheel`/`libvirt`), database
+  mode, plugin/config writability, and SELinux, in text and
+  `doctor --json.security`.
+- **`SECURITY.md`, ADR 0008, and a security-claim lint.** The lint fails
+  "tamper-proof", "trusted signature", "safe against a local user", and "signed
+  by a trusted authority" in README/SECURITY/docs and runs in the test chain.
+- **Signed handoff index entries (ADR 0007).**
   `teamwork_handoff` now signs the `handoffs/index.json` entry, never the
   markdown: `_auth` covers `{kind:"teamwork.handoff", v:1, runId, runKeyId,
   taskId, agent, agentSessionId, round, path, sha256, bytes, generatedAt,
@@ -24,6 +61,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `BLOCKED_BY_HANDOFFS`, `evidence.handoffs` records `auth` + `keyId`, and strict
   `GATE_STATUS.md` shows an `Auth` column. Handoff prose is still never parsed,
   and a signed handoff still cannot flip a failing verdict.
+
+### Changed
+
+- A same-UID writer can still mint a valid envelope by reading the local key;
+  `doctor --security` now surfaces the postures (root-equivalent groups,
+  `ptrace_scope=0`) that make that practical. Public-key verification changes
+  what a *verifier* needs, not what a local shell can do; ADR 0008 and
+  `SECURITY.md` state the single-UID vs hardened-profile boundary.
 
 ## [0.8.0] - 2026-11-22
 
