@@ -1,0 +1,48 @@
+Parent Notice — Task-Interview Gate, 2026-11-23
+==============================================
+
+Assembled excerpt. The labelled blocks are verbatim transcript text after
+id/path normalisation; the "#" headers and notes between blocks are ours.
+Sources: the two parent transcripts and the two coordinator transcripts
+(step numbers in the bundle README).
+
+
+# 1. Coordinator → parent, default model (15:46:31Z)
+
+Your Teamwork run is being prepared. Before execution begins, we are putting together a short task interview to confirm the requirement details with you—the run will start once you review and approve the task prompt. Tip: Whenever you already have a ready-to-run prompt, you can start your request with `[skip-interview]` (right after the slash command, if using one) to jump straight to execution.
+
+Unless you answer interviews yourself, please pass this on to your user now, as written.
+
+
+# 2. Coordinator → parent, flash-low (15:59:09Z)
+
+Your Teamwork run is being prepared. Before execution begins, we are putting together a short task interview to confirm the requirement details with you—the run will start once you review and approve the task prompt. Tip: Whenever you already have a ready-to-run prompt, you can start your request with `[skip-interview]` (right after the slash command, if using one) to jump straight to execution.
+
+Note to caller: Unless you answer interviews yourself, please pass the message above on to your user now, as written.
+
+
+# 3. What the parent relayed to the user (both conversations)
+
+Your Teamwork run is being prepared. Before execution begins, we are putting together a short task interview to confirm the requirement details with you—the run will start once you review and approve the task prompt. Tip: Whenever you already have a ready-to-run prompt, you can start your request with `[skip-interview]` (right after the slash command, if using one) to jump straight to execution.
+
+[The caller note is absent from both user-facing replies. The coordinator's
+instruction to "pass this on ... as written" was applied to the notice only.]
+
+
+# 4. User turns that resumed each parent
+
+Default (15:51:58Z):
+I am ready to answer the interview questions. Please send them.
+
+flash-low (16:01:05Z):
+Please send me the interview questions now.
+
+
+# 5. Server-restart notice, shown at the start of each resumed turn
+
+[Notice] All your subagents and background tasks have been stopped due to server restart. If you want a subagent to continue working, it needs to be revived by sending it a new message. If resuming work, please check on status and restart as needed.
+
+
+# 6. Parent → coordinator revive request, flash-low (16:03:34Z)
+
+The server restarted while you were preparing the task interview. Please resume and send the interview questions now—the user is asking for them.
