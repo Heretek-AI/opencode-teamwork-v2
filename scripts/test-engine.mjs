@@ -2417,6 +2417,82 @@ try {
 
   console.log("✓ contradiction codes name victory/task, report/branch, audit/High, and wave/FAIL conflicts; clean sets pass")
 
+  console.log("Testing bounded evidence artifacts...")
+
+  const evRun = "20261018-000000-ev-artifact"
+  await seedVerifiedRun(evRun, ["E1"], {
+    request: "Deliver the evidence-artifact fixture.",
+    victoryAudit: "skip",
+    victorySkipReason: "fixture: evidence-artifact test does not run the victory gate",
+    verification: "strict",
+    stampVictory: false,
+  })
+  const evWrite = await registeredTools.evidence.execute(
+    { sessionId: evRun, name: "trace.txt", content: "hello evidence\n" },
+    { sessionID: "ses_fixture_verifier" },
+  )
+  assert.strictEqual(evWrite.path, "verify/evidence/trace.txt", evWrite.content)
+  assert.strictEqual(evWrite.sha256, citeSha256("hello evidence\n"), "the evidence digest must be plain sha256")
+  assert.strictEqual(evWrite.bytes, Buffer.byteLength("hello evidence\n", "utf8"))
+  assert(existsSync(join(testDir, ".opencode", "teamwork", evRun, "verify", "evidence", "trace.txt")))
+
+  const evOversize = await registeredTools.evidence.execute(
+    { sessionId: evRun, name: "big.txt", content: "x".repeat(64 * 1024 + 1) },
+    { sessionID: "ses_fixture_verifier" },
+  )
+  assert(evOversize.content.startsWith("refused:"), `oversize evidence must be refused: ${evOversize.content}`)
+  const evBadName = await registeredTools.evidence.execute(
+    { sessionId: evRun, name: "../escape", content: "x" },
+    { sessionID: "ses_fixture_verifier" },
+  )
+  assert(evBadName.content.startsWith("refused:"), `an unsafe evidence name must be refused: ${evBadName.content}`)
+
+  const evChallenge = await recordCitedWave(evRun, "E1", "challenge", "PASS", "team/falsifier", {
+    cites: ["verify/evidence/trace.txt"],
+  })
+  assert.strictEqual(evChallenge.verdict?.cites?.[0]?.path, "verify/evidence/trace.txt")
+  assert.strictEqual(evChallenge.verdict?.cites?.[0]?.bytes, 15, "the cite must record the artifact byte length")
+  await recordCitedWave(evRun, "E1", "audit", "CLEAN", "team/security-auditor", {
+    cites: ["verify/evidence/trace.txt"],
+  })
+  await seedStrictHandoffs(registeredTools, evRun, ["E1"])
+  const evPass = await registeredTools.final_verify.execute({ sessionId: evRun })
+  assert.strictEqual(evPass.status, "PASS", `an unchanged artifact must PASS: ${evPass.content}`)
+
+  await registeredTools.evidence.execute(
+    { sessionId: evRun, name: "trace.txt", content: "hello evidence, edited\n" },
+    { sessionID: "ses_fixture_verifier" },
+  )
+  const evStale = await registeredTools.final_verify.execute({ sessionId: evRun })
+  assert.strictEqual(evStale.status, "FAIL", "an edited artifact must FAIL")
+  assert(
+    evStale.reasons.some((r) => r.includes("[AUTH_STALE]") && r.includes("verify/evidence/trace.txt changed")),
+    `the edited artifact must be named: ${JSON.stringify(evStale.reasons)}`,
+  )
+  rmSync(join(testDir, ".opencode", "teamwork", evRun, "verify", "evidence", "trace.txt"))
+  const evMissing = await registeredTools.final_verify.execute({ sessionId: evRun })
+  assert.strictEqual(evMissing.status, "FAIL", "a missing artifact must FAIL")
+  assert(
+    evMissing.reasons.some((r) => r.includes("verify/evidence/trace.txt") && r.includes("missing")),
+    `the missing artifact must be named: ${JSON.stringify(evMissing.reasons)}`,
+  )
+
+  // Count cap: at most 32 evidence files.
+  for (let i = 1; i <= 32; i++) {
+    const res = await registeredTools.evidence.execute(
+      { sessionId: evRun, name: `e${i}.txt`, content: `evidence ${i}` },
+      { sessionID: "ses_fixture_verifier" },
+    )
+    assert(!res.content.startsWith("refused:"), `evidence ${i} must be accepted: ${res.content}`)
+  }
+  const evCap = await registeredTools.evidence.execute(
+    { sessionId: evRun, name: "overflow.txt", content: "one too many" },
+    { sessionID: "ses_fixture_verifier" },
+  )
+  assert(evCap.content.startsWith("refused:") && evCap.content.includes("cap 32"), `the count cap must refuse: ${evCap.content}`)
+
+  console.log("✓ verify/evidence artifacts are bounded, hashed, cited, and re-hashed by the gate")
+
   // ==========================================
   // Part 1c-ter-strict: opt-in strict verification wave
   // ==========================================

@@ -10384,6 +10384,66 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     })
 
     editor.add({
+      name: "evidence",
+      description:
+        "Write one bounded evidence artifact under verify/evidence/<name> (max 64 KiB, at most 32 files) through the pinned run writer. Returns {path, sha256, bytes}; cite the path from teamwork_wave_record so the strict gate re-hashes it. This records bytes, not a verdict.",
+      input: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string" },
+          name: { type: "string", description: "One safe file segment, e.g. trace.txt (max 64 chars)." },
+          content: { type: "string", description: "Exact UTF-8 content (max 65536 bytes)." },
+        },
+        required: ["sessionId", "name", "content"],
+        additionalProperties: false,
+      },
+      execute: async (input: any, context: any) => {
+        const resolved = resolveRun(root, input?.sessionId)
+        if (resolved.error) return { content: resolved.error }
+        const run = resolved.run as string
+        const authz = await authorizeToolAction(ctx, run, "evidence", undefined, context)
+        if (!authz.ok) return { content: authz.content }
+        const name = typeof input?.name === "string" ? input.name.trim() : ""
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
+          return { content: `refused: evidence name "${clean(name, 80)}" must be one safe segment (^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$); nothing was written` }
+        }
+        const content = typeof input?.content === "string" ? input.content : undefined
+        if (content === undefined) {
+          return { content: "refused: evidence content must be a string; nothing was written" }
+        }
+        const bytes = Buffer.byteLength(content, "utf8")
+        const MAX_EVIDENCE_BYTES = 64 * 1024
+        const MAX_EVIDENCE_FILES = 32
+        if (bytes > MAX_EVIDENCE_BYTES) {
+          return {
+            content: `refused: evidence ${name} is ${bytes} bytes; the cap is ${MAX_EVIDENCE_BYTES}; nothing was written`,
+          }
+        }
+        try {
+          createDirWithin(run, "verify")
+          createDirWithin(run, "verify/evidence")
+          const dir = join(run, "verify", "evidence")
+          const existing = readdirSync(dir).filter((entry) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(entry))
+          if (!existing.includes(name) && existing.length >= MAX_EVIDENCE_FILES) {
+            return {
+              content: `refused: verify/evidence already holds ${existing.length} artifacts (cap ${MAX_EVIDENCE_FILES}); nothing was written`,
+            }
+          }
+          const relativePath = `verify/evidence/${name}`
+          writeSafeRunFile(run, join(run, relativePath), content)
+          return {
+            content: `EVIDENCE RECORDED: ${relativePath} (${bytes} bytes, sha256 ${contentSha256Hex(content)}).`,
+            path: relativePath,
+            sha256: contentSha256Hex(content),
+            bytes,
+          }
+        } catch (err: any) {
+          return { content: `refused: could not write verify/evidence/${clean(name, 64)} (${clean(err?.message, 160)}); nothing was written` }
+        }
+      },
+    })
+
+    editor.add({
       name: "report",
       description:
         "Trusted writer for verify/report-<taskId>.json. Only a session whose trusted agent is team/verifier, descending from the run root, may call it. The task must exist in plan.dag.json and a PASS report must carry evidence (a summary or checks, every check passed, no fatal findings). The report is signed for a signed run (run.manifest.json) and indexed in ctx.storage; final_verify re-checks the signature and the PASS evidence. A wrong agent, a missing task, or an inconsistent PASS is refused.",
