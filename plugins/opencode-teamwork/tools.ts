@@ -1492,6 +1492,7 @@ function normalizeClaim(raw: any): any | undefined {
   if (previous && previous.by !== by) claim.previousClaimant = previous
   if (raw.override === "sentinel") claim.override = "sentinel"
   if (typeof raw.host === "string" && raw.host.trim()) claim.host = clean(raw.host, 80).trim()
+  if (typeof raw.runHost === "string" && raw.runHost.trim()) claim.runHost = clean(raw.runHost, 80).trim()
   const epoch = Number(raw.epoch)
   if (Number.isFinite(epoch) && epoch >= 0) claim.epoch = Math.trunc(epoch)
   const heartbeatAt = claimTime(raw.heartbeatAt)
@@ -1507,11 +1508,6 @@ function normalizeClaim(raw: any): any | undefined {
   if (raw.needsInspection === true) claim.needsInspection = true
   if (raw.maxTenureReached === true) claim.maxTenureReached = true
   return claim
-}
-
-function claimIsLive(claim: any, now = Date.now()): boolean {
-  const until = Date.parse(claim?.leaseUntil)
-  return Number.isFinite(until) && until > now
 }
 
 function nextFence(task: any): number {
@@ -1558,13 +1554,14 @@ function makeTaskClaim(
   by: string,
   now: number,
   previous: any,
-  opts: { host: string; leaseMs: number; epoch: number; event?: string; reason?: string },
+  opts: { host: string; runHost?: string; leaseMs: number; epoch: number; event?: string; reason?: string },
 ): any {  const at = new Date(now).toISOString()
   const claim: any = {
     by: clean(by, 80),
     at,
     leaseUntil: new Date(now + opts.leaseMs).toISOString(),
     host: opts.host,
+    ...(opts.runHost ? { runHost: opts.runHost } : {}),
     epoch: Math.max(1, Math.trunc(opts.epoch) || 1),
     heartbeatAt: at,
     tenureStartAt: at,
@@ -1634,6 +1631,7 @@ function publicClaim(raw: any): any | undefined {
     at: claim.at,
     leaseUntil: claim.leaseUntil,
     ...(claim.host ? { host: claim.host } : {}),
+    ...(claim.runHost ? { runHost: claim.runHost } : {}),
     ...(claim.epoch !== undefined ? { epoch: claim.epoch } : {}),
     ...(claim.heartbeatAt ? { heartbeatAt: claim.heartbeatAt } : {}),
     ...(claim.renewals !== undefined ? { renewals: claim.renewals } : {}),
@@ -1794,6 +1792,30 @@ function captureGitBaseline(cwd: string, baseRef: string): ClaimBaseline | undef
     untracked,
     fingerprint,
     at: new Date().toISOString(),
+  }
+}
+
+/**
+ * The cheap half of a git baseline: HEAD, the tracked diff and porcelain status.
+ * It deliberately omits the untracked scan (up to 1000 files / 8 MiB), which is
+ * captured once outside the state.json critical section. Used under the lock to
+ * prove the tracked tree did not move while a claim was being evaluated.
+ */
+function captureGitBaselineCheap(
+  cwd: string,
+  baseRef: string,
+): { headSha: string; baseSha?: string; diffHash: string; statusHash: string } | undefined {
+  const headSha = execGitCapture(cwd, ["rev-parse", "HEAD"])
+  if (!headSha) return undefined
+  const baseSha = execGitCapture(cwd, ["rev-parse", "--verify", baseRef])
+  const diff = baseSha ? execGitCapture(cwd, ["diff", "--no-color", `${baseSha}..${headSha}`]) : ""
+  const status = execGitCapture(cwd, ["status", "--porcelain"])
+  if (diff === undefined || status === undefined) return undefined
+  return {
+    headSha,
+    ...(baseSha ? { baseSha } : {}),
+    diffHash: sha256Hex(diff),
+    statusHash: sha256Hex(status),
   }
 }
 
@@ -2032,6 +2054,7 @@ function normalizeInspection(raw: any): any | undefined {
     fingerprint,
     round: Math.max(0, Math.trunc(Number(raw.round) || 0)),
     fence: Math.max(0, Math.trunc(Number(raw.fence) || 0)),
+    ...(typeof raw.by === "string" && raw.by.trim() ? { by: clean(raw.by, 80).trim() } : {}),
     ...(typeof raw.baseSha === "string" ? { baseSha: clean(raw.baseSha, 64) } : {}),
     ...(typeof raw.headSha === "string" ? { headSha: clean(raw.headSha, 64) } : {}),
     ...(typeof raw.diffHash === "string" ? { diffHash: clean(raw.diffHash, 64) } : {}),
@@ -2040,6 +2063,7 @@ function normalizeInspection(raw: any): any | undefined {
 
 function issueInspectionToken(task: any, observed: ClaimBaseline | undefined, now: number): string {
   const token = randomBytes(24).toString("base64url")
+  const claim = normalizeClaim(task?.claim)
   task.inspection = {
     tokenHash: sha256Hex(token),
     at: new Date(now).toISOString(),
@@ -2047,6 +2071,7 @@ function issueInspectionToken(task: any, observed: ClaimBaseline | undefined, no
     fingerprint: observed?.fingerprint ?? "unknown",
     round: Math.max(0, Math.trunc(Number(task?.round) || 0)),
     fence: nextFence(task),
+    ...(claim?.by ? { by: claim.by } : {}),
     ...(observed?.baseSha ? { baseSha: observed.baseSha } : {}),
     ...(observed?.headSha ? { headSha: observed.headSha } : {}),
     ...(observed?.diffHash ? { diffHash: observed.diffHash } : {}),
@@ -2070,6 +2095,21 @@ function validateInspectionToken(
   if (!presented || sha256Hex(presented) !== inspection.tokenHash) {
     return { ok: false, code: "INSPECTION_TOKEN_INVALID", reason: "the inspection token does not match" }
   }
+  // A token is bound to the exact claim generation it was issued for. If the
+  // round, fence, or claimant changed since inspection, the evidence the
+  // operator saw no longer describes the claim they are about to recover.
+  const claim = normalizeClaim(task?.claim)
+  if (
+    inspection.round !== Math.max(0, Math.trunc(Number(task?.round) || 0)) ||
+    inspection.fence !== nextFence(task) ||
+    (inspection.by ?? "") !== (claim?.by ?? "")
+  ) {
+    return {
+      ok: false,
+      code: "INSPECTION_STALE",
+      reason: `the inspection token was issued for round ${inspection.round}, fence ${inspection.fence}, claim ${inspection.by ?? "unknown"}; the task is now round ${Math.max(0, Math.trunc(Number(task?.round) || 0))}, fence ${nextFence(task)}, claim ${claim?.by ?? "unknown"}. Inspect again`,
+    }
+  }
   return { ok: true, inspection }
 }
 
@@ -2088,6 +2128,7 @@ interface ReportBindingCheck {
 function validateVerifierReportBinding(
   report: any,
   opts: { taskId: string; round: number; fence: number; root: string; runId: string },
+  evidence?: { headSha?: string; baseSha?: string; diffHash?: string },
 ): ReportBindingCheck {
   if (!report || typeof report !== "object") {
     return { ok: false, code: "REPORT_MISSING", reason: "no verifier report was found" }
@@ -2110,7 +2151,9 @@ function validateVerifierReportBinding(
     }
   }
   const branch = `teamwork/${opts.runId}-${opts.taskId}`
-  const headSha = execGitCapture(opts.root, ["rev-parse", "--verify", branch])
+  // `evidence` is the pre-lock git read. Only the cheap HEAD is re-read under
+  // the lock, so the critical section never runs a full diff.
+  const headSha = evidence ? evidence.headSha : execGitCapture(opts.root, ["rev-parse", "--verify", branch])
   if (typeof report.headSha === "string" && report.headSha && headSha && report.headSha !== headSha) {
     return {
       ok: false,
@@ -2119,16 +2162,20 @@ function validateVerifierReportBinding(
     }
   }
   if (typeof report.diffHash === "string" && report.diffHash) {
-    const baseSha = execGitCapture(opts.root, ["rev-parse", "--verify", `teamwork/base-${opts.runId}`])
-    const head = headSha ?? execGitCapture(opts.root, ["rev-parse", "HEAD"])
-    if (baseSha && head) {
-      const diff = execGitCapture(opts.root, ["diff", "--no-color", `${baseSha}..${head}`]) ?? ""
-      if (sha256Hex(diff) !== report.diffHash) {
-        return {
-          ok: false,
-          code: "BRANCH_MOVED",
-          reason: "the branch diff changed after the verifier report",
-        }
+    let actualDiffHash = evidence?.diffHash
+    if (actualDiffHash === undefined) {
+      const baseSha = execGitCapture(opts.root, ["rev-parse", "--verify", `teamwork/base-${opts.runId}`])
+      const head = headSha ?? execGitCapture(opts.root, ["rev-parse", "HEAD"])
+      if (baseSha && head) {
+        const diff = execGitCapture(opts.root, ["diff", "--no-color", `${baseSha}..${head}`]) ?? ""
+        actualDiffHash = sha256Hex(diff)
+      }
+    }
+    if (actualDiffHash !== undefined && actualDiffHash !== report.diffHash) {
+      return {
+        ok: false,
+        code: "BRANCH_MOVED",
+        reason: "the branch diff changed after the verifier report",
       }
     }
   }
@@ -2276,6 +2323,8 @@ async function claimReadyTasks(
   readyForWorker: ClaimCandidate[],
   readyForVerifier: ClaimCandidate[],
   callSession: string | undefined,
+  observedBaselines: Map<string, ClaimBaseline | undefined> = new Map(),
+  observedWorktrees: Map<string, string | undefined> = new Map(),
 ): Promise<{
   worker: ClaimCandidate[]
   verifier: ClaimCandidate[]
@@ -2330,15 +2379,34 @@ async function claimReadyTasks(
         return
       }
       const existing = normalizeClaim(st.claim)
-      if (existing && existing.by !== callSession && claimIsLive(existing, now)) {
+      const derivedExisting = existing ? deriveClaimState(st, now) : undefined
+      const heldLive =
+        derivedExisting?.state === "live" ||
+        (protocol < CLAIM_PROTOCOL && derivedExisting?.state === "cross-host")
+      if (existing && existing.by !== callSession && heldLive) {
         skipped.push({
           id: candidate.id,
           status: "claimed",
           round: Number(st.round) || 0,
           claim: publicClaim(existing),
-          claimState: deriveClaimState(st, now).state,
+          claimState: derivedExisting.state,
           fence: nextFence(st),
           reason: `live claim held by ${existing.by}`,
+        })
+        return
+      }
+
+      // A flagged claim is never re-dispatched, even when the caller owns it and
+      // the fingerprint happens to match. Inspect, then explicitly recover.
+      if (existing && protocol >= CLAIM_PROTOCOL && (existing.needsInspection === true || derivedExisting?.state === "needs-inspection")) {
+        skipped.push({
+          id: candidate.id,
+          status: "claimed",
+          round: Number(st.round) || 0,
+          claim: publicClaim(existing),
+          claimState: "needs-inspection",
+          fence: nextFence(st),
+          reason: "the claim needs inspection; run teamwork_recover { action: \"inspect\" } before reclaiming",
         })
         return
       }
@@ -2395,6 +2463,18 @@ async function claimReadyTasks(
           })
           return
         }
+        if (derived.state === "needs-inspection") {
+          skipped.push({
+            id: candidate.id,
+            status: "claimed",
+            round: Number(st.round) || 0,
+            claim: publicClaim(existing),
+            claimState: "needs-inspection",
+            fence: nextFence(st),
+            reason: "needs-inspection: the claim was flagged by an earlier transition",
+          })
+          return
+        }
         const baseline = normalizeBaseline(st.claim?.baseline)
         if (derived.state === "expired") {
           skipped.push({
@@ -2421,7 +2501,34 @@ async function claimReadyTasks(
           })
           return
         }
-        const current = captureClaimBaseline(root, run, st, candidate.id, status, plan)
+        // The full baseline (including the bounded untracked scan) was captured
+        // before this lock. Under the lock only the cheap tracked evidence is
+        // re-read, so a multi-MiB untracked scan never extends the critical
+        // section. A tracked tree that moved in between is not reclaimable.
+        const current = observedBaselines.get(candidate.id)
+        const cwd = observedWorktrees.get(candidate.id)
+        let drifted = false
+        if (current && current.scope === "git" && cwd) {
+          const cheap = captureGitBaselineCheap(cwd, `teamwork/base-${basename(run)}`)
+          drifted =
+            !cheap ||
+            cheap.headSha !== current.headSha ||
+            cheap.diffHash !== current.diffHash ||
+            cheap.statusHash !== current.statusHash
+        }
+        if (drifted) {
+          markNeedsInspection(candidate.id, st, "the tracked worktree changed while the claim was being evaluated")
+          skipped.push({
+            id: candidate.id,
+            status: "claimed",
+            round: Number(st.round) || 0,
+            claim: publicClaim(st.claim),
+            claimState: "needs-inspection",
+            fence: nextFence(st),
+            reason: "needs-inspection: the tracked worktree changed during claim evaluation",
+          })
+          return
+        }
         if (!current || current.fingerprint === "unknown" || current.fingerprint !== baseline.fingerprint) {
           markNeedsInspection(candidate.id, st, "side effects changed since the claim baseline")
           skipped.push({
@@ -2445,7 +2552,8 @@ async function claimReadyTasks(
       const claim =
         protocol >= CLAIM_PROTOCOL
           ? makeTaskClaim(callSession, now, previous, {
-              host,
+              host: SELF_HOST,
+              runHost: host,
               leaseMs,
               epoch: (Number(existing?.epoch) || 0) + 1,
               event: previous ? "reclaimed" : "claimed",
@@ -7220,7 +7328,30 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         // instead of being dispatched twice. Protocol 2 requires a baseline
         // match (or an explicit recovery) before an expired claim is reclaimed.
         if (claimCallSession) {
-          const claimed = await claimReadyTasks(root, run, plan, readyForWorker, readyForVerifier, claimCallSession)
+          // Capture every full side-effect baseline (including the bounded
+          // untracked scan) BEFORE the state.json lock. The reclaim decision
+          // under the lock then only re-reads cheap tracked evidence (HEAD,
+          // porcelain status, tracked diff), so `git ls-files`/8 MiB reads never
+          // extend the critical section.
+          const observedBaselines = new Map<string, ClaimBaseline | undefined>()
+          const observedWorktrees = new Map<string, string | undefined>()
+          for (const candidate of [...readyForWorker, ...readyForVerifier]) {
+            const task = taskStates[candidate.id]
+            if (!task || typeof task !== "object") continue
+            const status = typeof task.status === "string" ? task.status : ""
+            observedBaselines.set(candidate.id, captureClaimBaseline(root, run, task, candidate.id, status, plan))
+            observedWorktrees.set(candidate.id, findTaskWorktree(root, basename(run), task, candidate.id)?.path)
+          }
+          const claimed = await claimReadyTasks(
+            root,
+            run,
+            plan,
+            readyForWorker,
+            readyForVerifier,
+            claimCallSession,
+            observedBaselines,
+            observedWorktrees,
+          )
           readyForWorker.length = 0
           readyForWorker.push(...claimed.worker)
           readyForVerifier.length = 0
@@ -7384,6 +7515,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const preClaim = normalizeClaim(preTask?.claim)
         const preRelation = preClaim ? await claimRelation(ctx, callSession, preClaim.by) : "none"
         let preBaseline: ClaimBaseline | undefined
+        // The verifier-binding git read (base/head/full diff) also happens
+        // outside the lock. Only a cheap HEAD re-read runs inside it.
+        let reportEvidence: { headSha?: string; baseSha?: string; diffHash?: string } | undefined
         if (preProtocol >= CLAIM_PROTOCOL) {
           const rawStatus = clean(input.status, 32)
           const preStatus = rawStatus === "pass" ? "verified_pass" : rawStatus === "fail" ? "verified_fail" : rawStatus === "running" ? "worker_active" : rawStatus
@@ -7393,6 +7527,17 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               ...(input.worktree ? { worktree: clean(input.worktree, 200) } : {}),
             }
             preBaseline = captureClaimBaseline(root, run, captureTask, taskId, preStatus, plan)
+          }
+          if (preStatus === "verified_pass") {
+            const branch = `teamwork/${runId}-${taskId}`
+            const headSha = execGitCapture(root, ["rev-parse", "--verify", branch])
+            const baseSha = execGitCapture(root, ["rev-parse", "--verify", `teamwork/base-${runId}`])
+            const diff = baseSha && headSha ? execGitCapture(root, ["diff", "--no-color", `${baseSha}..${headSha}`]) ?? "" : ""
+            reportEvidence = {
+              ...(headSha ? { headSha } : {}),
+              ...(baseSha ? { baseSha } : {}),
+              ...(baseSha && headSha ? { diffHash: sha256Hex(diff) } : {}),
+            }
           }
         }
 
@@ -7490,7 +7635,24 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // override with a recorded reason.
           const existingClaim = normalizeClaim((current as any).claim)
           const nowMs = Date.now()
-          const claimLive = claimIsLive(existingClaim, nowMs)
+          const derivedCurrent = deriveClaimState(current, nowMs)
+          const claimLive =
+            derivedCurrent.state === "live" || derivedCurrent.state === "cross-host"
+          // A flagged claim always wins: no transition may resume it in place,
+          // even if the fingerprint happens to match. Inspect + recover first.
+          if (
+            protocol >= CLAIM_PROTOCOL &&
+            status === "worker_active" &&
+            canonicalFrom !== "worker_active" &&
+            (existingClaim?.needsInspection === true || derivedCurrent.state === "needs-inspection")
+          ) {
+            return {
+              status: "CLAIM_NEEDS_INSPECTION",
+              content: `CLAIM_NEEDS_INSPECTION: task "${taskId}" is flagged for inspection (${existingClaim?.by ?? "unknown"}); run teamwork_recover { action: "inspect" } and adopt/requeue/block before resuming. State was not changed.`,
+              claim: publicClaim(existingClaim),
+              fence: currentFence,
+            }
+          }
           const relation =
             !existingClaim || !callSession
               ? "none"
@@ -7536,7 +7698,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 }
                 claimNote = `sentinel override: ${authz.caller?.agent} started task without a teamwork_next claim`
                 claimForState = {
-                  ...makeTaskClaim(callSession!, nowMs, undefined, { host, leaseMs, epoch: 1, event: "override" }),
+                  ...makeTaskClaim(callSession!, nowMs, undefined, { host: SELF_HOST, runHost: host, leaseMs, epoch: 1, event: "override" }),
                   override: "sentinel",
                 }
               } else if (claimOwnedByCaller) {
@@ -7550,7 +7712,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               } else if (override) {
                 claimForState = {
                   ...makeTaskClaim(callSession!, nowMs, existingClaim, {
-                    host,
+                    host: SELF_HOST,
+                    runHost: host,
                     leaseMs,
                     epoch: (Number(existingClaim.epoch) || 0) + 1,
                     event: "override",
@@ -7603,13 +7766,28 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               }
             }
             if (protocol >= CLAIM_PROTOCOL && report?.status === "PASS") {
-              const binding = validateVerifierReportBinding(report, {
-                taskId,
-                round,
-                fence: currentFence,
-                root,
-                runId,
-              })
+              // Cheap movement check under the lock: the expensive base/head
+              // diff was read before it. A moved branch still refuses.
+              if (reportEvidence?.headSha) {
+                const liveHead = execGitCapture(root, ["rev-parse", "--verify", `teamwork/${runId}-${taskId}`])
+                if (liveHead !== reportEvidence.headSha) {
+                  return {
+                    status: "BRANCH_MOVED",
+                    content: `BRANCH_MOVED: refusing verified_pass for task "${taskId}" — the branch moved while the transition was evaluated. Re-run the verifier against the current branch and write a fresh report.`,
+                  }
+                }
+              }
+              const binding = validateVerifierReportBinding(
+                report,
+                {
+                  taskId,
+                  round,
+                  fence: currentFence,
+                  root,
+                  runId,
+                },
+                reportEvidence,
+              )
               if (!binding.ok) {
                 return {
                   status: binding.code,
@@ -7665,6 +7843,17 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               : ["pending", "worker_done", "verified_pass", "verified_fail", "blocked"].includes(status)
                 ? undefined
                 : claimForState ?? existingClaim
+          const claimReleased = !!existingClaim && !keepClaim
+          if (claimReleased && protocol >= CLAIM_PROTOCOL) {
+            // A released claim is still evidence: keep its bounded history on
+            // the task so release/adopt/requeue/block never erase who held it.
+            nextTask.claimHistory = appendClaimHistory(normalizeHistory(current.claimHistory), {
+              by: existingClaim.by,
+              at: existingClaim.at,
+              leaseUntil: existingClaim.leaseUntil,
+              event: "released",
+            })
+          }
           if (keepClaim) {
             // Any other owner-authorized transition renews the heartbeat too.
             if (protocol >= CLAIM_PROTOCOL && status !== "worker_active" && existingClaim && claimOwnedByCaller && !override) {
@@ -7683,10 +7872,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
           if (protocol >= CLAIM_PROTOCOL) {
             // Fence increments once per protocol event: claim/reclaim/override,
-            // release, and round change. A heartbeat does not.
+            // release, and round change. A heartbeat — and a renewal of the
+            // same owner/epoch — does not. `next` therefore returns a fence
+            // that the immediate `task_update` can still present.
             const roundChanged = round !== (Number(current.round) || 0)
-            const claimChanged = !!(claimForState || override)
-            const claimReleased = !!existingClaim && !keepClaim
+            const ownerChanged =
+              !!claimForState &&
+              (!existingClaim ||
+                claimForState.by !== existingClaim.by ||
+                (Number(claimForState.epoch) || 0) !== (Number(existingClaim.epoch) || 0))
+            const claimChanged = ownerChanged || override
             let fence = currentFence
             if (roundChanged) fence++
             if (claimChanged) fence++
@@ -7730,6 +7925,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             keepClaim: nextTask.claim,
             claimNote,
             claimEvent,
+            claimReleased,
             fence: protocol >= CLAIM_PROTOCOL ? nextTask.fence : undefined,
             protocol,
             reportWarning,
@@ -7763,6 +7959,18 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             agent: recordedAgent,
             agentSource,
             note: outcome.claimNote ?? outcome.claimEvent,
+          })
+        }
+        if (outcome.claimReleased && outcome.protocol >= 2) {
+          await appendEvent(run, {
+            event: "claim_released",
+            sessionId: basename(run),
+            taskId,
+            to: outcome.status,
+            round: outcome.round,
+            agent: recordedAgent,
+            agentSource,
+            note: `released the dispatch claim on the ${outcome.status} transition`,
           })
         }
         await refreshBriefingSafe(run)
@@ -7800,6 +8008,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           confirm: { type: "boolean", description: "Explicit second confirmation for force/discard and cross-host release." },
           allowCrossHost: { type: "boolean", description: "Explicitly allow releasing a claim recorded on another host (TEAMWORK_ALLOW_CROSS_HOST=1 is the env equivalent). Default refuse." },
           note: { type: "string", description: "Optional checkpoint note recorded by adopt/discard." },
+          fence: {
+            type: "number",
+            description:
+              "Optional claim-protocol fence returned by teamwork_next/teamwork_status. When supplied it must match the task's current fence or the call is refused with INSPECTION_STALE and nothing is written.",
+          },
         },
         required: ["taskId", "action"],
         additionalProperties: false,
@@ -7840,6 +8053,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const now = Date.now()
         const runId = basename(run)
         const derived = deriveClaimState(task, now)
+        if (input.fence !== undefined && input.fence !== null && claimProtocolOf(state) >= CLAIM_PROTOCOL) {
+          const presented = Number(input.fence)
+          if (!Number.isFinite(presented) || Math.trunc(presented) !== nextFence(task)) {
+            return {
+              status: "INSPECTION_STALE",
+              content: `INSPECTION_STALE: task "${taskId}" is at fence ${nextFence(task)}, but the call carried fence ${clean(input.fence, 16)}. Re-read teamwork_status and inspect again; nothing was written.`,
+              fence: nextFence(task),
+            }
+          }
+        }
         const baseline = normalizeBaseline(task.claim?.baseline)
         const observed = captureClaimBaseline(root, run, task, taskId, String(task.status ?? "pending"), plan)
         const inspectionState = inspectWorktreeState(root, run, task, taskId, baseline)
@@ -7966,6 +8189,19 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               }
             }
 
+            // A removed claim is still evidence: keep its last holder in the
+            // bounded task-level history so release/adopt/requeue/block never
+            // erase who held it.
+            const preserveReleasedClaim = (event: string) => {
+              t.claimHistory = appendClaimHistory(normalizeHistory(t.claimHistory), {
+                by: currentClaim.by,
+                at: currentClaim.at,
+                leaseUntil: currentClaim.leaseUntil,
+                event,
+                ...(reasonText ? { reason: reasonText } : {}),
+              })
+            }
+
             const needsToken = rawAction === "adopt" || rawAction === "requeue" || rawAction === "block"
             if (needsToken) {
               const check = validateInspectionToken(t, input.token, now)
@@ -7985,6 +8221,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
             if (rawAction === "release") {
               t.fence = nextFence(t) + 1
+              preserveReleasedClaim("released")
               delete t.claim
               delete t.inspection
               wrote = true
@@ -7999,6 +8236,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             if (rawAction === "block") {
               t.status = "blocked"
               t.fence = nextFence(t) + 1
+              preserveReleasedClaim("blocked")
               delete t.claim
               delete t.inspection
               wrote = true
@@ -8040,6 +8278,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               t.status = "worker_done"
               t.fence = nextFence(t) + 1
               t.checkpoint = checkpoint
+              preserveReleasedClaim("adopted")
               delete t.claim
               delete t.inspection
               wrote = true
@@ -8072,6 +8311,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             t.status = "pending"
             t.fence = nextFence(t) + 1
             if (explicitDiscard) t.checkpoint = { ...checkpoint, discarded: true }
+            preserveReleasedClaim(explicitDiscard ? "discarded" : "requeued")
             delete t.claim
             delete t.inspection
             wrote = true
@@ -9827,20 +10067,34 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         }
 
         if (action === "cleanup") {
-          // Never remove a worktree another live claim (local or foreign) is
-          // still using. Expired/stale claims are recoverable; live ones are not.
+          // Never remove a worktree another claim is still using. One predicate:
+          // live, expired (inside the grace window), needs-inspection, and
+          // cross-host all block; only a stale claim is recoverable.
           const cleanupState = readJson<any>(run, join(run, "state.json"), undefined)
           const nowMs = Date.now()
-          const liveClaims = Object.entries(cleanupState?.tasks ?? {})
-            .map(([id, task]: [string, any]) => ({ id, claim: normalizeClaim(task?.claim) }))
-            .filter((entry) => entry.claim && claimIsLive(entry.claim, nowMs))
-          if (liveClaims.length) {
+          const BLOCKING_STATES = new Set(["live", "expired", "needs-inspection", "cross-host"])
+          const blockingClaims = Object.entries(cleanupState?.tasks ?? {})
+            .map(([id, task]: [string, any]) => ({
+              id,
+              claim: normalizeClaim(task?.claim),
+              claimState: deriveClaimState(task, nowMs).state,
+            }))
+            .filter(
+              (entry) =>
+                entry.claim &&
+                (BLOCKING_STATES.has(entry.claimState) || entry.claim.needsInspection === true),
+            )
+          if (blockingClaims.length) {
             return {
-              content: `refused: cleanup is blocked by live claim(s): ${liveClaims
-                .map((entry) => `${clean(entry.id, 64)} (${entry.claim!.by} until ${entry.claim!.leaseUntil})`)
+              content: `refused: cleanup is blocked by claim(s) that are not stale: ${blockingClaims
+                .map((entry) => `${clean(entry.id, 64)} (${entry.claim!.by}, state=${entry.claimState} until ${entry.claim!.leaseUntil})`)
                 .join(", ")}. Wait for release, or use teamwork_recover to release/requeue explicitly. Nothing was removed.`,
               refused: "LIVE_CLAIM",
-              liveClaims: liveClaims.map((entry) => ({ id: entry.id, claim: publicClaim(entry.claim) })),
+              liveClaims: blockingClaims.map((entry) => ({
+                id: entry.id,
+                claim: publicClaim(entry.claim),
+                claimState: entry.claimState,
+              })),
             }
           }
           if (existsSync(runWorktreesDir)) {
