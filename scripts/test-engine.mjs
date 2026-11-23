@@ -1,4 +1,5 @@
 import { registerTeamworkTools, registerTeamworkHooks, describeRun, touch, nextEventSeq } from "../plugins/opencode-teamwork/tools.ts"
+import { createAuthContext, canonicalJson } from "../plugins/opencode-teamwork/auth.ts"
 import {
   analyzeLeanDeclarations,
   bindVerifiedDeclaration,
@@ -61,6 +62,58 @@ const testDir = mkdtempSync(join(tmpdir(), "teamwork-engine-test-"))
 // Sonar S6324: build ESC without embedding a control character in a regex literal.
 const ESC_CHAR = String.fromCharCode(27)
 
+// ---------------------------------------------------------------------------
+// Artifact-authenticity test harness
+//
+// Each project root gets its own Map-backed ctx.storage shim. The plugin and
+// the fixture signer share the same shim, so they see the same key ring and
+// digest index. No env key is set for the suite; dedicated cases opt in.
+// ---------------------------------------------------------------------------
+const FIXTURE_ROOT_SESSION = "ses_fixture_root"
+const rootStores = new Map()
+function storageFor(root) {
+  let entry = rootStores.get(root)
+  if (!entry) {
+    const map = new Map()
+    entry = {
+      map,
+      shim: {
+        get: async (key) => map.get(key),
+        set: async (key, value) => {
+          map.set(key, value)
+        },
+        remove: async (key) => {
+          map.delete(key)
+        },
+        scan: async () => ({ entries: [], hasMore: false }),
+      },
+    }
+    rootStores.set(root, entry)
+  }
+  return entry.shim
+}
+const authByRoot = new Map()
+function authFor(root) {
+  let auth = authByRoot.get(root)
+  if (!auth) {
+    auth = createAuthContext(storageFor(root), process.env)
+    authByRoot.set(root, auth)
+  }
+  return auth
+}
+function fixtureSessionGet({ sessionID }) {
+  if (sessionID === FIXTURE_ROOT_SESSION) return { agent: "team/sentinel" }
+  if (sessionID === "ses_fixture_verifier") return { agent: "team/verifier", parentID: FIXTURE_ROOT_SESSION }
+  return undefined
+}
+async function writeSignedFixture(root, runId, relPath, payload) {
+  const signed = await authFor(root).signRunArtifact(runId, relPath, payload)
+  const file = join(root, ".opencode", "teamwork", runId, relPath)
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, JSON.stringify(signed, null, 2) + "\n")
+  return signed
+}
+
 // Compare URLs by parsed origin/path instead of substring containment
 // (CodeQL js/incomplete-url-substring-sanitization).
 function mentionsExactUrl(text, expected) {
@@ -80,7 +133,10 @@ function mentionsExactUrl(text, expected) {
 async function stampVictoryFor(tools, ctx, root, runId, { sessionID = "ses_victory_auditor", summary = "Fixture audit: delivered work matches the request." } = {}) {
   const reqs = JSON.parse(readFileSync(join(root, ".opencode", "teamwork", runId, "requirements.json"), "utf8"))
   const originalGet = ctx?.session?.get
-  if (ctx?.session) ctx.session.get = async () => ({ agent: "team/victory-auditor" })
+  if (ctx?.session) {
+    ctx.session.get = async ({ sessionID: id }) =>
+      id === FIXTURE_ROOT_SESSION ? { agent: "team/sentinel" } : { agent: "team/victory-auditor", parentID: FIXTURE_ROOT_SESSION }
+  }
   try {
     const res = await tools.victory_audit.execute(
       {
@@ -110,7 +166,8 @@ async function makeToolsFor(root) {
           await cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = tool) })
         },
       },
-      session: { get: async () => undefined },
+      session: { get: async (args) => fixtureSessionGet(args) },
+      storage: storageFor(root),
     },
     root,
   )
@@ -131,7 +188,8 @@ try {
         await cb(editor)
       },
     },
-    session: { get: async () => undefined },
+    session: { get: async (args) => fixtureSessionGet(args) },
+    storage: storageFor(testDir),
   }
 
   await registerTeamworkTools(mockCtx, testDir)
@@ -306,7 +364,10 @@ try {
 
   // (c) A hand-written PASS report is UNSTAMPED: only the explicit legacy
   //     bypass lets it complete the run. (Before A2 any PASS was accepted.)
-  writeFileSync(finalFile, JSON.stringify({ status: "PASS", summary: "independent final check passed" }) + "\n")
+  await writeSignedFixture(testDir, "20261018-000000-test", "verify/final.json", {
+    status: "PASS",
+    summary: "independent final check passed",
+  })
   nextRes = await registeredTools.next.execute({ sessionId: "20261018-000000-test" })
   assert.strictEqual(nextRes.status, "FINAL_VERIFICATION_UNVERIFIED", "an unstamped PASS must not reach ALL_PASSED by default")
   assert.strictEqual(nextRes.finalReport, finalFile, "FINAL_VERIFICATION_UNVERIFIED must include the final report path")
@@ -618,14 +679,17 @@ try {
 
   // (f) final-gate responses carry the mode read from the artifact.
   const gateRun = "20261018-000000-gate-demo"
-  await registeredTools.plan.execute({
-    sessionId: gateRun,
-    topology: "iterative-coding",
-    skipInterview: true,
-    request: "Ship the demo.",
-    integrityMode: "demo",
-    tasks: [{ id: "G1" }],
-  })
+  await registeredTools.plan.execute(
+    {
+      sessionId: gateRun,
+      topology: "iterative-coding",
+      skipInterview: true,
+      request: "Ship the demo.",
+      integrityMode: "demo",
+      tasks: [{ id: "G1" }],
+    },
+    { sessionID: FIXTURE_ROOT_SESSION },
+  )
   for (const status of ["worker_active", "worker_done", "verifier_active"]) {
     await registeredTools.task_update.execute({ sessionId: gateRun, taskId: "G1", status })
   }
@@ -653,7 +717,7 @@ try {
 
   // The gate demo's report is hand-written, so reaching ALL_PASSED here takes
   // the explicit bypass (the default refusal is covered in Part 1c(c) above).
-  writeFileSync(gateFinal, JSON.stringify({ status: "PASS", summary: "ok" }) + "\n")
+  await writeSignedFixture(testDir, gateRun, "verify/final.json", { status: "PASS", summary: "ok" })
   gateRes = await registeredTools.next.execute({ sessionId: gateRun })
   assert.strictEqual(gateRes.status, "FINAL_VERIFICATION_UNVERIFIED", "a hand-written PASS must be refused by default")
   gateRes = await registeredTools.next.execute({ sessionId: gateRun, allowUnstamped: true })
@@ -862,16 +926,32 @@ try {
     mkdirSync(dirname(file), { recursive: true })
     writeFileSync(file, JSON.stringify({ taskId, status, timestamp: new Date().toISOString() }) + "\n")
   }
-  const seedVerifiedRun = async (runId, taskIds, { request, integrityMode, auditStatus = "PASS", stampVictory = request !== undefined, victoryAudit, verification } = {}) => {
-    await registeredTools.plan.execute({
-      sessionId: runId,
-      topology: "iterative-coding",
-      skipInterview: true,
-      ...(request !== undefined ? { request, integrityMode } : {}),
-      ...(victoryAudit !== undefined ? { victoryAudit } : {}),
-      ...(verification !== undefined ? { verification } : {}),
-      tasks: taskIds.map((id) => ({ id })),
-    })
+  const seedVerifiedRun = async (
+    runId,
+    taskIds,
+    {
+      request,
+      integrityMode,
+      auditStatus = "PASS",
+      stampVictory = request !== undefined,
+      victoryAudit,
+      verification,
+      allowUnsignedLegacy,
+    } = {},
+  ) => {
+    await registeredTools.plan.execute(
+      {
+        sessionId: runId,
+        topology: "iterative-coding",
+        skipInterview: true,
+        ...(request !== undefined ? { request, integrityMode } : {}),
+        ...(victoryAudit !== undefined ? { victoryAudit } : {}),
+        ...(verification !== undefined ? { verification } : {}),
+        ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
+        tasks: taskIds.map((id) => ({ id })),
+      },
+      { sessionID: FIXTURE_ROOT_SESSION },
+    )
     for (const taskId of taskIds) {
       for (const status of ["worker_active", "worker_done", "verifier_active"]) {
         await registeredTools.task_update.execute({ sessionId: runId, taskId, status })
@@ -882,7 +962,17 @@ try {
         status: "verified_pass",
         verification: { status: "PASS" },
       })
-      writeTaskReport(runId, taskId, "PASS")
+      const reportRes = await registeredTools.report.execute(
+        {
+          sessionId: runId,
+          taskId,
+          status: "PASS",
+          summary: `Fixture PASS for ${taskId}.`,
+          checks: [{ name: "fixture", type: "check", passed: true }],
+        },
+        { sessionID: "ses_fixture_verifier" },
+      )
+      assert(!reportRes.content.startsWith("refused:"), `fixture report failed: ${reportRes.content}`)
     }
     await registeredTools.security_audit.execute({
       sessionId: runId,
@@ -958,8 +1048,7 @@ try {
   const fvHandRun = "20261018-000000-fv-handwritten"
   await seedVerifiedRun(fvHandRun, ["F1"])
   const fvHandFile = finalFileOf(fvHandRun)
-  mkdirSync(dirname(fvHandFile), { recursive: true })
-  writeFileSync(fvHandFile, JSON.stringify({ status: "PASS", summary: "looks fine to me" }) + "\n")
+  await writeSignedFixture(testDir, fvHandRun, "verify/final.json", { status: "PASS", summary: "looks fine to me" })
   const fvHandDefault = await registeredTools.next.execute({ sessionId: fvHandRun })
   assert.strictEqual(
     fvHandDefault.status,
@@ -1001,16 +1090,13 @@ try {
   // (k) A report with provenance but no evidence is still unstamped.
   const fvNoEvidenceRun = "20261018-000000-fv-noevidence"
   await seedVerifiedRun(fvNoEvidenceRun, ["F1"])
-  writeFileSync(
-    finalFileOf(fvNoEvidenceRun),
-    JSON.stringify({
-      status: "PASS",
-      generatedBy: { agent: "team/verifier", session: "ses_handwritten" },
-      generatedAt: new Date().toISOString(),
-      integrityMode: "development",
-      reasons: [],
-    }) + "\n",
-  )
+  await writeSignedFixture(testDir, fvNoEvidenceRun, "verify/final.json", {
+    status: "PASS",
+    generatedBy: { agent: "team/verifier", session: "ses_handwritten" },
+    generatedAt: new Date().toISOString(),
+    integrityMode: "development",
+    reasons: [],
+  })
   const fvNoEvidence = await registeredTools.next.execute({ sessionId: fvNoEvidenceRun })
   assert.strictEqual(
     fvNoEvidence.status,
@@ -1190,7 +1276,7 @@ try {
   )
   assert(vWrongAgent.content.startsWith("refused:"), `unknown session identity must be refused: ${vWrongAgent.content}`)
   const originalAuditorGet = mockCtx.session.get
-  mockCtx.session.get = async () => ({ agent: "team/verifier" })
+  mockCtx.session.get = async ({ sessionID: id }) => id === FIXTURE_ROOT_SESSION ? { agent: "team/sentinel" } : { agent: "team/verifier", parentID: FIXTURE_ROOT_SESSION }
   try {
     const vVerifier = await registeredTools.victory_audit.execute(
       { sessionId: vAuthRun, verdict: "VICTORY CONFIRMED", requirements: vAuthRequirements },
@@ -1204,7 +1290,7 @@ try {
 
   // Requirement result validation: missing, unknown, duplicate, and met-without-evidence.
   const originalVictoryGet = mockCtx.session.get
-  mockCtx.session.get = async () => ({ agent: "team/victory-auditor" })
+  mockCtx.session.get = async ({ sessionID: id }) => id === FIXTURE_ROOT_SESSION ? { agent: "team/sentinel" } : { agent: "team/victory-auditor", parentID: FIXTURE_ROOT_SESSION }
   try {
     const vMissingId = await registeredTools.victory_audit.execute(
       { sessionId: vAuthRun, verdict: "VICTORY CONFIRMED", requirements: [] },
@@ -1244,14 +1330,17 @@ try {
 
   // CONFIRMED without ORIGINAL_REQUEST.md is refused (requestHash cannot be forged).
   const vNoRequestRun = "20261018-000000-v-norequest"
-  await registeredTools.plan.execute({
-    sessionId: vNoRequestRun,
-    topology: "iterative-coding",
-    skipInterview: true,
-    requirements: [{ id: "R1", text: "Caller-only baseline." }],
-    tasks: [{ id: "V1" }],
-  })
-  mockCtx.session.get = async () => ({ agent: "team/victory-auditor" })
+  await registeredTools.plan.execute(
+    {
+      sessionId: vNoRequestRun,
+      topology: "iterative-coding",
+      skipInterview: true,
+      requirements: [{ id: "R1", text: "Caller-only baseline." }],
+      tasks: [{ id: "V1" }],
+    },
+    { sessionID: FIXTURE_ROOT_SESSION },
+  )
+  mockCtx.session.get = async ({ sessionID: id }) => id === FIXTURE_ROOT_SESSION ? { agent: "team/sentinel" } : { agent: "team/victory-auditor", parentID: FIXTURE_ROOT_SESSION }
   try {
     const vNoRequest = await registeredTools.victory_audit.execute(
       { sessionId: vNoRequestRun, verdict: "VICTORY CONFIRMED", requirements: [{ id: "R1", met: true, evidence: "seen" }] },
@@ -1270,7 +1359,7 @@ try {
     met: true,
     evidence: `Observed ${item.id} in the fixture artifact.`,
   }))
-  mockCtx.session.get = async () => ({ agent: "team/victory-auditor" })
+  mockCtx.session.get = async ({ sessionID: id }) => id === FIXTURE_ROOT_SESSION ? { agent: "team/sentinel" } : { agent: "team/victory-auditor", parentID: FIXTURE_ROOT_SESSION }
   try {
     const vHappyAudit = await registeredTools.victory_audit.execute(
       { sessionId: vHappyRun, verdict: "VICTORY CONFIRMED", requirements: vHappyReqs, summary: "Fixture matches." },
@@ -1316,17 +1405,13 @@ try {
   const vNextRun = "20261018-000000-v-next-gate"
   await seedVerifiedRun(vNextRun, ["V1"], { request: "Deliver the next-gate fixture.", stampVictory: false })
   const vNextFinalFile = finalFileOf(vNextRun)
-  mkdirSync(dirname(vNextFinalFile), { recursive: true })
-  writeFileSync(
-    vNextFinalFile,
-    JSON.stringify({
-      status: "PASS",
-      generatedBy: { agent: "team/verifier", session: "ses_next_fixture" },
-      generatedAt: new Date().toISOString(),
-      evidence: {},
-      reasons: [],
-    }) + "\n",
-  )
+  await writeSignedFixture(testDir, vNextRun, "verify/final.json", {
+    status: "PASS",
+    generatedBy: { agent: "team/verifier", session: "ses_next_fixture" },
+    generatedAt: new Date().toISOString(),
+    evidence: {},
+    reasons: [],
+  })
   const vNextBefore = await registeredTools.next.execute({ sessionId: vNextRun })
   assert.strictEqual(vNextBefore.status, "READY_FOR_VICTORY_AUDIT", `next must stop at the victory gate: ${vNextBefore.content}`)
   assert.notStrictEqual(vNextBefore.status, "ALL_PASSED")
@@ -1337,7 +1422,7 @@ try {
   // REJECTED -> FAIL and no completion.
   const vRejectedRun = "20261018-000000-v-rejected"
   await seedVerifiedRun(vRejectedRun, ["V1"], { request: "Deliver the rejected fixture.", stampVictory: false })
-  mockCtx.session.get = async () => ({ agent: "team/victory-auditor" })
+  mockCtx.session.get = async ({ sessionID: id }) => id === FIXTURE_ROOT_SESSION ? { agent: "team/sentinel" } : { agent: "team/victory-auditor", parentID: FIXTURE_ROOT_SESSION }
   try {
     const vRejectedAudit = await registeredTools.victory_audit.execute(
       {
@@ -1361,7 +1446,7 @@ try {
   // One unmet requirement -> FAIL with the requirement id.
   const vUnmetRun = "20261018-000000-v-unmet"
   await seedVerifiedRun(vUnmetRun, ["V1"], { request: "Deliver the unmet fixture.", stampVictory: false })
-  mockCtx.session.get = async () => ({ agent: "team/victory-auditor" })
+  mockCtx.session.get = async ({ sessionID: id }) => id === FIXTURE_ROOT_SESSION ? { agent: "team/sentinel" } : { agent: "team/victory-auditor", parentID: FIXTURE_ROOT_SESSION }
   try {
     await registeredTools.victory_audit.execute(
       {
@@ -1437,7 +1522,8 @@ try {
   const sha256 = (text) => createHash("sha256").update(text, "utf8").digest("hex")
   const withAgent = async (agent, fn) => {
     const previous = mockCtx.session.get
-    mockCtx.session.get = async () => ({ agent })
+    mockCtx.session.get = async ({ sessionID }) =>
+      sessionID === FIXTURE_ROOT_SESSION ? { agent: "team/sentinel" } : { agent, parentID: FIXTURE_ROOT_SESSION }
     try {
       return await fn()
     } finally {
@@ -1697,15 +1783,14 @@ try {
   const reworkFirstFinal = await registeredTools.final_verify.execute({ sessionId: strictReworkRun })
   assert.strictEqual(reworkFirstFinal.status, "PASS", `the original report must pass: ${reworkFirstFinal.content}`)
 
-  const reworkedReportText =
-    JSON.stringify({
-      taskId: "RH1",
-      status: "PASS",
-      checks: [{ name: "reworked behavior", type: "programmatic", passed: true }],
-      timestamp: "2026-11-22T00:00:00.000Z",
-    }) + "\n"
+  await writeSignedFixture(testDir, strictReworkRun, "verify/report-RH1.json", {
+    taskId: "RH1",
+    status: "PASS",
+    checks: [{ name: "reworked behavior", type: "programmatic", passed: true }],
+    timestamp: "2026-11-22T00:00:00.000Z",
+  })
+  const reworkedReportText = readFileSync(reportFileOf(strictReworkRun, "RH1"), "utf8")
   assert.notStrictEqual(reworkedReportText, originalReportText, "the fixture must actually change the report bytes")
-  writeFileSync(reportFileOf(strictReworkRun, "RH1"), reworkedReportText)
   const reworkStaleFinal = await registeredTools.final_verify.execute({ sessionId: strictReworkRun })
   assert.strictEqual(reworkStaleFinal.status, "FAIL", `a changed report must invalidate the wave: ${reworkStaleFinal.content}`)
   assert(
@@ -2166,6 +2251,7 @@ try {
             })
           },
         },
+        storage: storageFor(gitRepoDir),
       },
       gitRepoDir,
     )
@@ -2513,6 +2599,7 @@ try {
           },
         },
         session: { get: async () => (sessionAgent ? { agent: sessionAgent } : undefined) },
+        storage: storageFor(root),
       },
       root,
     )
@@ -2872,6 +2959,7 @@ try {
           {
             tool: { transform: async (cb) => cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = tool) }) },
             session: { get: async () => undefined },
+            storage: storageFor(root),
           },
           root,
         )
@@ -2935,6 +3023,7 @@ try {
           },
         },
         session: { get: async () => undefined },
+        storage: storageFor(ledgerDir),
       },
       ledgerDir,
     )
@@ -3059,6 +3148,7 @@ try {
             },
           },
           session: { get: async () => undefined },
+          storage: storageFor(root),
         },
         root,
       )
@@ -3440,9 +3530,15 @@ try {
         },
       },
       session: {
-        get: async () => ({ agent: "team/verifier" }),
+        get: async ({ sessionID }) =>
+          sessionID === FIXTURE_ROOT_SESSION
+            ? { agent: "team/sentinel" }
+            : sessionID === "ses_fixture_verifier"
+              ? { agent: "team/verifier", parentID: FIXTURE_ROOT_SESSION }
+              : { agent: "team/verifier" },
         hook: async () => {},
       },
+      storage: storageFor(docRoot),
     }
 
     await registerTeamworkTools(ctx, docRoot)
@@ -3461,12 +3557,14 @@ try {
     }
 
     const passTask = async (sessionId, taskId) => {
-      const verifyDir = join(docRoot, ".opencode", "teamwork", sessionId, "verify")
-      mkdirSync(verifyDir, { recursive: true })
-      writeFileSync(
-        join(verifyDir, `report-${taskId}.json`),
-        JSON.stringify({ taskId, verifierAgent: "team/verifier", status: "PASS", checks: [{ name: "rubric", type: "rubric", passed: true }], fatalFindings: [] }) + "\n",
-      )
+      await writeSignedFixture(docRoot, sessionId, `verify/report-${taskId}.json`, {
+        taskId,
+        verifierAgent: "team/verifier",
+        status: "PASS",
+        summary: `Segment ${taskId} reviewed against the rubric.`,
+        checks: [{ name: "rubric", type: "rubric", passed: true }],
+        fatalFindings: [],
+      })
       for (const status of ["worker_active", "worker_done", "verifier_active", "verified_pass"]) {
         const res = await tools.task_update.execute({
           sessionId,
@@ -3501,12 +3599,15 @@ try {
     assert.strictEqual(routeMd.documentDetected, true)
 
     const mdRun = "20261122-000001-docmd"
-    const triageMd = await tools.document_triage.execute({
-      sessionId: mdRun,
-      request: "Please critique ./docs-design.md for soundness and gaps.",
-      document: { path: "docs-design.md" },
-      skipInterview: true,
-    })
+    const triageMd = await tools.document_triage.execute(
+      {
+        sessionId: mdRun,
+        request: "Please critique ./docs-design.md for soundness and gaps.",
+        document: { path: "docs-design.md" },
+        skipInterview: true,
+      },
+      { sessionID: FIXTURE_ROOT_SESSION },
+    )
     assert.strictEqual(triageMd.topology, "document-review")
     assert.strictEqual(triageMd.extractionStatus, "extracted")
     assert.strictEqual(triageMd.segments.length, 3, "3-heading doc should produce 3 segments")
@@ -4222,6 +4323,7 @@ try {
         get: async () => undefined,
         hook: async () => {},
       },
+      storage: storageFor(testDir9),
     }
     await registerTeamworkTools(ctx9, testDir9)
     await registerTeamworkHooks(ctx9, testDir9)
@@ -4486,16 +4588,19 @@ try {
       }
 
       const sid = "20261018-190020-e2e"
-      const planRes = await tools9.plan.execute({
-        sessionId: sid,
-        topology: "massive-proof",
-        massiveProofOptIn: true,
-        request: "Prove synthetic lemma via massive-proof tournament",
-        budgetUsd: 20,
-        skipInterview: true,
-        tournament: { levels: 2, branchingFactor: 3, maxCandidates: 8, maxIterations: 2 },
-        tasks: [{ id: "T1", agent: "team/proposer" }],
-      })
+      const planRes = await tools9.plan.execute(
+        {
+          sessionId: sid,
+          topology: "massive-proof",
+          massiveProofOptIn: true,
+          request: "Prove synthetic lemma via massive-proof tournament",
+          budgetUsd: 20,
+          skipInterview: true,
+          tournament: { levels: 2, branchingFactor: 3, maxCandidates: 8, maxIterations: 2 },
+          tasks: [{ id: "T1", agent: "team/proposer" }],
+        },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
       assert(planRes.content.startsWith("Planned"), `bounded plan must succeed: ${planRes.content}`)
 
       const nextInit = await tools9.next.execute({ sessionId: sid })
@@ -4559,8 +4664,11 @@ try {
 
       // final_verify while tournament incomplete MUST stamp FAIL
       const runPath = join(testDir9, ".opencode", "teamwork", sid)
-      mkdirSync(join(runPath, "verify"), { recursive: true })
-      writeFileSync(join(runPath, "verify", "report-T1.json"), JSON.stringify({ status: "PASS" }))
+      await writeSignedFixture(testDir9, sid, "verify/report-T1.json", {
+        taskId: "T1",
+        status: "PASS",
+        summary: "Tournament fixture PASS.",
+      })
       await tools9.task_update.execute({ sessionId: sid, taskId: "T1", status: "worker_active", agent: "team/proposer" })
       await tools9.task_update.execute({ sessionId: sid, taskId: "T1", status: "worker_done", agent: "team/proposer" })
       await tools9.task_update.execute({ sessionId: sid, taskId: "T1", status: "verifier_active", agent: "team/verifier" })
@@ -5693,9 +5801,11 @@ process.exit(0);
         await tools.task_update.execute({ sessionId: RUN, taskId: "L1", status: st })
       }
       await tools.task_update.execute({ sessionId: RUN, taskId: "L1", status: "verified_pass", verification: { status: "PASS" } })
-      const repFile = join(rootV, ".opencode", "teamwork", RUN, "verify", "report-L1.json")
-      mkdirSync(dirname(repFile), { recursive: true })
-      writeFileSync(repFile, JSON.stringify({ taskId: "L1", status: "PASS" }) + "\n")
+      await writeSignedFixture(rootV, RUN, "verify/report-L1.json", {
+        taskId: "L1",
+        status: "PASS",
+        summary: "LEMMA fixture PASS.",
+      })
       await tools.security_audit.execute({ sessionId: RUN, status: "PASS", findings: [] })
 
       // (d) clean .lean + exit 0 -> PASS, but without final FAITHFUL review final_verify must FAIL
@@ -6218,9 +6328,11 @@ process.exit(0);
       await advanceTask("worker_done")
       await advanceTask("verifier_active")
       await tools.task_update.execute({ sessionId: RUN_FINAL, taskId: "L1", status: "verified_pass", verification: { status: "PASS" } })
-      const finalRepFile = join(rootP, ".opencode", "teamwork", RUN_FINAL, "verify", "report-L1.json")
-      mkdirSync(dirname(finalRepFile), { recursive: true })
-      writeFileSync(finalRepFile, JSON.stringify({ taskId: "L1", status: "PASS" }) + "\n")
+      await writeSignedFixture(rootP, RUN_FINAL, "verify/report-L1.json", {
+        taskId: "L1",
+        status: "PASS",
+        summary: "LEMMA policy fixture PASS.",
+      })
       await tools.security_audit.execute({ sessionId: RUN_FINAL, status: "PASS", findings: [] })
       await tools.lemma_formalize.execute({ sessionId: RUN_FINAL, action: "review_final", verdict: "FAITHFUL", notes: "matches" })
       const fvPolicyOk = await tools.final_verify.execute({ sessionId: RUN_FINAL })
@@ -6867,5 +6979,463 @@ process.exit(0);
     console.log("✓ BRIEFING.md is bounded, sanitised, atomic, fail-open, refreshed, and excerpted; handoff docs match")
   } finally {
     rmSync(root, { recursive: true, force: true })
+  }
+
+  // ==========================================
+  // Part 12: artifact authenticity (Phase A)
+  // ==========================================
+  {
+    console.log("Testing artifact authenticity (Phase A)...")
+    // Local registration sharing testDir's storage shim, so this block is
+    // independent of earlier fixture scopes. Tools and the mock ctx are the
+    // same objects, so a test can swap the trusted session identity.
+    const registeredTools = {}
+    const mockCtx = {
+      tool: {
+        transform: async (cb) => {
+          await cb({ namespace: () => {}, add: (tool) => (registeredTools[tool.name] = tool) })
+        },
+      },
+      session: { get: async (args) => fixtureSessionGet(args) },
+      storage: storageFor(testDir),
+    }
+    await registerTeamworkTools(mockCtx, testDir)
+    const runFile = (root, runId, name) => join(root, ".opencode", "teamwork", runId, name)
+    const readEvents = (root, runId) =>
+      readFileSync(runFile(root, runId, "events.jsonl"), "utf8")
+        .split("\n")
+        .filter((l) => l !== "")
+        .map((l) => JSON.parse(l))
+    const reqText = (runId) => readFileSync(runFile(testDir, runId, "ORIGINAL_REQUEST.md"), "utf8")
+    const reportPath = (runId, taskId) => runFile(testDir, runId, `verify/report-${taskId}.json`)
+    const victoryPath = (runId) => runFile(testDir, runId, "verify/victory.json")
+    const readJsonFile = (file) => JSON.parse(readFileSync(file, "utf8"))
+    const writeJsonFile = (file, value) => {
+      mkdirSync(dirname(file), { recursive: true })
+      writeFileSync(file, JSON.stringify(value, null, 2) + "\n")
+    }
+    const requirementsOf = (runId) => readJsonFile(runFile(testDir, runId, "requirements.json"))
+    const callAs = async (agent, fn) => {
+      const previous = mockCtx.session.get
+      mockCtx.session.get = async ({ sessionID }) => {
+        if (sessionID === FIXTURE_ROOT_SESSION) return { agent: "team/sentinel" }
+        return agent ? { agent, parentID: FIXTURE_ROOT_SESSION } : undefined
+      }
+      try {
+        return await fn()
+      } finally {
+        mockCtx.session.get = previous
+      }
+    }
+    const seedVerifiedRun = async (
+      runId,
+      taskIds,
+      { request, integrityMode, auditStatus = "PASS", stampVictory = request !== undefined, victoryAudit, verification, allowUnsignedLegacy } = {},
+    ) => {
+      await registeredTools.plan.execute(
+        {
+          sessionId: runId,
+          topology: "iterative-coding",
+          skipInterview: true,
+          ...(request !== undefined ? { request, integrityMode } : {}),
+          ...(victoryAudit !== undefined ? { victoryAudit } : {}),
+          ...(verification !== undefined ? { verification } : {}),
+          ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
+          tasks: taskIds.map((id) => ({ id })),
+        },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+      for (const taskId of taskIds) {
+        for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+          await registeredTools.task_update.execute({ sessionId: runId, taskId, status })
+        }
+        await registeredTools.task_update.execute({
+          sessionId: runId,
+          taskId,
+          status: "verified_pass",
+          verification: { status: "PASS" },
+        })
+        const reportRes = await registeredTools.report.execute(
+          {
+            sessionId: runId,
+            taskId,
+            status: "PASS",
+            summary: `Authenticity fixture PASS for ${taskId}.`,
+            checks: [{ name: "fixture", type: "check", passed: true }],
+          },
+          { sessionID: "ses_fixture_verifier" },
+        )
+        assert(!reportRes.content.startsWith("refused:"), `authenticity fixture report failed: ${reportRes.content}`)
+      }
+      await registeredTools.security_audit.execute({
+        sessionId: runId,
+        status: auditStatus,
+        findings: auditStatus === "FAIL" ? [{ severity: "Critical", description: "hardcoded secret" }] : [],
+      })
+      if (stampVictory && request !== undefined) await stampVictoryFor(registeredTools, mockCtx, testDir, runId)
+    }
+
+    const unsignedVictory = (runId) => {
+      const baseline = requirementsOf(runId)
+      return {
+        version: 1,
+        sessionId: runId,
+        verdict: "VICTORY CONFIRMED",
+        auditor: "team/victory-auditor",
+        auditorSessionId: "ses_victory_auditor",
+        requestHash: createHash("sha256").update(reqText(runId), "utf8").digest("hex"),
+        requirementsHash: createHash("sha256").update(canonicalJson(baseline), "utf8").digest("hex"),
+        requirements: baseline.items.map((item) => ({ id: item.id, met: true, evidence: `Fixture evidence for ${item.id}` })),
+        findings: [],
+        summary: "unsigned fixture",
+        generatedAt: new Date().toISOString(),
+      }
+    }
+
+    // Forged victory with no _auth envelope: a signed run fails AUTH_MISSING,
+    // and `next` never reports ALL_PASSED.
+    {
+      const runId = "20261123-000001-auth-forged-victory"
+      await seedVerifiedRun(runId, ["A1"], { request: "Authenticity forged victory fixture.", stampVictory: false })
+      writeJsonFile(victoryPath(runId), unsignedVictory(runId))
+      const fv = await registeredTools.final_verify.execute({ sessionId: runId })
+      assert.strictEqual(fv.status, "FAIL", `an unsigned victory must FAIL: ${fv.content}`)
+      assert(fv.reasons.some((r) => r.includes("AUTH_MISSING")), `AUTH_MISSING must be named: ${JSON.stringify(fv.reasons)}`)
+      const gate = await registeredTools.next.execute({ sessionId: runId })
+      assert.notStrictEqual(gate.status, "ALL_PASSED", "next must not complete with a forged victory")
+    }
+
+    // Tampered verdict field: AUTH_INVALID (and the semantic rejection remains).
+    {
+      const runId = "20261123-000002-auth-tampered-victory"
+      await seedVerifiedRun(runId, ["A1"], { request: "Authenticity tampered verdict fixture." })
+      const victory = readJsonFile(victoryPath(runId))
+      victory.summary = "tampered after signing"
+      writeJsonFile(victoryPath(runId), victory)
+      const fv = await registeredTools.final_verify.execute({ sessionId: runId })
+      assert.strictEqual(fv.status, "FAIL")
+      assert(fv.reasons.some((r) => r.includes("AUTH_INVALID")), `AUTH_INVALID must be named: ${JSON.stringify(fv.reasons)}`)
+    }
+
+    // Tampered final status (FAIL -> PASS) cannot be auth-valid.
+    {
+      const runId = "20261123-000003-auth-tampered-final"
+      await seedVerifiedRun(runId, ["A1"], { request: "Authenticity tampered final fixture.", victoryAudit: "skip" })
+      const fvFail = await registeredTools.final_verify.execute({ sessionId: runId, failReason: "fixture forces FAIL" })
+      assert.strictEqual(fvFail.status, "FAIL")
+      const final = readJsonFile(runFile(testDir, runId, "verify/final.json"))
+      final.status = "PASS"
+      final.reasons = []
+      writeJsonFile(runFile(testDir, runId, "verify/final.json"), final)
+      const gate = await registeredTools.next.execute({ sessionId: runId })
+      assert.strictEqual(gate.status, "AUTH_INVALID", `a tampered final status must be AUTH_INVALID: ${gate.content}`)
+    }
+
+    // Copied _auth across files and across runs.
+    {
+      const runId = "20261123-000004-auth-copied-auth"
+      await seedVerifiedRun(runId, ["A1"], { request: "Authenticity copied _auth fixture.", victoryAudit: "skip" })
+      const fv = await registeredTools.final_verify.execute({ sessionId: runId })
+      assert.strictEqual(fv.status, "PASS", `fixture final must PASS: ${fv.content}`)
+      const final = readJsonFile(runFile(testDir, runId, "verify/final.json"))
+      const victoryEnvelope = (await writeSignedFixture(testDir, runId, "verify/other.json", { x: 1 }))._auth
+      final._auth = victoryEnvelope
+      writeJsonFile(runFile(testDir, runId, "verify/final.json"), final)
+      const gate = await registeredTools.next.execute({ sessionId: runId })
+      assert.strictEqual(gate.status, "AUTH_INVALID", `a copied envelope must fail its path binding: ${gate.content}`)
+
+      const sourceRun = "20261123-000005-auth-copy-source"
+      const targetRun = "20261123-000006-auth-copy-target"
+      await seedVerifiedRun(sourceRun, ["A1"], { request: "Copy source fixture." })
+      await seedVerifiedRun(targetRun, ["A1"], { request: "Copy target fixture.", stampVictory: false })
+      writeJsonFile(victoryPath(targetRun), readJsonFile(victoryPath(sourceRun)))
+      const copied = await registeredTools.final_verify.execute({ sessionId: targetRun })
+      assert.strictEqual(copied.status, "FAIL", "a victory copied into another run must fail")
+      assert(
+        copied.reasons.some((r) => r.includes("AUTH_INDEX_MISSING")),
+        `the missing index must be named: ${JSON.stringify(copied.reasons)}`,
+      )
+    }
+
+    // Stale report/victory after an evidence change.
+    {
+      const runId = "20261123-000007-auth-stale-report"
+      await seedVerifiedRun(runId, ["A1"], { request: "Authenticity stale report fixture.", victoryAudit: "skip" })
+      const fv = await registeredTools.final_verify.execute({ sessionId: runId })
+      assert.strictEqual(fv.status, "PASS", `fixture final must PASS: ${fv.content}`)
+      await writeSignedFixture(testDir, runId, "verify/report-A1.json", {
+        taskId: "A1",
+        status: "PASS",
+        summary: "re-signed report after final verification",
+      })
+      const gate = await registeredTools.next.execute({ sessionId: runId })
+      assert.strictEqual(gate.status, "AUTH_STALE", `a changed report must make the final verdict stale: ${gate.content}`)
+
+      const victoryRun = "20261123-000008-auth-stale-victory"
+      await seedVerifiedRun(victoryRun, ["A1"], { request: "Authenticity stale victory fixture." })
+      const baseline = requirementsOf(victoryRun)
+      baseline.items[0].text = "changed after the victory audit"
+      writeJsonFile(runFile(testDir, victoryRun, "requirements.json"), baseline)
+      const stale = await registeredTools.final_verify.execute({ sessionId: victoryRun })
+      assert.strictEqual(stale.status, "FAIL")
+      assert(stale.reasons.some((r) => r.includes("AUTH_STALE")), `a stale baseline must be AUTH_STALE: ${JSON.stringify(stale.reasons)}`)
+    }
+
+    // Policy downgrades: verification, victoryAudit, integrityMode, requirements.
+    {
+      const downgradeRun = async (runId, opts = {}) => {
+        await seedVerifiedRun(runId, ["A1"], {
+          request: "Authenticity downgrade fixture.",
+          victoryAudit: "required",
+          ...opts,
+        })
+        return runId
+      }
+      const mutatePlanAndState = (runId, patch) => {
+        for (const name of ["plan.dag.json", "state.json"]) {
+          const file = runFile(testDir, runId, name)
+          const value = readJsonFile(file)
+          Object.assign(value, patch)
+          writeJsonFile(file, value)
+        }
+      }
+      const strictRun = await downgradeRun("20261123-000009-auth-downgrade-strict", { verification: "strict" })
+      mutatePlanAndState(strictRun, { verification: "standard" })
+      const strictFv = await registeredTools.final_verify.execute({ sessionId: strictRun })
+      assert.strictEqual(strictFv.status, "FAIL")
+      assert(strictFv.reasons.some((r) => r.includes("verification downgrade")), `strict->standard must be refused: ${JSON.stringify(strictFv.reasons)}`)
+
+      const victoryRun = await downgradeRun("20261123-000010-auth-downgrade-victory")
+      mutatePlanAndState(victoryRun, { victoryAudit: "skip" })
+      const victoryFv = await registeredTools.final_verify.execute({ sessionId: victoryRun })
+      assert.strictEqual(victoryFv.status, "FAIL")
+      assert(victoryFv.reasons.some((r) => r.includes("victory audit downgrade")), `required->skip must be refused: ${JSON.stringify(victoryFv.reasons)}`)
+
+      const integrityRun = await downgradeRun("20261123-000011-auth-downgrade-integrity", { integrityMode: "benchmark" })
+      mutatePlanAndState(integrityRun, { integrityMode: "demo" })
+      const integrityFv = await registeredTools.final_verify.execute({ sessionId: integrityRun })
+      assert.strictEqual(integrityFv.status, "FAIL")
+      assert(integrityFv.reasons.some((r) => r.includes("integrity mode downgrade")), `benchmark->demo must be refused: ${JSON.stringify(integrityFv.reasons)}`)
+
+      const requirementsRun = await downgradeRun("20261123-000012-auth-downgrade-requirements")
+      const baseline = requirementsOf(requirementsRun)
+      baseline.items[0].text = "a different requirement"
+      writeJsonFile(runFile(testDir, requirementsRun, "requirements.json"), baseline)
+      const requirementsFv = await registeredTools.final_verify.execute({ sessionId: requirementsRun })
+      assert.strictEqual(requirementsFv.status, "FAIL")
+      assert(requirementsFv.reasons.some((r) => r.includes("requirements baseline changed")), `requirements drift must be refused: ${JSON.stringify(requirementsFv.reasons)}`)
+    }
+
+    // Key rotation: old artifacts stay verifiable with the pinned previous key,
+    // new writes use the new key, and an unknown key fails closed.
+    {
+      const rotRoot = mkdtempSync(join(testDir, "auth-rotation-"))
+      const rotTools = await makeToolsFor(rotRoot)
+      const rotAuth = authFor(rotRoot)
+      const old = await rotAuth.signRunArtifact("run-old", "verify/old.json", { n: 1 })
+      const oldKey = old._auth.keyId
+      const rotated = await rotAuth.rotate()
+      assert.strictEqual(rotated.ok, true, `rotation must succeed: ${JSON.stringify(rotated)}`)
+      const fresh = await rotAuth.signRunArtifact("run-new", "verify/new.json", { n: 1 })
+      assert.notStrictEqual(fresh._auth.keyId, oldKey, "new writes must use the rotated key")
+      const oldCheck = await rotAuth.verifyRunArtifact("run-old", "verify/old.json", old)
+      assert.strictEqual(oldCheck.status, "signed", `the previous key must still verify the old artifact: ${JSON.stringify(oldCheck)}`)
+      const unknown = JSON.parse(JSON.stringify(old))
+      unknown._auth.keyId = "k_unknown_fixture"
+      const unknownCheck = await rotAuth.verifyArtifact("verify/old.json", unknown)
+      assert.strictEqual(unknownCheck.ok, false)
+      assert.strictEqual(unknownCheck.failure.code, "AUTH_UNKNOWN_KEY", `unknown key must be named: ${JSON.stringify(unknownCheck)}`)
+
+      const planRes = await rotTools.plan.execute(
+        { sessionId: "20261123-000013-auth-rotated-plan", topology: "iterative-coding", skipInterview: true, tasks: [{ id: "R1" }] },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+      assert.strictEqual(planRes.content.startsWith("Planned"), true, `a post-rotation plan must use the new key: ${planRes.content}`)
+      const manifest = readJsonFile(join(rotRoot, ".opencode", "teamwork", "20261123-000013-auth-rotated-plan", "run.manifest.json"))
+      assert.strictEqual(manifest._auth.keyId, rotated.keyId, "the manifest must be signed with the rotated key")
+      rmSync(rotRoot, { recursive: true, force: true })
+    }
+
+    // Legacy unsigned runs: default AUTH_LEGACY, recorded bypass works,
+    // benchmark refuses both allowUnsignedLegacy and victoryAudit skip.
+    {
+      const runId = "20261123-000014-auth-legacy"
+      await seedVerifiedRun(runId, ["L1"], {
+        request: "Authenticity legacy fixture.",
+        victoryAudit: "skip",
+        allowUnsignedLegacy: true,
+      })
+      assert(!existsSync(runFile(testDir, runId, "run.manifest.json")), "a legacy plan must not write a manifest")
+      const noManifest = await registeredTools.next.execute({ sessionId: runId })
+      assert.strictEqual(noManifest.status, "AUTH_LEGACY", `an unsigned run must return AUTH_LEGACY: ${noManifest.content}`)
+      const fvDefault = await registeredTools.final_verify.execute({ sessionId: runId })
+      assert.strictEqual(fvDefault.status, "FAIL")
+      assert.strictEqual(fvDefault.auth, "AUTH_LEGACY", "final_verify must report AUTH_LEGACY")
+      const fvBypass = await registeredTools.final_verify.execute({ sessionId: runId, allowUnsignedLegacy: true })
+      assert.strictEqual(fvBypass.status, "PASS", `the explicit legacy bypass must PASS: ${fvBypass.content}`)
+      const nextBypass = await registeredTools.next.execute({ sessionId: runId, allowUnsignedLegacy: true })
+      assert.strictEqual(nextBypass.status, "ALL_PASSED", `the legacy bypass must complete: ${nextBypass.content}`)
+      assert(
+        readEvents(testDir, runId).some((e) => e.event === "legacy_unsigned_bypass"),
+        "the legacy bypass must be an explicit event",
+      )
+
+      const benchRun = "20261123-000015-auth-bench-legacy"
+      const bench = await registeredTools.plan.execute({
+        sessionId: benchRun,
+        topology: "iterative-coding",
+        skipInterview: true,
+        integrityMode: "benchmark",
+        allowUnsignedLegacy: true,
+        request: "Benchmark cannot be unsigned.",
+        tasks: [{ id: "B1" }],
+      })
+      assert(/AUTH_LEGACY/.test(bench.content), `benchmark must refuse allowUnsignedLegacy: ${bench.content}`)
+      const benchSkip = await registeredTools.plan.execute({
+        sessionId: "20261123-000016-auth-bench-skip",
+        topology: "iterative-coding",
+        skipInterview: true,
+        integrityMode: "benchmark",
+        victoryAudit: "skip",
+        request: "Benchmark cannot skip victory.",
+        tasks: [{ id: "B1" }],
+      })
+      assert(/benchmark mode requires the independent victory audit/.test(benchSkip.content), `benchmark must refuse victoryAudit skip: ${benchSkip.content}`)
+    }
+
+    // Storage unavailable refuses a signed plan; the env key is a usable override;
+    // a malformed key ring fails closed without rotating.
+    {
+      const noStoreRoot = mkdtempSync(join(testDir, "auth-nostore-"))
+      const noStoreTools = {}
+      await registerTeamworkTools(
+        {
+          tool: { transform: async (cb) => cb({ namespace: () => {}, add: (tool) => (noStoreTools[tool.name] = tool) }) },
+          session: { get: async (args) => fixtureSessionGet(args) },
+        },
+        noStoreRoot,
+      )
+      const refused = await noStoreTools.plan.execute(
+        { sessionId: "20261123-000017-auth-no-storage", topology: "iterative-coding", skipInterview: true, tasks: [{ id: "S1" }] },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+      assert(refused.content.includes("AUTH_UNAVAILABLE"), `missing storage must refuse: ${refused.content}`)
+      assert(!existsSync(join(noStoreRoot, ".opencode", "teamwork", "20261123-000017-auth-no-storage", "plan.dag.json")), "a refused plan must write nothing")
+      rmSync(noStoreRoot, { recursive: true, force: true })
+
+      const savedKey = process.env.OPENCODE_TEAMWORK_HMAC_KEY
+      const savedId = process.env.OPENCODE_TEAMWORK_HMAC_KEY_ID
+      const envRoot = mkdtempSync(join(testDir, "auth-env-"))
+      try {
+        process.env.OPENCODE_TEAMWORK_HMAC_KEY = randomBytes(32).toString("base64url")
+        process.env.OPENCODE_TEAMWORK_HMAC_KEY_ID = "ci-test-key"
+        const envTools = await makeToolsFor(envRoot)
+        const envPlan = await envTools.plan.execute(
+          { sessionId: "20261123-000018-auth-env-key", topology: "iterative-coding", skipInterview: true, tasks: [{ id: "E1" }] },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
+        assert(envPlan.content.startsWith("Planned"), `the env key must make a plan possible: ${envPlan.content}`)
+        const manifest = readJsonFile(join(envRoot, ".opencode", "teamwork", "20261123-000018-auth-env-key", "run.manifest.json"))
+        assert.strictEqual(manifest._auth.keyId, "ci-test-key", "the env key id must be used")
+      } finally {
+        if (savedKey === undefined) delete process.env.OPENCODE_TEAMWORK_HMAC_KEY
+        else process.env.OPENCODE_TEAMWORK_HMAC_KEY = savedKey
+        if (savedId === undefined) delete process.env.OPENCODE_TEAMWORK_HMAC_KEY_ID
+        else process.env.OPENCODE_TEAMWORK_HMAC_KEY_ID = savedId
+        rmSync(envRoot, { recursive: true, force: true })
+      }
+
+      const corruptRoot = mkdtempSync(join(testDir, "auth-corrupt-"))
+      storageFor(corruptRoot).set("auth/key/ring", { version: 1, keys: [{ keyId: "bad", key: "not-a-key", createdAt: new Date().toISOString() }] })
+      const corruptTools = await makeToolsFor(corruptRoot)
+      const corruptPlan = await corruptTools.plan.execute(
+        { sessionId: "20261123-000019-auth-corrupt-key", topology: "iterative-coding", skipInterview: true, tasks: [{ id: "K1" }] },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+      assert(corruptPlan.content.includes("AUTH_KEY_CORRUPT"), `a malformed ring must fail closed: ${corruptPlan.content}`)
+      rmSync(corruptRoot, { recursive: true, force: true })
+    }
+
+    // Session-tree binding: a top-level team/victory-auditor that does not
+    // descend from the plan-time root is refused; a descendant is accepted.
+    {
+      const runId = "20261123-000020-auth-session-tree"
+      await seedVerifiedRun(runId, ["A1"], { request: "Authenticity session-tree fixture.", stampVictory: false })
+      const requirements = requirementsOf(runId).items.map((item) => ({ id: item.id, met: true, evidence: "fixture" }))
+      const topLevel = await callAs("team/victory-auditor", () =>
+        registeredTools.victory_audit.execute(
+          { sessionId: runId, verdict: "VICTORY CONFIRMED", requirements },
+          { sessionID: "ses_top_level_auditor" },
+        ),
+      )
+      // callAs injects a parent, so use an explicit no-parent mock for the
+      // true top-level case.
+      const prevGet = mockCtx.session.get
+      mockCtx.session.get = async ({ sessionID }) =>
+        sessionID === "ses_top_level_auditor" ? { agent: "team/victory-auditor" } : { agent: "team/sentinel" }
+      try {
+        const refused = await registeredTools.victory_audit.execute(
+          { sessionId: runId, verdict: "VICTORY CONFIRMED", requirements },
+          { sessionID: "ses_top_level_auditor" },
+        )
+        assert(/descends from the run root/.test(refused.content), `a top-level auditor must be refused: ${refused.content}`)
+      } finally {
+        mockCtx.session.get = prevGet
+      }
+      assert.strictEqual(topLevel.verdict?.verdict, "VICTORY CONFIRMED", "a descendant auditor must be accepted")
+    }
+
+    // teamwork_report: trusted writer, task check, PASS evidence, signing,
+    // and signed-run rejection of an unsigned report.
+    {
+      const runId = "20261123-000021-auth-report"
+      await registeredTools.plan.execute(
+        { sessionId: runId, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "R1" }] },
+        { sessionID: FIXTURE_ROOT_SESSION },
+      )
+      const wrongAgent = await callAs("team/worker", () =>
+        registeredTools.report.execute(
+          { sessionId: runId, taskId: "R1", status: "PASS", summary: "x" },
+          { sessionID: "ses_wrong_report" },
+        ),
+      )
+      assert(wrongAgent.content.startsWith("refused:"), `a non-verifier must not write a report: ${wrongAgent.content}`)
+      const missingTask = await callAs("team/verifier", () =>
+        registeredTools.report.execute(
+          { sessionId: runId, taskId: "NOPE", status: "PASS", summary: "x" },
+          { sessionID: "ses_report_verifier" },
+        ),
+      )
+      assert(missingTask.content.startsWith("refused:"), `a missing task must be refused: ${missingTask.content}`)
+      const noEvidence = await callAs("team/verifier", () =>
+        registeredTools.report.execute(
+          { sessionId: runId, taskId: "R1", status: "PASS" },
+          { sessionID: "ses_report_verifier" },
+        ),
+      )
+      assert(/needs evidence/.test(noEvidence.content), `a PASS without evidence must be refused: ${noEvidence.content}`)
+      const accepted = await callAs("team/verifier", () =>
+        registeredTools.report.execute(
+          { sessionId: runId, taskId: "R1", status: "PASS", summary: "verified", checks: [{ name: "rubric", passed: true }] },
+          { sessionID: "ses_report_verifier" },
+        ),
+      )
+      assert.strictEqual(accepted.signed, true, `a signed run report must be signed: ${accepted.content}`)
+      assert(accepted.report._auth, "the report must carry an _auth envelope")
+      const reportFile = reportPath(runId, "R1")
+      const unsigned = readJsonFile(reportFile)
+      delete unsigned._auth
+      writeJsonFile(reportFile, unsigned)
+      for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+        await registeredTools.task_update.execute({ sessionId: runId, taskId: "R1", status })
+      }
+      await registeredTools.task_update.execute({ sessionId: runId, taskId: "R1", status: "verified_pass", verification: { status: "PASS" } })
+      await registeredTools.security_audit.execute({ sessionId: runId, status: "PASS", findings: [] })
+      const fv = await registeredTools.final_verify.execute({ sessionId: runId })
+      assert.strictEqual(fv.status, "FAIL", "an unsigned report must fail a signed run")
+      assert(fv.reasons.some((r) => r.includes("AUTH_MISSING") && r.includes("report-R1.json")), `the unsigned report must be named: ${JSON.stringify(fv.reasons)}`)
+    }
+
+    console.log("✓ authenticity: forgery, tampering, copies, staleness, downgrades, rotation, legacy bypass, storage/env keys, session-tree binding, and the trusted report writer")
   }
 }
