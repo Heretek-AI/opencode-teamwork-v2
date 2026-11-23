@@ -237,6 +237,11 @@ function victoryStatusLabel(
       : "CONFIRMED (unverified envelope)"
   }
   if (gate.status === "REJECTED") return "REJECTED"
+  if (gate.status === "AUTH_STALE") {
+    return envelope === "present"
+      ? "CONFIRMED (envelope present; stale or unbound evidence)"
+      : "CONFIRMED (unverified envelope; stale or unbound evidence)"
+  }
   return "PENDING"
 }
 

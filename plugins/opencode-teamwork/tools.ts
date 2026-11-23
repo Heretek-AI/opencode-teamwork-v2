@@ -120,6 +120,7 @@ import {
   deriveRequirementsFromRequest,
   describeVictoryGate,
   evaluateVictoryGateChecked,
+  evidenceDigestsFromDisk,
   normalizeVictoryAuditMode,
   originalRequestHash,
   persistRequirementsBaseline,
@@ -146,7 +147,16 @@ import {
 import { contentSha256Hex, isApprovalNonce } from "./approval-format.mjs"
 import type { RequirementsFile, VictoryAuditMode } from "./victory.ts"
 import { readAgentBriefingExcerpt, readBriefingExcerpt, refreshAgentBriefing, refreshRunBriefing } from "./briefing.ts"
-import { writeHandoff, resolveHandoffScope, handoffAgentSlug, evaluateHandoffGateChecked, normalizeHandoffMode, resolveHandoffMode } from "./handoff.ts"
+import {
+  writeHandoff,
+  resolveHandoffScope,
+  handoffAgentSlug,
+  evaluateHandoffGateChecked,
+  normalizeHandoffMode,
+  resolveHandoffMode,
+  assignedWorkerAgent,
+  readWorkerHandoffBinding,
+} from "./handoff.ts"
 import type { HandoffGate, HandoffMode, HandoffTaskRef } from "./handoff.ts"
 import { withCrossProcessLock, withFileLock, withPinnedCrossProcessLock, recentLockDiagnostics } from "./locks.ts"
 import {
@@ -792,6 +802,211 @@ function integrityModeRank(mode: IntegrityMode): number {
 function isIntegrityRuleForbidden(rule: IntegrityRule, mode: IntegrityMode): boolean {
   return integrityModeRank(mode) >= integrityModeRank(INTEGRITY_RULES[rule].forbiddenFrom)
 }
+
+/** Every rule the run's integrity mode forbids (the audit must cover each once). */
+function forbiddenIntegrityRules(mode: IntegrityMode): IntegrityRule[] {
+  return INTEGRITY_RULE_IDS.filter((rule) => isIntegrityRuleForbidden(rule, mode))
+}
+
+export interface SecurityAuditRuleCheck {
+  rule: string
+  result: "clean" | "violation"
+  where?: string
+}
+
+/**
+ * 0.12.0: named contradictions between artifacts that can each pass their own
+ * check. The engine never fixes these; it refuses and asks for a re-record.
+ */
+export const CONTRADICTION_CODES = [
+  "INCONSISTENT_VICTORY_TASK",
+  "INCONSISTENT_REPORT_BRANCH",
+  "INCONSISTENT_AUDIT_HIGH",
+  "INCONSISTENT_WAVE_REPORT",
+] as const
+export type ContradictionCode = (typeof CONTRADICTION_CODES)[number]
+export interface EvidenceContradiction {
+  code: ContradictionCode
+  detail: string
+}
+
+function detectEvidenceContradictions(opts: {
+  run: string
+  root: string
+  runId: string
+  tasks: Array<{ id: string; status: string; reportStatus: string }>
+  reports: Record<string, any>
+  audit: any
+  victory: any
+  strictGate?: { tasks?: Array<any> }
+}): EvidenceContradiction[] {
+  const out: EvidenceContradiction[] = []
+  const { run, root, runId, tasks, reports, audit, victory } = opts
+
+  // 1. A CONFIRMED victory while a task fails.
+  if (victory?.verdict === VICTORY_CONFIRMED) {
+    for (const task of tasks) {
+      if (task.status === "verified_fail" || task.status === "failed" || task.reportStatus === "FAIL") {
+        out.push({
+          code: "INCONSISTENT_VICTORY_TASK",
+          detail: `VICTORY CONFIRMED while task ${task.id} is ${task.status}${task.reportStatus === "FAIL" ? " and its report is FAIL" : ""}`,
+        })
+      }
+    }
+  }
+
+  // 2. A PASS report computed against a branch that has moved.
+  for (const task of tasks) {
+    const report = reports[task.id]
+    if (task.reportStatus !== "PASS" || !report || typeof report !== "object") continue
+    const branch = typeof report.branch === "string" && report.branch ? report.branch : `teamwork/${runId}-${task.id}`
+    const head = execGitCapture(root, ["rev-parse", "--verify", branch])
+    if (!head) continue
+    if (typeof report.headSha === "string" && report.headSha && report.headSha !== head) {
+      out.push({
+        code: "INCONSISTENT_REPORT_BRANCH",
+        detail: `task ${task.id}: PASS report names head ${clean(report.headSha, 64).slice(0, 12)}, but ${branch} is ${head.slice(0, 12)}`,
+      })
+      continue
+    }
+    if (typeof report.diffHash === "string" && report.diffHash) {
+      const base = execGitCapture(root, ["rev-parse", "--verify", `teamwork/base-${runId}`])
+      if (!base) continue
+      const diff = execGitCapture(root, ["diff", "--no-color", `${base}..${head}`])
+      if (diff !== undefined && sha256Hex(diff) !== report.diffHash) {
+        out.push({
+          code: "INCONSISTENT_REPORT_BRANCH",
+          detail: `task ${task.id}: PASS report's diffHash does not match the current ${branch} diff`,
+        })
+      }
+    }
+  }
+
+  // 3. A PASS/CLEAN security audit with a High (or Critical) finding.
+  if (audit?.status === "PASS") {
+    const counts = audit?.severityCounts ?? {}
+    const highCount = Number(counts.high) || 0
+    const criticalCount = Number(counts.critical) || 0
+    const highFinding = Array.isArray(audit?.findings)
+      ? audit.findings.find((f: any) => ["high", "critical"].includes(String(f?.severity).toLowerCase()))
+      : undefined
+    if (highCount > 0 || criticalCount > 0 || highFinding) {
+      out.push({
+        code: "INCONSISTENT_AUDIT_HIGH",
+        detail: `security audit reports PASS with ${criticalCount} Critical / ${highCount} High finding(s)`,
+      })
+    }
+  }
+
+  // 4. A strict wave verdict bound to the current hash of a FAIL report.
+  for (const task of opts.strictGate?.tasks ?? []) {
+    if (task.reportStatus !== "FAIL") continue
+    const raw = readBoundedRunFile(run, join(run, `verify/report-${task.id}.json`), MAX_RUN_FILE_BYTES)
+    const digest = raw.status === "ok" ? contentSha256Hex(raw.text) : null
+    if (!digest) continue
+    const wave = [task.challenge, task.audit].find(
+      (w: any) => w && w.present && typeof w.reportHash === "string" && w.reportHash === digest,
+    )
+    if (wave) {
+      out.push({
+        code: "INCONSISTENT_WAVE_REPORT",
+        detail: `task ${task.id}: ${wave.path} records ${clean(wave.verdict, 32)} against the current FAIL report`,
+      })
+    }
+  }
+  return out
+}
+
+/**
+ * 0.12.0: validate a recorded security audit against the run's mode.
+ * A PASS must cover every forbidden rule exactly once, contain no `violation`,
+ * and its `reviewedDigests` must still match the evidence on disk.
+ */
+function evaluateSecurityAuditEvidence(
+  run: string,
+  audit: any,
+  mode: IntegrityMode,
+): { ok: boolean; authStale: boolean; reasons: string[] } {
+  const reasons: string[] = []
+  if (audit?.status !== "PASS") return { ok: true, authStale: false, reasons: [] }
+
+  const forbidden = forbiddenIntegrityRules(mode)
+  const checks = Array.isArray(audit?.ruleChecks) ? audit.ruleChecks : []
+  if (!Array.isArray(audit?.ruleChecks)) {
+    reasons.push(`security audit: ruleChecks is missing (a PASS must cover ${forbidden.join(", ")} at mode ${mode})`)
+  } else {
+    const seen = new Map<string, number>()
+    for (const check of checks) {
+      const rule = check && typeof check === "object" ? check.rule : undefined
+      if (typeof rule !== "string" || !Object.prototype.hasOwnProperty.call(INTEGRITY_RULES, rule)) {
+        reasons.push(`security audit: ruleChecks names an unknown rule "${clean(rule, 64)}"`)
+        continue
+      }
+      seen.set(rule, (seen.get(rule) ?? 0) + 1)
+      if (check.result !== "clean" && check.result !== "violation") {
+        reasons.push(`security audit: ruleChecks[${rule}].result must be clean | violation`)
+      }
+      if (check.result === "violation") {
+        reasons.push(`security audit: ruleChecks records a violation for ${rule} while the audit reports PASS`)
+      }
+    }
+    for (const rule of forbidden) {
+      const count = seen.get(rule) ?? 0
+      if (count === 0) reasons.push(`security audit: ruleChecks is missing the forbidden rule ${rule} at mode ${mode}`)
+      else if (count > 1) reasons.push(`security audit: ruleChecks records ${rule} ${count} times (expected exactly once)`)
+    }
+  }
+
+  let authStale = false
+  const reviewed = audit?.reviewedDigests
+  if (!reviewed || typeof reviewed !== "object" || Array.isArray(reviewed)) {
+    authStale = true
+    reasons.push("[AUTH_STALE] security audit: reviewedDigests is missing; the audit is not bound to the evidence it reviewed")
+  } else {
+    const current = evidenceDigestsFromDisk(run)
+    const recordedReports =
+      reviewed.reports && typeof reviewed.reports === "object" && !Array.isArray(reviewed.reports)
+        ? reviewed.reports
+        : null
+    if (!recordedReports) {
+      authStale = true
+      reasons.push("[AUTH_STALE] security audit: reviewedDigests.reports is missing or malformed")
+    } else {
+      for (const [id, digest] of Object.entries(recordedReports)) {
+        if (!isSafeTaskId(id)) {
+          authStale = true
+          reasons.push(`[AUTH_STALE] security audit: reviewedDigests names an invalid task id "${clean(id, 40)}"`)
+          continue
+        }
+        if (current.reports[id] !== digest) {
+          authStale = true
+          reasons.push(`[AUTH_STALE] security audit: report ${id} changed since the audit reviewed it`)
+        }
+      }
+      for (const id of Object.keys(current.reports)) {
+        if (!Object.prototype.hasOwnProperty.call(recordedReports, id)) {
+          authStale = true
+          reasons.push(`[AUTH_STALE] security audit: report ${id} was never reviewed by this audit`)
+        }
+      }
+    }
+    const recordedFinal = reviewed.final ?? null
+    if (recordedFinal !== null) {
+      const currentFinalValue = readJson<any>(run, join(run, "verify", "final.json"), undefined)
+      const currentFinalAt = typeof currentFinalValue?.generatedAt === "string" ? Date.parse(currentFinalValue.generatedAt) : NaN
+      const auditAt = typeof audit?.timestamp === "string" ? Date.parse(audit.timestamp) : NaN
+      // A final verdict written *after* the audit could not have been reviewed by
+      // it; only a final that predates the audit is a binding mismatch.
+      const writtenAfterAudit = Number.isFinite(currentFinalAt) && Number.isFinite(auditAt) && currentFinalAt > auditAt
+      if (!writtenAfterAudit && recordedFinal !== current.final) {
+        authStale = true
+        reasons.push("[AUTH_STALE] security audit: verify/final.json changed since the audit reviewed it")
+      }
+    }
+  }
+  return { ok: reasons.length === 0, authStale, reasons }
+}
+
 
 /**
  * Read the integrity mode from `<run>/ORIGINAL_REQUEST.md`. That artifact is the
@@ -7740,6 +7955,46 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const signedRun = manifestCheck.signed
         const allowUnsignedLegacy = input?.allowUnsignedLegacy === true
 
+        // 0.12.0: contradictions are checked before any "ready for worker" or
+        // completion path, so a failing task cannot sit under a CONFIRMED audit.
+        {
+          const earlyReports: Record<string, any> = Object.create(null)
+          const earlyTasks: Array<{ id: string; status: string; reportStatus: string }> = []
+          const earlyIds: string[] = []
+          for (const task of plan.tasks) {
+            if (isSafeTaskId(task?.id) && !earlyIds.includes(task.id)) earlyIds.push(task.id)
+          }
+          for (const id of Object.keys(state.tasks)) {
+            if (isSafeTaskId(id) && !earlyIds.includes(id)) earlyIds.push(id)
+          }
+          for (const id of earlyIds) {
+            const report = readJson<any>(run, join(run, `verify/report-${id}.json`), undefined)
+            if (report) earlyReports[id] = report
+            earlyTasks.push({
+              id,
+              status: String(state.tasks[id]?.status ?? "pending"),
+              reportStatus: report?.status === "PASS" ? "PASS" : report?.status === "FAIL" ? "FAIL" : "MISSING",
+            })
+          }
+          const earlyContradictions = detectEvidenceContradictions({
+            run,
+            root,
+            runId: basename(run),
+            tasks: earlyTasks,
+            reports: earlyReports,
+            audit: readJson<any>(run, join(run, "verify", "security-audit.json"), undefined),
+            victory: readVictoryVerdict(run),
+          })
+          if (earlyContradictions.length > 0) {
+            return {
+              status: "INCONSISTENT_EVIDENCE",
+              content: `INCONSISTENT_EVIDENCE: the recorded artifacts contradict each other; nothing is auto-fixed. Re-record the named evidence.\n${earlyContradictions.map((c) => `  - [${c.code}] ${c.detail}`).join("\n")}`,
+              contradictions: earlyContradictions,
+              reasons: earlyContradictions.map((c) => `[${c.code}] ${c.detail}`),
+            }
+          }
+        }
+
         const tournamentPresent =
           plan.topology === "massive-proof" &&
           (!!plan.tournament ||
@@ -8121,6 +8376,26 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               ? `Integrity mode: ${integrity.mode} (from ORIGINAL_REQUEST.md).`
               : `Integrity mode: ${integrity.mode} (default; no ORIGINAL_REQUEST.md for this run).`
 
+          // 0.12.0: the security audit is bound to the reports/final it
+          // reviewed. A PASS must also cover every forbidden rule exactly once.
+          if (audit && audit.status === "PASS") {
+            const auditCoverage = evaluateSecurityAuditEvidence(run, audit, integrity.mode)
+            if (auditCoverage.reasons.length > 0) {
+              const stale = auditCoverage.authStale
+              return {
+                status: stale ? "AUTH_STALE" : "BLOCKED_BY_SECURITY",
+                auth: stale ? "AUTH_STALE" : undefined,
+                content: stale
+                  ? `BLOCKED_BY_AUTH: [AUTH_STALE] the security audit no longer matches the evidence it reviewed: ${auditCoverage.reasons.join("; ")}. Re-run teamwork_security_audit.`
+                  : `BLOCKED_BY_SECURITY: the security audit does not cover the run's integrity rules: ${auditCoverage.reasons.join("; ")}. Re-run teamwork_security_audit.`,
+                auditReport: auditFile,
+                reasons: auditCoverage.reasons,
+                passedCount: passedTasks.length,
+                integrityMode: integrity.mode,
+              }
+            }
+          }
+
           if (!audit || audit.status !== "PASS") {
             const auditFailed = audit && audit.status === "FAIL"
             if (state.phase !== "SECURITY_AUDIT" && !auditFailed) {
@@ -8153,6 +8428,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // security-auditor audit per task, recorded after its verifier PASS.
           // Never complete (or pretend final verification is ready) without them.
           const verification = resolveVerificationMode(plan, state)
+          let nextStrictGate: { tasks?: Array<any> } | undefined
           if (verification.mode === "strict") {
             const strictTasks = [...taskDefs.keys()]
               .filter((id) => isSafeTaskId(id))
@@ -8161,6 +8437,33 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               auth,
               requireSigned: signedRun,
             })
+            nextStrictGate = strictGate
+            // A wave bound to a FAIL report is a contradiction, not just a
+            // missing strict verdict: name it before NEEDS/BLOCKED_STRICT_WAVE.
+            const waveContradictions = detectEvidenceContradictions({
+              run,
+              root,
+              runId: basename(run),
+              tasks: strictGate.tasks.map((t) => ({
+                id: t.id,
+                status: t.workerStatus,
+                reportStatus: t.reportStatus,
+              })),
+              reports: {},
+              audit: undefined,
+              victory: undefined,
+              strictGate,
+            })
+            if (waveContradictions.length > 0) {
+              return {
+                status: "INCONSISTENT_EVIDENCE",
+                content: `INCONSISTENT_EVIDENCE: a strict wave verdict approves a FAIL report; nothing is auto-fixed. Re-record the report and the wave.\n${waveContradictions.map((c) => `  - [${c.code}] ${c.detail}`).join("\n")}`,
+                contradictions: waveContradictions,
+                reasons: waveContradictions.map((c) => `[${c.code}] ${c.detail}`),
+                passedCount: passedTasks.length,
+                integrityMode: integrity.mode,
+              }
+            }
             if (!strictGate.ok) {
               const status =
                 strictGate.status === "MISSING" ? "NEEDS_STRICT_WAVE" : "BLOCKED_BY_STRICT_WAVE"
@@ -8180,6 +8483,46 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 missing: strictGate.missing,
                 reasons: strictGate.reasons,
                 passedCount: passedTasks.length,
+              }
+            }
+          }
+
+          // 0.12.0: name contradictions before reporting readiness. These are
+          // refusals, not something the gate silently repairs.
+          {
+            const nextReports: Record<string, any> = Object.create(null)
+            const nextEvidenceTasks: Array<{ id: string; status: string; reportStatus: string }> = []
+            const nextIds: string[] = []
+            for (const id of [...taskDefs.keys(), ...Object.keys(taskStates)]) {
+              if (isSafeTaskId(id) && !nextIds.includes(id)) nextIds.push(id)
+            }
+            for (const id of nextIds) {
+              const report = readJson<any>(run, join(run, `verify/report-${id}.json`), undefined)
+              if (report) nextReports[id] = report
+              nextEvidenceTasks.push({
+                id,
+                status: String(taskStates[id]?.status ?? "pending"),
+                reportStatus: report?.status === "PASS" ? "PASS" : report?.status === "FAIL" ? "FAIL" : "MISSING",
+              })
+            }
+            const contradictions = detectEvidenceContradictions({
+              run,
+              root,
+              runId: basename(run),
+              tasks: nextEvidenceTasks,
+              reports: nextReports,
+              audit,
+              victory: readVictoryVerdict(run),
+              strictGate: nextStrictGate,
+            })
+            if (contradictions.length > 0) {
+              return {
+                status: "INCONSISTENT_EVIDENCE",
+                content: `INCONSISTENT_EVIDENCE: the recorded artifacts contradict each other; nothing is auto-fixed. Re-record the named evidence.\n${contradictions.map((c) => `  - [${c.code}] ${c.detail}`).join("\n")}\n${integrityModeNote}`,
+                contradictions,
+                reasons: contradictions.map((c) => `[${c.code}] ${c.detail}`),
+                passedCount: passedTasks.length,
+                integrityMode: integrity.mode,
               }
             }
           }
@@ -8220,7 +8563,25 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 if (!isSafeTaskId(id)) continue
                 const raw = readBoundedRunFile(run, join(run, `verify/report-${id}.json`), MAX_RUN_FILE_BYTES)
                 const current = raw.status === "ok" ? sha256Hex(raw.text) : null
-                if (current !== digest) drift.push(`report ${id} changed since final verification`)
+                if (current !== digest) {
+                  drift.push(`report ${id} changed since final verification`)
+                  continue
+                }
+                // The report also binds the worker handoff; a re-recorded
+                // handoff invalidates a stamped PASS without changing the report.
+                if (raw.status === "ok" && resolveHandoffMode(plan, state).mode === "required") {
+                  let parsed: any
+                  try {
+                    parsed = JSON.parse(raw.text)
+                  } catch {}
+                  const bound = parsed?.workerHandoff
+                  if (bound && typeof bound === "object" && typeof bound.agent === "string") {
+                    const live = readWorkerHandoffBinding(run, id, bound.agent)
+                    if (live.reason || !live.binding || live.binding.path !== bound.path || live.binding.sha256 !== bound.sha256) {
+                      drift.push(`worker handoff for report ${id} changed since final verification`)
+                    }
+                  }
+                }
               }
             }
             const recordedAudit = finalReport.evidence?.auditDigest
@@ -8346,6 +8707,20 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               state.phase = "FINAL_VERIFICATION"
               await setRunPhase(run, "FINAL_VERIFICATION")
               await refreshBriefingSafe(run)
+            }
+            // A recorded verdict that no longer matches the evidence it saw is
+            // drift, not a missing audit: name it AUTH_STALE and force re-record.
+            if (nextVictoryGate.status === "AUTH_STALE") {
+              return {
+                content: `BLOCKED_BY_AUTH: [AUTH_STALE] the recorded victory audit is stale: ${nextVictoryGate.reasons.join("; ")}. Re-run teamwork_victory_audit against the current evidence.\n${integrityModeNote}`,
+                status: "AUTH_STALE",
+                auth: "AUTH_STALE",
+                finalReport: finalFile,
+                passedCount: passedTasks.length,
+                integrityMode: integrity.mode,
+                victory: nextVictoryGate.status,
+                reasons: nextVictoryGate.reasons,
+              }
             }
             const rejected = nextVictoryGate.status === "REJECTED"
             return {
@@ -9769,6 +10144,18 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           })),
           integrityFindings,
           integrityViolations,
+          // 0.12.0: the engine records coverage, not the caller. Every forbidden
+          // rule appears exactly once; any violation forces FAIL above.
+          ruleChecks: forbiddenIntegrityRules(integrity.mode).map((rule) => {
+            const finding = integrityFindings.find((f: any) => f.rule === rule)
+            return finding
+              ? { rule, result: "violation" as const, ...(finding.where ? { where: finding.where } : {}) }
+              : { rule, result: "clean" as const }
+          }),
+          reviewedDigests: (() => {
+            const digests = evidenceDigestsFromDisk(run)
+            return { reports: digests.reports, final: digests.final }
+          })(),
         }
         const manifestCheck = await readRunManifest(run, auth)
         if (!manifestCheck.ok) {
@@ -9929,6 +10316,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           verdict: { type: "string", description: "challenge: PASS; audit: CLEAN. Any other value is refused." },
           notes: { type: "string", description: "Optional adversarial notes (max 1000 chars, sanitized)." },
           evidence: { type: "string", description: "Optional evidence pointer (max 2000 chars, sanitized)." },
+          cites: {
+            type: "array",
+            description:
+              "Optional verify/ evidence paths this verdict reviewed (max 16). The engine hashes each file; a missing file refuses the call and a changed/missing cite makes the verdict stale.",
+            items: { type: "string" },
+          },
         },
         required: ["sessionId", "taskId", "kind", "verdict"],
         additionalProperties: false,
@@ -9963,6 +10356,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             verdict: input?.verdict,
             notes: input?.notes,
             evidence: input?.evidence,
+            cites: input?.cites,
             agent: caller.agent,
             agentSessionId: callSession,
           },
@@ -9985,6 +10379,66 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           content: `STRICT WAVE RECORDED: ${kind}=${result.verdict.verdict} for ${result.verdict.taskId} by ${expectedAgent}.\nArtifact: ${result.artifact}`,
           verdict: result.verdict,
           artifact: result.artifact,
+        }
+      },
+    })
+
+    editor.add({
+      name: "evidence",
+      description:
+        "Write one bounded evidence artifact under verify/evidence/<name> (max 64 KiB, at most 32 files) through the pinned run writer. Returns {path, sha256, bytes}; cite the path from teamwork_wave_record so the strict gate re-hashes it. This records bytes, not a verdict.",
+      input: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string" },
+          name: { type: "string", description: "One safe file segment, e.g. trace.txt (max 64 chars)." },
+          content: { type: "string", description: "Exact UTF-8 content (max 65536 bytes)." },
+        },
+        required: ["sessionId", "name", "content"],
+        additionalProperties: false,
+      },
+      execute: async (input: any, context: any) => {
+        const resolved = resolveRun(root, input?.sessionId)
+        if (resolved.error) return { content: resolved.error }
+        const run = resolved.run as string
+        const authz = await authorizeToolAction(ctx, run, "evidence", undefined, context)
+        if (!authz.ok) return { content: authz.content }
+        const name = typeof input?.name === "string" ? input.name.trim() : ""
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
+          return { content: `refused: evidence name "${clean(name, 80)}" must be one safe segment (^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$); nothing was written` }
+        }
+        const content = typeof input?.content === "string" ? input.content : undefined
+        if (content === undefined) {
+          return { content: "refused: evidence content must be a string; nothing was written" }
+        }
+        const bytes = Buffer.byteLength(content, "utf8")
+        const MAX_EVIDENCE_BYTES = 64 * 1024
+        const MAX_EVIDENCE_FILES = 32
+        if (bytes > MAX_EVIDENCE_BYTES) {
+          return {
+            content: `refused: evidence ${name} is ${bytes} bytes; the cap is ${MAX_EVIDENCE_BYTES}; nothing was written`,
+          }
+        }
+        try {
+          createDirWithin(run, "verify")
+          createDirWithin(run, "verify/evidence")
+          const dir = join(run, "verify", "evidence")
+          const existing = readdirSync(dir).filter((entry) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(entry))
+          if (!existing.includes(name) && existing.length >= MAX_EVIDENCE_FILES) {
+            return {
+              content: `refused: verify/evidence already holds ${existing.length} artifacts (cap ${MAX_EVIDENCE_FILES}); nothing was written`,
+            }
+          }
+          const relativePath = `verify/evidence/${name}`
+          writeSafeRunFile(run, join(run, relativePath), content)
+          return {
+            content: `EVIDENCE RECORDED: ${relativePath} (${bytes} bytes, sha256 ${contentSha256Hex(content)}).`,
+            path: relativePath,
+            sha256: contentSha256Hex(content),
+            bytes,
+          }
+        } catch (err: any) {
+          return { content: `refused: could not write verify/evidence/${clean(name, 64)} (${clean(err?.message, 160)}); nothing was written` }
         }
       },
     })
@@ -10187,6 +10641,27 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           input?.checkpoint && typeof input.checkpoint === "object" && typeof input.checkpoint.headSha === "string"
             ? clean(input.checkpoint.headSha, 64).trim()
             : ""
+        // 0.12.0: bind the report to the worker handoff that preceded it. The
+        // binding is resolved from the handoff index on disk, never from input.
+        const handoffMode = resolveHandoffMode(plan, state).mode
+        const assignedWorker = assignedWorkerAgent(run, taskId)
+        const workerHandoffResult = assignedWorker
+          ? readWorkerHandoffBinding(run, taskId, assignedWorker)
+          : { reason: `task ${taskId} has no assigned worker role that can record a handoff` }
+        if (status === "PASS" && handoffMode === "required") {
+          if (workerHandoffResult.reason) {
+            return {
+              status: "REPORT_HANDOFF_STALE",
+              content: `refused: [REPORT_HANDOFF_STALE] ${workerHandoffResult.reason}; nothing was written. Re-record the worker handoff (teamwork_handoff) for ${taskId}, then re-run the verifier report.`,
+            }
+          }
+          if (!workerHandoffResult.binding) {
+            return {
+              status: "REPORT_HANDOFF_MISSING",
+              content: `refused: [REPORT_HANDOFF_MISSING] task "${taskId}" has requireHandoffs: "required" but no ${assignedWorker} handoff is recorded in handoffs/index.json; nothing was written. Have the worker call teamwork_handoff before the verifier reports.`,
+            }
+          }
+        }
         await renewClaimFor(run, taskId, authz.sessionID, ctx, "report")
         const report: any = {
           taskId,
@@ -10203,6 +10678,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           round: currentRound,
           fence: currentFence,
           branch: reportBranch,
+          ...(workerHandoffResult.binding ? { workerHandoff: workerHandoffResult.binding } : {}),
           ...(observedBase ? { baseSha: observedBase } : {}),
           ...(observedHead ? { headSha: observedHead } : {}),
           ...(observedDiffHash ? { diffHash: observedDiffHash } : {}),
@@ -10355,12 +10831,14 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // Evidence comes from disk only; no input can supply or alter it.
           const tasks: Array<{ id: string; status: string; report: string | null; reportStatus: string }> = []
           const reportDigests: Record<string, string | null> = Object.create(null)
+          const reportValues: Record<string, any> = Object.create(null)
           const authReasons: string[] = []
           const contentIntegrityReasons: string[] = []
           for (const id of ids) {
             const safe = isSafeTaskId(id)
             const reportRel = safe ? `verify/report-${id}.json` : null
             const report = reportRel ? readJson<any>(run, join(run, reportRel), undefined) : undefined
+            if (report) reportValues[id] = report
             const rawStatus = taskStates[id]?.status
             tasks.push({
               id: clean(id, 64),
@@ -10403,6 +10881,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const securityAudit = {
             path: "verify/security-audit.json",
             status: audit?.status === "PASS" ? "PASS" : audit?.status === "FAIL" ? "FAIL" : "MISSING",
+          }
+          // 0.12.0: a PASS audit must cover every forbidden rule exactly once
+          // and its reviewed digests must still match. Violations force FAIL.
+          {
+            const auditCoverage = evaluateSecurityAuditEvidence(run, audit, readIntegrityMode(run).mode)
+            contentIntegrityReasons.push(...auditCoverage.reasons)
           }
           const auditRaw = readBoundedRunFile(run, join(run, "verify", "security-audit.json"), MAX_RUN_FILE_BYTES)
           const auditDigest = auditRaw.status === "ok" ? sha256Hex(auditRaw.text) : null
@@ -10477,6 +10961,41 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             manifestCheck.signed ? manifestCheck.manifest : undefined,
           )
           if (!handoffGate.skipped) reasons.push(...handoffGate.reasons)
+
+          // 0.12.0: re-check every PASS report's worker-handoff binding against
+          // the current index and body hash. A re-recorded worker handoff makes
+          // the old report stale.
+          if (resolveHandoffMode(plan, state).mode === "required") {
+            for (const t of tasks) {
+              if (t.reportStatus !== "PASS") continue
+              const recorded = reportValues[t.id]?.workerHandoff
+              if (!recorded || typeof recorded !== "object" || typeof recorded.agent !== "string") {
+                reasons.push(
+                  `[REPORT_HANDOFF_MISSING] task ${t.id}: PASS report has no workerHandoff binding but requireHandoffs is "required"; re-record the report through teamwork_report after the worker handoff`,
+                )
+                continue
+              }
+              const current = readWorkerHandoffBinding(run, t.id, recorded.agent)
+              if (current.reason) {
+                reasons.push(`[REPORT_HANDOFF_STALE] task ${t.id}: ${current.reason}`)
+                continue
+              }
+              if (!current.binding) {
+                reasons.push(
+                  `[REPORT_HANDOFF_STALE] task ${t.id}: the worker handoff (${clean(recorded.agent, 64)}) bound into the report is no longer in handoffs/index.json`,
+                )
+                continue
+              }
+              if (
+                current.binding.path !== recorded.path ||
+                current.binding.sha256 !== recorded.sha256
+              ) {
+                reasons.push(
+                  `[REPORT_HANDOFF_STALE] task ${t.id}: ${current.binding.path} changed since the verifier report was recorded; the report is not bound to the current worker handoff`,
+                )
+              }
+            }
+          }
 
           let documentReviewEvidence:
             | { checked: boolean; segmentReportsComplete: boolean; finalReportPresent: boolean }
@@ -10701,6 +11220,21 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           })
           if (!victoryGate.ok) reasons.push(...victoryGate.reasons)
 
+          // 0.12.0: contradictions are named refusals, never silently fixed.
+          const contradictions = detectEvidenceContradictions({
+            run,
+            root,
+            runId: basename(run),
+            tasks,
+            reports: reportValues,
+            audit,
+            victory: readVictoryVerdict(run),
+            strictGate,
+          })
+          for (const contradiction of contradictions) {
+            reasons.push(`[${contradiction.code}] ${contradiction.detail}`)
+          }
+
           // A supplied failReason can only make the verdict fail, never pass it.
           const failReason = typeof input?.failReason === "string" ? clean(input.failReason, 500).trim() : ""
           if (failReason) reasons.push(failReason)
@@ -10843,6 +11377,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                           agent: t.challenge.agent,
                           reportHash: t.challenge.reportHash,
                           ok: t.challenge.ok,
+                          cites: t.challenge.cites,
+                          warnings: t.challenge.warnings,
                         },
                         audit: {
                           path: t.audit.path,
@@ -10850,6 +11386,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                           agent: t.audit.agent,
                           reportHash: t.audit.reportHash,
                           ok: t.audit.ok,
+                          cites: t.audit.cites,
+                          warnings: t.audit.warnings,
                         },
                       })),
                     },
@@ -10857,6 +11395,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 : {}),
             },
             reasons: cappedReasons,
+            ...(contradictions.length ? { contradictions } : {}),
             ...(summary ? { summary } : {}),
             ...(findings.length ? { findings } : {}),
           }

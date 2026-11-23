@@ -4,6 +4,64 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-11-23
+
+Minor release binding verdicts to the evidence they reviewed and making
+in-run claims falsifiable by a privileged party. No schema version bump; new
+fields are additive and legacy artifacts are read with explicit staleness.
+
+### Added
+
+- **Victory reviewed digests (A3).** `verify/victory.json` gains
+  `evidenceDigests {reports, securityAudit, final}`, computed from disk by
+  `teamwork_victory_audit`. `CONFIRMED` with an empty `reports` map is refused;
+  the gate recomputes the set and returns `AUTH_STALE` on drift, including a
+  legacy verdict with no digests. `next` surfaces the drift as `AUTH_STALE`.
+- **Report → worker-handoff binding (A4).** `verify/report-<task>.json` gains
+  `workerHandoff {taskId, agent, path, sha256}` from `handoffs/index.json`. With
+  `requireHandoffs: "required"` a PASS report is refused as
+  `REPORT_HANDOFF_MISSING`/`REPORT_HANDOFF_STALE`; `final_verify` and `next`
+  re-check the binding.
+- **Audit coverage (A5).** `verify/security-audit.json` gains `ruleChecks`
+  (exactly one `clean|violation` per forbidden rule) and
+  `reviewedDigests {reports, final}`. A missing rule, a recorded violation, or
+  drift FAILs the gate; digest drift is `AUTH_STALE`.
+- **Wave evidence citations (A6).** `teamwork_wave_record` accepts up to 16
+  `verify/` paths and records `cites [{path, sha256, bytes}]`. A missing,
+  edited, or resized cite is `STALE`; a pre-0.12.0 verdict warns
+  `legacy_unbound_wave`.
+- **Verifier → worker citation (A7).** A verifier handoff also cites
+  `handoffs/<task>-<worker>.md`; changing the worker handoff stales the
+  verifier handoff and `next` names why.
+- **Contradiction detection (O6).** `INCONSISTENT_VICTORY_TASK`,
+  `INCONSISTENT_REPORT_BRANCH`, `INCONSISTENT_AUDIT_HIGH`, and
+  `INCONSISTENT_WAVE_REPORT` are named refusals in `final_verify`/`next`
+  (`INCONSISTENT_EVIDENCE`); nothing is auto-fixed.
+- **Bounded evidence artifacts (A9).** `teamwork_evidence` writes
+  `verify/evidence/<name>` through the pinned writer (64 KiB/file, 32 files),
+  returns `{path, sha256, bytes}`, and wave cites re-hash them.
+- **ADR 0012** records the design and the honest boundary sentence: a same-UID
+  writer can still author false content; the engine makes the false claim
+  specific, signed, path-bound and digest-chained so a privileged verifier can
+  falsify it.
+
+### Changed
+
+- `teamwork_report` refuses a PASS before the worker handoff exists on a
+  required run; record the worker handoff before the report.
+- `teamwork_security_audit` records coverage and the reviewed report digests.
+- A `verify/final.json` written after an audit is not treated as reviewed
+  evidence (timestamp guard), so audit → final remains a valid order.
+- Run/briefing labels: an unbound/legacy victory renders as
+  `CONFIRMED (…; stale or unbound evidence)`, never a plain `CONFIRMED`.
+
+### Tests
+
+- New engine coverage for victory digests, report/handoff binding, audit
+  coverage and drift, wave cites (including legacy warnings), the verifier →
+  worker chain, the four contradiction codes, and evidence artifacts. Existing
+  engine/doctor/timeline/export/auth/approval/security suites stay green.
+
 ## [0.11.0] - 2026-11-23
 
 Minor release closing the interview-gate gap: an authenticated approval now
