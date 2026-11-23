@@ -512,7 +512,7 @@ export function renderGateStatus(input: {
   handoffs?: {
     mode: "required" | "skip"
     status: string
-    entries: Array<{ taskId: string; agent: string; path: string; sha256: string }>
+    entries: Array<{ taskId: string; agent: string; path: string; sha256: string; auth?: string; keyId?: string }>
   }
 }): string {
   const lines: string[] = [
@@ -545,12 +545,21 @@ export function renderGateStatus(input: {
     if (input.handoffs.mode === "skip") {
       lines.push("Handoffs: **SKIPPED (explicit)**")
     } else {
+      const showAuth = input.handoffs.entries.some((entry) => !!entry.auth)
       lines.push(`Handoffs: **${cell(input.handoffs.status)}** (required)`, "")
-      lines.push("| Task | Agent | Handoff | sha256 |")
-      lines.push("| --- | --- | --- | --- |")
+      if (showAuth) {
+        lines.push("| Task | Agent | Handoff | sha256 | Auth |")
+        lines.push("| --- | --- | --- | --- | --- |")
+      } else {
+        lines.push("| Task | Agent | Handoff | sha256 |")
+        lines.push("| --- | --- | --- | --- |")
+      }
       for (const entry of input.handoffs.entries) {
+        const authCell = showAuth
+          ? `| ${cell(entry.auth ? `${entry.auth}${entry.keyId ? ` (${entry.keyId})` : ""}` : "unknown")}`
+          : ""
         lines.push(
-          `| ${cell(entry.taskId)} | ${cell(entry.agent)} | ${cell(entry.path)} | ${cell(entry.sha256)} |`,
+          `| ${cell(entry.taskId)} | ${cell(entry.agent)} | ${cell(entry.path)} | ${cell(entry.sha256)}${authCell} |`,
         )
       }
     }

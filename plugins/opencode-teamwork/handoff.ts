@@ -20,8 +20,13 @@
 import { lstatSync, readdirSync } from "node:fs"
 import { basename, join } from "node:path"
 import { sha256Hex } from "./auth.ts"
+import type { AuthContext, AuthEnvelope, AuthFailure } from "./auth.ts"
 import { clean, isSafeTaskId, readBoundedRunFile, writeSafeRunFile } from "./tournament.ts"
 import { withCrossProcessLock } from "./locks.ts"
+
+/** Domain separator for the signed handoff index payload. */
+export const HANDOFF_AUTH_KIND = "teamwork.handoff"
+export const HANDOFF_AUTH_VERSION = 1
 
 export const HANDOFF_SECTIONS = [
   "Observation",
@@ -80,6 +85,13 @@ export interface HandoffIndexEntry {
   bytes: number
   generatedAt: string
   cites: HandoffCite[]
+  /**
+   * Key id used to sign this entry. Absent on an unsigned legacy entry; the
+   * checked gate requires it to equal the plan manifest's `runKeyId`.
+   */
+  runKeyId?: string
+  /** HMAC envelope over the entry payload; absent on an unsigned legacy entry. */
+  _auth?: AuthEnvelope
 }
 
 export interface HandoffIndex {
@@ -384,21 +396,65 @@ export interface WriteHandoffOptions {
   round?: number
   sections: Partial<Record<keyof HandoffSections, unknown>>
   generatedAt?: string
+  /** Authenticity context. When present the entry is signed opportunistically. */
+  auth?: AuthContext
+  /**
+   * True on a run whose manifest pinned `handoffAuth: "signed"`. A signing
+   * failure then refuses the write instead of recording an unsigned entry.
+   */
+  requireSigned?: boolean
 }
 
-/**
- * Write one handoff markdown file and refresh the bounded index. Throws a
- * `refused:` error on any validation/containment failure; nothing is written in
- * that case (the markdown is validated before its first write).
- */
-export function writeHandoffSync(run: string, opts: WriteHandoffOptions): {
+interface PreparedHandoff {
+  file: string
+  relativePath: string
+  runId: string
+  sha256: string
+  bytes: number
+  entry: HandoffIndexEntry
+}
+
+interface WrittenHandoff {
   path: string
   relativePath: string
   sha256: string
   bytes: number
   entry: HandoffIndexEntry
   index: HandoffIndex
-} {
+}
+
+/** Build the canonical payload that binds one index entry to its run and body. */
+export function handoffAuthPayload(runId: string, entry: HandoffIndexEntry): Record<string, unknown> {
+  return {
+    kind: HANDOFF_AUTH_KIND,
+    v: HANDOFF_AUTH_VERSION,
+    runId,
+    ...(typeof entry.runKeyId === "string" ? { runKeyId: entry.runKeyId } : {}),
+    taskId: entry.taskId,
+    agent: entry.agent,
+    agentSessionId: entry.agentSessionId,
+    round: entry.round,
+    path: entry.path,
+    sha256: entry.sha256,
+    bytes: entry.bytes,
+    generatedAt: entry.generatedAt,
+    cites: entry.cites,
+    ...(entry._auth !== undefined ? { _auth: entry._auth } : {}),
+  }
+}
+
+function authRefusal(failure: AuthFailure, detail: string): Error {
+  const err = new Error(`refused: [${failure.code}] ${detail}`)
+  ;(err as any).failure = failure
+  return err
+}
+
+/**
+ * Validate and compose one handoff, then write the markdown atomically. The
+ * index entry is not touched here, so a later signing refusal cannot leave an
+ * unsigned entry behind.
+ */
+function prepareHandoff(run: string, opts: WriteHandoffOptions): PreparedHandoff {
   const slug = handoffAgentSlug(opts.agent)
   if (!slug) throw new Error("refused: the caller agent is not a team/<role> handoff author; nothing was written")
   const scope = resolveHandoffScope(opts.agent, opts.taskId)
@@ -433,31 +489,99 @@ export function writeHandoffSync(run: string, opts: WriteHandoffOptions): {
   assertRegularOrAbsent(file)
   writeSafeRunFile(run, file, text)
 
-  const entry: HandoffIndexEntry = {
-    taskId: scope.taskKey,
-    agent: opts.agent,
-    agentSessionId,
-    round,
-    path: relativePath,
+  return {
+    file,
+    relativePath,
+    runId,
     sha256,
     bytes,
-    generatedAt,
-    cites,
+    entry: {
+      taskId: scope.taskKey,
+      agent: opts.agent,
+      agentSessionId,
+      round,
+      path: relativePath,
+      sha256,
+      bytes,
+      generatedAt,
+      cites,
+    },
   }
-  const index = updateIndex(run, entry)
-  return { path: file, relativePath, sha256, bytes, entry, index }
 }
 
-/** Async wrapper; index updates share the process-wide file lock. */
-export async function writeHandoff(run: string, opts: WriteHandoffOptions): Promise<{
-  path: string
-  relativePath: string
-  sha256: string
-  bytes: number
-  entry: HandoffIndexEntry
-  index: HandoffIndex
-}> {
-  return withCrossProcessLock(join(run, handoffIndexRelativePath()), () => writeHandoffSync(run, opts))
+function finishHandoff(run: string, prepared: PreparedHandoff, entry: HandoffIndexEntry): WrittenHandoff {
+  const index = updateIndex(run, entry)
+  return {
+    path: prepared.file,
+    relativePath: prepared.relativePath,
+    sha256: prepared.sha256,
+    bytes: prepared.bytes,
+    entry,
+    index,
+  }
+}
+
+/**
+ * Sign one prepared entry. The plan key id is resolved before signing so the
+ * payload and the stored `runKeyId` agree; the digest index record is written
+ * by `signRunArtifact`.
+ */
+async function signPreparedHandoff(prepared: PreparedHandoff, auth: AuthContext): Promise<HandoffIndexEntry> {
+  const ready = await auth.ready()
+  if (!ready.ok) throw authRefusal(ready.failure, `could not resolve an authenticity key for ${prepared.relativePath}`)
+  const payload = handoffAuthPayload(prepared.runId, { ...prepared.entry, runKeyId: ready.keyId })
+  let signed: any
+  try {
+    signed = await auth.signRunArtifact(prepared.runId, prepared.relativePath, payload)
+  } catch (err: any) {
+    const failure: AuthFailure = err?.failure ?? { code: "AUTH_UNAVAILABLE", message: clean(err?.message ?? err, 200) }
+    throw authRefusal(failure, `could not sign ${prepared.relativePath} (${clean(err?.message ?? err, 200)})`)
+  }
+  const envelope = signed?._auth as AuthEnvelope | undefined
+  if (!envelope || envelope.keyId !== ready.keyId) {
+    throw authRefusal(
+      { code: "AUTH_INVALID", message: "the signing helper returned an envelope for a different key" },
+      `could not bind ${prepared.relativePath} to run key ${ready.keyId}`,
+    )
+  }
+  return { ...prepared.entry, runKeyId: ready.keyId, _auth: envelope }
+}
+
+/**
+ * Write one handoff markdown file and refresh the bounded index, without
+ * signing. Throws a `refused:` error on any validation/containment failure;
+ * nothing is written in that case (the markdown is validated before its first
+ * write). Use `writeHandoff` when an authenticity context is available.
+ */
+export function writeHandoffSync(run: string, opts: WriteHandoffOptions): WrittenHandoff {
+  if (opts.auth) {
+    throw new Error("refused: writeHandoffSync cannot sign; use the async writeHandoff")
+  }
+  const prepared = prepareHandoff(run, opts)
+  return finishHandoff(run, prepared, prepared.entry)
+}
+
+/**
+ * Async writer. The markdown is written first, then the index entry is signed
+ * (when `opts.auth` is present) and committed under the handoff-index lock. A
+ * required signature that cannot be produced refuses the call and writes no
+ * unsigned entry; a legacy run keeps the unsigned entry so a 0.8.0 run still
+ * works, and re-recording upgrades that pair on any later call.
+ */
+export async function writeHandoff(run: string, opts: WriteHandoffOptions): Promise<WrittenHandoff> {
+  return withCrossProcessLock(join(run, handoffIndexRelativePath()), async () => {
+    const prepared = prepareHandoff(run, opts)
+    let entry = prepared.entry
+    if (opts.auth) {
+      try {
+        entry = await signPreparedHandoff(prepared, opts.auth)
+      } catch (err) {
+        if (opts.requireSigned) throw err
+        // Legacy migration: an unsigned entry is tolerated on a legacy run.
+      }
+    }
+    return finishHandoff(run, prepared, entry)
+  })
 }
 
 /** List valid handoff documents (used by tests/diagnostics); never follows links. */
@@ -525,6 +649,9 @@ export interface HandoffGateEntryEvidence {
   sha256: string
   agentSessionId: string
   cites: HandoffCite[]
+  /** Provenance of this entry, checked only against `_auth`, never prose. */
+  auth?: "signed" | "unsigned" | "invalid"
+  keyId?: string
 }
 
 export interface HandoffGate {
@@ -536,6 +663,142 @@ export interface HandoffGate {
   missing: Array<{ taskId: string; agent: string }>
   required: RequiredHandoffPair[]
   entries: HandoffGateEntryEvidence[]
+  /** Aggregate provenance of the required entries when the checked gate ran. */
+  auth?: "signed" | "unsigned" | "invalid"
+}
+
+export interface HandoffAuthCheckOptions {
+  /** Authenticity context; absent fails closed for a signed entry. */
+  auth?: AuthContext
+  /** True when the run manifest pinned `handoffAuth: "signed"`. */
+  requireSigned?: boolean
+  /** The plan manifest's run key id; signed entries must match it. */
+  manifestRunKeyId?: string
+}
+
+export interface HandoffEntryAuthCheck {
+  status: "signed" | "unsigned" | "invalid"
+  keyId?: string
+  failure?: AuthFailure
+}
+
+/**
+ * Verify one index entry's `_auth`. The signed payload is reconstructed from
+ * the entry plus the run id, so a copied envelope fails on path/digest/run and a
+ * changed entry field fails on the payload digest. Prose is never inspected.
+ */
+export async function checkHandoffEntryAuth(
+  run: string,
+  entry: HandoffIndexEntry,
+  opts: HandoffAuthCheckOptions,
+): Promise<HandoffEntryAuthCheck> {
+  const raw = (entry as any)._auth
+  if (raw === undefined || raw === null) {
+    if (opts.requireSigned) {
+      return {
+        status: "invalid",
+        failure: { code: "AUTH_MISSING", message: `${entry.path} has no _auth envelope (a signed run requires one)` },
+      }
+    }
+    return { status: "unsigned" }
+  }
+  if (!opts.auth) {
+    return {
+      status: "invalid",
+      failure: { code: "AUTH_UNAVAILABLE", message: "no authenticity context is wired for this run" },
+    }
+  }
+  const runId = basename(run)
+  const check = await opts.auth.verifyRunArtifact(runId, entry.path, handoffAuthPayload(runId, entry))
+  if (check.status !== "signed") {
+    if (check.status === "unsigned") {
+      return {
+        status: "invalid",
+        failure: { code: "AUTH_MISSING", message: `${entry.path} has no _auth envelope` },
+      }
+    }
+    return {
+      status: "invalid",
+      keyId: check.keyId,
+      failure: check.failure ?? { code: "AUTH_INVALID", message: `${entry.path} failed authenticity verification` },
+    }
+  }
+  if (typeof entry.runKeyId !== "string" || entry.runKeyId !== check.keyId) {
+    return {
+      status: "invalid",
+      keyId: check.keyId,
+      failure: {
+        code: "AUTH_INVALID",
+        message: `${entry.path} runKeyId ${String(entry.runKeyId)} does not match the signing key ${check.keyId}`,
+      },
+    }
+  }
+  if (opts.manifestRunKeyId !== undefined && entry.runKeyId !== opts.manifestRunKeyId) {
+    return {
+      status: "invalid",
+      keyId: check.keyId,
+      failure: {
+        code: "AUTH_INVALID",
+        message: `${entry.path} runKeyId ${entry.runKeyId} does not match run.manifest.json ${opts.manifestRunKeyId}`,
+      },
+    }
+  }
+  return { status: "signed", keyId: check.keyId }
+}
+
+/**
+ * Continuity gate plus provenance. The structural gate runs unchanged; this
+ * wrapper only appends `[AUTH_*]` reasons for present index entries and can only
+ * turn a would-be PASS into INVALID. It never reads the narrative.
+ */
+export async function evaluateHandoffGateChecked(
+  run: string,
+  tasks: HandoffTaskRef[],
+  opts: HandoffAuthCheckOptions & { mode: HandoffMode; strict: boolean; victoryAudit: boolean },
+): Promise<HandoffGate> {
+  const gate = evaluateHandoffGate(run, tasks, opts)
+  if (gate.skipped) return gate
+  let index: HandoffIndex
+  try {
+    index = readIndex(run)
+  } catch {
+    return gate
+  }
+  if (index.entries.length === 0) return gate
+
+  const checks = new Map<string, HandoffEntryAuthCheck>()
+  const reasons = [...gate.reasons]
+  let authInvalid = false
+  for (const entry of index.entries) {
+    const key = `${entry.taskId}\u0000${entry.agent}`
+    const check = await checkHandoffEntryAuth(run, entry, opts)
+    checks.set(key, check)
+    if (check.status === "invalid") {
+      authInvalid = true
+      const failure = check.failure ?? { code: "AUTH_INVALID", message: "handoff _auth failed verification" }
+      reasons.push(`handoff ${entry.path}: [${failure.code}] ${failure.message}`)
+    }
+  }
+
+  const entries = gate.entries.map((entry) => {
+    const check = checks.get(`${entry.taskId}\u0000${entry.agent}`)
+    return {
+      ...entry,
+      auth: check?.status ?? "unsigned",
+      ...(check?.keyId ? { keyId: check.keyId } : {}),
+    }
+  })
+  const auth: HandoffGateEntryEvidence["auth"] = authInvalid
+    ? "invalid"
+    : entries.some((e) => e.auth === "signed")
+      ? "signed"
+      : "unsigned"
+
+  if (reasons.length === gate.reasons.length) {
+    return { ...gate, entries, auth }
+  }
+  const status: HandoffGate["status"] = gate.status === "STALE" ? "STALE" : "INVALID"
+  return { ...gate, ok: false, status, reasons, entries, auth }
 }
 
 /**

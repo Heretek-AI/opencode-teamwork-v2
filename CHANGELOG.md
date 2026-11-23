@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Signed handoff index entries (0.9.0 workstream B, ADR 0007).**
+  `teamwork_handoff` now signs the `handoffs/index.json` entry, never the
+  markdown: `_auth` covers `{kind:"teamwork.handoff", v:1, runId, runKeyId,
+  taskId, agent, agentSessionId, round, path, sha256, bytes, generatedAt,
+  cites}` and a digest-index record lives at
+  `auth/run/<runId>/handoffs/<taskId|_run>-<role>.md`. `run.manifest.json` gains
+  optional `handoffAuth: "signed" | "legacy"`; new signed plans write `signed`,
+  `allowUnsignedLegacy` plans write `legacy`, absent (0.8.0) is legacy, and a
+  re-plan refuses a signed→legacy downgrade. `final_verify`/`next` use
+  `evaluateHandoffGateChecked`: the structural gate is unchanged, then every
+  present entry's `_auth` and `runKeyId` are verified. Unsigned required entries
+  on a signed run are `[AUTH_MISSING]`; legacy unsigned entries are tolerated but
+  present-and-invalid envelopes are rejected. Auth failures map to `INVALID` /
+  `BLOCKED_BY_HANDOFFS`, `evidence.handoffs` records `auth` + `keyId`, and strict
+  `GATE_STATUS.md` shows an `Auth` column. Handoff prose is still never parsed,
+  and a signed handoff still cannot flip a failing verdict.
+
 ## [0.8.0] - 2026-11-22
 
 ### Added
