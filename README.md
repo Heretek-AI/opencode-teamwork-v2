@@ -143,7 +143,7 @@ topologies, and the JSON schemas (`spec.json`, `plan.dag.json`, `state.json`,
 - A plan writes a signed `run.manifest.json` (the default). Verifier reports, security audit, strict-wave verdicts, victory verdict, and final verdict carry an HMAC `_auth` envelope and a `ctx.storage` digest-index entry. `final_verify`/`next` fail as `AUTH_MISSING`, `AUTH_INVALID`, `AUTH_UNKNOWN_KEY`, `AUTH_INDEX_MISSING`, or `AUTH_STALE` when an artifact is forged, copied, edited, or the signed plan/requirements/policy baseline drifts. See [`docs/adr/0005-artifact-authenticity.md`](docs/adr/0005-artifact-authenticity.md).
 - A run completes only with a `PASS` `verify/final.json` stamped by `teamwork_final_verify`; an unstamped report needs the recorded `allowUnstamped` bypass. An unsigned legacy run returns `AUTH_LEGACY` until the recorded `allowUnsignedLegacy` bypass is passed at the completion gate; `benchmark` refuses that bypass, `victoryAudit: "skip"`, and `requireHandoffs: "skip"`.
 - `teamwork_victory_audit`, `teamwork_wave_record`, and `teamwork_report` require the caller session to descend from the plan-time `rootSessionId`, so a top-level `opencode run --agent team/victory-auditor` cannot self-authorize.
-- That PASS also needs a `verify/victory.json` from the independent `team/victory-auditor` reporting `VICTORY CONFIRMED` for every requirement and the current `ORIGINAL_REQUEST.md` hash, unless the plan explicitly recorded `victoryAudit: "skip"` (then `final_verify` records `victory: "SKIPPED (explicit)"`).
+- That PASS also needs a `verify/victory.json` from the independent `team/victory-auditor` reporting `VICTORY CONFIRMED` for every requirement and the current `ORIGINAL_REQUEST.md` hash, unless the plan explicitly recorded `victoryAudit: "skip"` with a non-empty `victorySkipReason` (then `final_verify` records `victory: "SKIPPED (explicit): <reason>"`). A skip without a reason is refused; the legacy no-baseline default is labelled `SKIPPED (legacy default: no requirements baseline)`.
 - The security audit fails on integrity-rule violations for the run's mode, and that blocks the merge.
 - Opt-in `verification: "strict"` adds exactly one `team/falsifier` challenge (`PASS`) and one `team/security-auditor` audit (`CLEAN`) per task after its verifier report. Missing, stale, or non-PASS/CLEAN verdicts block `teamwork_next` (`NEEDS_STRICT_WAVE`) and `teamwork_final_verify`; a strict PASS writes `GATE_STATUS.md` with worker/verifier/challenger/auditor rows and a `## Continuity` handoff table. The default `standard` mode is unchanged, and the wave reuses the existing agents rather than adding roles.
 - `requireHandoffs: "required"` (the default for a new run with a request or requirements baseline) makes `final_verify` and `next` demand continuity handoffs derived from the plan: the assigned worker and `team/verifier` per task, `team/falsifier` + `team/security-auditor` per task in strict mode, one `team/sentinel`/`team/orchestrator` run-level handoff, and the `team/victory-auditor` run-level handoff after a confirmed victory audit. Each entry must match `handoffs/index.json` (regular non-symlink file, sha256/byte length) and cite the current report/wave/audit/victory; a changed cited artifact makes it stale. Missing pairs return `NEEDS_HANDOFFS`, stale/duplicate/unknown/tampered evidence returns `BLOCKED_BY_HANDOFFS`, and a passing gate records `handoffs` plus `evidence.handoffs` in `verify/final.json`. An explicit `requireHandoffs: "skip"` is recorded as `handoffs: "SKIPPED (explicit)"` and never reads the index; handoff prose is never a verdict.
@@ -274,9 +274,12 @@ defaults without touching files that already exist.
 3. In your project, run `/teamwork-craft`. The 9-step interview writes the
    approved spec to `.opencode/teamwork/<session-id>/prompt_draft.md`.
 
-4. Review it, then run `/teamwork <session-id>`. Planning now **requires a
-   non-empty `prompt_draft.md`**; the explicit bypass is `skipInterview: true`
-   on `teamwork_plan`, recorded as `specGate: "bypassed"`.
+4. Review it, then run `/teamwork <session-id>`. Planning enforces the **spec
+   presence gate**: a non-empty `prompt_draft.md` must exist. The explicit
+   bypass is `skipInterview: true` on `teamwork_plan`, recorded as
+   `specGate: "bypassed"`. Presence is not proof of user approval:
+   `skipInterview` / `requireSpec: false` are caller-controlled and recorded,
+   not an approval signature.
 
 5. The run directory `.opencode/teamwork/<session-id>/` holds `plan.dag.json`
    (the task DAG), per-task `verify/report-<task>.json` reports, and

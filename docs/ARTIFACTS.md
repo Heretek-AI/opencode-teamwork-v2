@@ -195,6 +195,7 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
   "integrityMode": "development|demo|benchmark",
   "verification": "standard|strict",
   "victoryAudit": "required|skip",
+  "victorySkipReason": "why an explicit victory skip was recorded (only when skip)",
   "requireHandoffs": "required|skip",
   "requestHash": "sha256 | null",
   "requirementsHash": "sha256 | null",
@@ -217,8 +218,13 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
 - `rootSessionId` is the plan-time caller session. `teamwork_victory_audit`,
   `teamwork_wave_record`, and `teamwork_report` require the caller session to
   be a strict descendant of it (walked through `parentID`, bounded, fail closed).
-- `planHash` covers the semantic plan (topology, modes, route, LEMMA bounds,
-  tasks), not formatting or `routingReason`.
+- `planHash` covers the semantic plan (topology, modes, the victory skip reason
+  when present, route, LEMMA bounds, tasks), not formatting or `routingReason`.
+- An explicit `victoryAudit: "skip"` requires `victorySkipReason` (non-empty,
+  trimmed, ≤500 chars, sanitized). The reason is persisted in
+  `plan.dag.json`, `state.json` and this manifest; a re-plan may repeat it but
+  not change it (`AUTH_STALE`). The legacy no-baseline default skip has no
+  reason and is labelled `SKIPPED (legacy default: no requirements baseline)`.
 - A re-plan must present the same modes and hashes. `final_verify`/`next`
   return `AUTH_STALE` if `plan.dag.json`, `state.json`, `ORIGINAL_REQUEST.md`,
   `requirements.json`, or the LEMMA policy diverges from the manifest.
@@ -295,6 +301,7 @@ Failure vocabulary: `AUTH_UNAVAILABLE`, `AUTH_KEY_CORRUPT`, `AUTH_MISSING`,
   "verification": "standard|strict",
   "victoryAudit": "required",
   "victoryAuditSource": "default",
+  "victorySkipReason": "required when victoryAudit is skip",
   "requireHandoffs": "required",
   "requireHandoffsSource": "default",
   "requirementsSource": "request",
@@ -323,6 +330,7 @@ Failure vocabulary: `AUTH_UNAVAILABLE`, `AUTH_KEY_CORRUPT`, `AUTH_MISSING`,
   "integrityMode": "development",
   "verification": "standard|strict",
   "victoryAudit": "required|skip",
+  "victorySkipReason": "present only when victoryAudit is skip",
   "requireHandoffs": "required|skip",
   "phase": "LOAD_SPEC|WORKTREE_INIT|DAG_BUILD|DISPATCH|SECURITY_AUDIT|FINAL_VERIFICATION|MERGE|PRESENT_PARTIAL|DONE",
   "tasks": {
@@ -464,7 +472,7 @@ continuity record a fresh agent session starts from.
 - Phase: DISPATCH
 - Tasks: 3 total — pending 2, active 1, verified_pass 0, failed 0, blocked 0
 - Gate (strict): PASS|FAIL|MISSING        # strict runs only
-- Victory: CONFIRMED|REJECTED|PENDING|SKIPPED
+- Victory: CONFIRMED|REJECTED|PENDING|SKIPPED (with the recorded reason when explicit)
 
 ## Artifact Index
 - plan.dag.json
@@ -661,14 +669,22 @@ The plugin provides deterministic orchestration tools for the Sentinel coordinat
 - `teamwork_worktree`: Isolates git worktrees outside the project repo (`setup` for sentinel and worker), inspects branch diffs (`diff`), performs clean merges into `teamwork/base-$SESSION_ID` with automatic conflict abort (`merge`), and prunes worktrees (`cleanup`).
 - `teamwork_preflight`: Re-checks the inputs named by an existing run's `ORIGINAL_REQUEST.md` (plus optional `inputs`), writes `<run>/preflight.json`, and appends a `preflight` event. It never throws and never blocks; it reports.
 
-**Spec gate (`teamwork_plan`).** A run must start from an approved spec: `<run>/prompt_draft.md`, present and non-empty after trimming. The check runs after topology/task-id validation and **before anything is written**, so a refusal creates no run directory and no plan files. Two inputs control it:
+**Spec presence gate (`teamwork_plan`).** A run must start from a spec
+artifact: `<run>/prompt_draft.md`, present and non-empty after trimming. This is
+a **presence** check, not an approval check — the engine cannot prove the user
+reviewed or approved the file. The check runs after topology/task-id validation
+and **before anything is written**, so a refusal creates no run directory and no
+plan files. Two inputs control it:
 
 | Input | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `requireSpec` | boolean | `true` | When true, a usable `prompt_draft.md` must exist or the plan is refused. `false` records `specGate: "not_required"`. |
-| `skipInterview` | boolean | `false` | Explicit bypass: plan without an approved prompt. Recorded as `specGate: "bypassed"`, and the tool result says so. |
+| `skipInterview` | boolean | `false` | Explicit bypass: plan without a prompt file. Recorded as `specGate: "bypassed"`, and the tool result says so. |
 
-With no spec and neither override, the call is refused with an actionable message naming the expected path, `/teamwork-craft`, and `skipInterview: true`. A whitespace-only `prompt_draft.md` counts as no spec.
+Both inputs are **caller-controlled and recorded; they are not proof of user
+approval**. With no spec and neither override, the call is refused with an
+actionable message naming the expected path, `/teamwork-craft`, and
+`skipInterview: true`. A whitespace-only `prompt_draft.md` counts as no spec.
 
 **Request record & integrity mode (`teamwork_plan`).** Two additive, optional inputs:
 
@@ -678,11 +694,11 @@ With no spec and neither override, the call is refused with an actionable messag
 | `integrityMode` | `development \| demo \| benchmark` | `development` | Recorded in `ORIGINAL_REQUEST.md`, `state.json` and `plan.dag.json`. Any other value refuses the plan before anything is written. |
 | `verification` | `standard \| strict` | `standard` | Recorded in `plan.dag.json` and `state.json`. `strict` adds exactly one `team/falsifier` challenge (`PASS`) and one `team/security-auditor` audit (`CLEAN`) per task. Any other value refuses the plan before anything is written; a re-plan may omit or repeat the persisted mode but not change it. |
 | `requirements` | `Array<{id, text}>` | omitted | Up to 50 plan-time requirements. `id` matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$` and must be unique; `text` is non-empty and ≤2,000 chars. Persisted to `requirements.json` (source `caller`). Invalid/duplicate items refuse the plan before anything is written. |
-| `victoryAudit` | `required \| skip` | `required` when a request/requirements baseline exists | Recorded in `plan.dag.json` and `state.json`. A run with no request and no requirements records `skip`; `required` without a baseline is refused. An explicit `skip` makes `final_verify` record `victory: "SKIPPED (explicit)"`. |
+| `victoryAudit` | `required \| skip` | `required` when a request/requirements baseline exists | Recorded in `plan.dag.json`, `state.json` and the signed `run.manifest.json`. A run with no request and no requirements records the legacy default `skip`; `required` without a baseline is refused. An explicit `skip` requires `victorySkipReason` (non-empty, trimmed, ≤500 chars, sanitized) and makes `final_verify` record `victory: "SKIPPED (explicit): <reason>"`. A re-plan may repeat but not change the mode or reason; `benchmark` refuses skip. |
 | `requireHandoffs` | `required \| skip` | `required` for a new run with a request/requirements baseline; `skip` for legacy/unsigned runs | Recorded in `plan.dag.json`, `state.json`, and the signed `run.manifest.json`. `required` makes `final_verify` and `next` demand the continuity matrix. An explicit `skip` is recorded (surface in `verify/final.json` as `handoffs: "SKIPPED (explicit)"`). A re-plan may repeat but not change the mode. `benchmark` refuses `skip`; a run that cannot be signed records `skip` under `allowUnsignedLegacy`. |
 
 The request record is a separate artifact from the approved spec: it does not
-satisfy the spec gate, and the spec gate does not replace it. `teamwork_security_audit`
+satisfy the spec presence gate, and the spec presence gate does not replace it. `teamwork_security_audit`
 and the final-verification gate read the mode back from `ORIGINAL_REQUEST.md`.
 
 **Input preflight (`teamwork_plan`).** Before anything is written, the plan
@@ -994,11 +1010,11 @@ The event kinds:
 
 - `run_created`: written by `teamwork_plan` once the run is created. `taskId` and
   `from` are `null`, `to` is `"pending"`, `round` is `0`, `phase` is `"DAG_BUILD"`.
-  It additionally carries the spec-gate decision: `specGate`
+  It additionally carries the spec-presence-gate decision: `specGate`
   (`"satisfied" | "bypassed" | "not_required"`) and, only when satisfied,
   `specPath` (the `prompt_draft.md` path, ≤200 chars). These two fields appear
   **only** on `run_created`; every other event keeps the fields above.
-  `specGate` and `specPath` also go through `clean()`. The timeline view parses
+  `specGate` and `specPath` also go through `clean()`. The field records what the caller did; it is not proof that a user approved the spec. The timeline view parses
   events field by field and does not surface `specGate` (it is visible in
   `events.jsonl` itself). When the input-preflight gate was bypassed with
   `allowMissingInputs: true`, `run_created` also carries `note` (e.g.
@@ -1270,7 +1286,7 @@ baseline changed) rather than trusting it.
   "generatedBy": { "agent": "team/verifier", "session": "ses_abc123" },
   "generatedAt": "ISO8601",
   "integrityMode": "development",
-  "victory": "CONFIRMED|FAILED|SKIPPED (explicit)",
+  "victory": "CONFIRMED|FAILED|SKIPPED (explicit): <reason>|SKIPPED (legacy default: no requirements baseline)",
   "handoffs": "PASS|MISSING|STALE|INVALID|SKIPPED (explicit)",
   "requirementsHash": "<sha256 of canonical requirements.json>",
   "evidence": {
@@ -1328,6 +1344,9 @@ baseline changed) rather than trusting it.
 }
 ```
 
+For a skip, `evidence.victory` is
+`{ "mode": "skip", "status": "SKIPPED (explicit)", "reason": "<victorySkipReason>", "reasons": [] }`.
+
 `teamwork_final_verify` writes this file atomically. On a signed run the final
 verdict is signed and the evidence digests let `teamwork_next` detect a report
 or audit edited after the verdict (`AUTH_STALE`). An unsigned legacy run needs
@@ -1337,7 +1356,10 @@ when every task in `state.json` is `verified_pass`, every task report
 allowlist) reports `PASS`, `verify/security-audit.json` reports `PASS`, and the
 independent victory audit is `CONFIRMED` with every requirement met and a
 `requestHash` matching the current `ORIGINAL_REQUEST.md`. A plan that explicitly
-recorded `victoryAudit: "skip"` records `victory: "SKIPPED (explicit)"` instead.
+recorded `victoryAudit: "skip"` records
+`victory: "SKIPPED (explicit): <victorySkipReason>"` instead; a legacy
+no-baseline default skip records
+`victory: "SKIPPED (legacy default: no requirements baseline)"`.
 When the plan's `requireHandoffs` is `required`, `status` also requires the
 continuity matrix to be complete: every plan task has its assigned worker and
 `team/verifier` task-scoped handoff, strict runs add `team/falsifier` and
@@ -1586,6 +1608,7 @@ suitable for pasting into a PR description or an issue comment.
 | Section | Source |
 | --- | --- |
 | Summary | `plan.dag.json`, `state.json`, `costs.json`, `events.jsonl`: session id, topology, overall status, phase, duration, budget, spend, tokens, task totals |
+| Run terms | integrity mode, input-preflight status, final-verdict provenance, `victory` label, handoff-gate status, and artifact-authenticity display (envelope presence only; HMACs are not verified) |
 | Tasks | one row per task: status, worker, verifier, rounds, duration, cost, checks. Details: summary, feedback, fatal findings, branch, worktree |
 | Acceptance checklist | (Markdown) one box per task, ticked when `verified_pass`, plus the security gate |
 | Security audit | `verify/security-audit.json`: pre-merge status, severity counts, findings |
@@ -1593,6 +1616,15 @@ suitable for pasting into a PR description or an issue comment.
 | Pitfalls | `pitfalls.md` entries |
 | Other cost buckets | cost buckets that are not task ids (HTML only, when present) |
 | Warnings | files that were oversize, unreadable, or malformed and were skipped |
+
+**Run terms labels.** `victory` is copied from `verify/final.json` (for example
+`CONFIRMED`, or `SKIPPED (explicit): <reason>`). The handoff gate is shown as
+`required (PASS|MISSING|STALE|INVALID)` or `SKIPPED (explicit)`. Artifact
+authenticity is **envelope presence only**: `signed` means an `_auth` object is
+present (the export has no key and cannot verify the MAC), `unsigned` means it
+is absent, and `unknown` means there is no final verdict. A final report that
+reports `PASS` while required handoffs are unmet is marked
+**ENGINE WOULD REJECT**; the export never upgrades that to a clean PASS claim.
 
 The overall status is decided from three inputs: the tasks, the security audit, and
 `verify/final.json`. It is checked in this order:

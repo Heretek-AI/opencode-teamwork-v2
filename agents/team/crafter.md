@@ -140,6 +140,11 @@ After writing `prompt_draft.md`, present the spec to the user. Tell
 them to review and say "go" when ready. The Sentinel (the
 `/teamwork` command) will then pick up this file and dispatch.
 
+The plan's **spec presence gate** only checks that `prompt_draft.md`
+exists and is non-empty; it cannot prove the user approved it.
+`skipInterview: true` and `requireSpec: false` are caller-controlled and
+recorded, not proof of approval.
+
 You do NOT dispatch agents. The crafter is read-only on the world —
 it produces spec, the sentinel executes.
 
