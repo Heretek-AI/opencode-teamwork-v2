@@ -231,9 +231,10 @@ function runsCommand() {
     "TOPOLOGY".padEnd(20) +
     "TASKS".padEnd(12) +
     "SECURITY".padEnd(14) +
+    "AUTH".padEnd(10) +
     "COST ($)"
   )
-  console.log("-".repeat(96))
+  console.log("-".repeat(106))
 
   for (const r of runs) {
     const tasks = `${r.tasksPassed}/${r.tasksTotal}${r.tasksBlocked ? ` (${r.tasksBlocked} blk)` : ""}`
@@ -244,6 +245,7 @@ function runsCommand() {
       r.topology.padEnd(20) +
       tasks.padEnd(12) +
       r.securityStatus.padEnd(14) +
+      (r.authenticity || "unknown").padEnd(10) +
       cost
     )
   }
@@ -257,10 +259,12 @@ function inspectCommand(options) {
     return
   }
 
-  const { run, tasks, costs, audit, pitfalls, conflicts } = result
+  const { run, tasks, costs, audit, pitfalls, conflicts, authenticity, auditAuthenticity } = result
   console.log(`Teamwork Run: ${run.sessionId}`)
   console.log(`Topology    : ${run.topology}`)
   console.log(`Phase       : ${run.phase}`)
+  console.log(`Authenticity: ${authenticity || "unknown"} (envelope presence only; the CLI cannot verify)`)
+  console.log(`Audit auth  : ${auditAuthenticity || "unknown"} (envelope presence only; the CLI cannot verify)`)
   console.log(`Cost        : $${run.spentUsd} / $${run.budgetUsd} (source: ${costs?.budgetSource || "default"})`)
   console.log(`Updated At  : ${run.updatedAt}`)
 

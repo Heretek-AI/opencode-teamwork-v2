@@ -17,7 +17,7 @@
 //   * Symlink-safe bounded reads/writes via the tournament artifact helpers.
 
 import { createHash } from "node:crypto"
-import { join } from "node:path"
+import { basename, join } from "node:path"
 import {
   clean,
   cleanBlock,
@@ -25,6 +25,7 @@ import {
   readBoundedRunJson,
   writeSafeRunJson,
 } from "./tournament.ts"
+import { canonicalJson, sha256Hex, type AuthContext, type AuthEnvelope, type AuthFailure } from "./auth.ts"
 
 export const VICTORY_AUDITOR_AGENT = "team/victory-auditor"
 export const VICTORY_CONFIRMED = "VICTORY CONFIRMED"
@@ -68,10 +69,13 @@ export interface VictoryVerdictFile {
   auditor: string
   auditorSessionId: string
   requestHash: string | null
+  /** sha256 of the canonical requirements.json baseline this verdict reviewed. */
+  requirementsHash?: string | null
   requirements: VictoryRequirementResult[]
   findings: string[]
   summary: string
   generatedAt: string
+  _auth?: AuthEnvelope
 }
 
 export type VictoryGate =
@@ -86,7 +90,20 @@ export type VictoryGate =
   | {
       ok: false
       skipped: false
-      status: "MISSING" | "REJECTED" | "STALE" | "FORGED" | "INVALID"
+      status:
+        | "MISSING"
+        | "REJECTED"
+        | "STALE"
+        | "FORGED"
+        | "INVALID"
+        | "AUTH_MISSING"
+        | "AUTH_INVALID"
+        | "AUTH_UNKNOWN_KEY"
+        | "AUTH_INDEX_MISSING"
+        | "AUTH_STALE"
+        | "AUTH_LEGACY"
+        | "AUTH_UNAVAILABLE"
+        | "AUTH_KEY_CORRUPT"
       reasons: string[]
     }
 
@@ -226,6 +243,17 @@ export function originalRequestHash(run: string): string | null {
   return createHash("sha256").update(res.text, "utf8").digest("hex")
 }
 
+/** Canonical digest of a requirements baseline (or null when absent). */
+export function requirementsBaselineHash(baseline: RequirementsFile | undefined): string | null {
+  if (!baseline) return null
+  return sha256Hex(canonicalJson(baseline))
+}
+
+/** Canonical digest of the persisted requirements.json, or null. */
+export function currentRequirementsHash(run: string): string | null {
+  return requirementsBaselineHash(readRequirementsBaseline(run))
+}
+
 /** Read the existing verdict, or undefined when absent/unreadable. */
 export function readVictoryVerdict(run: string): VictoryVerdictFile | undefined {
   const res = readBoundedRunJson<any>(run, join(run, "verify", "victory.json"), MAX_VICTORY_BYTES)
@@ -242,7 +270,7 @@ export type RecordVictoryResult =
  * Validate a victory-audit call, enforce write-once for a confirmed verdict,
  * bind it to the current request, and write `verify/victory.json`.
  */
-export function recordVictoryAudit(
+export async function recordVictoryAudit(
   run: string,
   sessionId: string,
   input: {
@@ -252,7 +280,8 @@ export function recordVictoryAudit(
     summary?: unknown
     auditorSessionId: string
   },
-): RecordVictoryResult {
+  auth?: AuthContext,
+): Promise<RecordVictoryResult> {
   const verdictKind = normalizeVictoryVerdict(input.verdict)
   if (!verdictKind) {
     return {
@@ -336,18 +365,32 @@ export function recordVictoryAudit(
     auditor: VICTORY_AUDITOR_AGENT,
     auditorSessionId: input.auditorSessionId,
     requestHash,
+    requirementsHash: requirementsBaselineHash(baseline),
     requirements: results,
     findings,
     summary,
     generatedAt: new Date().toISOString(),
   }
 
+  let toWrite: VictoryVerdictFile = verdict
+  if (auth) {
+    try {
+      toWrite = await auth.signRunArtifact(basename(run), "verify/victory.json", verdict)
+    } catch (err: any) {
+      const failure = err?.failure as AuthFailure | undefined
+      return {
+        ok: false,
+        error: `refused: could not sign verify/victory.json (${failure ? failure.code : "signing failed"}: ${clean(err?.message, 160)}); nothing was written`,
+      }
+    }
+  }
+
   try {
-    writeSafeRunJson(run, join(run, "verify", "victory.json"), verdict)
+    writeSafeRunJson(run, join(run, "verify", "victory.json"), toWrite)
   } catch (err: any) {
     return { ok: false, error: `refused: could not write verify/victory.json (${clean(err?.message, 120)})` }
   }
-  return { ok: true, verdict }
+  return { ok: true, verdict: toWrite }
 }
 
 /**
@@ -374,7 +417,26 @@ export function resolveVictoryAuditMode(
  * Recompute the completion gate from artifacts. This is the only authority used
  * by `teamwork_final_verify` and `teamwork_next`; it never trusts the caller.
  */
-export function evaluateVictoryGate(run: string, mode: VictoryAuditMode): VictoryGate {
+export interface VictoryGateAuth {
+  auth?: AuthContext
+  /** A signed run must carry a valid `_auth` envelope and index entry. */
+  requireSigned?: boolean
+  /** Current canonical requirements.json digest; a mismatch is AUTH_STALE. */
+  requirementsHash?: string | null
+}
+
+type AuthFailureCodeLike = Extract<
+  VictoryGate extends { ok: false; status: infer S } ? S : never,
+  `AUTH_${string}`
+>
+
+function evaluateVictoryCore(
+  run: string,
+  mode: VictoryAuditMode,
+  extraReasons: string[],
+  authCode: AuthFailureCodeLike | undefined,
+  requirementsHash?: string | null,
+): VictoryGate {
   if (mode === "skip") {
     return { ok: true, skipped: true, status: "SKIPPED (explicit)", reasons: [] }
   }
@@ -385,7 +447,7 @@ export function evaluateVictoryGate(run: string, mode: VictoryAuditMode): Victor
       ok: false,
       skipped: false,
       status: "MISSING",
-      reasons: ["victory audit: requirements.json missing, unreadable, or malformed"],
+      reasons: ["victory audit: requirements.json missing, unreadable, or malformed", ...extraReasons],
     }
   }
 
@@ -395,11 +457,23 @@ export function evaluateVictoryGate(run: string, mode: VictoryAuditMode): Victor
       ok: false,
       skipped: false,
       status: "MISSING",
-      reasons: ["victory audit: verify/victory.json missing, unreadable, or malformed"],
+      reasons: ["victory audit: verify/victory.json missing, unreadable, or malformed", ...extraReasons],
     }
   }
 
-  const reasons: string[] = []
+  const reasons: string[] = [...extraReasons]
+  if (requirementsHash !== undefined && requirementsHash !== null) {
+    const recorded =
+      typeof (victory as any).requirementsHash === "string" ? (victory as any).requirementsHash : null
+    if (recorded !== requirementsHash) {
+      authCode = authCode ?? "AUTH_STALE"
+      reasons.push(
+        recorded === null
+          ? "[AUTH_STALE] victory audit: verdict has no requirementsHash (stale or unsigned baseline)"
+          : "[AUTH_STALE] victory audit: requirementsHash does not match the current requirements.json",
+      )
+    }
+  }
   if (victory.verdict !== VICTORY_CONFIRMED && victory.verdict !== VICTORY_REJECTED) {
     reasons.push(`victory audit: invalid verdict "${clean(victory.verdict, 40)}"`)
   } else if (victory.verdict === VICTORY_REJECTED) {
@@ -453,17 +527,56 @@ export function evaluateVictoryGate(run: string, mode: VictoryAuditMode): Victor
   }
 
   if (reasons.length > 0) {
-    const status: VictoryGate["status"] = reasons.some((r) => r.includes("VICTORY REJECTED"))
+    const semantic: VictoryGate["status"] = reasons.some((r) => r.includes("VICTORY REJECTED"))
       ? "REJECTED"
       : reasons.some((r) => r.includes("does not match"))
         ? "STALE"
         : reasons.some((r) => r.includes("auditor must be") || r.includes("invalid requirement result"))
           ? "FORGED"
           : "INVALID"
+    // An authenticity failure is the headline status unless a stronger semantic
+    // rejection is also present; both kinds of reason stay in the list.
+    const status: VictoryGate["status"] =
+      semantic === "REJECTED" ? semantic : authCode ?? semantic
     return { ok: false, skipped: false, status, reasons }
   }
 
   return { ok: true, skipped: false, status: "CONFIRMED", reasons: [], verdict: victory }
+}
+
+/** Semantic-only gate (used by the continuity briefing, which never claims authenticity). */
+export function evaluateVictoryGate(run: string, mode: VictoryAuditMode): VictoryGate {
+  return evaluateVictoryCore(run, mode, [], undefined)
+}
+
+/** Gate with artifact authenticity enforced for signed runs. */
+export async function evaluateVictoryGateChecked(
+  run: string,
+  mode: VictoryAuditMode,
+  opts: VictoryGateAuth = {},
+): Promise<VictoryGate> {
+  const extra: string[] = []
+  let authCode: AuthFailureCodeLike | undefined
+  if (opts.requireSigned && mode !== "skip") {
+    const victory = readVictoryVerdict(run)
+    const check = victory
+      ? opts.auth
+        ? await opts.auth.verifyRunArtifact(basename(run), "verify/victory.json", victory)
+        : {
+            status: "unknown" as const,
+            failure: { code: "AUTH_UNAVAILABLE" as const, message: "no authenticity context is wired for this run" },
+          }
+      : undefined
+    if (check && check.status === "unsigned") {
+      authCode = "AUTH_MISSING"
+      extra.push("[AUTH_MISSING] victory audit: verify/victory.json has no _auth envelope (a signed run requires one)")
+    } else if (check && check.status !== "signed") {
+      const failure = check.failure ?? { code: "AUTH_INVALID" as const, message: "victory artifact failed verification" }
+      authCode = failure.code as AuthFailureCodeLike
+      extra.push(`[${failure.code}] victory audit: ${failure.message}`)
+    }
+  }
+  return evaluateVictoryCore(run, mode, extra, authCode, opts.requirementsHash)
 }
 
 /** Human-readable one-line gate summary for tool results. */

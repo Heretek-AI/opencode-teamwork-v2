@@ -30,6 +30,7 @@ import {
   readBoundedRunJson,
   writeSafeRunJson,
 } from "./tournament.ts"
+import type { AuthContext, AuthEnvelope, AuthFailure } from "./auth.ts"
 
 export const VERIFICATION_MODES = ["standard", "strict"] as const
 export type VerificationMode = (typeof VERIFICATION_MODES)[number]
@@ -106,6 +107,7 @@ export interface WaveVerdictFile {
   notes: string
   evidence: string
   generatedAt: string
+  _auth?: AuthEnvelope
 }
 
 export type RecordWaveResult =
@@ -117,7 +119,7 @@ export type RecordWaveResult =
  * by `tools.ts` from `deriveCallerAgent`; this function enforces the expected
  * agent for the kind as a second boundary.
  */
-export function recordVerificationWave(
+export async function recordVerificationWave(
   run: string,
   sessionId: string,
   input: {
@@ -129,7 +131,8 @@ export function recordVerificationWave(
     agent: string
     agentSessionId: string
   },
-): RecordWaveResult {
+  auth?: AuthContext,
+): Promise<RecordWaveResult> {
   const kind = normalizeWaveKind(input.kind)
   if (!kind) {
     return {
@@ -237,15 +240,27 @@ export function recordVerificationWave(
     evidence: typeof input.evidence === "string" ? cleanBlock(input.evidence, EVIDENCE_MAX).trim() : "",
     generatedAt: new Date().toISOString(),
   }
+  let toWrite: WaveVerdictFile = verdict
+  if (auth) {
+    try {
+      toWrite = await auth.signRunArtifact(basename(run), relativePath, verdict)
+    } catch (err: any) {
+      const failure = err?.failure as AuthFailure | undefined
+      return {
+        ok: false,
+        error: `refused: could not sign ${relativePath} (${failure ? failure.code : "signing failed"}: ${clean(err?.message, 160)}); nothing was written`,
+      }
+    }
+  }
   try {
-    writeSafeRunJson(run, target, verdict)
+    writeSafeRunJson(run, target, toWrite)
   } catch (err: any) {
     return {
       ok: false,
       error: `refused: could not write ${relativePath} (${clean(err?.message, 120)})`,
     }
   }
-  return { ok: true, verdict, artifact: target }
+  return { ok: true, verdict: toWrite, artifact: target }
 }
 
 export interface WaveEvidence {
@@ -426,6 +441,51 @@ export function evaluateStrictGate(
     reasons,
     missing,
     tasks: evidence,
+  }
+}
+
+/**
+ * Strict gate with artifact authenticity enforced. Wave verdicts on a signed
+ * run must carry a valid `_auth` envelope and digest-index entry. The semantic
+ * verdict is still computed so a forged file reports both problems.
+ */
+export async function evaluateStrictGateChecked(
+  run: string,
+  tasks: Array<{ id: string; status: string }>,
+  mode: VerificationMode,
+  opts: { auth?: AuthContext; requireSigned?: boolean } = {},
+): Promise<StrictGate> {
+  const gate = evaluateStrictGate(run, tasks, mode)
+  if (mode !== "strict" || !opts.requireSigned) return gate
+  const reasons = [...gate.reasons]
+  const missing = [...gate.missing]
+  for (const task of tasks) {
+    for (const kind of WAVE_KINDS) {
+      const relativePath = `verify/${kind}-${task.id}.json`
+      const res = readBoundedRunJson<any>(run, join(run, relativePath), MAX_WAVE_BYTES)
+      if (res.status !== "ok") continue
+      const check = opts.auth
+        ? await opts.auth.verifyRunArtifact(basename(run), relativePath, res.value)
+        : {
+            status: "unknown" as const,
+            failure: { code: "AUTH_UNAVAILABLE" as const, message: "no authenticity context is wired for this run" },
+          }
+      if (check.status === "unsigned") {
+        reasons.push(`strict ${kind} ${task.id}: [AUTH_MISSING] ${relativePath} has no _auth envelope (a signed run requires one)`)
+      } else if (check.status !== "signed") {
+        const failure = check.failure ?? { code: "AUTH_INVALID" as const, message: "wave artifact failed verification" }
+        reasons.push(`strict ${kind} ${task.id}: [${failure.code}] ${failure.message}`)
+      }
+    }
+  }
+  if (reasons.length === gate.reasons.length) return gate
+  const anyFileMissing = gate.tasks.some((task) => !task.challenge.present || !task.audit.present)
+  return {
+    ...gate,
+    ok: false,
+    status: anyFileMissing ? "MISSING" : "FAIL",
+    reasons,
+    missing,
   }
 }
 
