@@ -108,6 +108,14 @@ function fail(code: AuthFailureCode, message: string): { ok: false; failure: Aut
   return { ok: false, failure: { code, message } }
 }
 
+/** Convert a thrown AuthError (or unknown failure) into the public result shape. */
+function failureFromError(err: unknown, fallback: AuthFailureCode = "AUTH_UNAVAILABLE"): { ok: false; failure: AuthFailure } {
+  const candidate = err instanceof AuthError ? err.failure : (err as any)?.failure
+  if (candidate && typeof candidate.code === "string") return { ok: false, failure: candidate }
+  const message = String((err as any)?.message ?? err).slice(0, 200)
+  return { ok: false, failure: { code: fallback, message } }
+}
+
 // ---------------------------------------------------------------------------
 // Canonical JSON / hashing / HMAC
 // ---------------------------------------------------------------------------
@@ -224,39 +232,44 @@ function makeKeyId(): string {
   return `k_${randomBytes(8).toString("hex")}`
 }
 
-function validateRing(raw: unknown): { ok: true; ring: KeyRing } | { ok: false; failure: AuthFailure } {
+function corruptRing(message: string): never {
+  throw new AuthError({ code: "AUTH_KEY_CORRUPT", message })
+}
+
+/** Validate a persisted ring. Throws AuthError; success returns the ring only. */
+function validateRing(raw: unknown): KeyRing {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    return fail("AUTH_KEY_CORRUPT", "auth/key/ring is not an object")
+    corruptRing("auth/key/ring is not an object")
   }
   const ring = raw as any
-  if (ring.version !== 1) return fail("AUTH_KEY_CORRUPT", `auth/key/ring version must be 1 (got ${String(ring.version)})`)
+  if (ring.version !== 1) corruptRing(`auth/key/ring version must be 1 (got ${String(ring.version)})`)
   if (!Array.isArray(ring.keys) || ring.keys.length === 0) {
-    return fail("AUTH_KEY_CORRUPT", "auth/key/ring has no keys")
+    corruptRing("auth/key/ring has no keys")
   }
   if (ring.keys.length > KEY_RING_MAX_KEYS) {
-    return fail("AUTH_KEY_CORRUPT", `auth/key/ring has ${ring.keys.length} keys; the maximum is ${KEY_RING_MAX_KEYS}`)
+    corruptRing(`auth/key/ring has ${ring.keys.length} keys; the maximum is ${KEY_RING_MAX_KEYS}`)
   }
   const keys: KeyRecord[] = []
   const seen = new Set<string>()
   for (let i = 0; i < ring.keys.length; i++) {
     const entry = ring.keys[i]
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
-      return fail("AUTH_KEY_CORRUPT", `auth/key/ring keys[${i}] is not an object`)
+      corruptRing(`auth/key/ring keys[${i}] is not an object`)
     }
     const keyId = entry.keyId
     if (typeof keyId !== "string" || keyId.trim() === "" || keyId.length > 128) {
-      return fail("AUTH_KEY_CORRUPT", `auth/key/ring keys[${i}].keyId is invalid`)
+      corruptRing(`auth/key/ring keys[${i}].keyId is invalid`)
     }
-    if (seen.has(keyId)) return fail("AUTH_KEY_CORRUPT", `auth/key/ring has a duplicate keyId "${keyId}"`)
+    if (seen.has(keyId)) corruptRing(`auth/key/ring has a duplicate keyId "${keyId}"`)
     seen.add(keyId)
     if (typeof entry.key !== "string" || !decodeKey(entry.key)) {
-      return fail("AUTH_KEY_CORRUPT", `auth/key/ring keys[${i}].key is not a base64url 32-byte key`)
+      corruptRing(`auth/key/ring keys[${i}].key is not a base64url 32-byte key`)
     }
     if (typeof entry.createdAt !== "string" || entry.createdAt.trim() === "") {
-      return fail("AUTH_KEY_CORRUPT", `auth/key/ring keys[${i}].createdAt is missing`)
+      corruptRing(`auth/key/ring keys[${i}].createdAt is missing`)
     }
     if (entry.retiredAt !== undefined && (typeof entry.retiredAt !== "string" || entry.retiredAt.trim() === "")) {
-      return fail("AUTH_KEY_CORRUPT", `auth/key/ring keys[${i}].retiredAt is invalid`)
+      corruptRing(`auth/key/ring keys[${i}].retiredAt is invalid`)
     }
     keys.push({
       keyId,
@@ -265,22 +278,23 @@ function validateRing(raw: unknown): { ok: true; ring: KeyRing } | { ok: false; 
       ...(entry.retiredAt !== undefined ? { retiredAt: entry.retiredAt } : {}),
     })
   }
-  return { ok: true, ring: { version: 1, keys } }
+  return { version: 1, keys }
 }
 
 // Shared across every AuthContext over the same storage object so a rotation
 // performed by one caller is visible to the plugin's long-lived context.
 const ringCache = new WeakMap<object, KeyRing>()
 
-function envRing(env: Record<string, string | undefined>): AuthResult<{ ring: KeyRing; source: "env" }> {
+function envRing(env: Record<string, string | undefined>): { ring: KeyRing; source: "env" } {
   const raw = env[ENV_KEY]
-  if (!raw) return fail("AUTH_UNAVAILABLE", `${ENV_KEY} is not set`)
+  if (!raw) throw new AuthError({ code: "AUTH_UNAVAILABLE", message: `${ENV_KEY} is not set` })
   const key = raw.trim()
-  if (!decodeKey(key)) return fail("AUTH_KEY_CORRUPT", `${ENV_KEY} is not a base64url 32-byte key`)
+  if (!decodeKey(key)) {
+    throw new AuthError({ code: "AUTH_KEY_CORRUPT", message: `${ENV_KEY} is not a base64url 32-byte key` })
+  }
   const keyId = (env[ENV_KEY_ID] || "env").trim() || "env"
   const now = new Date().toISOString()
   return {
-    ok: true,
     ring: { version: 1, keys: [{ keyId, key, createdAt: now }] },
     source: "env",
   }
@@ -325,24 +339,27 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
     typeof storage.set === "function"
   let cached: KeyRing | null = null
 
-  const pull = async (): Promise<AuthResult<{ ring: KeyRing; source: "storage" | "env" }>> => {
+  const pull = async (): Promise<{ ring: KeyRing; source: "storage" | "env" }> => {
     if (env[ENV_KEY]) {
       return envRing(env)
     }
     if (!storageUsable) {
-      return fail("AUTH_UNAVAILABLE", "ctx.storage is unavailable and no env HMAC key is set")
+      throw new AuthError({ code: "AUTH_UNAVAILABLE", message: "ctx.storage is unavailable and no env HMAC key is set" })
     }
-    if (cached) return { ok: true, ring: cached, source: "storage" }
+    if (cached) return { ring: cached, source: "storage" }
     const shared = ringCache.get(storage as object)
     if (shared) {
       cached = shared
-      return { ok: true, ring: shared, source: "storage" }
+      return { ring: shared, source: "storage" }
     }
     let existing: unknown
     try {
       existing = await storage.get(KEY_RING_STORAGE_KEY)
     } catch (err: any) {
-      return fail("AUTH_UNAVAILABLE", `could not read auth/key/ring (${String(err?.message ?? err).slice(0, 120)})`)
+      throw new AuthError({
+        code: "AUTH_UNAVAILABLE",
+        message: `could not read auth/key/ring (${String(err?.message ?? err).slice(0, 120)})`,
+      })
     }
     if (existing === undefined || existing === null) {
       const created: KeyRing = {
@@ -352,7 +369,10 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
       try {
         await storage.set(KEY_RING_STORAGE_KEY, created)
       } catch (err: any) {
-        return fail("AUTH_UNAVAILABLE", `could not write auth/key/ring (${String(err?.message ?? err).slice(0, 120)})`)
+        throw new AuthError({
+          code: "AUTH_UNAVAILABLE",
+          message: `could not write auth/key/ring (${String(err?.message ?? err).slice(0, 120)})`,
+        })
       }
       // Re-read is authoritative. If another process won the create race we
       // adopt the persisted ring instead of silently using ours.
@@ -360,30 +380,33 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
       try {
         reread = await storage.get(KEY_RING_STORAGE_KEY)
       } catch (err: any) {
-        return fail("AUTH_UNAVAILABLE", `could not re-read auth/key/ring (${String(err?.message ?? err).slice(0, 120)})`)
+        throw new AuthError({
+          code: "AUTH_UNAVAILABLE",
+          message: `could not re-read auth/key/ring (${String(err?.message ?? err).slice(0, 120)})`,
+        })
       }
       const checked = validateRing(reread ?? created)
-      if (!checked.ok) return checked
-      cached = checked.ring
-      ringCache.set(storage as object, checked.ring)
-      return { ok: true, ring: checked.ring, source: "storage" }
+      cached = checked
+      ringCache.set(storage as object, checked)
+      return { ring: checked, source: "storage" }
     }
     const checked = validateRing(existing)
-    if (!checked.ok) return checked
-    cached = checked.ring
-    ringCache.set(storage as object, checked.ring)
-    return { ok: true, ring: checked.ring, source: "storage" }
+    cached = checked
+    ringCache.set(storage as object, checked)
+    return { ring: checked, source: "storage" }
   }
 
-  const ready = async () => {
-    const res = await pull()
-    if (!res.ok) return res
-    return { ok: true as const, keyId: res.ring.keys[0].keyId, source: res.source }
+  const ready = async (): Promise<AuthResult<{ keyId: string; source: "storage" | "env" }>> => {
+    try {
+      const res = await pull()
+      return { ok: true as const, keyId: res.ring.keys[0].keyId, source: res.source }
+    } catch (err) {
+      return failureFromError(err)
+    }
   }
 
   const signArtifact = async (relPath: string, payload: unknown): Promise<any> => {
     const res = await pull()
-    if (!res.ok) throw new AuthError(res.failure)
     if (typeof relPath !== "string" || relPath.trim() === "") {
       throw new AuthError({ code: "AUTH_INVALID", message: "artifact path is empty" })
     }
@@ -411,8 +434,12 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
     relPath: string,
     payload: unknown,
   ): Promise<AuthResult<{ auth: AuthEnvelope; keyId: string }>> => {
-    const res = await pull()
-    if (!res.ok) return res
+    let res: { ring: KeyRing; source: "storage" | "env" }
+    try {
+      res = await pull()
+    } catch (err) {
+      return failureFromError(err)
+    }
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
       return fail("AUTH_INVALID", "artifact is not an object")
     }
@@ -546,8 +573,12 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
       return fail("AUTH_UNAVAILABLE", `${ENV_KEY} pins a single key; rotation is a storage-key operation`)
     }
     if (!storageUsable) return fail("AUTH_UNAVAILABLE", "ctx.storage is unavailable; cannot rotate")
-    const res = await pull()
-    if (!res.ok) return res
+    let res: { ring: KeyRing; source: "storage" | "env" }
+    try {
+      res = await pull()
+    } catch (err) {
+      return failureFromError(err)
+    }
     const now = new Date().toISOString()
     const previous = res.ring.keys[0]
     const next: KeyRing = {
@@ -569,11 +600,14 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
     } catch (err: any) {
       return fail("AUTH_UNAVAILABLE", `could not re-read the rotated key ring (${String(err?.message ?? err).slice(0, 120)})`)
     }
-    const checked = validateRing(reread)
-    if (!checked.ok) return checked
-    cached = checked.ring
-    ringCache.set(storage as object, checked.ring)
-    return { ok: true, keyId: checked.ring.keys[0].keyId }
+    try {
+      const checked = validateRing(reread)
+      cached = checked
+      ringCache.set(storage as object, checked)
+      return { ok: true, keyId: checked.keys[0].keyId }
+    } catch (err) {
+      return failureFromError(err, "AUTH_KEY_CORRUPT")
+    }
   }
 
   return {
