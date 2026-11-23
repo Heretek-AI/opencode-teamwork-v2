@@ -155,6 +155,19 @@ if (!testSessionId) {
 }
 
 const testDir = mkdtempSync(join(tmpdir(), "teamwork-test-"))
+// Minimal ctx.storage shim: the plan tool now requires a signed baseline (or an
+// explicit allowUnsignedLegacy opt-out), and this test exercises cost, not auth.
+const costStore = new Map()
+const costStorage = {
+  get: async (key) => costStore.get(key),
+  set: async (key, value) => {
+    costStore.set(key, value)
+  },
+  remove: async (key) => {
+    costStore.delete(key)
+  },
+  scan: async () => ({ entries: [], hasMore: false }),
+}
 
 try {
   let registeredTools = {}
@@ -178,6 +191,7 @@ try {
         return undefined
       },
     },
+    storage: costStorage,
   }
 
   await registerTeamworkTools(mockCtx, testDir)
@@ -211,6 +225,7 @@ try {
   const mockOfflineCtx = {
     tool: mockCtx.tool,
     session: { get: async () => undefined },
+    storage: costStorage,
   }
   let offlineTools = {}
   mockOfflineCtx.tool.transform = async (cb) => {
