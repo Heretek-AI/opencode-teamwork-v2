@@ -31,7 +31,7 @@ import {
   writeSafeRunFile,
 } from "./tournament.ts"
 import { evaluateStrictGate, normalizeVerificationMode } from "./strict.ts"
-import { evaluateVictoryGate, resolveVictoryAuditMode } from "./victory.ts"
+import { evaluateVictoryGate, recordedVictorySkipReason, resolveVictoryAuditMode } from "./victory.ts"
 
 export const BRIEFING_FILE = "BRIEFING.md"
 /** Hard cap for the on-disk briefing, in UTF-8 bytes. */
@@ -207,6 +207,8 @@ function identityFor(run: string, plan: any, state: any, costs: any) {
     integrityMode: clean(plan?.integrityMode || state?.integrityMode || "development", 32),
     verification: normalizeVerificationMode(plan?.verification ?? state?.verification) ?? "standard",
     victoryMode: resolveVictoryAuditMode(plan, state, run).mode,
+    victorySkipReason:
+      recordedVictorySkipReason(plan?.victorySkipReason) ?? recordedVictorySkipReason(state?.victorySkipReason),
     budget: costs && typeof costs.budgetUsd === "number" ? `$${costs.budgetUsd}` : "unknown",
     phase: clean(state?.phase || "UNKNOWN", 32),
   }
@@ -223,7 +225,7 @@ function strictGateStatus(run: string, ids: string[], stateTasks: any): string {
 }
 
 function victoryStatusLabel(gate: ReturnType<typeof evaluateVictoryGate>): string {
-  if (gate.skipped) return "SKIPPED"
+  if (gate.skipped) return gate.reason ? `SKIPPED (explicit): ${gate.reason}` : "SKIPPED (legacy default)"
   if (gate.status === "CONFIRMED") return "CONFIRMED"
   if (gate.status === "REJECTED") return "REJECTED"
   return "PENDING"
@@ -269,7 +271,7 @@ export function buildBriefing(
     identity.verification === "strict"
       ? `- Gate (strict): ${strictGateStatus(run, safeIds, state?.tasks)}`
       : undefined
-  const victory = victoryStatusLabel(evaluateVictoryGate(run, identity.victoryMode))
+  const victory = victoryStatusLabel(evaluateVictoryGate(run, identity.victoryMode, identity.victorySkipReason))
   const artifacts = ARTIFACT_INDEX.filter((rel) => isRegularRunFile(run, rel))
 
   const lines: string[] = [

@@ -302,7 +302,7 @@ function makeSeedVerifiedRun(tools, ctx, root) {
   return async (
     runId,
     taskIds,
-    { request, integrityMode, auditStatus = "PASS", stampVictory = request !== undefined, victoryAudit, verification, allowUnsignedLegacy, requireHandoffs, handoffs = true } = {},
+    { request, integrityMode, auditStatus = "PASS", stampVictory = request !== undefined, victoryAudit, victorySkipReason, verification, allowUnsignedLegacy, requireHandoffs, handoffs = true } = {},
   ) => {
     await tools.plan.execute(
       {
@@ -311,6 +311,12 @@ function makeSeedVerifiedRun(tools, ctx, root) {
         skipInterview: true,
         ...(request !== undefined ? { request, integrityMode } : {}),
         ...(victoryAudit !== undefined ? { victoryAudit } : {}),
+        ...(victoryAudit === "skip"
+          ? {
+              victorySkipReason:
+                victorySkipReason ?? "fixture: the independent victory audit is intentionally skipped for this test",
+            }
+          : {}),
         ...(verification !== undefined ? { verification } : {}),
         ...(requireHandoffs !== undefined ? { requireHandoffs } : {}),
         ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
@@ -409,7 +415,7 @@ try {
   const planRes = await registeredTools.plan.execute({
     sessionId: "20261018-000000-test",
     topology: "distributed-coding",
-    skipInterview: true, // fixture: this part exercises the DAG engine, not the spec gate
+    skipInterview: true, // fixture: this part exercises the DAG engine, not the spec presence gate
     tasks: [
       { id: "T1", dependsOn: [], maxRounds: 2 },
       { id: "T2", dependsOn: ["T1"], maxRounds: 2 },
@@ -681,9 +687,9 @@ try {
   console.log("✓ topology aliases normalised, unknown topologies refused, verified_pass counted as complete")
 
   // ==========================================
-  // Part 1c: teamwork_plan spec gate (3.4)
+  // Part 1c: teamwork_plan spec presence gate (3.4)
   // ==========================================
-  console.log("Testing the teamwork_plan spec gate...")
+  console.log("Testing the teamwork_plan spec presence gate...")
 
   // (a) no spec + defaults -> refused, and the run dir is never created.
   const noSpecRun = "20261018-000000-nospec"
@@ -692,7 +698,7 @@ try {
   assert(noSpecRes.content.includes(runFile(testDir, noSpecRun, "prompt_draft.md")), "refusal must name the expected spec path")
   assert(noSpecRes.content.includes("skipInterview: true"), "refusal must name the explicit bypass")
   assert(noSpecRes.content.includes("/teamwork-craft"), "refusal must name the action that produces a spec")
-  assert(!existsSync(join(testDir, ".opencode", "teamwork", noSpecRun)), "a spec-gate refusal must create no run directory")
+  assert(!existsSync(join(testDir, ".opencode", "teamwork", noSpecRun)), "a spec-presence-gate refusal must create no run directory")
 
   // A whitespace-only prompt_draft.md is not a spec: still refused, still no plan files.
   const blankSpecRun = "20261018-000000-blankspec"
@@ -706,7 +712,9 @@ try {
   const bypassRun = "20261018-000000-specbypass"
   const bypassRes = await registeredTools.plan.execute({ sessionId: bypassRun, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "S1" }] })
   assert(bypassRes.content.startsWith("Planned"), `skipInterview must allow planning without a spec: ${bypassRes.content}`)
-  assert(bypassRes.content.includes("Spec gate bypassed"), "the bypass must be visible in the tool result")
+  assert(bypassRes.content.includes("Spec presence gate bypassed"), "the bypass must be visible in the tool result")
+  assert(bypassRes.content.includes("caller-controlled"), "the bypass must say it is caller-controlled")
+  assert(bypassRes.content.includes("not proof of approval"), "the bypass must say it is not proof of approval")
   const bypassCreated = readEvents(testDir, bypassRun).find((e) => e.event === "run_created")
   assert.strictEqual(bypassCreated.specGate, "bypassed", "run_created must record specGate: bypassed")
   assert(!Object.hasOwn(bypassCreated, "specPath"), "a bypass must not record a specPath")
@@ -735,7 +743,7 @@ try {
   assert.strictEqual(optOutCreated.specGate, "not_required", "run_created must record specGate: not_required")
   assert(!Object.hasOwn(optOutCreated, "specPath"), "not_required must not record a specPath")
 
-  console.log("✓ plan refuses without a spec (writing nothing), records satisfied/bypassed/not_required")
+  console.log("✓ plan enforces spec presence (writing nothing), records satisfied/bypassed/not_required as caller-controlled")
 
   // ==========================================
   // Part 1c-bis: request artifact and integrity modes
@@ -1647,18 +1655,125 @@ try {
   assert.strictEqual(vForgedAuditorFinal.status, "FAIL", "a forged auditor label must FAIL final_verify")
   assert(vForgedAuditorFinal.reasons.some((r) => r.includes("auditor must be team/victory-auditor")), `the reason must name the forged label: ${JSON.stringify(vForgedAuditorFinal.reasons)}`)
 
-  // Explicit plan skip is recorded and completes as SKIPPED (explicit).
+  // Explicit plan skip is recorded with its reason and completes as a labelled skip.
   const vSkipRun = "20261018-000000-v-skip"
   await seedVerifiedRun(vSkipRun, ["V1"], { request: "Deliver the explicit-skip fixture.", victoryAudit: "skip", stampVictory: false })
+  const vSkipReason = "fixture: the independent victory audit is intentionally skipped for this test"
   assert.strictEqual(JSON.parse(readFileSync(vPlanFile(vSkipRun), "utf8")).victoryAudit, "skip")
+  assert.strictEqual(JSON.parse(readFileSync(vPlanFile(vSkipRun), "utf8")).victorySkipReason, vSkipReason)
   assert.strictEqual(JSON.parse(readFileSync(join(vRunDir(vSkipRun), "state.json"), "utf8")).victoryAudit, "skip")
+  assert.strictEqual(JSON.parse(readFileSync(join(vRunDir(vSkipRun), "state.json"), "utf8")).victorySkipReason, vSkipReason)
   const vSkipFinal = await registeredTools.final_verify.execute({ sessionId: vSkipRun })
   assert.strictEqual(vSkipFinal.status, "PASS", `an explicit skip must complete: ${vSkipFinal.content}`)
-  assert.strictEqual(vSkipFinal.victory, "SKIPPED (explicit)")
+  assert.strictEqual(vSkipFinal.victory, `SKIPPED (explicit): ${vSkipReason}`)
   const vSkipJson = JSON.parse(readFileSync(finalFileOf(vSkipRun), "utf8"))
-  assert.strictEqual(vSkipJson.victory, "SKIPPED (explicit)")
+  assert.strictEqual(vSkipJson.victory, `SKIPPED (explicit): ${vSkipReason}`)
   const vSkipGate = await registeredTools.next.execute({ sessionId: vSkipRun })
   assert.strictEqual(vSkipGate.status, "ALL_PASSED")
+
+  // A skip without a reason is refused, and the reason is part of the signed baseline.
+  const noReasonRun = "20261018-000000-v-skip-noreason"
+  const noReason = await registeredTools.plan.execute({
+    sessionId: noReasonRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: "Deliver the missing-reason fixture.",
+    victoryAudit: "skip",
+    tasks: [{ id: "V1" }],
+  })
+  assert.strictEqual(noReason.content.startsWith("refused:"), true, `a skip without a reason must be refused: ${noReason.content}`)
+  assert(/victorySkipReason/.test(noReason.content), "the refusal must name victorySkipReason")
+  assert(!existsSync(vPlanFile(noReasonRun)), "a refused skip must write no plan")
+
+  const blankReasonRun = "20261018-000000-v-skip-blank"
+  const blankReason = await registeredTools.plan.execute({
+    sessionId: blankReasonRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: "Deliver the blank-reason fixture.",
+    victoryAudit: "skip",
+    victorySkipReason: "   \t  ",
+    tasks: [{ id: "V1" }],
+  })
+  assert.strictEqual(blankReason.content.startsWith("refused:"), true, `a blank reason must be refused: ${blankReason.content}`)
+  assert(/non-empty/.test(blankReason.content), "the refusal must say non-empty")
+  assert(!existsSync(vPlanFile(blankReasonRun)), "a refused blank reason must write no plan")
+
+  const oversizeReasonRun = "20261018-000000-v-skip-oversize"
+  const oversizeReason = await registeredTools.plan.execute({
+    sessionId: oversizeReasonRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: "Deliver the oversize-reason fixture.",
+    victoryAudit: "skip",
+    victorySkipReason: "x".repeat(501),
+    tasks: [{ id: "V1" }],
+  })
+  assert.strictEqual(oversizeReason.content.startsWith("refused:"), true, `an oversize reason must be refused: ${oversizeReason.content}`)
+  assert(/maximum is 500/.test(oversizeReason.content), "the refusal must name the 500-char maximum")
+  assert(!existsSync(vPlanFile(oversizeReasonRun)), "a refused oversize reason must write no plan")
+
+  const benchSkipReasonRun = "20261018-000000-v-skip-benchmark"
+  const benchSkipReason = await registeredTools.plan.execute({
+    sessionId: benchSkipReasonRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: "Benchmark still refuses skip even with a reason.",
+    integrityMode: "benchmark",
+    victoryAudit: "skip",
+    victorySkipReason: "A reasoned request is still not permitted in benchmark mode.",
+    tasks: [{ id: "V1" }],
+  })
+  assert(
+    /benchmark mode requires the independent victory audit/.test(benchSkipReason.content),
+    `benchmark must refuse skip even with a reason: ${benchSkipReason.content}`,
+  )
+  assert(!existsSync(vPlanFile(benchSkipReasonRun)), "a benchmark skip refusal must write no plan")
+
+  const replanRun = "20261018-000000-v-skip-replan"
+  const replanReason = "fixture: this run intentionally has no independent victory audit"
+  const firstReplan = await registeredTools.plan.execute({
+    sessionId: replanRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    request: "Deliver the re-plan fixture.",
+    victoryAudit: "skip",
+    victorySkipReason: replanReason,
+    tasks: [{ id: "V1" }],
+  })
+  assert(firstReplan.content.startsWith("Planned"), `the first skip plan must succeed: ${firstReplan.content}`)
+  const sameReason = await registeredTools.plan.execute({
+    sessionId: replanRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    victoryAudit: "skip",
+    victorySkipReason: replanReason,
+    tasks: [{ id: "V1" }],
+  })
+  assert(sameReason.content.startsWith("Planned"), `a re-plan may repeat the reason: ${sameReason.content}`)
+  const changedReason = await registeredTools.plan.execute({
+    sessionId: replanRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    victoryAudit: "skip",
+    victorySkipReason: "a different reason",
+    tasks: [{ id: "V1" }],
+  })
+  assert.strictEqual(changedReason.content.startsWith("refused:"), true, `a re-plan must not change the reason: ${changedReason.content}`)
+  assert(/victory skip reason changed|victorySkipReason/.test(changedReason.content), "the refusal must name the skip reason")
+  const changedMode = await registeredTools.plan.execute({
+    sessionId: replanRun,
+    topology: "iterative-coding",
+    skipInterview: true,
+    victoryAudit: "required",
+    tasks: [{ id: "V1" }],
+  })
+  assert.strictEqual(changedMode.content.startsWith("refused:"), true, `a re-plan must not change the mode: ${changedMode.content}`)
+  assert(/already persisted as "skip"/.test(changedMode.content), "the refusal must name the persisted mode")
+  const replanManifest = JSON.parse(readFileSync(join(vRunDir(replanRun), "run.manifest.json"), "utf8"))
+  assert.strictEqual(replanManifest.victorySkipReason, replanReason, "the signed manifest must record the reason")
+  assert.strictEqual(JSON.parse(readFileSync(vPlanFile(replanRun), "utf8")).victorySkipReason, replanReason)
+  assert.strictEqual(JSON.parse(readFileSync(join(vRunDir(replanRun), "state.json"), "utf8")).victorySkipReason, replanReason)
 
   console.log("✓ requirements baseline, trusted victory-auditor identity, write-once verdict, and completion gate verified")
 
@@ -2644,8 +2759,8 @@ try {
       topology: "iterative-coding",
       tasks: [{ id: "T1" }],
     })
-    assert(specRes.content.startsWith("refused: no spec found"), `a symlinked prompt_draft.md must not satisfy the spec gate: ${specRes.content}`)
-    assert(!existsSync(join(specDir, "plan.dag.json")), "a refused spec gate must write no plan")
+    assert(specRes.content.startsWith("refused: no spec found"), `a symlinked prompt_draft.md must not satisfy the spec presence gate: ${specRes.content}`)
+    assert(!existsSync(join(specDir, "plan.dag.json")), "a refused spec presence gate must write no plan")
   }
 
   console.log("✓ ADR 0004 cross-reader containment (verify/, snapshots.json, prompt_draft.md) verified")
