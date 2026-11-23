@@ -23,7 +23,6 @@ import {
   readFileSync,
   realpathSync,
   writeFileSync,
-  appendFileSync,
   renameSync,
   rmSync,
   openSync,
@@ -147,8 +146,18 @@ import type { RequirementsFile, VictoryAuditMode } from "./victory.ts"
 import { readAgentBriefingExcerpt, readBriefingExcerpt, refreshAgentBriefing, refreshRunBriefing } from "./briefing.ts"
 import { writeHandoff, resolveHandoffScope, handoffAgentSlug, evaluateHandoffGateChecked, normalizeHandoffMode, resolveHandoffMode } from "./handoff.ts"
 import type { HandoffGate, HandoffMode, HandoffTaskRef } from "./handoff.ts"
-import { withCrossProcessLock, recentLockDiagnostics } from "./locks.ts"
-import { fdWithin, readWithinBounded, supportsFdContainment } from "./safe-fs.mjs"
+import { withCrossProcessLock, withPinnedCrossProcessLock, recentLockDiagnostics } from "./locks.ts"
+import {
+  appendLineWithin,
+  createDirWithin,
+  fdWithin,
+  onWriteAnomaly,
+  readWithinBounded,
+  supportsFdContainment,
+  touchWithin,
+  writeFileAtomicWithin,
+  writeOnceWithin,
+} from "./safe-fs.mjs"
 
 // ---------------------------------------------------------------------------
 // OpenCode native cost tracking
@@ -218,30 +227,24 @@ function readSnapshots(run: string, file: string): SnapshotsFile | undefined {
 }
 
 /**
- * Write `content` to `file` atomically. The temp file is created with a fresh
- * random suffix and `O_CREAT|O_EXCL` (`wx`), so a symlink or hard link planted
- * at the old predictable `<file>.tmp` path cannot redirect the write; the
- * `renameSync` replaces the destination directory entry itself.
+ * Write `content` to a run artifact atomically through the pinned-fd writer
+ * (ADR 0010). The destination's parent is pinned once and every create, rename
+ * and identity check is relative to that descriptor, so a raced intermediate
+ * directory cannot redirect the write outside the run.
  */
-function writeTextAtomicSafe(file: string, content: string) {
-  refuseSymlink(file)
-  mkdirSync(dirname(file), { recursive: true })
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const tmp = `${file}.${randomBytes(6).toString("hex")}.tmp`
-    try {
-      writeFileSync(tmp, content, { encoding: "utf8", flag: "wx" })
-    } catch (err: any) {
-      if (err?.code === "EEXIST") continue
-      throw err
-    }
-    renameSync(tmp, file)
-    return
-  }
-  throw new Error(`refused: could not create a unique temp file for "${basename(file)}"`)
+function runRel(run: string, file: string): string {
+  return relative(resolve(run), resolve(file))
 }
 
-function writeSnapshots(file: string, value: SnapshotsFile) {
-  writeTextAtomicSafe(file, JSON.stringify(value, null, 2) + "\n")
+function writeTextAtomicSafe(run: string, file: string, content: string) {
+  // Retain the path-level policy and error vocabulary (final symlink, escape,
+  // non-directory parent) before the pinned write.
+  ensureSafeRunSubpath(run, file)
+  writeFileAtomicWithin(run, runRel(run, file), content)
+}
+
+function writeSnapshots(run: string, file: string, value: SnapshotsFile) {
+  writeTextAtomicSafe(run, file, JSON.stringify(value, null, 2) + "\n")
 }
 
 function getOpencodeDbPath(): string | undefined {
@@ -612,14 +615,14 @@ function snapshotCursor(raw: any): SessionSnapshot | undefined {
  * diagnostics. The digest/cursors are the authoritative delta baseline; the
  * legacy snapshots.json remains a compatibility view only.
  */
-function writeCostsOnce(file: string, costs: any, update: { source: string; digest?: string; skippedDuplicate?: boolean }) {
+function writeCostsOnce(run: string, file: string, costs: any, update: { source: string; digest?: string; skippedDuplicate?: boolean }) {
   costs.lastCostUpdate = {
     at: new Date().toISOString(),
     source: clean(update.source, 80),
     ...(update.digest ? { digest: update.digest } : {}),
     skippedDuplicate: update.skippedDuplicate === true,
   }
-  writeJson(file, costs)
+  writeJson(run, file, costs)
 }
 
 async function isConsoleMcpConnected(ctx: any): Promise<boolean> {
@@ -985,7 +988,10 @@ function writeOriginalRequest(run: string, request: string, mode: IntegrityMode,
   const file = join(run, "ORIGINAL_REQUEST.md")
   const body = `# Original Request\n\n- Integrity mode: ${mode}\n- Recorded: ${new Date().toISOString()}\n- Session: ${sessionId}\n\n## Request\n\n${request}`
   try {
-    writeFileSync(file, body.endsWith("\n") ? body : body + "\n", { flag: "wx" })
+    // ADR 0010: create-once inside the pinned run directory. O_CREAT|O_EXCL
+    // makes "once" true across concurrent planners and refuses an existing
+    // file or symlink; the parent descriptor cannot be diverted by a swap.
+    writeOnceWithin(run, "ORIGINAL_REQUEST.md", body.endsWith("\n") ? body : body + "\n")
   } catch (err: any) {
     if (err?.code === "EEXIST") {
       return `refused: ${file} already records this run's request and is write-once.\nUse a new session (a new teamwork_plan sessionId) for a different request. Nothing was written.`
@@ -1331,8 +1337,37 @@ function readJson<T>(run: string, file: string, fallback: T): T {
   }
 }
 
-function writeJson(file: string, value: unknown) {
-  writeTextAtomicSafe(file, JSON.stringify(value, null, 2) + "\n")
+function writeJson(run: string, file: string, value: unknown) {
+  writeTextAtomicSafe(run, file, JSON.stringify(value, null, 2) + "\n")
+}
+
+/**
+ * Directories every run is expected to use. They are created once at plan time
+ * through the pinned writer (ADR 0010). This is attack-surface reduction, not a
+ * substitute for pinning: a writer still pins and validates the parent it uses,
+ * and a missing directory is created one validated segment at a time.
+ */
+const PRECREATED_RUN_DIRS = [
+  "verify",
+  "tournament",
+  "tournament/candidates",
+  "tournament/critiques",
+  "tournament/merges",
+  "lemma",
+  "lemma/nodes",
+  "synthesis",
+  "document-review",
+  "document-review/segments",
+  "document-review/synthesis",
+]
+
+function precreateRunDirs(run: string, taskIds: string[] = []) {
+  for (const dir of PRECREATED_RUN_DIRS) createDirWithin(run, dir)
+  for (const id of taskIds) {
+    // Document-review segment ids are already allowlisted at triage time; the
+    // anchored pattern keeps a hostile plan from adding a path segment here.
+    if (/^seg-[A-Za-z0-9_-]{1,32}$/.test(id)) createDirWithin(run, `document-review/segments/${id}`)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2112,13 +2147,13 @@ async function mutateRunState<T>(
   opts: { write?: (state: any) => boolean } = {},
 ): Promise<T | undefined> {
   const stateFile = join(run, "state.json")
-  return withCrossProcessLock(stateFile, async () => {
+  return withPinnedCrossProcessLock(run, runRel(run, stateFile), async () => {
     const state = readJson<any>(run, stateFile, undefined)
     if (!state || typeof state.tasks !== "object") return undefined
     const result = await mutator(state)
     if (!opts.write || opts.write(state)) {
       state.updatedAt = new Date().toISOString()
-      writeJson(stateFile, state)
+      writeJson(run, stateFile, state)
     }
     return result
   })
@@ -2250,7 +2285,7 @@ async function claimReadyTasks(
 }> {
   if (!callSession) return { worker: readyForWorker, verifier: readyForVerifier, skipped: [], events: [], protocol: 1 }
   const stateFile = join(run, "state.json")
-  return withCrossProcessLock(stateFile, async () => {
+  return withPinnedCrossProcessLock(run, runRel(run, stateFile), async () => {
     const state = readJson<any>(run, stateFile, undefined)
     if (!state || typeof state.tasks !== "object") {
       return { worker: [], verifier: [], skipped: [], events: [], protocol: 1 }
@@ -2463,7 +2498,7 @@ async function claimReadyTasks(
 
     if (changed) {
       state.updatedAt = new Date(now).toISOString()
-      writeJson(stateFile, state)
+      writeJson(run, stateFile, state)
     }
     return { worker, verifier, skipped, events, protocol }
   })
@@ -2481,12 +2516,19 @@ async function claimReadyTasks(
  * no-op. Exported for the regression tests.
  */
 export function touch(file: string, content: string) {
+  // Path signature retained for non-run callers and tests. Run call sites use
+  // `touchRun`, which creates the file inside the pinned run directory.
   mkdirSync(dirname(file), { recursive: true })
   try {
     writeFileSync(file, content, { encoding: "utf8", flag: "wx" })
   } catch (err: any) {
     if (err?.code !== "EEXIST") throw err
   }
+}
+
+/** Create `run/relPath` once through the pinned writer; EEXIST is a no-op. */
+function touchRun(run: string, relPath: string, content: string) {
+  touchWithin(run, relPath, content)
 }
 
 /**
@@ -2524,13 +2566,29 @@ export function nextEventSeq(file: string, run?: string): number {
       }
       if (!fdWithin(runReal, fd)) return 1
     }
+    return nextEventSeqFromFd(fd)
+  } catch {
+    return 1
+  } finally {
+    closeSync(fd)
+  }
+}
+
+/**
+ * Sequence number computed from an already-open `events.jsonl` descriptor. The
+ * pinned append path (ADR 0010) passes the append fd here, so the tail read and
+ * the append are guaranteed to be the same inode. Positional reads do not move
+ * the append offset.
+ */
+export function nextEventSeqFromFd(fd: number): number {
+  try {
+    const stat = fstatSync(fd)
+    if (!stat.isFile()) return 1
     const fromTail = seqFromTail(readTail(fd, stat.size))
     if (fromTail !== null) return fromTail
     return countNonEmptyLines(fd) + 1
   } catch {
     return 1
-  } finally {
-    closeSync(fd)
   }
 }
 
@@ -2643,6 +2701,7 @@ async function appendEvent(
       | "claim_inspection_required"
       | "claim_recovered"
       | "claim_override"
+      | "write_anomaly"
     sessionId: string
     taskId?: string | null
     from?: string | null
@@ -2667,8 +2726,10 @@ async function appendEvent(
 ) {
   try {
     const eventsFile = join(run, "events.jsonl")
-    await withCrossProcessLock(eventsFile, () => {
-      refuseSymlink(eventsFile)
+    // ADR 0010: the lock file and the append both live inside the pinned run
+    // directory. `nextEventSeqFromFd` reads the tail through the *same* append
+    // descriptor, so a sequence number cannot come from a different inode.
+    await withPinnedCrossProcessLock(run, "events.jsonl", () => {
       const opt = (v: unknown, max: number) => (v === null || v === undefined || v === "" ? null : clean(v, max))
       const agent = opt(ev.agent, 64)
       const note = opt(ev.note, 200)
@@ -2676,34 +2737,70 @@ async function appendEvent(
         agent && (ev.agentSource === "explicit" || ev.agentSource === "session" || ev.agentSource === "plan")
           ? ev.agentSource
           : null
-      const line = JSON.stringify({
-        ts: new Date().toISOString(),
-        seq: nextEventSeq(eventsFile, run),
-        event: ev.event,
-        sessionId: clean(ev.sessionId, 64),
-        taskId: opt(ev.taskId, 64),
-        from: opt(ev.from, 32),
-        to: clean(ev.to, 32),
-        round: Number(ev.round) || 0,
-        agent,
-        ...(source ? { agentSource: source } : {}),
-        branch: opt(ev.branch, 120),
-        worktree: opt(ev.worktree, 200),
-        phase: opt(ev.phase, 32),
-        ...(note ? { note } : {}),
-        // Only run_created carries the spec-presence-gate decision. Every line now also
-        // carries seq (and agentSource when an actor exists); legacy lines on
-        // disk keep their old shape and remain valid.
-        ...(ev.specGate
-          ? { specGate: clean(ev.specGate, 16), ...(ev.specPath ? { specPath: clean(ev.specPath, 200) } : {}) }
-          : {}),
-      })
-      appendFileSync(eventsFile, line + "\n")
+      const buildLine = (fd: number) =>
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          seq: nextEventSeqFromFd(fd),
+          event: ev.event,
+          sessionId: clean(ev.sessionId, 64),
+          taskId: opt(ev.taskId, 64),
+          from: opt(ev.from, 32),
+          to: clean(ev.to, 32),
+          round: Number(ev.round) || 0,
+          agent,
+          ...(source ? { agentSource: source } : {}),
+          branch: opt(ev.branch, 120),
+          worktree: opt(ev.worktree, 200),
+          phase: opt(ev.phase, 32),
+          ...(note ? { note } : {}),
+          // Only run_created carries the spec-presence-gate decision. Every line now also
+          // carries seq (and agentSource when an actor exists); legacy lines on
+          // disk keep their old shape and remain valid.
+          ...(ev.specGate
+            ? { specGate: clean(ev.specGate, 16), ...(ev.specPath ? { specPath: clean(ev.specPath, 200) } : {}) }
+            : {}),
+        }) + "\n"
+      appendLineWithin(run, "events.jsonl", buildLine)
     })
   } catch {
     // fail-open: an events.jsonl write failure must never alter tool results
   }
 }
+
+// Best-effort audit trail for a refused write anomaly (ADR 0010). The shared
+// safe-fs ring is always updated; this sink also appends a bounded event to the
+// run that produced it. It is intentionally reentrancy-guarded and swallows all
+// errors: a diagnostic must never turn a write failure into a crash loop.
+let writeAnomalySinkBusy = false
+onWriteAnomaly((anomaly: any) => {
+  if (writeAnomalySinkBusy) return
+  const run = typeof anomaly?.run === "string" ? anomaly.run : ""
+  if (!run) return
+  writeAnomalySinkBusy = true
+  try {
+    const kind = clean(anomaly.kind, 32)
+    const name = clean(anomaly.name, 64)
+    const detail = clean(anomaly.detail, 200)
+    appendLineWithin(run, "events.jsonl", (fd: number) =>
+      JSON.stringify({
+        ts: new Date().toISOString(),
+        seq: nextEventSeqFromFd(fd),
+        event: "write_anomaly",
+        sessionId: clean(basename(run), 64),
+        taskId: null,
+        from: null,
+        to: kind || "refused",
+        round: 0,
+        agent: null,
+        note: detail || name || null,
+      }) + "\n",
+    )
+  } catch {
+    // best effort only
+  } finally {
+    writeAnomalySinkBusy = false
+  }
+})
 
 // Serialise read-modify-write of a run's cost files within this process, so
 // concurrent agents (parallel workers calling teamwork_cost at once) cannot
@@ -2932,20 +3029,15 @@ function ensureSafeRunSubpath(run: string, targetFile: string) {
 }
 
 function writeTextSafe(run: string, targetFile: string, content: string) {
-  // Write-path residual (ADR 0004): the containment check is by path. A raced
-  // intermediate directory can still redirect the temp create/rename outside
-  // the run. The read path is the one with post-open fd containment.
+  // Keep the path-level policy/error text, then write with pinned-fd
+  // containment. No path-based mkdir/create/rename remains on this writer; an
+  // intermediate directory swap cannot redirect it.
   ensureSafeRunSubpath(run, targetFile)
-  mkdirSync(dirname(targetFile), { recursive: true })
-  const tmp = targetFile + ".tmp"
-  refuseSymlink(tmp)
-  writeFileSync(tmp, content, "utf8")
-  renameSync(tmp, targetFile)
+  writeFileAtomicWithin(run, runRel(run, targetFile), content)
 }
 
 function writeJsonSafe(run: string, targetFile: string, value: unknown) {
-  ensureSafeRunSubpath(run, targetFile)
-  writeJson(targetFile, value)
+  writeJson(run, targetFile, value)
 }
 
 function readRegularJson<T>(run: string, targetFile: string): { ok: true; data: T } | { ok: false; reason: "missing" | "symlink" | "invalid" } {
@@ -4218,12 +4310,18 @@ async function createPlanRun(
     ...(routingReason ? { routingReason } : {}),
     ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
   }
-  writeJson(join(run, "plan.dag.json"), planObject)
+  // Pre-create the known run subdirectories (attack-surface reduction; every
+  // later write still pins and validates its own parent).
+  precreateRunDirs(
+    run,
+    tasks.map((t: any) => t.id),
+  )
+  writeJson(run, join(run, "plan.dag.json"), planObject)
   const planStateFile = join(run, "state.json")
   if (!existsSync(planStateFile)) {
-    await withCrossProcessLock(planStateFile, async () => {
+    await withPinnedCrossProcessLock(run, runRel(run, planStateFile), async () => {
       if (existsSync(planStateFile)) return
-      writeJson(planStateFile, {
+      writeJson(run, planStateFile, {
         version: 1,
         sessionId,
         rootSessionId,
@@ -4383,10 +4481,10 @@ async function createPlanRun(
   const budget = input.budgetUsd ?? (tournamentContextActive && existingBudget !== undefined ? existingBudget : 20)
   const costsFile = join(run, "costs.json")
   // Same lock as the cost tool so a re-plan cannot race a concurrent cost call.
-  await withCrossProcessLock(costsFile, async () => {
+  await withPinnedCrossProcessLock(run, runRel(run, costsFile), async () => {
     const existing = readJson<any>(run, costsFile, undefined)
     if (!existing) {
-      writeJson(costsFile, {
+      writeJson(run, costsFile, {
         sessionId,
         rootSessionIds: callSession ? [callSession] : [],
         budgetUsd: budget,
@@ -4415,7 +4513,7 @@ async function createPlanRun(
         if (input.budgetSource) existing.budgetSource = clean(input.budgetSource, 32)
       }
       existing.updatedAt = new Date().toISOString()
-      writeJson(costsFile, existing)
+      writeJson(run, costsFile, existing)
     }
     // Establish the native cost baseline for the calling session, preserving
     // any baselines already recorded for other sessions (merge, don't clobber).
@@ -4430,12 +4528,12 @@ async function createPlanRun(
     if (callSession && usage && !snaps.bySession[callSession]) {
       snaps.bySession[callSession] = { lastCost: usage.cost, lastTokens: usage.tokens, timestamp: now }
     }
-    writeSnapshots(join(run, "snapshots.json"), snaps)
+    writeSnapshots(run, join(run, "snapshots.json"), snaps)
   })
-  touch(join(run, "pitfalls.md"), "# Pitfalls\n\n_answer-agnostic failure modes; one per line_\n")
+  touchRun(run, "pitfalls.md", "# Pitfalls\n\n_answer-agnostic failure modes; one per line_\n")
   if (validatedTournamentConfig && tournamentEstimate) {
     try {
-      await withCrossProcessLock(manifestPathOf(run), async () => {
+      await withPinnedCrossProcessLock(run, runRel(run, manifestPathOf(run)), async () => {
         const current = readTournamentManifest(run)
         if (current.status === "absent") {
           initTournamentManifest({
@@ -4916,6 +5014,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               }
             }
             mkdirSync(planRun, { recursive: true })
+            precreateRunDirs(planRun, segments.map((s) => s.id))
             manifest = {
               version: 1,
               sessionId: planSid,
@@ -5258,7 +5357,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const report = { checkedAt, integrityMode: integrity.mode, items, summary }
         const file = join(run, "preflight.json")
         refuseSymlink(file)
-        writeJson(file, report)
+        writeJson(run, file, report)
 
         const problems = items.filter((i) => i.status === "MISSING" || i.status === "OUTAGE")
         const note = problems.length
@@ -5451,7 +5550,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
         // Serialise the read-modify-write so parallel processes cannot lose
         // each other's attribution.
-        return await withCrossProcessLock(file, async () => {
+        return await withPinnedCrossProcessLock(run, runRel(run, file), async () => {
           const costs = readJson<any>(run, file, undefined)
           if (!costs || typeof costs !== "object") {
             return { content: `No costs.json for run ${basename(run)} — call teamwork_plan first.` }
@@ -5524,10 +5623,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               costs.rootSessionIds = snaps.rootSessionIds
               skippedDuplicate = true
               source = sourceLabel
-              writeCostsOnce(file, costs, { source: sourceLabel, digest, skippedDuplicate: true })
+              writeCostsOnce(run, file, costs, { source: sourceLabel, digest, skippedDuplicate: true })
               // Compatibility view only; costs.json remains sufficient for
               // idempotency even if this second write crashes or is skipped.
-              writeSnapshots(snapshotsFile, snaps)
+              writeSnapshots(run, snapshotsFile, snaps)
               return
             }
 
@@ -5572,8 +5671,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             // Costs is the authority and is written once. If the process dies
             // before snapshots.json is refreshed, the digest + cursors in
             // costs.json still make the retry idempotent.
-            writeCostsOnce(file, costs, { source: sourceLabel, digest })
-            writeSnapshots(snapshotsFile, snaps)
+            writeCostsOnce(run, file, costs, { source: sourceLabel, digest })
+            writeSnapshots(run, snapshotsFile, snaps)
           }
 
           if (treeResult && treeResult.sessions.length > 0) {
@@ -5596,7 +5695,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               costs.spentUsd =
                 Math.round(Object.values(costs.byTask).reduce((a: number, b: any) => a + (Number(b) || 0), 0) * 1e4) / 1e4
               costs.updatedAt = new Date().toISOString()
-              writeCostsOnce(file, costs, { source: "manual (client unavailable)" })
+              writeCostsOnce(run, file, costs, { source: "manual (client unavailable)" })
               source = "manual (client unavailable)"
             } else {
               source = "manual (client unavailable)"
@@ -5608,7 +5707,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             costs.spentUsd =
               Math.round(Object.values(costs.byTask).reduce((a: number, b: any) => a + (Number(b) || 0), 0) * 1e4) / 1e4
             costs.updatedAt = new Date().toISOString()
-            writeCostsOnce(file, costs, { source: "manual (client unavailable)" })
+            writeCostsOnce(run, file, costs, { source: "manual (client unavailable)" })
             source = "manual (client unavailable)"
           } else {
             source = "manual (client unavailable)"
@@ -5826,7 +5925,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
 
-          return await withCrossProcessLock(manifestPathOf(run), async () => {
+          return await withPinnedCrossProcessLock(run, runRel(run, manifestPathOf(run)), async () => {
           let existingPlan: any
           let existingCosts: any
           let runExistsOrSymlink = existsSync(run)
@@ -5873,6 +5972,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
           try {
             mkdirSync(run, { recursive: true })
+            precreateRunDirs(run)
             if (request !== undefined && !existsSync(join(run, "ORIGINAL_REQUEST.md"))) {
               const refused = writeOriginalRequest(run, request, DEFAULT_INTEGRITY_MODE, sessionId)
               if (refused) return { content: refused }
@@ -5887,7 +5987,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 round: 0,
                 maxRounds: Number.isFinite(t.maxRounds) ? t.maxRounds : 4,
               }))
-              writeJson(join(run, "plan.dag.json"), {
+              writeJson(run, join(run, "plan.dag.json"), {
                 sessionId,
                 rootSessionId: callSession,
                 topology: "massive-proof",
@@ -5898,9 +5998,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               })
               if (!existsSync(join(run, "state.json"))) {
                 const initStateFile = join(run, "state.json")
-                await withCrossProcessLock(initStateFile, async () => {
+                await withPinnedCrossProcessLock(run, runRel(run, initStateFile), async () => {
                   if (existsSync(initStateFile)) return
-                  writeJson(initStateFile, {
+                  writeJson(run, initStateFile, {
                     version: 1,
                     sessionId,
                     rootSessionId: callSession,
@@ -5911,7 +6011,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                   })
                 })
               }
-              touch(join(run, "pitfalls.md"), "# Pitfalls\n\n_answer-agnostic failure modes; one per line_\n")
+              touchRun(run, "pitfalls.md", "# Pitfalls\n\n_answer-agnostic failure modes; one per line_\n")
               await appendEvent(run, {
                 event: "run_created",
                 sessionId,
@@ -5925,17 +6025,17 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             } else {
               existingPlan.tournament = { config: cfgRes.config, estimate }
               if (!existingPlan.rootSessionId && callSession) existingPlan.rootSessionId = callSession
-              writeJson(join(run, "plan.dag.json"), existingPlan)
+              writeJson(run, join(run, "plan.dag.json"), existingPlan)
             }
 
             // Repair a missing cost record even on a retry (plan may already
             // exist), and persist the budget this init approved while preserving
             // accumulated spend and buckets.
             const costsFile = join(run, "costs.json")
-            await withCrossProcessLock(costsFile, async () => {
+            await withPinnedCrossProcessLock(run, runRel(run, costsFile), async () => {
               const current = readJson<any>(run, costsFile, undefined)
               if (!current) {
-                writeJson(costsFile, {
+                writeJson(run, costsFile, {
                   sessionId,
                   rootSessionIds: callSession ? [callSession] : [],
                   budgetUsd: rawBudget,
@@ -5967,7 +6067,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               }
               if (changed) {
                 current.updatedAt = new Date().toISOString()
-                writeJson(costsFile, current)
+                writeJson(run, costsFile, current)
               }
             })
 
@@ -6035,7 +6135,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
         const mFile = manifestPathOf(run)
         try {
-          return await withCrossProcessLock(mFile, async () => {
+          return await withPinnedCrossProcessLock(run, runRel(run, mFile), async () => {
             const mRes = readTournamentManifest(run)
             if (mRes.status === "absent") return { content: `No tournament/manifest.json found for run ${sessionId}.` }
             if (mRes.status === "error") {
@@ -6341,10 +6441,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const run = resolved.run as string
         const authz = await authorizeToolAction(ctx, run, "pitfall", undefined, context)
         if (!authz.ok) return { content: authz.content }
-        const file = join(run, "pitfalls.md")
-        refuseSymlink(file)
         const line = `- [round ${Number(input.round) || "?"}] ${clean(input.pitfall, 200)}${input.taskId ? ` — seen in ${clean(input.taskId, 64)}` : ""}\n`
-        appendFileSync(file, line)
+        // ADR 0010: append through a pinned parent descriptor, O_NOFOLLOW, and
+        // refuse an aliased inode (nlink !== 1).
+        appendLineWithin(run, "pitfalls.md", () => line)
         return { content: `Logged pitfall: ${line.trim()}` }
       },
     })
@@ -6412,7 +6512,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
           let tOutcome: any
           try {
-            tOutcome = await withCrossProcessLock(manifestPathOf(run), async () => {
+            tOutcome = await withPinnedCrossProcessLock(run, runRel(run, manifestPathOf(run)), async () => {
               const mRes = readTournamentManifest(run)
               if (mRes.status === "error") {
                 return {
@@ -7296,7 +7396,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
         }
 
-        const outcome = await withCrossProcessLock(stateFile, async () => {
+        const outcome = await withPinnedCrossProcessLock(run, runRel(run, stateFile), async () => {
           const state = readJson<any>(run, stateFile, undefined)
           if (!state || typeof state.tasks !== "object") {
             return { content: `Error: No state.json found for run ${basename(run)}.` }
@@ -7617,7 +7717,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
 
           state.updatedAt = new Date().toISOString()
-          writeJson(stateFile, state)
+          writeJson(run, stateFile, state)
 
           return {
             taskId,
@@ -8198,8 +8298,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }))
         const violationRules = [...new Set(integrityViolations.map((v) => v.rule))]
 
+        // Pre-create the known run subdirectory through the pinned writer; the
+        // JSON write below would create it too, but an explicit plan-time shape
+        // reduces the attack surface and makes failures early and clear.
+        createDirWithin(run, "verify")
         const verifyDir = join(run, "verify")
-        mkdirSync(verifyDir, { recursive: true })
         const auditFile = join(verifyDir, "security-audit.json")
         const integrityModeNote =
           integrity.source === "artifact"
@@ -8258,7 +8361,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
         }
-        writeJson(auditFile, auditToWrite)
+        writeJson(run, auditFile, auditToWrite)
 
         let stateForEvent: any
         await mutateRunState(run, (state) => {
@@ -8270,7 +8373,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             for (const f of findings) {
               if (["critical", "high"].includes(String(f.severity).toLowerCase())) {
                 const line = `- [security] ${clean(f.severity, 16).toUpperCase()}: ${clean(f.description, 160)}${f.location ? ` at ${clean(f.location, 64)}` : ""}\n`
-                appendFileSync(join(run, "pitfalls.md"), line)
+                appendLineWithin(run, "pitfalls.md", () => line)
               }
             }
           }
@@ -8734,7 +8837,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const finalFile = join(run, "verify", "final.json")
         const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
 
-        return await withCrossProcessLock(finalFile, async () => {
+        return await withPinnedCrossProcessLock(run, runRel(run, finalFile), async () => {
           const caller = await deriveCallerAgent(ctx, run, callSession)
           const state = readJson<any>(run, join(run, "state.json"), undefined)
           if (!state || typeof state.tasks !== "object") {
@@ -9006,7 +9109,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (tournamentPresent) {
             const mFile = manifestPathOf(run)
             try {
-              await withCrossProcessLock(mFile, async () => {
+              await withPinnedCrossProcessLock(run, runRel(run, mFile), async () => {
                 const mRes = readTournamentManifest(run)
                 if (mRes.status === "ok" && TOURNAMENT_ACTIVE_PHASES.has(mRes.manifest.phase) && context?.signal?.aborted) {
                   const callerAbort = await deriveCallerAgent(ctx, run, callSession)
@@ -9302,7 +9405,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
           refuseSymlink(finalFile)
-          writeJson(finalFile, finalToWrite)
+          writeJson(run, finalFile, finalToWrite)
 
           await appendEvent(run, {
             event: "final_verification",
@@ -9674,8 +9777,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
             execGit(["merge", "--abort"], targetCwd)
 
+            createDirWithin(run, "synthesis")
             const synDir = join(run, "synthesis")
-            mkdirSync(synDir, { recursive: true })
             const conflictFile = join(synDir, `conflict-${taskId}.json`)
             const conflictArtifact = {
               taskId,
@@ -9687,7 +9790,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               diffTheirs: theirsDiff.slice(0, 10000),
               timestamp: new Date().toISOString(),
             }
-            writeJson(conflictFile, conflictArtifact)
+            writeJson(run, conflictFile, conflictArtifact)
 
             return {
               content: `MERGE CONFLICT for task ${taskId} into ${baseBranch}:\n${conflictingFiles.join("\n") || mergeRes.stderr || mergeRes.stdout}\n\nConflict artifact generated at: ${conflictFile}\n(Merge was aborted; worktree remains clean. Sentinel should dispatch team/synthesizer to resolve conflict.)`,
@@ -9860,7 +9963,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const manifestFile = join(run, "lemma", "manifest.json")
         const callSession = authz.sessionID
 
-        return await withCrossProcessLock(manifestFile, async () => {
+        return await withPinnedCrossProcessLock(run, runRel(run, manifestFile), async () => {
           if (action === "draft") {
             const modeRaw = input?.mode ? clean(input.mode, 32) : "lean"
             if (modeRaw !== "lean" && modeRaw !== "lake-env-lean") {
@@ -9951,7 +10054,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           return { content: `refused: unknown action "${action}" (allowed: create | update | blueprint | attempt)` }
         }
         const manifestFile = join(run, "lemma", "manifest.json")
-        return await withCrossProcessLock(manifestFile, async () => {
+        return await withPinnedCrossProcessLock(run, runRel(run, manifestFile), async () => {
           const res = mutateLemmaNode(run, {
             action,
             lemmaId: String(input?.lemmaId ?? ""),
@@ -10010,7 +10113,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (!cwdRes.ok) return { content: cwdRes.error }
         const verifiedCwd = cwdRes.cwd
         const manifestFile = join(run, "lemma", "manifest.json")
-        return await withCrossProcessLock(manifestFile, async () => {
+        return await withPinnedCrossProcessLock(run, runRel(run, manifestFile), async () => {
           const res = verifyLemmaNodeAttempt(run, {
             lemmaId: String(input?.lemmaId ?? ""),
             round: typeof input?.round === "number" ? input.round : undefined,

@@ -1,6 +1,6 @@
 # ADR 0004: Post-Open fd Containment for Intermediate-Component Symlink Races in Run-Directory Reads
 
-- **Status:** Implemented for the read path on Linux (Sprint 1.2); the write path remains proposed
+- **Status:** Implemented for the read path on Linux (Sprint 1.2); the write path is implemented in [ADR 0010](0010-pinned-fd-write-containment.md)
 - **Date:** 2026-11-22
 - **Workstream:** Sprint 2, S4a (follow-up to the PR #10 hardening)
 - **Classification:** ADR / security design gate
@@ -361,7 +361,7 @@ This is deterministic and directly tests the new primitive, independent of the r
 
 - The `open()` itself still occurs on the outside path before the check. For regular files this is harmless; the `fstat` regular-file check prevents reading devices/FIFOs.
 - macOS and Windows retain the intermediate-component race.
-- Write paths retain the same race; `writeSafeRunFile` is not fixed by this ADR.
+- Write paths retained the same race under this ADR; [ADR 0010](0010-pinned-fd-write-containment.md) now closes it on Linux with pinned directory descriptors (macOS/Windows remain detective-only).
 - A run-dir writer can still forge content inside the run and influence what agents read. That is accepted and documented; verdicts are recomputed from evidence.
 - Hardlinks inside the run to outside files are outside this threat model.
 
@@ -408,3 +408,29 @@ Node's `fs` exposes only path-based `open`, and `fs.constants.O_PATH` is not def
 - `scripts/test-engine.mjs:3485-3577` — existing symlink/containment tests.
 - `package.json:33-44` — npm `files` whitelist; `package.json:53` — `npm test` chain.
 - Runtime probe: Node v26.13.1, Linux 7.4, `/proc/self/fd` present; `O_NOFOLLOW`, `O_DIRECTORY`, `O_NONBLOCK` defined; `O_PATH` undefined.
+
+## 10. Follow-up: the write path (ADR 0010)
+
+This ADR deliberately fixed only the read path. The write path had the same
+intermediate-component race: a target was validated by path and then
+`mkdir`/create/rename'd by path. [ADR 0010](0010-pinned-fd-write-containment.md)
+implements the mirror of §8's missing primitive for **writes** on Linux without a
+native addon:
+
+- a directory descriptor is opened once (`O_RDONLY|O_DIRECTORY|O_NOFOLLOW`) and
+  checked with an exact `/proc/self/fd` realpath match;
+- every create, mkdir, rename, write, lstat, unlink and lock publication is
+  expressed as `/proc/self/fd/<dirfd>/<one-validated-segment>`;
+- the temp file is a fresh random single segment with
+  `O_CREAT|O_EXCL|O_NOFOLLOW`, and the post-rename `(dev, ino)` is compared with
+  the `fsync`'ed temp inode;
+- an append is refused when the opened inode has `nlink !== 1`, so a hard link
+  planted at `events.jsonl` cannot modify the outside file;
+- Linux without a usable `/proc/self/fd` **fails closed** for writes;
+- macOS/Windows keep the path-based atomic write plus a **detective** post-check,
+  and a transient swap that is reverted can be missed. That is the permanent
+  platform stance.
+
+The read-side guarantee in §5 is unchanged. The "write path not solved"
+conclusion in this document and in `docs/spikes/shared-safe-fs.md` is superseded
+on Linux by ADR 0010.

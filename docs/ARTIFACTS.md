@@ -1786,12 +1786,32 @@ there. Verdicts are not affected — they are recomputed from the evidence
 artifacts, not from injected context. `events.jsonl` remains a best-effort,
 fail-open path with the same guarantee boundary.
 
-**Write path.** ADR 0004 intentionally does **not** claim write containment.
-`writeSafeRunFile` and `writeTextSafe`/`writeJsonSafe` validate the target by
-path, then `mkdir`/create/`rename` by path; a raced intermediate directory can
-still redirect a write outside the run. The random `wx` temp plus rename does
-prevent a planted temp-path symlink or hard link from overwriting a victim.
-Closing the remaining write race needs the same component-wise primitive.
+**Write path (ADR 0010).** Run-artifact writes are **preventive on Linux** when
+`/proc/self/fd` is usable. The writer opens the destination's parent directory
+once (`O_RDONLY|O_DIRECTORY|O_NOFOLLOW`), requires an exact `/proc/self/fd`
+realpath match with the run realpath, and then expresses every create, mkdir,
+rename, write, lstat and unlink as
+`/proc/self/fd/<dirfd>/<one-validated-segment>`. A directory swapped for a
+symlink after the pin cannot redirect the bytes. Each write uses a fresh random
+temp segment with `O_CREAT|O_EXCL|O_NOFOLLOW`, an `fstat` + `fsync`, a rename
+under the pinned descriptor, and a post-rename `(dev, ino)` identity compare.
+`ORIGINAL_REQUEST.md` is created once (`O_CREAT|O_EXCL`, write-once); an append
+(`events.jsonl`, `pitfalls.md`) is refused when the opened inode has
+`nlink !== 1`, so a hard link planted at the log cannot modify an outside file.
+The cross-process lock file is created inside the same pinned directory
+(`withPinnedCrossProcessLock`), keyed in-process by the stable realpath plus
+relative path. Known run subdirectories are pre-created at plan time.
+
+**Boundary.** This is a Linux guarantee. On Linux where `/proc/self/fd` is
+absent or unusable, run writes fail closed. On **macOS and Windows** there is no
+pure-JS fd-to-path primitive, so writers keep the path-based atomic
+write and add only a **detective** post-write containment/identity check; a
+transient swap that is reverted before the check can be missed. That is the
+permanent platform stance. The first `mkdir` of the run root is still
+path-based, and a same-UID process that can ptrace the plugin is outside this
+boundary. Containment does not authenticate artifact content: a writer that can
+already modify the run directory can still forge content inside it, which is why
+verdicts are recomputed from evidence.
 
 - `tournament/manifest.json`: 5-phase bounded state machine (`PROPOSE → FALSIFY_PRUNE → MERGE → REFEREE_SCORE → VICTORY_AUDIT` → `COMPLETED | FAILED | CANCELLED | BUDGET_HALTED`), `optInProof`, `budgetEstimate`, `candidates`, and deterministic `rankedCandidates`.
 - `tournament/verdict.json`: written by `team/referee` on `audit` (`ACCEPT`/`REJECT`) or by `finalizeTournamentPartial` on cancellation/budget halt (`PARTIAL`).

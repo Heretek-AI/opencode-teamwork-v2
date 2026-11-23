@@ -23,3 +23,126 @@ export function readRegularBounded(file: string, maxBytes: number): SafeFsRead
 
 /** Bounded no-follow read that also refuses a descriptor outside `runReal`. */
 export function readWithinBounded(runReal: string, file: string, maxBytes: number): SafeFsRead
+
+// ---------------------------------------------------------------------------
+// Write containment (ADR 0010)
+// ---------------------------------------------------------------------------
+
+export type FdTraversalMode = "pinned" | "detective" | "fail-closed"
+
+/** "pinned" (Linux), "detective" (non-Linux), or "fail-closed" (Linux, no procfs). */
+export function fdTraversalMode(): FdTraversalMode
+
+/** True only when writes are preventive (a pinned directory descriptor). */
+export function supportsPinnedWrites(): boolean
+
+/** Test seam: force a traversal mode; production never calls this. */
+export function setFdTraversalModeForTest(mode: FdTraversalMode | null): void
+
+export interface WriteRefusal {
+  status: "refused"
+  reason: string
+  message: string
+}
+
+export interface PinnedRoot {
+  status: "ok"
+  fd: number
+  real: string
+}
+
+export interface ParentPin {
+  status: "ok"
+  dirFd: number
+  name: string
+  real: string
+  relPath: string
+}
+
+export interface WriteOptions {
+  durable?: boolean
+  mode?: FdTraversalMode
+  createDirs?: boolean
+  /** Set internally by the `*Within` wrappers so anomalies can name the run. */
+  run?: string
+  afterRename?: (info: { dirFd: number | null; tempName: string; destName: string; destPath?: string }) => void
+}
+
+export interface WriteOk {
+  status: "ok"
+  bytes: number
+  name: string
+  path?: string
+}
+
+export interface TouchResult {
+  status: "ok" | "exists"
+  name: string
+  bytes?: number
+  path?: string
+}
+
+export interface WriteAnomaly {
+  at: string
+  kind: string
+  run?: string | null
+  dir?: string | null
+  name?: string
+  detail?: string
+}
+
+export function assertSingleSegment(name: string): string
+export function fdPath(fd: number): string
+export function fdExactly(real: string, fd: number): boolean
+export function openPinnedRoot(run: string): PinnedRoot | WriteRefusal
+export function openChildDir(parentFd: number, name: string): number
+export function openOrCreateDir(parentFd: number, name: string): number
+export function pinParent(
+  run: string,
+  relPath: string,
+  options?: { create?: boolean },
+): ParentPin | WriteRefusal
+
+export function writeFileAtomicAt(
+  dirFd: number,
+  name: string,
+  content: string | Buffer,
+  options?: WriteOptions,
+): WriteOk
+export function writeFileAtomicWithin(
+  run: string,
+  relPath: string,
+  content: string | Buffer,
+  options?: WriteOptions,
+): WriteOk
+export function writeOnceAt(
+  dirFd: number,
+  name: string,
+  content: string | Buffer,
+  options?: WriteOptions,
+): WriteOk
+export function writeOnceWithin(
+  run: string,
+  relPath: string,
+  content: string | Buffer,
+  options?: WriteOptions,
+): WriteOk
+export function touchAt(dirFd: number, name: string, content: string | Buffer, options?: WriteOptions): TouchResult
+export function touchWithin(run: string, relPath: string, content: string | Buffer, options?: WriteOptions): TouchResult
+export function appendLineAt(
+  dirFd: number,
+  name: string,
+  buildLineFromFd: (fd: number, stat: unknown) => string,
+  options?: WriteOptions,
+): WriteOk
+export function appendLineWithin(
+  run: string,
+  relPath: string,
+  buildLineFromFd: (fd: number, stat: unknown) => string,
+  options?: WriteOptions,
+): WriteOk
+export function unlinkAt(dirFd: number, name: string): boolean
+export function unlinkWithin(run: string, relPath: string, options?: WriteOptions): boolean
+export function createDirWithin(run: string, relPath: string, options?: WriteOptions): { status: "ok"; path: string }
+export function recentWriteAnomalies(limit?: number): WriteAnomaly[]
+export function onWriteAnomaly(sink: ((anomaly: WriteAnomaly) => void) | null): void

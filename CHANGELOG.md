@@ -8,6 +8,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Linux pinned-fd write containment (0.11.0, ADR 0010).** Run-artifact writes
+  are now preventive on Linux when `/proc/self/fd` is usable. A parent directory
+  descriptor is opened with `O_DIRECTORY|O_NOFOLLOW`, checked for an exact fd
+  realpath match, and every create, mkdir, rename, write, lstat, unlink and lock
+  publication is expressed as `/proc/self/fd/<dirfd>/<one-validated-segment>`.
+  Each atomic write uses a fresh random `O_EXCL` temp, write loop + `fstat` +
+  `fsync`, a rename under the pin, and a post-rename `(dev, ino)` identity check.
+  `ORIGINAL_REQUEST.md` uses `O_CREAT|O_EXCL`; `events.jsonl`/`pitfalls.md`
+  appends refuse an inode with `nlink !== 1`, and the event `seq` is computed from
+  the same append descriptor (`nextEventSeqFromFd`). The cross-process lock file
+  is created inside the pinned directory (`withPinnedCrossProcessLock`) with a
+  stable in-process key, and known run subdirectories are pre-created at plan
+  time. Linux without usable procfs **fails closed** for writes. macOS/Windows
+  keep the path-based atomic write plus a detective post-write check only; a
+  transient swap that is reverted can be missed. New
+  `scripts/test-safe-fs-write.mjs` covers nested pins, root renames, a 2,000
+  write swapper race, an append race, hard-link refusal, two-process append
+  sequencing, write-once concurrency, pre-planted temp links, and the detective
+  audit event. Residuals: run-root `mkdir` is still path-based, hard-link
+  semantics are best-effort on network filesystems, a renamed pinned directory
+  loses its old name, same-UID ptrace is unaffected, and writes inside the run
+  remain attacker-influenceable.
 - **Claim protocol 2: fencing, side-effect baselines and explicit recovery
   (0.10.0, ADR 0009).** New runs record `claimProtocol: 2`,
   `claimLeaseMs` (default 300000, bounded 60 s–60 m), `host` and lock-storage
