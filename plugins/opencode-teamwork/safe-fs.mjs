@@ -48,7 +48,7 @@ import {
   writeSync,
 } from "node:fs"
 import { randomBytes } from "node:crypto"
-import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path"
+import { basename, dirname, isAbsolute, relative, resolve, sep, win32 as win32Path } from "node:path"
 
 const PROC_SELF_FD = "/proc/self/fd"
 const DELETED_SUFFIX = " (deleted)"
@@ -82,14 +82,27 @@ function probeFdMode() {
 
 const FD_MODE = probeFdMode()
 
+// Test-only override for the read-side containment mode. The non-Linux branch
+// (containment unavailable) can then be exercised on a Linux CI host.
+let containmentModeOverride = null
+
+function currentContainmentMode() {
+  return containmentModeOverride ?? FD_MODE
+}
+
+/** Test seam: force "enforce" | "fail-closed" | "unsupported" (or null). */
+export function setFdContainmentModeForTest(mode) {
+  containmentModeOverride = mode === "enforce" || mode === "fail-closed" || mode === "unsupported" ? mode : null
+}
+
 /** True when the post-open fd containment check is enforced on this host. */
 export function supportsFdContainment() {
-  return FD_MODE === "enforce"
+  return currentContainmentMode() === "enforce"
 }
 
 /** "enforce" | "fail-closed" | "unsupported" (exported for tests/diagnostics). */
 export function fdContainmentMode() {
-  return FD_MODE
+  return currentContainmentMode()
 }
 
 // Separator-aware relative containment: a file literally named "..foo" is
@@ -111,7 +124,7 @@ function isPathWithin(root, target) {
  * resolved or fd containment is unavailable (fail closed).
  */
 export function fdWithin(runReal, fd) {
-  if (FD_MODE !== "enforce") return false
+  if (currentContainmentMode() !== "enforce") return false
   let fdPath
   try {
     fdPath = realpathSync(`${PROC_SELF_FD}/${fd}`)
@@ -167,7 +180,7 @@ function readOpened(file, maxBytes, runReal) {
     if (fst.size > maxBytes) return { status: "oversize", size: fst.size, cap: maxBytes }
     // ADR 0004 order: the descriptor is checked BEFORE the buffer is allocated
     // and before any byte is read. "unsupported" keeps the old behavior.
-    if (runReal !== null && FD_MODE !== "unsupported" && !fdWithin(runReal, fd)) {
+    if (runReal !== null && currentContainmentMode() !== "unsupported" && !fdWithin(runReal, fd)) {
       return refused(
         "containment",
         `refused: "${basename(file)}" is not inside the run directory (fd containment unavailable or failed)`,
@@ -314,7 +327,7 @@ export function onWriteAnomaly(sink) {
   writeAuditSink = typeof sink === "function" ? sink : null
 }
 
-function recordWriteAnomaly(entry) {
+export function recordWriteAnomaly(entry) {
   const record = { at: new Date().toISOString(), ...entry }
   writeAnomalies.push(record)
   if (writeAnomalies.length > MAX_WRITE_ANOMALIES) {
@@ -338,7 +351,35 @@ function refusalError(reason, message) {
 /**
  * Reject anything that is not exactly one path component: no empty name, no
  * `.`/`..`, no separator or NUL, and at most NAME_MAX (255) UTF-8 bytes.
+ *
+ * On Windows (or when the test seam enables the Windows policy) names that NTFS
+ * silently rewrites or reserves are refused too: a trailing dot/space, any `:`
+ * (drive/ADS syntax), the reserved device names (`CON`, `PRN`, `AUX`, `NUL`,
+ * `COM1`-`COM9`, `LPT1`-`LPT9`, including an extension) and any name that does
+ * not survive a `path.win32.resolve` round-trip. Linux behaviour is unchanged.
  */
+let windowsLexicalOverride = null
+
+/** Test seam: force the Windows lexical policy on any host (or null). */
+export function setWindowsLexicalModeForTest(enabled) {
+  windowsLexicalOverride = typeof enabled === "boolean" ? enabled : null
+}
+
+const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i
+
+function windowsSegmentInvalid(value) {
+  if (/[. ]$/.test(value)) return true
+  if (value.includes(":")) return true
+  if (WINDOWS_RESERVED_NAME.test(value)) return true
+  try {
+    const roundTrip = win32Path.resolve(win32Path.sep + "tw-root", value)
+    if (win32Path.basename(roundTrip) !== value) return true
+  } catch {
+    return true
+  }
+  return false
+}
+
 export function assertSingleSegment(name) {
   const value = typeof name === "string" ? name : String(name ?? "")
   const invalid =
@@ -349,7 +390,7 @@ export function assertSingleSegment(name) {
     value.includes("\\") ||
     value.includes("\u0000") ||
     Buffer.byteLength(value, "utf8") > 255
-  if (invalid) {
+  if (invalid || ((windowsLexicalOverride ?? process.platform === "win32") && windowsSegmentInvalid(value))) {
     throw refusalError(
       "segment",
       `refused: invalid single path segment ${JSON.stringify(value).slice(0, 80)}`,
@@ -545,8 +586,38 @@ function toBuffer(content) {
   return Buffer.from(String(content ?? ""), "utf8")
 }
 
+let identityUnavailableForTest = false
+
+/** Test seam: force `sameIdentity` to report an unusable (dev, ino) pair. */
+export function setIdentityUnavailableForTest(enabled) {
+  identityUnavailableForTest = enabled === true
+}
+
+/**
+ * Compare the opened/recorded inode identity. A filesystem that reports
+ * `dev === 0` or `ino === 0` cannot support a meaningful identity check, so it
+ * is refused by name (`identity-unavailable`) instead of being treated as a
+ * match or a benign mismatch.
+ */
 function sameIdentity(stat, recorded) {
-  return !!stat && !!recorded && stat.dev === recorded.dev && stat.ino === recorded.ino
+  if (!stat || !recorded) return false
+  if (
+    identityUnavailableForTest ||
+    stat.dev === 0 ||
+    stat.ino === 0 ||
+    recorded.dev === 0 ||
+    recorded.ino === 0
+  ) {
+    recordWriteAnomaly({
+      kind: "identity-unavailable",
+      detail: "the filesystem reported dev=0 or ino=0; identity containment cannot be verified",
+    })
+    throw refusalError(
+      "identity-unavailable",
+      "refused: the filesystem reports no stable (dev, ino) identity; the write cannot be verified",
+    )
+  }
+  return stat.dev === recorded.dev && stat.ino === recorded.ino
 }
 
 function fsyncDirBestEffort(fd) {
@@ -831,14 +902,44 @@ export function appendLineWithin(run, relPath, buildLineFromFd, options = {}) {
 export function unlinkWithin(run, relPath, options = {}) {
   const mode = options.mode ?? currentTraversalMode()
   if (mode === "detective") {
-    const target = detectiveTarget(run, relPath)
+    // A delete never creates parent directories as a side effect. A missing
+    // parent is "nothing to remove", not permission to materialise a tree.
+    let target
+    try {
+      target = detectiveTarget(run, relPath, { createParents: false })
+    } catch (err) {
+      if (err?.reason === "absent") return false
+      throw err
+    }
     try {
       unlinkSync(target.dest)
-      return true
     } catch (err) {
       if (err?.code === "ENOENT") return false
       throw err
     }
+    if (typeof options.afterUnlink === "function") options.afterUnlink({ dest: target.dest })
+    try {
+      const parentReal = realpathSync(dirname(target.dest))
+      if (parentReal !== target.runReal && !isPathWithin(target.runReal, parentReal)) {
+        recordWriteAnomaly({
+          kind: "detective-unlink",
+          run: target.run ?? null,
+          name: target.name,
+          detail: "post-unlink parent realpath is outside the run",
+        })
+        throw refusalError("containment", "refused: post-unlink containment check failed")
+      }
+    } catch (err) {
+      if (err?.code === "EREFUSED") throw err
+      recordWriteAnomaly({
+        kind: "detective-unlink",
+        run: target.run ?? null,
+        name: target.name,
+        detail: sanitize(err?.message),
+      })
+      throw refusalError("postcheck", "refused: post-unlink containment check failed")
+    }
+    return true
   }
   if (mode !== "pinned") return false
   const pin = pinOrThrow(run, relPath, false, mode)
@@ -867,6 +968,28 @@ export function createDirWithin(run, relPath, options = {}) {
   if (mode === "detective") {
     const target = detectiveTarget(run, relPath)
     mkdirSync(target.dest, { recursive: true })
+    if (typeof options.afterCreate === "function") options.afterCreate({ dest: target.dest })
+    try {
+      const createdReal = realpathSync(target.dest)
+      if (createdReal !== target.runReal && !isPathWithin(target.runReal, createdReal)) {
+        recordWriteAnomaly({
+          kind: "detective-create-dir",
+          run: target.run ?? null,
+          name: target.name,
+          detail: "post-create directory realpath is outside the run",
+        })
+        throw refusalError("containment", "refused: post-create containment check failed")
+      }
+    } catch (err) {
+      if (err?.code === "EREFUSED") throw err
+      recordWriteAnomaly({
+        kind: "detective-create-dir",
+        run: target.run ?? null,
+        name: target.name,
+        detail: sanitize(err?.message),
+      })
+      throw refusalError("postcheck", "refused: post-create containment check failed")
+    }
     return { status: "ok", path: target.dest }
   }
   let rel
@@ -904,15 +1027,29 @@ export function createDirWithin(run, relPath, options = {}) {
 // post-write checks can be missed. On Linux without procfs writes fail closed
 // instead; this code is never selected there by default.
 
-function detectiveTarget(run, relPath) {
+function detectiveTarget(run, relPath, options = {}) {
   const runRoot = resolve(run)
   const dest = resolve(runRoot, relPath)
   const rel = relative(runRoot, dest)
-  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+  // Parity with tournament.ts: reject anything whose relative path starts with
+  // "..", so a sibling literally named "..foo" cannot masquerade as inside.
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
     throw refusalError("escape", "refused: path escapes the run directory")
   }
   const segments = rel.split(sep).filter((part) => part !== "")
   for (const segment of segments) assertSingleSegment(segment)
+  let runStat
+  try {
+    runStat = lstatSync(runRoot)
+  } catch {
+    throw refusalError("run-missing", "refused: run directory does not exist")
+  }
+  if (runStat.isSymbolicLink()) {
+    throw refusalError("run-symlink", "refused: run directory is a symlink")
+  }
+  if (!runStat.isDirectory()) {
+    throw refusalError("run-not-directory", "refused: run path is not a directory")
+  }
   let runReal
   try {
     runReal = realpathSync(runRoot)
@@ -932,8 +1069,16 @@ function detectiveTarget(run, relPath) {
       throw err
     }
   }
-  mkdirSync(dirname(dest), { recursive: true })
-  const dirReal = realpathSync(dirname(dest))
+  if (options.createParents !== false) mkdirSync(dirname(dest), { recursive: true })
+  let dirReal
+  try {
+    dirReal = realpathSync(dirname(dest))
+  } catch (err) {
+    if (options.createParents === false && err?.code === "ENOENT") {
+      throw refusalError("absent", "refused: the target's parent directory does not exist")
+    }
+    throw refusalError("postcheck", "refused: the target parent cannot be resolved")
+  }
   if (dirReal !== runReal && !isPathWithin(runReal, dirReal)) {
     throw refusalError("containment", "refused: target parent is outside the run realpath")
   }
@@ -1047,11 +1192,49 @@ function touchDetective(run, relPath, content, options) {
 
 function appendLineDetective(run, relPath, buildLineFromFd, options) {
   const target = detectiveTarget(run, relPath)
+  const nofollow = fsConstants.O_NOFOLLOW || 0
   let fd = null
+  let recorded = null
   try {
-    fd = openSync(target.dest, fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_CREAT, 0o600)
+    if (nofollow === 0) {
+      // Windows has no O_NOFOLLOW: refuse a symlink at the final component
+      // immediately before the open. This check is not atomic, but it closes
+      // the deterministic `pitfalls.md -> ~/.bashrc` pre-planted escape.
+      try {
+        if (lstatSync(target.dest).isSymbolicLink()) {
+          recordWriteAnomaly({
+            kind: "detective-append",
+            run: target.run ?? null,
+            name: target.name,
+            detail: "refused append: the final component is a symlink",
+          })
+          throw refusalError("symlink", `refused: "${sanitize(target.name)}" is a symlink; refusing to append`)
+        }
+      } catch (err) {
+        if (err?.code !== "ENOENT") throw err
+      }
+    }
+    try {
+      fd = openSync(
+        target.dest,
+        fsConstants.O_RDWR | fsConstants.O_APPEND | fsConstants.O_CREAT | nofollow,
+        0o600,
+      )
+    } catch (err) {
+      if (err?.code === "ELOOP") {
+        recordWriteAnomaly({
+          kind: "detective-append",
+          run: target.run ?? null,
+          name: target.name,
+          detail: "refused append: O_NOFOLLOW saw a symlink",
+        })
+        throw refusalError("symlink", `refused: "${sanitize(target.name)}" is a symlink; refusing to append`)
+      }
+      throw err
+    }
     const st = fstatSync(fd)
     if (!st.isFile()) throw refusalError("not-regular", `refused: "${target.name}" is not a regular file`)
+    recorded = { dev: st.dev, ino: st.ino }
     if (st.nlink !== 1) {
       recordWriteAnomaly({
         kind: "hardlink",
@@ -1064,7 +1247,7 @@ function appendLineDetective(run, relPath, buildLineFromFd, options) {
     // Where the read-side primitive is available, require the opened append
     // descriptor to resolve inside the run. On non-Linux it cannot, so the
     // check is skipped and the detective realpath post-check remains.
-    if (FD_MODE === "enforce" && !fdWithin(target.runReal, fd)) {
+    if (currentContainmentMode() === "enforce" && !fdWithin(target.runReal, fd)) {
       throw refusalError("containment", "refused: append descriptor is not inside the run")
     }
     const line = buildLineFromFd(fd, st)
@@ -1073,6 +1256,29 @@ function appendLineDetective(run, relPath, buildLineFromFd, options) {
     }
     writeAllSync(fd, Buffer.from(line, "utf8"))
     if (options.durable !== false) fsyncSync(fd)
+    if (typeof options.afterAppend === "function") options.afterAppend({ fd, dest: target.dest })
+    // Post-write identity against the descriptor that was actually opened.
+    let after
+    try {
+      after = lstatSync(target.dest)
+    } catch (err) {
+      recordWriteAnomaly({
+        kind: "detective-append",
+        run: target.run ?? null,
+        name: target.name,
+        detail: sanitize(err?.message),
+      })
+      throw refusalError("identity", `refused: "${sanitize(target.name)}" disappeared during the append`)
+    }
+    if (!after.isFile() || !sameIdentity(after, recorded)) {
+      recordWriteAnomaly({
+        kind: "detective-append",
+        run: target.run ?? null,
+        name: target.name,
+        detail: "post-append inode does not match the opened append descriptor",
+      })
+      throw refusalError("identity", `refused: "${sanitize(target.name)}" changed identity during the append`)
+    }
     const dirReal = realpathSync(dirname(target.dest))
     if (dirReal !== target.runReal && !isPathWithin(target.runReal, dirReal)) {
       recordWriteAnomaly({ kind: "detective-containment", run: target.run ?? null, name: target.name, detail: "append parent moved outside" })
