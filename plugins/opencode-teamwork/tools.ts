@@ -143,11 +143,12 @@ import {
   type AuthEnvelope,
   type AuthFailure,
 } from "./auth.ts"
+import { contentSha256Hex, isApprovalNonce } from "./approval-format.mjs"
 import type { RequirementsFile, VictoryAuditMode } from "./victory.ts"
 import { readAgentBriefingExcerpt, readBriefingExcerpt, refreshAgentBriefing, refreshRunBriefing } from "./briefing.ts"
 import { writeHandoff, resolveHandoffScope, handoffAgentSlug, evaluateHandoffGateChecked, normalizeHandoffMode, resolveHandoffMode } from "./handoff.ts"
 import type { HandoffGate, HandoffMode, HandoffTaskRef } from "./handoff.ts"
-import { withCrossProcessLock, withPinnedCrossProcessLock, recentLockDiagnostics } from "./locks.ts"
+import { withCrossProcessLock, withFileLock, withPinnedCrossProcessLock, recentLockDiagnostics } from "./locks.ts"
 import {
   appendLineWithin,
   createDirWithin,
@@ -749,11 +750,11 @@ function requiresApproval(trustLevel: TrustLevel): boolean {
 
 function approvalPolicyFor(trustLevel: TrustLevel, version: number): ApprovalPolicy {
   if (!requiresApproval(trustLevel)) return "none"
-  return version < RUN_MANIFEST_VERSION ? "in-run-legacy" : "external-dir"
+  return version < APPROVAL_EXTERNAL_MIN_VERSION ? "in-run-legacy" : "external-dir"
 }
 
 function normalizeApprovalPolicy(value: unknown, version: number): ApprovalPolicy {
-  if (version < RUN_MANIFEST_VERSION) return "in-run-legacy"
+  if (version < APPROVAL_EXTERNAL_MIN_VERSION) return "in-run-legacy"
   return value === "external-dir" || value === "none" || value === "in-run-legacy"
     ? (value as ApprovalPolicy)
     : "none"
@@ -2877,6 +2878,12 @@ async function appendEvent(
     specGate?: "satisfied" | "bypassed" | "not_required"
     /** run_created only: the spec file, when the gate was satisfied. */
     specPath?: string | null
+    /** run_created only: approval summary (0.11.0 prompt binding). */
+    approvalDigest?: string | null
+    approvalKeyId?: string | null
+    approvedBy?: string | null
+    promptDraftSha256?: string | null
+    binding?: "prompt" | null
     /**
      * final_verification_bypass: why an unstamped verdict was accepted.
      * preflight / run_created: an input-preflight bypass or missing-input note.
@@ -2919,6 +2926,13 @@ async function appendEvent(
           ...(ev.specGate
             ? { specGate: clean(ev.specGate, 16), ...(ev.specPath ? { specPath: clean(ev.specPath, 200) } : {}) }
             : {}),
+          // run_created approval summary (0.11.0). The event is a record of
+          // what the gate accepted; it is not itself a signature.
+          ...(ev.approvalDigest ? { approvalDigest: clean(ev.approvalDigest, 64) } : {}),
+          ...(ev.approvalKeyId ? { approvalKeyId: clean(ev.approvalKeyId, 128) } : {}),
+          ...(ev.approvedBy ? { approvedBy: clean(ev.approvedBy, 200) } : {}),
+          ...(ev.promptDraftSha256 ? { promptDraftSha256: clean(ev.promptDraftSha256, 64) } : {}),
+          ...(ev.binding ? { binding: clean(ev.binding, 16) } : {}),
         }) + "\n"
       appendLineWithin(run, "events.jsonl", buildLine)
     })
@@ -3227,14 +3241,24 @@ function readRegularJson<T>(run: string, targetFile: string): { ok: true; data: 
 
 const RUN_MANIFEST = "run.manifest.json"
 /**
- * 0.10.2 bumps the signed manifest to version 2: approvals must come from an
+ * 0.10.2 bumped the signed manifest to version 2: approvals must come from an
  * external approval directory with a distinct Ed25519 approver key. Version 1
  * manifests stay readable; their in-run approval path is honoured only for
  * those pre-0.10.2 runs and is recorded as `approval_unbound`.
+ *
+ * 0.11.0 bumps to version 3: an approval is bound to the exact bytes of
+ * `prompt_draft.md` (not only to the manifest), and the manifest records the
+ * approval digest/nonce/approver so a re-plan or a later edit is `AUTH_STALE`.
+ * Version 2 stays readable and keeps its manifestDigest-bound approval
+ * semantics.
  */
-const RUN_MANIFEST_VERSION = 2
-const SUPPORTED_RUN_MANIFEST_VERSIONS = [1, 2] as const
+const RUN_MANIFEST_VERSION = 3
+const SUPPORTED_RUN_MANIFEST_VERSIONS = [1, 2, 3] as const
 type RunManifestVersion = (typeof SUPPORTED_RUN_MANIFEST_VERSIONS)[number]
+/** First manifest version that requires the external approval directory. */
+const APPROVAL_EXTERNAL_MIN_VERSION = 2
+/** First manifest version that binds the approval to `prompt_draft.md`. */
+const APPROVAL_PROMPT_MIN_VERSION = 3
 
 type ApprovalPolicy = "external-dir" | "in-run-legacy" | "none"
 
@@ -3265,6 +3289,20 @@ type RunManifest = {
   approvalKeyId?: string | null
   /** Approval policy pinned at plan time: external-dir, in-run-legacy, or none. */
   approvalPolicy?: ApprovalPolicy
+  /** Version 3+: SHA-256 of the exact `prompt_draft.md` bytes. */
+  specHash?: string | null
+  /** Version 3+: byte length of `prompt_draft.md`. */
+  specBytes?: number | null
+  /** Version 3+: digest of the approval artifact payload (without `_auth`). */
+  approvalDigest?: string | null
+  /** Version 3+: one-use nonce, equal to the approval envelope's nonce. */
+  approvalNonce?: string | null
+  /** Version 3+: the approval binds the prompt draft, not only the manifest. */
+  approvalBinding?: "prompt"
+  /** Version 3+: the claimed approver identity (`approvedBy`/`attestedBy`). */
+  approvedBy?: string | null
+  /** Version 3+: ISO timestamp from the approval artifact. */
+  approvedAt?: string | null
   createdAt: string
   _auth?: AuthEnvelope
 }
@@ -3410,6 +3448,18 @@ function manifestDriftReason(drift: string): string {
   if (drift.startsWith("approvalPolicy")) {
     return `[AUTH_STALE] approval policy change refused (${drift})`
   }
+  if (drift.startsWith("specHash") || drift.startsWith("specBytes")) {
+    return `[AUTH_STALE] the approved prompt_draft.md text changed since the plan (${drift})`
+  }
+  if (
+    drift.startsWith("approvalDigest") ||
+    drift.startsWith("approvalNonce") ||
+    drift.startsWith("approvalBinding") ||
+    drift.startsWith("approvedBy") ||
+    drift.startsWith("approvedAt")
+  ) {
+    return `[AUTH_STALE] the approval binding changed since the plan (${drift})`
+  }
   if (drift.startsWith("planHash")) {
     return `[AUTH_STALE] plan baseline changed (${drift})`
   }
@@ -3419,7 +3469,10 @@ function manifestDriftReason(drift: string): string {
   return `[AUTH_STALE] ${drift}`
 }
 
-function manifestDrift(manifest: RunManifest, current: Omit<RunManifest, "version" | "sessionId" | "rootSessionId" | "runKeyId" | "createdAt" | "_auth">): string[] {
+function manifestDrift(
+  manifest: RunManifest,
+  current: Omit<RunManifest, "version" | "sessionId" | "rootSessionId" | "runKeyId" | "createdAt" | "_auth">,
+): string[] {
   const drift: string[] = []
   if (manifest.integrityMode !== current.integrityMode) {
     drift.push(`integrityMode drifted: manifest=${manifest.integrityMode} current=${current.integrityMode}`)
@@ -3461,6 +3514,21 @@ function manifestDrift(manifest: RunManifest, current: Omit<RunManifest, "versio
   if (baselineApprovalKey !== currentApprovalKey) {
     drift.push(`approvalKeyId drifted (manifest=${baselineApprovalKey ?? "null"} current=${currentApprovalKey ?? "null"})`)
   }
+  // Version 3 binds the exact prompt draft and the approval artifact. A
+  // re-plan that changes any of these is AUTH_STALE, never a silent rebind.
+  for (const key of [
+    "specHash",
+    "specBytes",
+    "approvalDigest",
+    "approvalNonce",
+    "approvalBinding",
+    "approvedBy",
+    "approvedAt",
+  ] as const) {
+    const a = manifest[key] ?? null
+    const b = (current as any)[key] ?? null
+    if (a !== b) drift.push(`${key} drifted (manifest=${a ?? "null"} current=${b ?? "null"})`)
+  }
   // Only a signed→legacy downgrade is drift; a 0.8.0 manifest (absent = legacy)
   // may be re-planned into a signed run.
   const baselineHandoffAuth = manifest.handoffAuth ?? "legacy"
@@ -3476,11 +3544,60 @@ function manifestDrift(manifest: RunManifest, current: Omit<RunManifest, "versio
   return drift
 }
 
+/**
+ * Current version-3 binding fields. For a non-approval run the draft is
+ * re-hashed here, so an edited spec is `AUTH_STALE`. For an approval-bound run
+ * the trust gate owns the check and names the precise failure; this function
+ * mirrors the manifest values so generic drift does not pre-empt it.
+ */
+function currentApprovalDriftFields(
+  manifest: RunManifest,
+  run: string,
+  trustLevel: TrustLevel,
+): Pick<RunManifest, "specHash" | "specBytes" | "approvalDigest" | "approvalNonce" | "approvalBinding" | "approvedBy" | "approvedAt"> {
+  if (manifest.version < APPROVAL_PROMPT_MIN_VERSION) {
+    return {
+      specHash: null,
+      specBytes: null,
+      approvalDigest: null,
+      approvalNonce: null,
+      approvedBy: null,
+      approvedAt: null,
+    }
+  }
+  // An approval-bound run is checked by evaluateTrustGate, which names the
+  // precise failure (AUTH_APPROVAL_STALE / _INCOMPLETE / _REPLAY). Mirroring
+  // the manifest values here keeps manifestDrift from pre-empting that named
+  // refusal; re-plan drift is still enforced in createPlanRun.
+  if (manifest.approvalBinding === "prompt" && requiresApproval(trustLevel)) {
+    return {
+      specHash: manifest.specHash ?? null,
+      specBytes: manifest.specBytes ?? null,
+      approvalDigest: manifest.approvalDigest ?? null,
+      approvalNonce: manifest.approvalNonce ?? null,
+      approvalBinding: "prompt",
+      approvedBy: manifest.approvedBy ?? null,
+      approvedAt: manifest.approvedAt ?? null,
+    }
+  }
+  const draft = readPromptDraft(run)
+  return {
+    specHash: draft.ok ? draft.sha256 : null,
+    specBytes: draft.ok ? draft.bytes : null,
+    approvalDigest: null,
+    approvalNonce: null,
+    approvedBy: null,
+    approvedAt: null,
+  }
+}
+
 /** Recompute the signed-baseline comparison from the current run artifacts. */
 function currentManifestDrift(manifest: RunManifest, plan: any, state: any, run: string): string[] {
   const currentTrust = normalizeTrustLevel(plan?.trustLevel ?? state?.trustLevel) ?? DEFAULT_TRUST_LEVEL
   const currentApprovalKey =
-    manifest.version < RUN_MANIFEST_VERSION ? manifest.approvalKeyId ?? null : approvalKeyIdFromEnv(process.env) ?? null
+    manifest.version < APPROVAL_EXTERNAL_MIN_VERSION
+      ? manifest.approvalKeyId ?? null
+      : approvalKeyIdFromEnv(process.env) ?? null
   return manifestDrift(manifest, {
     integrityMode: normalizeIntegrityMode(plan?.integrityMode ?? state?.integrityMode) ?? DEFAULT_INTEGRITY_MODE,
     verification: resolveVerificationMode(plan, state).mode,
@@ -3497,6 +3614,7 @@ function currentManifestDrift(manifest: RunManifest, plan: any, state: any, run:
     requirementsHash: currentRequirementsHash(run),
     planHash: planHashOf(plan),
     lemmaPolicyHash: lemmaPolicyHashOf(run),
+    ...currentApprovalDriftFields(manifest, run, currentTrust),
   })
 }
 
@@ -3512,6 +3630,8 @@ function currentManifestDrift(manifest: RunManifest, plan: any, state: any, run:
 
 const ENV_APPROVAL_DIR = "OPENCODE_TEAMWORK_APPROVAL_DIR"
 const ENV_APPROVAL_TTL_MS = "OPENCODE_TEAMWORK_APPROVAL_TTL_MS"
+/** Storage key: one consumed approval nonce per run (0.11.0 replay control). */
+const approvalConsumedKey = (runId: string) => `auth/approval/${runId}/consumed`
 const APPROVAL_TTL_DEFAULT_MS = 24 * 60 * 60 * 1000
 const APPROVAL_TTL_MAX_MS = 7 * 24 * 60 * 60 * 1000
 const APPROVAL_FILE_MAX_BYTES = 256 * 1024
@@ -3731,6 +3851,203 @@ function readApprovalDocument(file: string, owner: number | undefined): Approval
   }
 }
 
+// ---------------------------------------------------------------------------
+// Prompt-draft binding (0.11.0)
+//
+// An approval must be bound to the exact bytes of `<run>/prompt_draft.md`.
+// `specHash` is an unkeyed SHA-256 of those bytes (not the keyed artifact
+// digest `sha256Hex` uses); the byte count is recorded too so a re-encode cannot
+// masquerade as the same text.
+// ---------------------------------------------------------------------------
+
+type PromptDraftDigest =
+  | { ok: true; sha256: string; bytes: number; text: string; openGaps: number; path: string }
+  | { ok: false; code: AuthFailure["code"]; message: string }
+
+function countOpenGaps(text: string): number {
+  const matches = text.match(/\[OPEN:/g)
+  return matches ? matches.length : 0
+}
+
+/** Read and hash the draft through the bounded, no-follow run reader. */
+function readPromptDraft(run: string): PromptDraftDigest {
+  const file = join(run, "prompt_draft.md")
+  const res = readBoundedRunFile(run, file, MAX_RUN_FILE_BYTES)
+  if (res.status === "absent") {
+    return {
+      ok: false,
+      code: "AUTH_APPROVAL_INCOMPLETE",
+      message: `an approval is bound to ${file}, but that draft does not exist`,
+    }
+  }
+  if (res.status !== "ok") {
+    return {
+      ok: false,
+      code: "AUTH_APPROVAL_INCOMPLETE",
+      message: `an approval is bound to ${file}, but the draft could not be read (${res.error})`,
+    }
+  }
+  const bytes = res.bytes ?? Buffer.from(res.text, "utf8")
+  const text = bytes.toString("utf8")
+  return {
+    ok: true,
+    sha256: contentSha256Hex(bytes),
+    bytes: bytes.length,
+    text,
+    openGaps: countOpenGaps(text),
+    path: file,
+  }
+}
+
+type ApprovalConsumption = {
+  approvalNonce: string
+  approvalDigest: string
+  planHash: string | null
+  at: string
+  runId: string
+}
+
+async function readApprovalConsumption(ctx: any, runId: string): Promise<ApprovalConsumption | undefined> {
+  const storage = ctx?.storage
+  if (!storage || typeof storage.get !== "function") return undefined
+  try {
+    const value = await storage.get(approvalConsumedKey(runId))
+    if (!value || typeof value !== "object") return undefined
+    if (typeof value.approvalNonce !== "string" || value.approvalNonce === "") return undefined
+    return value as ApprovalConsumption
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Record the one-use approval nonce. The in-process lock serialises callers in
+ * this process; a cross-process race is bounded by the signed manifest drift
+ * (both processes must present the same approved draft and nonce to plan the
+ * same run). The residual is documented in ADR 0011.
+ */
+async function consumeApprovalNonce(
+  ctx: any,
+  runId: string,
+  record: Omit<ApprovalConsumption, "at" | "runId">,
+): Promise<{ ok: true } | { ok: false; failure: AuthFailure }> {
+  const storage = ctx?.storage
+  if (!storage || typeof storage.get !== "function" || typeof storage.set !== "function") {
+    return {
+      ok: false,
+      failure: { code: "AUTH_UNAVAILABLE", message: "ctx.storage is unavailable; the approval nonce cannot be consumed" },
+    }
+  }
+  return withFileLock(`approval-consume:${runId}`, async () => {
+    let existing: any
+    try {
+      existing = await storage.get(approvalConsumedKey(runId))
+    } catch (err: any) {
+      return {
+        ok: false as const,
+        failure: {
+          code: "AUTH_UNAVAILABLE" as const,
+          message: `could not read the consumed approval nonce (${String(err?.message ?? err).slice(0, 120)})`,
+        },
+      }
+    }
+    if (existing && typeof existing === "object") {
+      if (existing.approvalNonce !== record.approvalNonce) {
+        return {
+          ok: false as const,
+          failure: {
+            code: "AUTH_APPROVAL_REPLAY" as const,
+            message: `run ${runId} already consumed approval nonce ${clean(existing.approvalNonce, 80)}; a different nonce cannot re-approve the same run`,
+          },
+        }
+      }
+      if (existing.approvalDigest && existing.approvalDigest !== record.approvalDigest) {
+        return {
+          ok: false as const,
+          failure: {
+            code: "AUTH_APPROVAL_REPLAY" as const,
+            message: `run ${runId} already consumed nonce ${clean(record.approvalNonce, 80)} with a different approval digest`,
+          },
+        }
+      }
+      // A pre-mkdir consumption records planHash: null; the plan records the
+      // real hash as soon as it is known, without changing the nonce.
+      if (record.planHash && existing.planHash !== record.planHash) {
+        try {
+          await storage.set(approvalConsumedKey(runId), { ...existing, planHash: record.planHash })
+        } catch {}
+      }
+      return { ok: true as const }
+    }
+    try {
+      await storage.set(approvalConsumedKey(runId), {
+        approvalNonce: record.approvalNonce,
+        approvalDigest: record.approvalDigest,
+        planHash: record.planHash,
+        at: new Date().toISOString(),
+        runId,
+      })
+    } catch (err: any) {
+      return {
+        ok: false as const,
+        failure: {
+          code: "AUTH_UNAVAILABLE" as const,
+          message: `could not consume the approval nonce (${String(err?.message ?? err).slice(0, 120)})`,
+        },
+      }
+    }
+    return { ok: true as const }
+  })
+}
+
+/**
+ * Freshness shared by the plan-time gate and final verification. The default
+ * lifetime is 24 h and the hard cap is 7 days. A prompt-bound approval is
+ * issued before the plan, so it must still be live when the manifest was
+ * written rather than postdate it.
+ */
+function approvalFreshnessReasons(
+  label: string,
+  approval: any,
+  env: Record<string, string | undefined>,
+  opts: { requireManifestOrdering: boolean; manifestAt?: string; promptBound: boolean },
+): string[] {
+  const reasons: string[] = []
+  const ttl = approvalTtlMs(env)
+  const approvedAtMs = typeof approval.approvedAt === "string" ? Date.parse(approval.approvedAt) : Number.NaN
+  const manifestAtMs = opts.manifestAt !== undefined ? Date.parse(opts.manifestAt) : Number.NaN
+  if (!Number.isFinite(approvedAtMs)) {
+    return [`[AUTH_APPROVAL_STALE] ${clean(label, 200)} needs a valid ISO approvedAt`]
+  }
+  if (opts.requireManifestOrdering && Number.isFinite(manifestAtMs) && approvedAtMs < manifestAtMs) {
+    reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} approvedAt precedes the signed manifest createdAt`)
+  }
+  let expiresAtMs: number
+  if (approval.expiresAt === undefined || approval.expiresAt === null) {
+    expiresAtMs = approvedAtMs + ttl
+  } else {
+    expiresAtMs = typeof approval.expiresAt === "string" ? Date.parse(approval.expiresAt) : Number.NaN
+    if (!Number.isFinite(expiresAtMs)) {
+      reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} has an invalid expiresAt`)
+    } else if (expiresAtMs < approvedAtMs) {
+      reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} expiresAt precedes approvedAt`)
+    } else if (expiresAtMs > approvedAtMs + APPROVAL_TTL_MAX_MS) {
+      reasons.push(
+        `[AUTH_APPROVAL_STALE] ${clean(label, 200)} expiresAt exceeds the ${APPROVAL_TTL_MAX_MS / 3600000}h maximum approval lifetime`,
+      )
+    } else if (expiresAtMs > approvedAtMs + ttl) {
+      reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} expiresAt exceeds the configured approval TTL`)
+    }
+  }
+  if (Number.isFinite(expiresAtMs) && Date.now() > expiresAtMs) {
+    reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} expired at ${clean(approval.expiresAt ?? "", 40) || "its TTL"}`)
+  }
+  if (opts.promptBound && Number.isFinite(expiresAtMs) && Number.isFinite(manifestAtMs) && expiresAtMs < manifestAtMs) {
+    reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} expired before the signed manifest was written`)
+  }
+  return reasons
+}
+
 type ApprovalArtifactCheck = { reasons: string[]; legacy: boolean }
 
 /**
@@ -3741,6 +4058,7 @@ type ApprovalArtifactCheck = { reasons: string[]; legacy: boolean }
  * `uid:`/`oidc:`/`ci:` identity.
  */
 async function checkApprovalArtifact(
+  ctx: any,
   run: string,
   runId: string,
   manifest: RunManifest,
@@ -3751,7 +4069,7 @@ async function checkApprovalArtifact(
 ): Promise<ApprovalArtifactCheck> {
   const reasons: string[] = []
   const relPath = `approvals/${runId}.json`
-  const legacy = manifest.version < RUN_MANIFEST_VERSION
+  const legacy = manifest.version < APPROVAL_EXTERNAL_MIN_VERSION
   let approval: any
   let label = relPath
   if (legacy) {
@@ -3800,7 +4118,9 @@ async function checkApprovalArtifact(
       `[AUTH_INVALID] ${clean(label, 200)} records trustLevel ${clean(approval.trustLevel, 32)} (expected ${trustLevel})`,
     )
   }
-  if (approval.manifestDigest !== payloadDigest(manifest)) {
+  const promptBound =
+    !legacy && manifest.version >= APPROVAL_PROMPT_MIN_VERSION && manifest.approvalBinding === "prompt"
+  if (!promptBound && approval.manifestDigest !== payloadDigest(manifest)) {
     reasons.push(`[AUTH_INVALID] ${clean(label, 200)} manifestDigest does not match the signed run manifest`)
   }
   const approverField = trustLevel === "human-approved" ? "approvedBy" : "attestedBy"
@@ -3812,6 +4132,72 @@ async function checkApprovalArtifact(
     // Pre-0.10.2 runs predate the external-directory and identity policy. They
     // stay readable, but the caller records that the approval was unbound.
     return { reasons, legacy: true }
+  }
+  if (promptBound) {
+    // 0.11.0: the approval is bound to the draft and the manifest records the
+    // approval, so there is no circular manifestDigest requirement.
+    const approvalDigest = payloadDigest(approval)
+    if (typeof manifest.approvalDigest !== "string" || manifest.approvalDigest === "") {
+      reasons.push(`[AUTH_APPROVAL_INCOMPLETE] run.manifest.json does not record the approved approvalDigest`)
+    } else if (manifest.approvalDigest !== approvalDigest) {
+      reasons.push(
+        `[AUTH_APPROVAL_STALE] ${clean(label, 200)} payload digest ${clean(approvalDigest, 64)} does not match the signed manifest`,
+      )
+    }
+    if (approval.binding !== "prompt") {
+      reasons.push(`[AUTH_APPROVAL_INCOMPLETE] ${clean(label, 200)} does not record binding: "prompt"`)
+    }
+    if (manifest.approvalNonce !== approval.approvalNonce) {
+      reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} approvalNonce does not match the signed manifest`)
+    }
+    if (manifest.approvedBy !== undefined && manifest.approvedBy !== null && approver !== manifest.approvedBy) {
+      reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} approver ${clean(approver, 80)} does not match the signed manifest (${clean(manifest.approvedBy, 80)})`)
+    }
+    if (manifest.approvedAt !== undefined && manifest.approvedAt !== null && approval.approvedAt !== manifest.approvedAt) {
+      reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} approvedAt does not match the signed manifest`)
+    }
+    if (!isApprovalNonce(approval.approvalNonce)) {
+      reasons.push(`[AUTH_APPROVAL_INCOMPLETE] ${clean(label, 200)} needs a >=128-bit base64url approvalNonce`)
+    } else if (verified.auth.nonce !== approval.approvalNonce) {
+      reasons.push(
+        `[AUTH_APPROVAL_INCOMPLETE] ${clean(label, 200)} _auth.nonce does not equal approvalNonce; the one-use nonce must be inside the signed envelope`,
+      )
+    }
+    const draft = readPromptDraft(run)
+    if (!draft.ok) {
+      reasons.push(`[${draft.code}] ${draft.message}`)
+    } else {
+      if (manifest.specHash !== draft.sha256) {
+        reasons.push(
+          `[AUTH_APPROVAL_STALE] prompt_draft.md is ${draft.sha256.slice(0, 16)}… (${draft.bytes} bytes); the signed manifest records ${String(manifest.specHash ?? "null").slice(0, 16)}…`,
+        )
+      }
+      if (manifest.specBytes !== draft.bytes) {
+        reasons.push(
+          `[AUTH_APPROVAL_STALE] prompt_draft.md is ${draft.bytes} bytes; the signed manifest records ${String(manifest.specBytes ?? "null")}`,
+        )
+      }
+      if (approval.promptDraftSha256 !== draft.sha256) {
+        reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} is bound to a different prompt_draft.md digest`)
+      }
+      if (approval.promptDraftBytes !== draft.bytes) {
+        reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} is bound to a different prompt_draft.md byte count`)
+      }
+      if (draft.openGaps > 0) {
+        reasons.push(
+          `[AUTH_APPROVAL_INCOMPLETE] prompt_draft.md still contains ${draft.openGaps} [OPEN: gap(s); an approved draft must be resolved`,
+        )
+      }
+    }
+    if (approval.openGaps !== 0) {
+      reasons.push(`[AUTH_APPROVAL_INCOMPLETE] ${clean(label, 200)} records openGaps ${clean(approval.openGaps, 16)}; the plan refuses an approval granted with unresolved gaps`)
+    }
+    const consumed = ctx ? await readApprovalConsumption(ctx, runId) : undefined
+    if (consumed && consumed.approvalNonce !== approval.approvalNonce) {
+      reasons.push(
+        `[AUTH_APPROVAL_REPLAY] run ${runId} consumed approval nonce ${clean(consumed.approvalNonce, 80)}; this approval uses a different nonce`,
+      )
+    }
   }
 
   // Distinct-principal rules. An HMAC envelope or the run's own key is not a
@@ -3831,40 +4217,13 @@ async function checkApprovalArtifact(
       `[AUTH_APPROVAL_UNTRUSTED] ${clean(label, 200)} approver key ${clean(verified.keyId, 96)} is not the key pinned at plan time (${clean(manifest.approvalKeyId, 96)})`,
     )
   }
-  const ttl = approvalTtlMs(env)
-  const approvedAtMs = typeof approval.approvedAt === "string" ? Date.parse(approval.approvedAt) : Number.NaN
-  const manifestAtMs = Date.parse(manifest.createdAt)
-  if (!Number.isFinite(approvedAtMs)) {
-    reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} needs a valid ISO approvedAt`)
-  } else {
-    if (Number.isFinite(manifestAtMs) && approvedAtMs < manifestAtMs) {
-      reasons.push(
-        `[AUTH_APPROVAL_STALE] ${clean(label, 200)} approvedAt precedes the signed manifest createdAt`,
-      )
-    }
-    let expiresAtMs: number
-    if (approval.expiresAt === undefined || approval.expiresAt === null) {
-      expiresAtMs = approvedAtMs + ttl
-    } else {
-      expiresAtMs = typeof approval.expiresAt === "string" ? Date.parse(approval.expiresAt) : Number.NaN
-      if (!Number.isFinite(expiresAtMs)) {
-        reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} has an invalid expiresAt`)
-      } else if (expiresAtMs < approvedAtMs) {
-        reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} expiresAt precedes approvedAt`)
-      } else if (expiresAtMs > approvedAtMs + APPROVAL_TTL_MAX_MS) {
-        reasons.push(
-          `[AUTH_APPROVAL_STALE] ${clean(label, 200)} expiresAt exceeds the ${APPROVAL_TTL_MAX_MS / 3600000}h maximum approval lifetime`,
-        )
-      } else if (expiresAtMs > approvedAtMs + ttl) {
-        reasons.push(
-          `[AUTH_APPROVAL_STALE] ${clean(label, 200)} expiresAt exceeds the configured approval TTL`,
-        )
-      }
-    }
-    if (Number.isFinite(expiresAtMs) && Date.now() > expiresAtMs) {
-      reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} expired at ${clean(approval.expiresAt ?? "", 40) || "its TTL"}`)
-    }
-  }
+  reasons.push(
+    ...approvalFreshnessReasons(label, approval, env, {
+      requireManifestOrdering: !promptBound,
+      manifestAt: manifest.createdAt,
+      promptBound,
+    }),
+  )
   if (typeof approver === "string" && approver.trim() !== "" && !APPROVER_ID_RE.test(approver.trim())) {
     reasons.push(
       `[AUTH_APPROVAL_NOT_HUMAN] ${clean(label, 200)} ${approverField} must be uid:<name>, oidc:<issuer>#<sub>, or ci:<workflow> (got "${clean(approver, 80)}")`,
@@ -3900,6 +4259,174 @@ function checkApprovalPrerequisites(
   return { ok: true, approvalKeyId, approvalPolicy }
 }
 
+type PlanApprovalSummary = {
+  approvalDigest: string
+  approvalNonce: string
+  approver: string
+  approvedAt: string
+  approvalKeyId: string
+  path: string
+  specHash: string
+  specBytes: number
+  openGaps: number
+}
+
+/**
+ * Plan-time approval verification (0.11.0). Runs before any mkdir/state write
+ * and binds the approval to the exact bytes of `prompt_draft.md`, the run id,
+ * and a one-use nonce. Version 1/2 runs keep their pre-0.11 semantics; the
+ * caller only consults this for version 3.
+ */
+async function verifyPlanApproval(
+  run: string,
+  runId: string,
+  trustLevel: TrustLevel,
+  runKeyId: string | undefined,
+  existingPlanHash: string | null,
+  auth: AuthContext | undefined,
+  root: string,
+  env: Record<string, string | undefined>,
+): Promise<{ ok: true; summary: PlanApprovalSummary } | { ok: false; code: AuthFailure["code"]; message: string }> {
+  const fail = (code: AuthFailure["code"], message: string) => ({ ok: false as const, code, message })
+  const draft = readPromptDraft(run)
+  if (!draft.ok) return fail(draft.code, draft.message)
+  const dir = resolveApprovalDir(root, run, env)
+  if (!dir.ok) return fail(dir.code, dir.message)
+  const label = join(dir.dir, `${runId}.json`)
+  const read = readApprovalDocument(label, expectedApprovalOwnerUid())
+  if (!read.ok) return fail(read.code, read.message)
+  const approval = read.data
+  if (!auth) return fail("AUTH_UNAVAILABLE", "no authenticity context is wired to verify the approval artifact")
+  const verified = await auth.verifyArtifact(`approvals/${runId}.json`, approval, {})
+  if (!verified.ok) {
+    return fail(verified.failure.code, `${clean(label, 200)} failed verification: ${verified.failure.message}`)
+  }
+  // A human/CI approval is not the run key approving itself.
+  if (verified.auth.alg !== "ed25519") {
+    return fail(
+      "AUTH_APPROVAL_NOT_HUMAN",
+      `${clean(label, 200)} is signed with ${verified.auth.alg}; human-approved/ci-attested require an Ed25519 approver key`,
+    )
+  }
+  const pinnedApprovalKey = approvalKeyIdFromEnv(env)
+  if (!pinnedApprovalKey) {
+    return fail(
+      "AUTH_APPROVAL_UNTRUSTED",
+      "human-approved/ci-attested require OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY so the approval can be verified with a key that is not the run key",
+    )
+  }
+  if (verified.keyId === runKeyId) {
+    return fail(
+      "AUTH_APPROVAL_NOT_HUMAN",
+      `${clean(label, 200)} is signed by the run key ${clean(runKeyId ?? "", 96)}; approval must use a distinct approver key`,
+    )
+  }
+  if (verified.keyId !== pinnedApprovalKey) {
+    return fail(
+      "AUTH_APPROVAL_UNTRUSTED",
+      `${clean(label, 200)} approver key ${clean(verified.keyId, 96)} is not the configured approval key (${clean(pinnedApprovalKey, 96)})`,
+    )
+  }
+  if (approval.runId !== runId) {
+    return fail(
+      "AUTH_APPROVAL_INCOMPLETE",
+      `${clean(label, 200)} is bound to run ${clean(approval.runId, 64)} (expected ${runId})`,
+    )
+  }
+  if (approval.trustLevel !== trustLevel) {
+    return fail(
+      "AUTH_APPROVAL_INCOMPLETE",
+      `${clean(label, 200)} records trustLevel ${clean(approval.trustLevel, 32)} (expected ${trustLevel})`,
+    )
+  }
+  if (approval.binding !== "prompt") {
+    return fail("AUTH_APPROVAL_INCOMPLETE", `${clean(label, 200)} does not record binding: "prompt"`)
+  }
+  if (approval.manifestDigest !== undefined && approval.manifestDigest !== null) {
+    // v3 approvals are bound to the draft + manifest record, not to a digest
+    // that would have to include itself. An explicit legacy digest can never
+    // match and is refused rather than silently ignored.
+    return fail(
+      "AUTH_APPROVAL_INCOMPLETE",
+      `${clean(label, 200)} carries a manifestDigest; a prompt-bound approval must bind the draft instead`,
+    )
+  }
+  const approverField = trustLevel === "human-approved" ? "approvedBy" : "attestedBy"
+  const approver = approval[approverField]
+  if (typeof approver !== "string" || approver.trim() === "") {
+    return fail("AUTH_APPROVAL_MISSING", `${clean(label, 200)} needs ${approverField}`)
+  }
+  if (!APPROVER_ID_RE.test(approver.trim())) {
+    return fail(
+      "AUTH_APPROVAL_NOT_HUMAN",
+      `${clean(label, 200)} ${approverField} must be uid:<name>, oidc:<issuer>#<sub>, or ci:<workflow> (got "${clean(approver, 80)}")`,
+    )
+  }
+  if (approval.promptDraftSha256 !== draft.sha256) {
+    return fail(
+      "AUTH_APPROVAL_STALE",
+      `${clean(label, 200)} is bound to a different prompt_draft.md digest (${clean(approval.promptDraftSha256, 64)}); the current draft is ${draft.sha256}`,
+    )
+  }
+  if (approval.promptDraftBytes !== draft.bytes) {
+    return fail(
+      "AUTH_APPROVAL_STALE",
+      `${clean(label, 200)} is bound to ${clean(approval.promptDraftBytes, 16)} bytes; the current draft is ${draft.bytes} bytes`,
+    )
+  }
+  if (approval.openGaps !== 0) {
+    return fail(
+      "AUTH_APPROVAL_INCOMPLETE",
+      `${clean(label, 200)} records openGaps ${clean(approval.openGaps, 16)}; an approval granted with unresolved [OPEN:] gaps cannot be planned`,
+    )
+  }
+  if (approval.planHash !== undefined && approval.planHash !== null) {
+    if (typeof approval.planHash !== "string" || approval.planHash !== existingPlanHash) {
+      return fail(
+        "AUTH_APPROVAL_STALE",
+        `${clean(label, 200)} pre-commits to plan ${clean(approval.planHash, 64)}, but this run's plan baseline is ${clean(existingPlanHash ?? "null", 64)}`,
+      )
+    }
+  }
+  if (draft.openGaps > 0) {
+    return fail(
+      "AUTH_APPROVAL_INCOMPLETE",
+      `prompt_draft.md still contains ${draft.openGaps} [OPEN: gap(s); an approved draft must be resolved`,
+    )
+  }
+  if (!isApprovalNonce(approval.approvalNonce)) {
+    return fail("AUTH_APPROVAL_INCOMPLETE", `${clean(label, 200)} needs a >=128-bit base64url approvalNonce`)
+  }
+  if (verified.auth.nonce !== approval.approvalNonce) {
+    return fail(
+      "AUTH_APPROVAL_INCOMPLETE",
+      `${clean(label, 200)} _auth.nonce does not equal approvalNonce; the one-use nonce must be inside the signed envelope`,
+    )
+  }
+  const freshness = approvalFreshnessReasons(label, approval, env, {
+    requireManifestOrdering: false,
+    promptBound: false,
+  })
+  if (freshness.length > 0) {
+    const first = freshness[0]
+    return fail("AUTH_APPROVAL_STALE", first.replace(/^\[[A-Z_]+\]\s*/, ""))
+  }
+  return {
+    ok: true,
+    summary: {
+      approvalDigest: payloadDigest(approval),
+      approvalNonce: approval.approvalNonce,
+      approver: approver.trim(),
+      approvedAt: approval.approvedAt,
+      approvalKeyId: verified.keyId,
+      path: label,
+      specHash: draft.sha256,
+      specBytes: draft.bytes,
+      openGaps: draft.openGaps,
+    },
+  }
+}
+
 /**
  * Enforce the run's persisted trust level at completion:
  *   * external-signer — the manifest (and every sampled artifact) must carry a
@@ -3911,6 +4438,7 @@ function checkApprovalPrerequisites(
  * Returns named refusal reasons; an empty array means the level is satisfied.
  */
 async function evaluateTrustGate(
+  ctx: any,
   run: string,
   runId: string,
   manifest: RunManifest,
@@ -3931,7 +4459,7 @@ async function evaluateTrustGate(
     }
   }
   if (requiresApproval(trustLevel)) {
-    const check = await checkApprovalArtifact(run, runId, manifest, auth, trustLevel, repoRoot, env)
+    const check = await checkApprovalArtifact(ctx, run, runId, manifest, auth, trustLevel, repoRoot, env)
     reasons.push(...check.reasons)
     if (check.legacy && check.reasons.length === 0 && !approvalUnboundEmitted.has(run)) {
       approvalUnboundEmitted.add(run)
@@ -4783,6 +5311,33 @@ async function createPlanRun(
       content: `refused: no spec found for this run (expected ${specFile}). Run /teamwork-craft to produce one, or re-call with skipInterview: true to proceed without an approved prompt.`,
     }
   }
+  // 0.11.0: a human/CI approval is bound to the exact prompt-draft bytes. This
+  // runs before any mkdir/preflight/beforeMkdir work, so a refusal writes
+  // nothing. Version 1/2 re-plans keep their historical semantics; only a new
+  // version-3 plan enforces the prompt binding.
+  let planApproval: PlanApprovalSummary | undefined
+  const promptBoundApproval =
+    manifestVersion >= APPROVAL_PROMPT_MIN_VERSION && requiresApproval(trustLevel)
+  if (promptBoundApproval) {
+    const approvalCheck = await verifyPlanApproval(
+      run,
+      sessionId,
+      trustLevel,
+      authReady.ok ? authReady.keyId : undefined,
+      existingManifest?.planHash ?? null,
+      auth,
+      root,
+      process.env,
+    )
+    if (!approvalCheck.ok) {
+      return {
+        ok: false,
+        content: `refused: [${approvalCheck.code}] ${approvalCheck.message}. Nothing was written.`,
+        refused: approvalCheck.code,
+      }
+    }
+    planApproval = approvalCheck.summary
+  }
   // Input preflight. Runs before mkdir so a refusal writes NOTHING (no run
   // dir, no ORIGINAL_REQUEST.md, no plan). Only a narrow block list can
   // refuse: explicit inputs, URLs, and absolute/`~`/`file:` paths. Relative
@@ -4826,6 +5381,29 @@ async function createPlanRun(
   if (beforeMkdir) {
     const preErr = await beforeMkdir({ sessionId, run, integrityMode, topology })
     if (preErr) return { ok: false, content: preErr }
+  }
+  // The exact draft bytes are the plan baseline for a version-3 manifest. A
+  // draft that exists is hashed even without an approval, so editing it after
+  // the plan is AUTH_STALE rather than a silent spec swap.
+  const specBuffer =
+    specRead.status === "ok" ? (specRead.bytes ?? Buffer.from(specRead.text, "utf8")) : undefined
+  const baselineSpecHash = manifestVersion >= APPROVAL_PROMPT_MIN_VERSION && specBuffer ? contentSha256Hex(specBuffer) : null
+  const baselineSpecBytes = manifestVersion >= APPROVAL_PROMPT_MIN_VERSION && specBuffer ? specBuffer.length : null
+  // Consume the one-use approval nonce only after every refusal path above has
+  // passed. The planHash is filled in once the plan object exists (same nonce).
+  if (planApproval) {
+    const consumed = await consumeApprovalNonce(ctx, sessionId, {
+      approvalNonce: planApproval.approvalNonce,
+      approvalDigest: planApproval.approvalDigest,
+      planHash: null,
+    })
+    if (!consumed.ok) {
+      return {
+        ok: false,
+        content: `refused: ${authFailureText(consumed.failure)}. Nothing was written.`,
+        refused: consumed.failure.code,
+      }
+    }
   }
 
   mkdirSync(run, { recursive: true })
@@ -4908,6 +5486,14 @@ async function createPlanRun(
     tasks,
     ...(routingReason ? { routingReason } : {}),
     ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
+  }
+  if (planApproval) {
+    // Record the consumed nonce's plan hash now that the plan baseline exists.
+    await consumeApprovalNonce(ctx, sessionId, {
+      approvalNonce: planApproval.approvalNonce,
+      approvalDigest: planApproval.approvalDigest,
+      planHash: planHashOf(planObject),
+    })
   }
   // Pre-create the known run subdirectories (attack-surface reduction; every
   // later write still pins and validates its own parent).
@@ -5014,12 +5600,25 @@ async function createPlanRun(
       requireWitness,
       approvalPolicy: approvalPrereq.approvalPolicy,
       approvalKeyId:
-        manifestVersion < RUN_MANIFEST_VERSION ? existingManifest?.approvalKeyId ?? null : approvalPrereq.approvalKeyId,
+        manifestVersion < APPROVAL_EXTERNAL_MIN_VERSION
+          ? existingManifest?.approvalKeyId ?? null
+          : approvalPrereq.approvalKeyId,
       handoffAuth: allowUnsignedLegacy ? "legacy" : "signed",
       requestHash: baselineRequestHash,
       requirementsHash: baselineRequirementsHash,
       planHash: baselinePlanHash,
       lemmaPolicyHash: baselineLemmaPolicyHash,
+      ...(manifestVersion >= APPROVAL_PROMPT_MIN_VERSION
+        ? {
+            specHash: planApproval?.specHash ?? baselineSpecHash,
+            specBytes: planApproval?.specBytes ?? baselineSpecBytes,
+            approvalDigest: planApproval?.approvalDigest ?? null,
+            approvalNonce: planApproval?.approvalNonce ?? null,
+            approvalBinding: planApproval ? ("prompt" as const) : undefined,
+            approvedBy: planApproval?.approver ?? null,
+            approvedAt: planApproval?.approvedAt ?? null,
+          }
+        : {}),
     })
     if (drift.length > 0) {
       return {
@@ -5061,7 +5660,9 @@ async function createPlanRun(
         requireWitness,
         approvalPolicy: approvalPrereq.approvalPolicy,
         approvalKeyId:
-          manifestVersion < RUN_MANIFEST_VERSION ? existingManifest?.approvalKeyId ?? null : approvalPrereq.approvalKeyId,
+          manifestVersion < APPROVAL_EXTERNAL_MIN_VERSION
+            ? existingManifest?.approvalKeyId ?? null
+            : approvalPrereq.approvalKeyId,
         ...(victorySkipReason ? { victorySkipReason } : {}),
         requireHandoffs: requireHandoffsMode,
         ...(runNonce ? { runNonce } : {}),
@@ -5070,6 +5671,21 @@ async function createPlanRun(
         requirementsHash: baselineRequirementsHash,
         planHash: baselinePlanHash,
         lemmaPolicyHash: baselineLemmaPolicyHash,
+        ...(manifestVersion >= APPROVAL_PROMPT_MIN_VERSION
+          ? {
+              specHash: planApproval ? planApproval.specHash : baselineSpecHash,
+              specBytes: planApproval ? planApproval.specBytes : baselineSpecBytes,
+            }
+          : {}),
+        ...(planApproval
+          ? {
+              approvalDigest: planApproval.approvalDigest,
+              approvalNonce: planApproval.approvalNonce,
+              approvalBinding: "prompt" as const,
+              approvedBy: planApproval.approver,
+              approvedAt: planApproval.approvedAt,
+            }
+          : {}),
         runKeyId: authReady.keyId,
         createdAt: new Date().toISOString(),
       }
@@ -5162,7 +5778,27 @@ async function createPlanRun(
       return { ok: false, content: msg.startsWith("refused:") ? msg : `refused: ${msg}` }
     }
   }
-  await appendEvent(run, { event: "run_created", sessionId, taskId: null, from: null, to: "pending", round: 0, phase: "DAG_BUILD", specGate, ...(specGate === "satisfied" ? { specPath: specFile } : {}), ...(preflightNote ? { note: preflightNote } : {}) })
+  await appendEvent(run, {
+    event: "run_created",
+    sessionId,
+    taskId: null,
+    from: null,
+    to: "pending",
+    round: 0,
+    phase: "DAG_BUILD",
+    specGate,
+    ...(specGate === "satisfied" ? { specPath: specFile } : {}),
+    ...(preflightNote ? { note: preflightNote } : {}),
+    ...(planApproval
+      ? {
+          approvalDigest: planApproval.approvalDigest,
+          approvalKeyId: planApproval.approvalKeyId,
+          approvedBy: planApproval.approver,
+          promptDraftSha256: planApproval.specHash,
+          binding: "prompt" as const,
+        }
+      : {}),
+  })
   // Shared continuity briefing: written after plan/state/costs, never fatal.
   await refreshBriefingSafe(run)
   // Remember which root session owns this run, so a child context hook resolves
@@ -9805,6 +10441,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (signedRun) {
             reasons.push(
               ...(await evaluateTrustGate(
+                ctx,
                 run,
                 basename(run),
                 manifestCheck.manifest,
