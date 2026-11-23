@@ -6,25 +6,22 @@
 // Security & containment:
 //   * CANDIDATE_ID strict single-segment allowlist (no `/`, `\`, `.`, `..`)
 //   * Segment-wise `lstatSync` symlink refusal + `realpathSync` containment
-//   * `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` bounded reads (lstat fallback)
+//   * `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` bounded reads (lstat fallback), with
+//     post-open `/proc/self/fd` containment on Linux via ./safe-fs.mjs (ADR 0004)
 //   * Null-prototype dictionaries (`nullMap`) preventing prototype collisions
 //   * Control-character / line-separator stripping (`clean`, `cleanBlock`)
 
 import {
-  closeSync,
-  constants as fsConstants,
-  existsSync,
-  fstatSync,
   lstatSync,
   mkdirSync,
-  openSync,
-  readSync,
   realpathSync,
   renameSync,
   writeFileSync,
 } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { randomBytes } from "node:crypto"
+import { readRegularBounded, readWithinBounded } from "./safe-fs.mjs"
+import type { SafeFsRead } from "./safe-fs.mjs"
 
 export const TOURNAMENT_LIMITS = {
   MAX_LEVELS: 4,
@@ -248,7 +245,10 @@ function ownHas(obj: unknown, key: string): boolean {
  * physically, refusing any symlink along every segment from `run` down to
  * `targetPath`.
  */
-export function ensureSafeRunSubpath(run: string, targetPath: string): { ok: true; path: string } | { ok: false; error: string } {
+export function ensureSafeRunSubpath(
+  run: string,
+  targetPath: string,
+): { ok: true; path: string; runReal: string } | { ok: false; error: string } {
   let runReal: string
   try {
     const st = lstatSync(run)
@@ -292,7 +292,18 @@ export function ensureSafeRunSubpath(run: string, targetPath: string): { ok: tru
   }
 
   const parentDir = dirname(resolvedTarget)
-  if (existsSync(parentDir)) {
+  // Only ENOENT means "absent": a dangling symlink at the parent must be
+  // refused, and existsSync() would follow it and report false.
+  let parentStat: ReturnType<typeof lstatSync> | null = null
+  try {
+    parentStat = lstatSync(parentDir)
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") return { ok: false, error: "refused: target parent is not resolvable" }
+  }
+  if (parentStat) {
+    if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+      return { ok: false, error: "refused: target parent is not a directory" }
+    }
     try {
       const parentReal = realpathSync(parentDir)
       const relParent = relative(runReal, parentReal)
@@ -320,7 +331,7 @@ export function ensureSafeRunSubpath(run: string, targetPath: string): { ok: tru
     }
   }
 
-  return { ok: true, path: resolvedTarget }
+  return { ok: true, path: resolvedTarget, runReal }
 }
 
 export type BoundedReadResult =
@@ -331,80 +342,36 @@ export type BoundedReadResult =
 /**
  * Read a bounded view of `file`, refusing symlinks and non-regular files.
  *
- * On POSIX the atomic path is used: `O_NOFOLLOW` makes the open fail on a
- * symlink, `O_NONBLOCK` keeps a FIFO from blocking `open()`, and `fstat` on the
- * returned fd is the authoritative type/size check (no separate lstat that
- * could race the open). Only when `O_NOFOLLOW` or `O_NONBLOCK` is genuinely
- * unavailable (e.g. Windows) is a non-atomic lstat pre-check used, so those
- * platforms still refuse symlinks and non-regular files. EINTR is retried;
- * EAGAIN and every other error fail closed.
+ * This is the rootless primitive: it delegates to the shared
+ * `readRegularBounded` in `./safe-fs.mjs` (O_NOFOLLOW makes the open fail on a
+ * final symlink, O_NONBLOCK keeps a FIFO from blocking open(), fstat on the
+ * returned fd is authoritative, EINTR is retried, EAGAIN and every other error
+ * fail closed). It cannot enforce run containment because it has no root; use
+ * `readBoundedRunFile` / `readWithinBounded` for run artifacts.
  *
- * Known limitation: `O_NOFOLLOW` protects only the final path component. An
- * intermediate directory swapped for a symlink between the segment checks and
- * the open is still a race; closing it fully needs component-by-component
- * `openat`/`O_PATH` traversal, which is not implemented here.
+ * ADR 0004 boundary: `readBoundedRunFile` additionally checks the opened fd's
+ * `/proc/self/fd` path on Linux. macOS/Windows keep the checks above and the
+ * documented intermediate-component residual risk.
  */
 export function readBoundedFileNoFollow(file: string, maxBytes: number): BoundedReadResult {
-  let fd: number | null = null
-  try {
-    // Truthiness (not `typeof === "number"`) so a platform exposing 0 (no flag)
-    // is treated as "unavailable".
-    const nofollow = fsConstants.O_NOFOLLOW || 0
-    const nonblock = fsConstants.O_NONBLOCK || 0
-    if (nofollow === 0 || nonblock === 0) {
-      // Non-atomic fallback only where the flags are unavailable. It is still a
-      // refusal (never a permissive path); the POSIX path above is what avoids
-      // the check-then-use race.
-      const lst = lstatSync(file)
-      if (lst.isSymbolicLink() || !lst.isFile()) {
-        return { status: "error", error: `refused: "${basename(file)}" is not a regular file` }
-      }
-    }
-    fd = openSync(file, fsConstants.O_RDONLY | nofollow | nonblock)
-    const fst = fstatSync(fd)
-    if (!fst.isFile()) {
-      return { status: "error", error: `refused: "${basename(file)}" is not a regular file` }
-    }
-    if (fst.size > maxBytes) {
-      return { status: "error", error: `refused: "${basename(file)}" exceeds ${maxBytes} byte read cap` }
-    }
-    const cap = Math.min(fst.size, maxBytes) + 1
-    const buf = Buffer.alloc(cap)
-    let total = 0
-    while (total < cap) {
-      let n: number
-      try {
-        n = readSync(fd, buf, total, cap - total, null)
-      } catch (err: any) {
-        if (err?.code === "EINTR") continue
-        throw err // EAGAIN and everything else fail closed
-      }
-      if (n === 0) break
-      total += n
-    }
-    if (total > maxBytes) {
-      return { status: "error", error: `refused: "${basename(file)}" exceeds ${maxBytes} byte read cap` }
-    }
-    return { status: "ok", text: buf.subarray(0, total).toString("utf8") }
-  } catch (err: any) {
-    if (err?.code === "ENOENT") return { status: "absent" }
-    if (err?.code === "ELOOP" || err?.code === "EMLINK") {
-      return { status: "error", error: `refused: "${basename(file)}" is not a regular file` }
-    }
-    return { status: "error", error: `refused: cannot read "${basename(file)}" (${clean(err?.message, 80)})` }
-  } finally {
-    if (fd !== null) {
-      try {
-        closeSync(fd)
-      } catch {}
-    }
+  return toBoundedResult(readRegularBounded(file, maxBytes), file, maxBytes)
+}
+
+function toBoundedResult(r: SafeFsRead, file: string, maxBytes: number): BoundedReadResult {
+  if (r.status === "ok") return { status: "ok", text: r.text }
+  if (r.status === "absent") return { status: "absent" }
+  if (r.status === "oversize") {
+    return { status: "error", error: `refused: "${basename(file)}" exceeds ${maxBytes} byte read cap` }
   }
+  return { status: "error", error: r.message }
 }
 
 export function readBoundedRunFile(run: string, targetPath: string, maxBytes: number): BoundedReadResult {
   const check = ensureSafeRunSubpath(run, targetPath)
   if (!check.ok) return { status: "error", error: check.error }
-  return readBoundedFileNoFollow(check.path, maxBytes)
+  // ADR 0004: exact order open -> fstat -> regular -> size -> fd containment ->
+  // read. On Linux the opened fd's real path must stay under runReal.
+  return toBoundedResult(readWithinBounded(check.runReal, check.path, maxBytes), check.path, maxBytes)
 }
 
 export function readBoundedRunJson<T = any>(
@@ -440,6 +407,11 @@ export function writeSafeRunFile(run: string, targetPath: string, content: strin
   // A fresh random suffix plus O_CREAT|O_EXCL (`wx`, which also refuses an
   // existing symlink) keeps the write inside a brand-new inode; the rename then
   // replaces the destination entry itself, never a target it points at.
+  //
+  // Write-path residual (ADR 0004): this validation is by path, before the
+  // create/rename. An intermediate directory swapped for a symlink after the
+  // checks can still redirect the write; mkdir/rename have no fd-relative
+  // primitive in Node core, so only the read path has the /proc/self/fd check.
   for (let attempt = 0; attempt < 5; attempt++) {
     const tmp = `${file}.${randomBytes(6).toString("hex")}.tmp`
     const tmpCheck = ensureSafeRunSubpath(run, tmp)

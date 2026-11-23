@@ -5,14 +5,10 @@
 
 import {
   accessSync,
-  closeSync,
   constants as fsConstants,
   existsSync,
-  fstatSync,
   lstatSync,
   mkdirSync,
-  openSync,
-  readSync,
   realpathSync,
   renameSync,
   statSync,
@@ -22,6 +18,7 @@ import {
 import { execFileSync, spawnSync } from "node:child_process"
 import { createHash, randomBytes } from "node:crypto"
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path"
+import { readRegularBounded, readWithinBounded } from "./safe-fs.mjs"
 
 export const MAX_LEMMA_DEPTH = 3
 export const MAX_LEMMA_WIDTH = 4
@@ -151,7 +148,7 @@ export function refuseSymlink(file: string): void {
  * - Refuses any symlinked component along the path (including dangling target)
  * - Verifies `realpathSync` containment for existing ancestors and target
  */
-export function ensureSafeSubpath(runDir: string, relPath: string): { path?: string; error?: string } {
+export function ensureSafeSubpath(runDir: string, relPath: string): { path?: string; runReal?: string; error?: string } {
   if (typeof relPath !== "string" || !relPath.trim()) {
     return { error: "refused: empty relative path" }
   }
@@ -202,43 +199,38 @@ export function ensureSafeSubpath(runDir: string, relPath: string): { path?: str
     }
   }
 
-  return { path: target }
+  return { path: target, runReal }
 }
 
 /**
- * Read a regular file with O_NOFOLLOW and a strict byte cap (default 1 MiB).
- * Opens the descriptor first with O_NOFOLLOW and runs fstatSync(fd) on the open
- * descriptor so there is no TOCTOU check-then-open race.
+ * Read a regular file with O_NOFOLLOW | O_NONBLOCK and a strict byte cap
+ * (default 1 MiB). Opens the descriptor first and runs fstatSync(fd) on the open
+ * descriptor, so there is no TOCTOU check-then-open race on the final component;
+ * EINTR is retried and every other read error fails closed. When `runReal` is
+ * supplied (a run-root read) the shared primitive also checks the opened fd's
+ * /proc/self/fd path on Linux (ADR 0004). Arbitrary non-run `options.filePath`
+ * reads keep the rootless behavior.
  */
-export function readBoundedRegular(file: string, maxBytes = MAX_LEMMA_FILE_BYTES): { text?: string; error?: string } {
-  let fd: number | null = null
-  try {
-    const nofollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0
-    fd = openSync(file, fsConstants.O_RDONLY | nofollow)
-    const st = fstatSync(fd)
-    if (!st.isFile()) return { error: `refused: "${basename(file)}" is not a regular file` }
-    if (st.size > maxBytes) return { error: `refused: "${basename(file)}" exceeds ${maxBytes} byte read cap` }
-    const cap = Math.min(st.size, maxBytes) + 1
-    const buf = Buffer.alloc(cap)
-    let total = 0
-    while (total < cap) {
-      const n = readSync(fd, buf, total, cap - total, null)
-      if (n === 0) break
-      total += n
-    }
-    if (total > maxBytes) return { error: `refused: "${basename(file)}" exceeds ${maxBytes} byte read cap` }
-    return { text: buf.subarray(0, total).toString("utf8") }
-  } catch (err: any) {
-    if (err?.code === "ENOENT") return { error: `missing: "${basename(file)}" does not exist` }
-    if (err?.code === "ELOOP" || err?.code === "EMLINK") return { error: `refused: symlinked file "${basename(file)}"` }
-    return { error: `unreadable: "${basename(file)}" (${clean(err?.message, 80)})` }
-  } finally {
-    if (fd !== null) {
-      try {
-        closeSync(fd)
-      } catch {}
-    }
-  }
+export function readBoundedRegular(
+  file: string,
+  maxBytes = MAX_LEMMA_FILE_BYTES,
+  runReal?: string,
+): { text?: string; error?: string } {
+  const r = runReal ? readWithinBounded(runReal, file, maxBytes) : readRegularBounded(file, maxBytes)
+  if (r.status === "ok") return { text: r.text }
+  if (r.status === "absent") return { error: `missing: "${basename(file)}" does not exist` }
+  if (r.status === "oversize") return { error: `refused: "${basename(file)}" exceeds ${maxBytes} byte read cap` }
+  return { error: r.message }
+}
+
+// Read a path previously validated by ensureSafeSubpath; use the root-aware
+// primitive whenever the run's realpath is known.
+function readSafeSubpath(
+  safe: { path?: string; runReal?: string; error?: string },
+  maxBytes = MAX_LEMMA_FILE_BYTES,
+): { text?: string; error?: string } {
+  if (safe.error || !safe.path) return { error: safe.error ?? "refused: unsafe path" }
+  return readBoundedRegular(safe.path, maxBytes, safe.runReal)
 }
 
 function writeTextAtomicSafe(runDir: string, relPath: string, content: string): { path?: string; error?: string } {
@@ -261,7 +253,7 @@ function writeJsonAtomicSafe(runDir: string, relPath: string, value: unknown): {
 function readJsonSafe<T>(runDir: string, relPath: string): { value?: T; error?: string } {
   const safe = ensureSafeSubpath(runDir, relPath)
   if (safe.error || !safe.path) return { error: safe.error }
-  const r = readBoundedRegular(safe.path)
+  const r = readSafeSubpath(safe)
   if (r.error || r.text === undefined) return { error: r.error }
   try {
     return { value: JSON.parse(r.text) as T }
@@ -2162,7 +2154,7 @@ export function recordFormalizationPreReview(
 
   const draftSafe = ensureSafeSubpath(runDir, "lemma/problem_draft.lean")
   if (draftSafe.error || !draftSafe.path) return { error: draftSafe.error }
-  const draftRead = readBoundedRegular(draftSafe.path)
+  const draftRead = readSafeSubpath(draftSafe)
   if (draftRead.error || draftRead.text === undefined || !draftRead.text.trim()) {
     return { error: "refused: cannot review formalization without non-empty lemma/problem_draft.lean" }
   }
@@ -2254,7 +2246,7 @@ export function recordFormalizationFinalReview(
   let problemHash: string | undefined
   const probSafe = ensureSafeSubpath(runDir, "lemma/problem.lean")
   if (!probSafe.error && probSafe.path) {
-    const probRead = readBoundedRegular(probSafe.path)
+    const probRead = readSafeSubpath(probSafe)
     if (!probRead.error && probRead.text) {
       problemHash = createHash("sha256").update(probRead.text, "utf8").digest("hex")
     }
@@ -2443,7 +2435,7 @@ export function mutateLemmaNode(
     if (attemptSafe.error || !attemptSafe.path) return { error: attemptSafe.error }
     const normalizedAttempt = params.leanCode.endsWith("\n") ? params.leanCode : params.leanCode + "\n"
     if (existsSync(attemptSafe.path)) {
-      const existingRead = readBoundedRegular(attemptSafe.path)
+      const existingRead = readSafeSubpath(attemptSafe)
       if (!existingRead.error && existingRead.text !== undefined && existingRead.text !== normalizedAttempt) {
         return {
           error: `refused: attempt round ${round} (${relAttempt}) already exists and is immutable; submit the next round (${node.attempts + 1}) instead`,
@@ -2546,7 +2538,7 @@ function expectedDeclarationForNode(
   if (probSafe.error || !probSafe.path) {
     return { declaration: null, statement, error: "cannot bind declaration: node has no declaration and lemma/problem.lean is unavailable" }
   }
-  const probRead = readBoundedRegular(probSafe.path)
+  const probRead = readSafeSubpath(probSafe)
   if (probRead.error || probRead.text === undefined) {
     return {
       declaration: null,
@@ -2613,7 +2605,7 @@ export function verifyLemmaNodeAttempt(
   if (!existsSync(attemptSafe.path)) {
     return { error: `refused: attempt file ${attemptRel} does not exist` }
   }
-  const attemptRead = readBoundedRegular(attemptSafe.path)
+  const attemptRead = readSafeSubpath(attemptSafe)
   if (attemptRead.error || attemptRead.text === undefined) {
     return { error: attemptRead.error ?? `refused: cannot read ${attemptRel}` }
   }
@@ -2790,7 +2782,7 @@ export function evaluateLemmaFinalEvidence(runDir: string): LemmaFinalEvidence {
   if (probSafe.error || !probSafe.path) {
     reasons.push(`lemma/problem.lean: ${probSafe.error ?? "unsafe path"}`)
   } else {
-    const probRead = readBoundedRegular(probSafe.path)
+    const probRead = readSafeSubpath(probSafe)
     if (probRead.error || !probRead.text?.trim()) {
       reasons.push(`lemma/problem.lean: ${probRead.error ?? "empty or missing"}`)
     } else {
@@ -2919,7 +2911,7 @@ export function evaluateLemmaFinalEvidence(runDir: string): LemmaFinalEvidence {
         if (attSafe.error || !attSafe.path) {
           reasons.push(`lemma node ${id}: ${attSafe.error ?? "unsafe attemptFile"}`)
         } else {
-          const attRead = readBoundedRegular(attSafe.path)
+          const attRead = readSafeSubpath(attSafe)
           if (attRead.error || attRead.text === undefined) {
             reasons.push(`lemma node ${id}: ${attRead.error ?? "cannot read attemptFile"}`)
           } else {
