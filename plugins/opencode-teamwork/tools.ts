@@ -3698,6 +3698,13 @@ function readApprovalDocument(file: string, owner: number | undefined): Approval
         message: `approval artifact ${clean(file, 200)} changed identity while it was opened`,
       }
     }
+    if (after.size > APPROVAL_FILE_MAX_BYTES) {
+      return {
+        ok: false,
+        code: "AUTH_APPROVAL_UNTRUSTED",
+        message: `approval artifact ${clean(file, 200)} grew beyond ${APPROVAL_FILE_MAX_BYTES} bytes while it was opened`,
+      }
+    }
     const text = readFileSync(fd, "utf8")
     let data: any
     try {
