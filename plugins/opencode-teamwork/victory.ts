@@ -37,6 +37,7 @@ export const REQUIREMENTS_MAX_ITEMS = 50
 export const REQUIREMENT_TEXT_MAX = 2000
 export const VICTORY_FINDINGS_MAX = 50
 export const VICTORY_SUMMARY_MAX = 2000
+export const VICTORY_SKIP_REASON_MAX = 500
 
 const MAX_REQUIREMENTS_BYTES = 256 * 1024
 const MAX_VICTORY_BYTES = 512 * 1024
@@ -78,7 +79,7 @@ export interface VictoryVerdictFile {
 }
 
 export type VictoryGate =
-  | { ok: true; skipped: true; status: "SKIPPED (explicit)"; reasons: [] }
+  | { ok: true; skipped: true; status: "SKIPPED (explicit)"; reason: string | undefined; reasons: [] }
   | {
       ok: true
       skipped: false
@@ -115,6 +116,52 @@ export function normalizeVictoryVerdict(value: unknown): VictoryVerdictKind | un
 /** True when `value` is a recognised victory-audit mode. */
 export function normalizeVictoryAuditMode(value: unknown): VictoryAuditMode | undefined {
   return value === "required" || value === "skip" ? value : undefined
+}
+
+/**
+ * Validate a caller-supplied reason for `victoryAudit: "skip"`. A skip is a
+ * recorded completion bypass, so the reason is required, trimmed to 500 chars
+ * (refused, never truncated, when longer), and sanitized before persistence.
+ */
+export function validateVictorySkipReason(
+  value: unknown,
+): { ok: true; reason: string } | { ok: false; error: string } {
+  if (typeof value !== "string") {
+    return { ok: false, error: "refused: victorySkipReason must be a string when victoryAudit is \"skip\"" }
+  }
+  const trimmed = value.trim()
+  if (trimmed === "") {
+    return { ok: false, error: "refused: victorySkipReason must be non-empty when victoryAudit is \"skip\"" }
+  }
+  if (trimmed.length > VICTORY_SKIP_REASON_MAX) {
+    return {
+      ok: false,
+      error: `refused: victorySkipReason is ${trimmed.length} chars; the maximum is ${VICTORY_SKIP_REASON_MAX}`,
+    }
+  }
+  const reason = clean(trimmed, VICTORY_SKIP_REASON_MAX).trim()
+  if (reason === "") {
+    return { ok: false, error: "refused: victorySkipReason is empty after sanitization" }
+  }
+  return { ok: true, reason }
+}
+
+/** Read a persisted skip reason, or undefined when absent/blank. */
+export function recordedVictorySkipReason(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined
+  const reason = clean(value, VICTORY_SKIP_REASON_MAX).trim()
+  return reason === "" ? undefined : reason
+}
+
+/**
+ * Display label for a skipped victory audit. An explicit skip always carries a
+ * reason; the legacy no-baseline default is labelled separately so it is never
+ * mistaken for a justified bypass.
+ */
+export function victorySkipLabel(reason: string | undefined): string {
+  return reason
+    ? `SKIPPED (explicit): ${reason}`
+    : "SKIPPED (legacy default: no requirements baseline)"
 }
 
 /**
@@ -422,6 +469,8 @@ export interface VictoryGateAuth {
   requireSigned?: boolean
   /** Current canonical requirements.json digest; a mismatch is AUTH_STALE. */
   requirementsHash?: string | null
+  /** Persisted reason for an explicit skip (display only; never a verdict). */
+  skipReason?: string
 }
 
 type AuthFailureCodeLike = Extract<
@@ -435,9 +484,10 @@ function evaluateVictoryCore(
   extraReasons: string[],
   authCode: AuthFailureCodeLike | undefined,
   requirementsHash?: string | null,
+  skipReason?: string,
 ): VictoryGate {
   if (mode === "skip") {
-    return { ok: true, skipped: true, status: "SKIPPED (explicit)", reasons: [] }
+    return { ok: true, skipped: true, status: "SKIPPED (explicit)", reason: skipReason, reasons: [] }
   }
 
   const baseline = readRequirementsBaseline(run)
@@ -544,8 +594,8 @@ function evaluateVictoryCore(
 }
 
 /** Semantic-only gate (used by the continuity briefing, which never claims authenticity). */
-export function evaluateVictoryGate(run: string, mode: VictoryAuditMode): VictoryGate {
-  return evaluateVictoryCore(run, mode, [], undefined)
+export function evaluateVictoryGate(run: string, mode: VictoryAuditMode, skipReason?: string): VictoryGate {
+  return evaluateVictoryCore(run, mode, [], undefined, undefined, skipReason)
 }
 
 /** Gate with artifact authenticity enforced for signed runs. */
@@ -575,12 +625,12 @@ export async function evaluateVictoryGateChecked(
       extra.push(`[${failure.code}] victory audit: ${failure.message}`)
     }
   }
-  return evaluateVictoryCore(run, mode, extra, authCode, opts.requirementsHash)
+  return evaluateVictoryCore(run, mode, extra, authCode, opts.requirementsHash, opts.skipReason)
 }
 
 /** Human-readable one-line gate summary for tool results. */
 export function describeVictoryGate(gate: VictoryGate): string {
-  if (gate.ok && gate.skipped) return "Victory audit: SKIPPED (explicit in plan)."
+  if (gate.ok && gate.skipped) return `Victory audit: ${victorySkipLabel(gate.reason)}.`
   if (gate.ok) return "Victory audit: CONFIRMED."
   return `Victory audit: ${gate.status} — ${gate.reasons.join("; ")}`
 }

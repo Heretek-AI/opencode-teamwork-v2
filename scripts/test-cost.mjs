@@ -210,7 +210,7 @@ try {
     {
       topology: "small-focused",
       tasks: [{ id: "task-1" }],
-      skipInterview: true, // fixture: this test exercises cost aggregation, not the spec gate
+      skipInterview: true, // fixture: this test exercises cost aggregation, not the spec presence gate
     },
     { sessionID: testSessionId },
   )
@@ -250,7 +250,7 @@ try {
     {
       topology: "small-focused",
       tasks: [{ id: "task-1" }],
-      skipInterview: true, // fixture: this test exercises cost aggregation, not the spec gate
+      skipInterview: true, // fixture: this test exercises cost aggregation, not the spec presence gate
     },
     { sessionID: "ses_offline_test" },
   )

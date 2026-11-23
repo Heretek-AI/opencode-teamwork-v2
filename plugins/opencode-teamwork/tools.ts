@@ -128,7 +128,10 @@ import {
   readVictoryVerdict,
   recordVictoryAudit,
   resolveVictoryAuditMode,
+  recordedVictorySkipReason,
   validateRequirementsBaseline,
+  validateVictorySkipReason,
+  victorySkipLabel,
 } from "./victory.ts"
 import {
   canonicalJson,
@@ -1680,7 +1683,7 @@ async function appendEvent(
     branch?: string | null
     worktree?: string | null
     phase?: string | null
-    /** run_created only: how the spec gate was decided (3.4). */
+    /** run_created only: how the spec presence gate was decided (3.4). */
     specGate?: "satisfied" | "bypassed" | "not_required"
     /** run_created only: the spec file, when the gate was satisfied. */
     specPath?: string | null
@@ -1717,7 +1720,7 @@ async function appendEvent(
         worktree: opt(ev.worktree, 200),
         phase: opt(ev.phase, 32),
         ...(note ? { note } : {}),
-        // Only run_created carries the spec-gate decision. Every line now also
+        // Only run_created carries the spec-presence-gate decision. Every line now also
         // carries seq (and agentSource when an actor exists); legacy lines on
         // disk keep their old shape and remain valid.
         ...(ev.specGate
@@ -2009,6 +2012,7 @@ type RunManifest = {
   integrityMode: IntegrityMode
   verification: VerificationMode
   victoryAudit: VictoryAuditMode
+  victorySkipReason?: string
   requireHandoffs: HandoffMode
   requestHash: string | null
   requirementsHash: string | null
@@ -2030,6 +2034,10 @@ function planBaselineHash(plan: any): string {
       integrityMode: plan?.integrityMode ?? null,
       verification: plan?.verification ?? null,
       victoryAudit: plan?.victoryAudit ?? null,
+      // Omitted for legacy plans so their pre-victory-reason planHash stays valid.
+      ...(typeof plan?.victorySkipReason === "string" && plan.victorySkipReason !== ""
+        ? { victorySkipReason: plan.victorySkipReason }
+        : {}),
       // Omitted for legacy plans so their pre-continuity planHash stays valid.
       ...(plan?.requireHandoffs !== undefined && plan?.requireHandoffsSource !== "legacy"
         ? { requireHandoffs: plan.requireHandoffs }
@@ -2120,6 +2128,9 @@ function manifestDriftReason(drift: string): string {
   if (drift.startsWith("victoryAudit")) {
     return `[AUTH_STALE] victory audit downgrade/change refused (${drift})`
   }
+  if (drift.startsWith("victorySkipReason")) {
+    return `[AUTH_STALE] victory skip reason changed by a re-plan (${drift})`
+  }
   if (drift.startsWith("requireHandoffs")) {
     return `[AUTH_STALE] handoff gate downgrade/change refused (${drift})`
   }
@@ -2143,6 +2154,13 @@ function manifestDrift(manifest: RunManifest, current: Omit<RunManifest, "versio
   if (manifest.victoryAudit !== current.victoryAudit) {
     drift.push(`victoryAudit drifted: manifest=${manifest.victoryAudit} current=${current.victoryAudit}`)
   }
+  const baselineSkipReason = recordedVictorySkipReason(manifest.victorySkipReason) ?? ""
+  const currentSkipReason = recordedVictorySkipReason(current.victorySkipReason) ?? ""
+  if (baselineSkipReason !== currentSkipReason) {
+    drift.push(
+      `victorySkipReason drifted: manifest=${baselineSkipReason || "none"} current=${currentSkipReason || "none"}`,
+    )
+  }
   const baselineHandoffs = normalizeHandoffMode(manifest.requireHandoffs) ?? "skip"
   if (baselineHandoffs !== current.requireHandoffs) {
     drift.push(`requireHandoffs drifted: manifest=${baselineHandoffs} current=${current.requireHandoffs}`)
@@ -2161,6 +2179,8 @@ function currentManifestDrift(manifest: RunManifest, plan: any, state: any, run:
     integrityMode: normalizeIntegrityMode(plan?.integrityMode ?? state?.integrityMode) ?? DEFAULT_INTEGRITY_MODE,
     verification: resolveVerificationMode(plan, state).mode,
     victoryAudit: resolveVictoryAuditMode(plan, state, run).mode,
+    victorySkipReason:
+      recordedVictorySkipReason(plan?.victorySkipReason) ?? recordedVictorySkipReason(state?.victorySkipReason),
     requireHandoffs: resolveHandoffMode(plan, state).mode,
     requestHash: originalRequestHash(run),
     requirementsHash: currentRequirementsHash(run),
@@ -2453,6 +2473,8 @@ async function createPlanRun(
   }
   let persistedVerification: VerificationMode | undefined
   let persistedHandoffs: HandoffMode | undefined
+  let persistedVictorySkipReason: string | undefined
+  let persistedVictoryAudit: VictoryAuditMode | undefined
   if (existsSync(run)) {
     const planRes = readBoundedRunJson<any>(run, join(run, "plan.dag.json"), MAX_MANIFEST_BYTES)
     if (planRes.status === "error") {
@@ -2486,6 +2508,34 @@ async function createPlanRun(
       }
     }
     persistedVerification = fromPlan ?? fromState
+    const fromPlanVictoryRaw = planRes.status === "ok" ? planRes.value?.victoryAudit : undefined
+    const fromStateVictoryRaw = stateRes.status === "ok" ? stateRes.value?.victoryAudit : undefined
+    const fromPlanVictory =
+      fromPlanVictoryRaw === undefined || fromPlanVictoryRaw === null
+        ? undefined
+        : normalizeVictoryAuditMode(fromPlanVictoryRaw)
+    const fromStateVictory =
+      fromStateVictoryRaw === undefined || fromStateVictoryRaw === null
+        ? undefined
+        : normalizeVictoryAuditMode(fromStateVictoryRaw)
+    if (
+      (fromPlanVictoryRaw !== undefined && fromPlanVictoryRaw !== null && !fromPlanVictory) ||
+      (fromStateVictoryRaw !== undefined && fromStateVictoryRaw !== null && !fromStateVictory)
+    ) {
+      return {
+        ok: false,
+        content:
+          "refused: plan.dag.json or state.json records an invalid victoryAudit mode; repair the run or start a new session. Nothing was written.",
+      }
+    }
+    if (fromPlanVictory && fromStateVictory && fromPlanVictory !== fromStateVictory) {
+      return {
+        ok: false,
+        content:
+          "refused: plan.dag.json and state.json disagree about victoryAudit; repair the run or start a new session. Nothing was written.",
+      }
+    }
+    persistedVictoryAudit = fromPlanVictory ?? fromStateVictory
     const fromPlanHandoffsRaw = planRes.status === "ok" ? planRes.value?.requireHandoffs : undefined
     const fromStateHandoffsRaw = stateRes.status === "ok" ? stateRes.value?.requireHandoffs : undefined
     const fromPlanHandoffs =
@@ -2514,6 +2564,9 @@ async function createPlanRun(
       }
     }
     persistedHandoffs = fromPlanHandoffs ?? fromStateHandoffs
+    persistedVictorySkipReason =
+      recordedVictorySkipReason(planRes.status === "ok" ? planRes.value?.victorySkipReason : undefined) ??
+      recordedVictorySkipReason(stateRes.status === "ok" ? stateRes.value?.victorySkipReason : undefined)
   }
   if (persistedVerification && requestedVerification && persistedVerification !== requestedVerification) {
     return {
@@ -2558,8 +2611,16 @@ async function createPlanRun(
         content: "refused: victoryAudit must be \"required\" or \"skip\"; nothing was written.",
       }
     }
+    if (persistedVictoryAudit && persistedVictoryAudit !== requestedMode) {
+      return {
+        ok: false,
+        content: `refused: victoryAudit is already persisted as "${persistedVictoryAudit}" for this run and cannot be changed by a re-plan; omit it to keep the mode or start a new session. Nothing was written.`,
+      }
+    }
     victoryAuditMode = requestedMode
     victoryAuditSource = "caller"
+  } else if (persistedVictoryAudit) {
+    victoryAuditMode = persistedVictoryAudit
   } else {
     victoryAuditMode = requirementsBaseline ? "required" : "skip"
   }
@@ -2585,6 +2646,41 @@ async function createPlanRun(
       ok: false,
       content:
         "refused: benchmark mode requires the independent victory audit; victoryAudit: \"skip\" is not permitted with integrityMode: \"benchmark\". Nothing was written.",
+    }
+  }
+  // An explicit skip is a recorded completion bypass and must carry a reason.
+  // The reason is part of the signed baseline: a re-plan may repeat it, never
+  // change it. The legacy no-baseline default skip is exempt (it cannot carry
+  // an invented reason); it is labelled separately by final_verify/export.
+  let victorySkipReason: string | undefined
+  const requestedSkipReason = input.victorySkipReason
+  if (victoryAuditMode === "skip") {
+    if (requestedSkipReason !== undefined && requestedSkipReason !== null) {
+      const reasonCheck = validateVictorySkipReason(requestedSkipReason)
+      if (!reasonCheck.ok) return { ok: false, content: `${reasonCheck.error}; nothing was written.` }
+      if (persistedVictorySkipReason && persistedVictorySkipReason !== reasonCheck.reason) {
+        return {
+          ok: false,
+          content: `refused: [AUTH_STALE] victorySkipReason is already persisted for this run and cannot be changed by a re-plan; omit it to keep the recorded reason or start a new session. Nothing was written.`,
+          refused: "AUTH_STALE",
+        }
+      }
+      victorySkipReason = reasonCheck.reason
+    } else {
+      victorySkipReason = persistedVictorySkipReason
+    }
+    if (!victorySkipReason && victoryAuditSource === "caller") {
+      return {
+        ok: false,
+        content:
+          "refused: victoryAudit: \"skip\" requires a non-empty victorySkipReason (max 500 chars) recording why the independent victory audit is bypassed. Nothing was written.",
+      }
+    }
+  } else if (typeof requestedSkipReason === "string" && requestedSkipReason.trim() !== "") {
+    return {
+      ok: false,
+      content:
+        "refused: victorySkipReason is only valid with victoryAudit: \"skip\"; nothing was written.",
     }
   }
   // Continuity handoff gate: required by default when the run records a
@@ -2633,6 +2729,10 @@ async function createPlanRun(
     }
     if (existingManifest.victoryAudit !== victoryAuditMode) {
       modeDrift.push(`victoryAudit (${existingManifest.victoryAudit} -> ${victoryAuditMode})`)
+    }
+    const baselineReason = recordedVictorySkipReason(existingManifest.victorySkipReason) ?? ""
+    if (baselineReason !== (victorySkipReason ?? "")) {
+      modeDrift.push(`victorySkipReason (${baselineReason || "none"} -> ${victorySkipReason || "none"})`)
     }
     const baselineHandoffs = normalizeHandoffMode(existingManifest.requireHandoffs) ?? "skip"
     if (baselineHandoffs !== requireHandoffsMode) {
@@ -2839,6 +2939,7 @@ async function createPlanRun(
     verification: verificationMode,
     victoryAudit: victoryAuditMode,
     victoryAuditSource,
+    ...(victorySkipReason ? { victorySkipReason } : {}),
     requireHandoffs: requireHandoffsMode,
     requireHandoffsSource,
     ...(requirementsBaseline ? { requirementsSource: requirementsBaseline.source, requirementsCount: requirementsBaseline.items.length } : {}),
@@ -2863,6 +2964,7 @@ async function createPlanRun(
         integrityMode,
         verification: verificationMode,
         victoryAudit: victoryAuditMode,
+        ...(victorySkipReason ? { victorySkipReason } : {}),
         requireHandoffs: requireHandoffsMode,
         ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
         ...(isLemma ? { lemmaMode: true, route: "lemma" } : {}),
@@ -2883,6 +2985,7 @@ async function createPlanRun(
           (state.integrityMode !== integrityMode ||
             state.verification !== verificationMode ||
             state.victoryAudit !== victoryAuditMode ||
+            state.victorySkipReason !== victorySkipReason ||
             state.requireHandoffs !== requireHandoffsMode ||
             state.rootSessionId !== rootSessionId ||
             (allowUnsignedLegacy && state.allowUnsignedLegacy !== true) ||
@@ -2891,6 +2994,8 @@ async function createPlanRun(
           state.integrityMode = integrityMode
           state.verification = verificationMode
           state.victoryAudit = victoryAuditMode
+          if (victorySkipReason) state.victorySkipReason = victorySkipReason
+          else delete state.victorySkipReason
           state.requireHandoffs = requireHandoffsMode
           state.rootSessionId = rootSessionId
           if (allowUnsignedLegacy) state.allowUnsignedLegacy = true
@@ -2922,6 +3027,7 @@ async function createPlanRun(
       integrityMode,
       verification: verificationMode,
       victoryAudit: victoryAuditMode,
+      victorySkipReason,
       requireHandoffs: requireHandoffsMode,
       requestHash: baselineRequestHash,
       requirementsHash: baselineRequirementsHash,
@@ -2953,6 +3059,7 @@ async function createPlanRun(
         integrityMode,
         verification: verificationMode,
         victoryAudit: victoryAuditMode,
+        ...(victorySkipReason ? { victorySkipReason } : {}),
         requireHandoffs: requireHandoffsMode,
         requestHash: baselineRequestHash,
         requirementsHash: baselineRequirementsHash,
@@ -3069,7 +3176,7 @@ async function createPlanRun(
     tasks,
     topology,
     integrityMode,
-    content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\n${preflightLine}\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.\nVerification: ${verificationMode}${verificationMode === "strict" ? " (one falsifier challenge + one security-auditor audit per task)" : ""}.\nVictory audit: ${victoryAuditMode}${victoryAuditSource === "caller" ? " (explicit)" : ""}${requirementsBaseline ? `; requirements baseline ${requirementsBaseline.items.length} item(s) from ${requirementsBaseline.source} (requirements.json)` : "; no requirements baseline"}.\nHandoff gate: ${requireHandoffsMode}${requireHandoffsSource === "caller" ? " (explicit)" : requireHandoffsSource === "unsigned" ? " (unsigned legacy baseline records skip)" : ""}.\nAuthenticity: ${signedRun ? `signed baseline (run.manifest.json; key ${clean(authReady.ok ? authReady.keyId : "unknown", 64)})` : "UNSIGNED LEGACY (allowUnsignedLegacy: true; final_verify/next require the recorded bypass)"}.${specGate === "bypassed" ? "\n⚠ Spec gate bypassed (skipInterview: true): planned without an approved prompt_draft.md." : ""}${preflight.bypassed ? `\n⚠ Input preflight bypassed (allowMissingInputs: true): ${preflight.status}.` : ""}${creditWarning}`,
+    content: `Planned ${tasks.length} task(s).\nSESSION_ID: ${sessionId}\nRun dir: ${run}\nBudget: $${budget} (source: ${input.budgetSource ? clean(input.budgetSource, 32) : "default"})\nplan.dag.json + state.json + costs.json written.\n${preflightLine}\nIntegrity mode: ${integrityMode}${request !== undefined ? ` (request recorded in ${originalRequestFile})` : ""}.\nVerification: ${verificationMode}${verificationMode === "strict" ? " (one falsifier challenge + one security-auditor audit per task)" : ""}.\nVictory audit: ${victoryAuditMode}${victoryAuditSource === "caller" ? " (explicit)" : ""}${victorySkipReason ? ` (reason: ${clean(victorySkipReason, 500)})` : ""}${requirementsBaseline ? `; requirements baseline ${requirementsBaseline.items.length} item(s) from ${requirementsBaseline.source} (requirements.json)` : "; no requirements baseline"}.\nHandoff gate: ${requireHandoffsMode}${requireHandoffsSource === "caller" ? " (explicit)" : requireHandoffsSource === "unsigned" ? " (unsigned legacy baseline records skip)" : ""}.\nAuthenticity: ${signedRun ? `signed baseline (run.manifest.json; key ${clean(authReady.ok ? authReady.keyId : "unknown", 64)})` : "UNSIGNED LEGACY (allowUnsignedLegacy: true; final_verify/next require the recorded bypass)"}.${specGate === "bypassed" ? "\n⚠ Spec presence gate bypassed (skipInterview: true): planned without an approved prompt_draft.md; the bypass is caller-controlled and recorded, not proof of approval." : ""}${preflight.bypassed ? `\n⚠ Input preflight bypassed (allowMissingInputs: true): ${preflight.status}.` : ""}${creditWarning}`,
   }
 }
 
@@ -3115,7 +3222,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           },
           victoryAudit: {
             type: "string",
-            description: "required | skip. Default required when a request or requirements baseline exists. A skip is recorded in plan.dag.json/state.json and final_verify then records \"SKIPPED (explicit)\".",
+            description: "required | skip. Default required when a request or requirements baseline exists. An explicit skip requires a non-empty victorySkipReason; both are recorded in plan.dag.json/state.json/signed manifest and final_verify records \"SKIPPED (explicit): <reason>\". A re-plan may repeat but not change the mode or reason. Benchmark mode refuses skip.",
+          },
+          victorySkipReason: {
+            type: "string",
+            description: "Required with victoryAudit: \"skip\". Non-empty, trimmed, max 500 chars, sanitized. Recorded in plan.dag.json/state.json and the signed run.manifest.json; a re-plan may not change it.",
           },
           requireHandoffs: {
             type: "string",
@@ -3124,8 +3235,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           },
           budgetUsd: { type: "number", description: "Run budget in USD. When using opencode/ models + opencode_console, derive this from credits (full or partial, per the user's choice)." },
           budgetSource: { type: "string", description: "Where the budget came from: credits | default | manual." },
-          requireSpec: { type: "boolean", description: "Default true. When true, the run must have a non-empty prompt_draft.md (the approved spec) before the plan is written; see skipInterview for the explicit bypass." },
-          skipInterview: { type: "boolean", description: "Default false. Explicit bypass of the spec gate: plan without an approved prompt_draft.md. Recorded in events.jsonl as specGate: bypassed." },
+          requireSpec: { type: "boolean", description: "Default true. When true, the run must have a non-empty prompt_draft.md (the approved spec) before the plan is written; this is a spec PRESENCE check. Choosing false is caller-controlled and recorded, not proof of approval; see skipInterview for the explicit bypass." },
+          skipInterview: { type: "boolean", description: "Default false. Explicit bypass of the spec presence gate: plan without an approved prompt_draft.md. Recorded in events.jsonl as specGate: bypassed. Caller-controlled; recorded, not proof of approval." },
           inputs: {
             type: "array",
             items: { type: "string" },
@@ -5468,8 +5579,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const nextVictoryGate = await evaluateVictoryGateChecked(
             run,
             nextVictoryMode.mode === "required" ? "required" : "skip",
-            { auth, requireSigned: signedRun, requirementsHash: currentRequirementsHash(run) },
+            {
+              auth,
+              requireSigned: signedRun,
+              requirementsHash: currentRequirementsHash(run),
+              skipReason:
+                recordedVictorySkipReason(plan?.victorySkipReason) ??
+                recordedVictorySkipReason(state?.victorySkipReason),
+            },
           )
+          const nextVictoryLabel = nextVictoryGate.skipped ? victorySkipLabel(nextVictoryGate.reason) : nextVictoryGate.status
           if (!nextVictoryGate.ok) {
             if (state.phase !== "FINAL_VERIFICATION") {
               state.phase = "FINAL_VERIFICATION"
@@ -5571,19 +5690,19 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               finalReport: finalFile,
               stamped: false,
               unstampedBypass: true,
-              victory: nextVictoryGate.status,
+              victory: nextVictoryLabel,
             }
           }
 
           return {
-            content: `ALL_TASKS_PASSED: All ${taskDefs.size} tasks have passed verification, security audit PASSED, final verification PASSED, and the victory audit is ${nextVictoryGate.status}. Ready to merge Sentinel base worktree to user branch and present final artifact.\n${integrityModeNote}`,
+            content: `ALL_TASKS_PASSED: All ${taskDefs.size} tasks have passed verification, security audit PASSED, final verification PASSED, and the victory audit is ${nextVictoryLabel}. Ready to merge Sentinel base worktree to user branch and present final artifact.\n${integrityModeNote}`,
             status: "ALL_PASSED",
             integrityMode: integrity.mode,
             passedCount: passedTasks.length,
             securityAuditPassed: true,
             finalReport: finalFile,
             stamped: true,
-            victory: nextVictoryGate.status,
+            victory: nextVictoryLabel,
           }
         }
 
@@ -6918,6 +7037,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             auth,
             requireSigned,
             requirementsHash: currentRequirementsHash(run),
+            skipReason:
+              recordedVictorySkipReason(plan?.victorySkipReason) ??
+              recordedVictorySkipReason(state?.victorySkipReason),
           })
           if (!victoryGate.ok) reasons.push(...victoryGate.reasons)
 
@@ -7000,7 +7122,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
 
           const victoryRecord = victoryGate.skipped
-            ? "SKIPPED (explicit)"
+            ? victorySkipLabel(victoryGate.reason)
             : victoryGate.ok
               ? "CONFIRMED"
               : "FAILED"
@@ -7019,7 +7141,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               reportDigests,
               auditDigest,
               victory: victoryGate.skipped
-                ? { mode: "skip", status: victoryGate.status, reasons: [] }
+                ? { mode: "skip", status: victoryGate.status, reason: victoryGate.reason ?? null, reasons: [] }
                 : victoryGate.ok
                   ? {
                       mode: "required",
