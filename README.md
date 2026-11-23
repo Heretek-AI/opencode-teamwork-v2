@@ -73,6 +73,7 @@ tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission
 | `teamwork_pitfall` | append to the pitfall registry (dynamically injected into workers) |
 | `teamwork_next` | evaluates DAG dependencies, lifecycle states, and ready tasks; strict runs stop at `NEEDS_STRICT_WAVE` until both wave verdicts exist |
 | `teamwork_task_update` | deterministic task state machine transitions (`pending` → `worker_active` → `worker_done` → `verifier_active` → `verified_pass` / `verified_fail` / `blocked`) |
+| `teamwork_handoff` | trusted five-section handoff writer (`handoffs/<taskId\|_run>-<role>.md` + bounded `handoffs/index.json`); narrative/citation only, never a gate verdict |
 | `teamwork_report` | trusted writer for a signed `verify/report-<taskId>.json`: caller must be `team/verifier`, descend from the run root, and name an existing task; a `PASS` needs a summary or check |
 | `teamwork_security_audit` | mandatory pre-merge security gate (`verify/security-audit.json`; signed on a signed run) |
 | `teamwork_victory_audit` | record the independent `team/victory-auditor` acceptance verdict, bound to the current `ORIGINAL_REQUEST.md` and `requirements.json` hashes (`verify/victory.json`); caller must descend from the run root |
@@ -438,6 +439,15 @@ The 15 shipped agents are installed as markdown files under `~/.config/opencode/
 
 Model assignments live in each agent's frontmatter (`model:`); see
 [Model assignment](#model-assignment) for how to set them.
+
+**Continuity roster note.** The five roles that publish handoffs
+(`team/worker`, `team/verifier`, `team/falsifier`, `team/security-auditor`,
+`team/victory-auditor`) call `teamwork_handoff`; the sentinel/orchestrator pass
+the run id to every child and ask for a handoff before it reports. A handoff is
+narrative/citation evidence for the next agent, not a verdict: `final_verify`
+and `next` ignore `handoffs/`, and the per-agent briefing under `agents/` is a
+context convenience that falls back to the shared `BRIEFING.md` (see
+`docs/ARTIFACTS.md`).
 
 ### LEMMA (Lean 4 formal-proof route)
 

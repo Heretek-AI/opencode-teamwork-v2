@@ -93,6 +93,9 @@ dispatching. Do not start a multi-hour run on a guess.
 6. **Verify** — call `@team/verifier` on the synthesis. This is the gate.
    If verification fails, return to step 3 with the verifier's findings in
    the prompt and bump the round counter.
+   Include the run id in every dispatch and require the agent to call
+   `teamwork_handoff({ sessionId: "<run id>", taskId, observation, logicChain,
+   caveats, conclusion, verificationMethod })` before reporting back.
 7. **Learn** — log every failed attempt with the `teamwork_pitfall` tool
    (writes `.opencode/teamwork/<session-id>/pitfalls.md`, the **pitfall
    registry**). A pitfall is an answer-agnostic mistake (e.g. "assumes the

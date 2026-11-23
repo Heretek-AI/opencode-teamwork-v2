@@ -159,16 +159,27 @@ for (const file of HANDOFF_AGENTS) {
   const text = read(path)
   const missing = HANDOFF_SECTIONS.filter((section) => !text.includes(section))
   if (missing.length) fail(path, `handoff.md missing sections: ${missing.join(", ")}`)
+  if (!/teamwork_handoff/.test(text)) fail(path, "handoff must go through teamwork_handoff (not a bare handoff.md)")
 }
 const briefingSections = ["## Mission", "## Identity", "## Key Constraints", "## Project Status", "## Artifact Index", "## Succession"]
 if (existsSync(artifactsFile)) {
   const md = read(artifactsFile)
   const missingHandoff = HANDOFF_SECTIONS.filter((section) => !md.includes(section))
   if (missingHandoff.length) fail(artifactsFile, `handoff.md contract missing sections: ${missingHandoff.join(", ")}`)
-  if (!/handoff\.md/.test(md)) fail(artifactsFile, "handoff.md contract is not documented")
+  if (!/teamwork_handoff/.test(md)) fail(artifactsFile, "canonical handoff tool is not documented")
+  if (!/handoffs\//.test(md)) fail(artifactsFile, "handoffs/ artifact layout is not documented")
+  if (!/agents\//.test(md)) fail(artifactsFile, "agents/ per-agent briefing layout is not documented")
   const missingBriefing = briefingSections.filter((section) => !md.includes(section))
   if (missingBriefing.length) fail(artifactsFile, `BRIEFING.md contract missing sections: ${missingBriefing.join(", ")}`)
   if (!/BRIEFING\.md/.test(md)) fail(artifactsFile, "BRIEFING.md is not documented")
+}
+const guardrailsFile = join(root, "docs", "GUARDRAILS.md")
+if (!existsSync(guardrailsFile)) {
+  errors.push("docs/GUARDRAILS.md is missing")
+} else {
+  const md = read(guardrailsFile)
+  if (!/teamwork_handoff/.test(md)) fail(guardrailsFile, "canonical handoff tool is not documented")
+  if (!/handoffs\//.test(md)) fail(guardrailsFile, "handoffs/ artifact is not documented")
 }
 
 const toolsFile = join(root, "plugins", "opencode-teamwork", "tools.ts")
