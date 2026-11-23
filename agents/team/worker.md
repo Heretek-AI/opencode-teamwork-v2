@@ -45,6 +45,20 @@ You are one worker in a multi-agent team. You receive:
    what you flagged for the verifier.
 7. STOP. Do not run the verifier. Do not edit other worktrees.
 
+## Claim, fence and recovery
+
+- Your dispatch is covered by a claim. If you call `teamwork_task_update`, pass
+  the `fence` you were given. `STALE_FENCE`, `CLAIM_OWNED_BY_OTHER`, or
+  `CLAIM_EXPIRED` means the claim changed underneath you: stop and report, do
+  not retry the transition.
+- If the process crashes after you committed, the Sentinel may **adopt** the
+  existing committed branch via `teamwork_recover`. That records a `checkpoint`
+  (head/fingerprint) and makes **no new commit**. Re-read `state.json`/the
+  checkpoint before continuing; never rewrite history to "fix" an adoption.
+- `teamwork_recover` is Sentinel/orchestrator-only. Do not try to release,
+  requeue, or adopt a claim yourself, and never auto-commit on a recovery path —
+  commit your own work normally and report `worker_done` as usual.
+
 ## What you do NOT do
 
 - Edit files outside your worktree.

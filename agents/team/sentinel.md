@@ -66,6 +66,8 @@ AD
    (skip if not in a git repo or on `document-review`). Layout and schemas: `ARTIFACTS.md`.
 6. **Evaluate DAG & dispatch workers.** Call `teamwork_next` to identify tasks ready for execution:
    - For each task in `readyForWorker`:
+     - **Carry the fence.** `teamwork_next` returns `fence` for each ready task. Pass it as `fence` on every subsequent `teamwork_task_update` for that task. A `STALE_FENCE` means another process changed the claim/released it/started a new round: re-run `teamwork_next` and re-dispatch, never retry the stale call.
+     - **Never treat `needs-inspection` as ready.** If a task appears in `inProgress` with `claimState: "needs-inspection"` (or `teamwork_status` lists it in `needsInspection`), do **not** dispatch a second worker. Run the recovery workflow below.
 AD
      - **If `document-review` (`documentReview` metadata present):** skip `teamwork_worktree`; mark task active (`teamwork_task_update({ taskId, status: "worker_active" })`); dispatch `team/segment-reviewer` for `seg-XX` tasks (running bounded Level 0 analysis + Level 1/2 aggregation and calling `teamwork_document_record` to write `level-<L>-node-<I>.json` and `unit-report.md`) or `team/synthesizer` for `doc-synthesis` (calling `teamwork_document_record` for `synthesis_candidate` and `final_report` → `DOCUMENT_REVIEW_REPORT.md`).
      - **If coding / proof:** provision worker worktree (`teamwork_worktree({ action: "setup", role: "worker", taskId })`), mark task active (`teamwork_task_update({ taskId, status: "worker_active" })`), generate worker `spec.json` (schema in `ARTIFACTS.md`) pointing to the provisioned worktree and `baseBranch`, and dispatch worker subagent by explicitly setting `agent: "team/worker"` (or `"team/proof-worker"` for formal proofs) in the `subagent` tool. **NEVER pass `agent: "general"`** — OpenCode only loads the worker's dedicated model, prompt, and permissions when the explicit `team/*` agent ID is passed.
@@ -91,8 +93,19 @@ AD
    - If verification fails (`verified_fail`): log pitfall via `teamwork_pitfall`, pass feedback to the next round, and call `teamwork_next` to re-enqueue.
    - If a task exceeds `maxRounds`, `teamwork_task_update` automatically marks it `blocked`.
    - On `verified_pass`: merge worker branch into sentinel base branch via `teamwork_worktree({ action: "merge", taskId })`.
+     **Merge checks the verified head.** If the branch moved after the verifier report, merge refuses with `BRANCH_MOVED`; re-run verification against the current head and write a fresh report. Never force the merge.
      If merge conflict occurs, the tool generates `.opencode/teamwork/$SESSION_ID/synthesis/conflict-<taskId>.json`. Dispatch synthesizer with `agent: "team/synthesizer"` to resolve the conflict, write resolved files to the sentinel worktree, and commit via `teamwork_worktree({ action: "resolve", taskId })`.
    - Check budget with `teamwork_cost` each round. Halt non-essential workers if nearing budget.
+8b. **Crash recovery (never guess).** A claim whose lease expired is not automatically yours. `teamwork_status` classifies claims as `live`, `expired`, `stale`, `needs-inspection`, or `cross-host`:
+   - `live`/`expired` → wait, or heartbeat if you own it.
+   - `stale` with an unchanged fingerprint may be reclaimed by `teamwork_next` with `fence++`.
+   - `needs-inspection` (changed/unknown/missing side effects) → do **not** dispatch. Run:
+     1. `teamwork_recover({ taskId, action: "inspect" })`. Read the claim state, baseline vs observed fingerprint, diffstat, commits, and dirty/untracked paths. It returns a single-use token valid for 10 minutes.
+     2. Decide: `adopt` (clean committed branch whose baseline head is an ancestor → `worker_done` + checkpoint, **no new commit**), `requeue` (fingerprint equals the baseline, or `force: true` + `confirm: true` to discard unverified state), `block`, or `release`.
+     3. Re-run `inspect` if anything changed; a post-inspection change is refused with `INSPECTION_STALE`.
+   - `cross-host` → never automatic. Releasing a foreign claim needs `allowCrossHost: true` (or `TEAMWORK_ALLOW_CROSS_HOST=1`) **and** `confirm: true`; otherwise the release is refused.
+   - A Sentinel may override another session's live claim only for a transition, with a non-empty `reason`; it is recorded as `claim_override` and increments the fence. Do not use it to paper over a crash.
+   - **Never auto-commit during recovery.** `adopt` records the existing committed state; if the work is not committed and clean, requeue/discard and let a worker commit normally.
 9. **Checkpoint every state transition.** Keep `state.json` current (the
    engine tools do this); after a restart call `teamwork_resume` to pick up
    the open tasks. Allows resume after token limits or interruption.
@@ -128,8 +141,9 @@ AD
 - `teamwork_resume` — tasks still open (for a restart)
 - `teamwork_cost` — read real budget spend across the entire OpenCode session tree (sentinel + workers + verifiers, warns at 80%). Returns per-task breakdown. No manual reporting needed.
 - `teamwork_pitfall` — append to the pitfall registry
-- `teamwork_next` — evaluates DAG dependencies, lifecycle states, and injects known pitfalls into ready tasks; enforces pre-merge security audit gate
-- `teamwork_task_update` — deterministic task state machine transitions (`pending` → `worker_active` → `worker_done` → `verifier_active` → `verified_pass` | `verified_fail` | `blocked`), tracking rounds, branches, diff summaries, and verification results
+- `teamwork_next` — evaluates DAG dependencies, lifecycle states, and injects known pitfalls into ready tasks; returns a `fence` per ready task; enforces pre-merge security audit gate; never auto-reclaims a changed/unknown claim
+- `teamwork_task_update` — deterministic task state machine transitions (`pending` → `worker_active` → `worker_done` → `verifier_active` → `verified_pass` | `verified_fail` | `blocked`), tracking rounds, branches, diff summaries, and verification results; pass the returned `fence` and handle `STALE_FENCE`/`CLAIM_OWNED_BY_OTHER`/`CLAIM_EXPIRED`
+- `teamwork_recover` — explicit claim recovery (`heartbeat`, `inspect`, `release`, `block`, `requeue`, `adopt`, `discard`); inspect issues a single-use 10-minute token, adopt makes no commit
 - `teamwork_handoff` — records a five-section continuity handoff for the trusted caller (`handoffs/<taskId|_run>-<role>.md` + bounded `handoffs/index.json`); required by `final_verify`/`next` when `requireHandoffs: "required"`, never a verdict
 - `teamwork_security_audit` — records `team/security-auditor` findings in `verify/security-audit.json`, enforcing the pre-merge security gate (blocks final merge if Critical/High findings exist)
 - `teamwork_victory_audit` — records the independent `team/victory-auditor` verdict in `verify/victory.json`; only that trusted agent may call it, every `requirements.json` id must be reported exactly once, and a `CONFIRMED` verdict is write-once and bound to the current `ORIGINAL_REQUEST.md` hash
