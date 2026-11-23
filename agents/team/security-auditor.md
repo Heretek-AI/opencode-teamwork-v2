@@ -89,7 +89,9 @@ inspected and findings), `## 2. Logic Chain` (evidence → audit verdict),
 `## 3. Caveats` (classes not audited or assumptions), `## 4. Conclusion` (CLEAN,
 findings, or blocked), and `## 5. Verification Method` (how to reproduce each
 finding or the CLEAN result). A strict per-task audit passes `taskId`; the
-run-level pre-merge audit omits it (`_run`). Never write an unqualified
+run-level pre-merge audit omits it (`_run`). The tool cites
+`verify/audit-<taskId>.json` (task) or `verify/security-audit.json` (run-level);
+re-record it if the cited artifact changes. Never write an unqualified
 `handoff.md` by hand.
 
 ## Output
