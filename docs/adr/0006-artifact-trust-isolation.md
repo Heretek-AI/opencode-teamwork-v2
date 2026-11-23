@@ -3,7 +3,7 @@
 - **Status:** Proposed (Phase B decision) — recommended: accept and document for Sprint 2.1
 - **Date:** 2026-11-22
 - **Scope:** ADR 0005, `plugins/opencode-teamwork/auth.ts`, plugin storage, permission hooks, deployment
-- **Related:** ADR 0004, ADR 0005, `docs/spikes/auth-isolation-feasibility.md`
+- **Related:** [ADR 0004](0004-intermediate-symlink-races.md), [ADR 0005](0005-artifact-authenticity.md), [spike](../spikes/auth-isolation-feasibility.md)
 
 ## 1. Context
 
@@ -471,26 +471,38 @@ softened by marketing.
 
 **`docs/GUARDRAILS.md`, "Known gaps / non-goals":**
 
-> **Artifact authenticity is tamper-evident, not local-user-proof.** The HMAC
-> key is stored in the OpenCode KV database (`opencode.db`, mode `0600`) under
-> the same UID that runs agents. Any same-UID shell can read the key, mint a
-> valid `_auth` envelope, and rewrite the digest index. Phase A therefore stops
-> a run-directory-only writer, not a local user or a prompt-injected agent with
-> shell access. OpenCode v2.3.2 gives the plugin no process-placement/sandbox
-> API, no per-process credential that a same-UID shell cannot read or replay,
-> and no non-auto-approvable human approval bound to an artifact digest.
-> Phase B options are assessed in ADR 0006, which selects "accept and document"
-> until one of those primitives exists. Do not describe artifacts as
+> **Artifact authenticity is tamper-evident, not local-user-proof.**
+> Control-plane artifacts carry an HMAC `_auth` envelope and a digest-index
+> entry outside the run dir (ADR 0005), so a run-dir-only writer can no longer
+> forge a PASS, copy an envelope between files/runs, or downgrade the signed
+> plan baseline. **This does not stop a same-UID shell:** with read access to
+> `opencode.db` (or the plugin KV backing store) it can read the HMAC key and
+> mint a valid envelope, and `ctx.storage` is in the same user account, so the
+> digest index is not a separate privilege domain either. Moving the key to a
+> same-UID helper, using the OS keychain, or gating on `ctx.permission.assert`
+> does not fix this: a same-UID helper is a signing oracle, the keychain is
+> same-UID accessible, and `assert` is auto-approvable under `--auto`. **No
+> in-process, zero-dependency control fixes this.** Phase B options and the
+> administrator-only requirements (separate UID/system service, TPM/`tss`
+> access, SELinux labels) are assessed in
+> `docs/adr/0006-artifact-trust-isolation.md`, which recommends accepting and
+> documenting this boundary for now; a real Phase B needs a different privilege
+> domain and a non-oracle signing decision (a human-presence gate or an
+> independent verifier). Until then, do not claim protection against a local
+> user who can read the database, and do not describe artifacts as
 > tamper-proof, signed by a trusted authority, or safe against a local user.
 
-**`README.md`, "Security":**
+**`README.md`, "Security" / Notes footnote:**
 
-> Artifact authenticity is Phase A: signed control-plane artifacts are
-> tamper-evident against a writer limited to the run directory. They are **not**
-> protected against a same-UID process: the HMAC key lives in `opencode.db`
-> (mode `0600`, same user) and a local shell can read it and mint valid
-> envelopes. Phase B options and the decision to accept this boundary are in
-> [`docs/adr/0006-artifact-trust-isolation.md`](docs/adr/0006-artifact-trust-isolation.md).
+> **Artifact-trust boundary (ADR 0005/0006):** signed control-plane artifacts
+> are tamper-evident against a writer limited to the run directory. They are
+> **not** protected against a same-UID shell: the HMAC key lives in
+> `opencode.db` (mode `0600`, same user), so a local shell can read it and mint
+> valid envelopes. No in-process, zero-dependency control fixes this; Phase B
+> needs a different privilege domain (admin-only: separate UID/system service,
+> TPM/`tss` access, or SELinux labels) and a non-oracle signing decision. See
+> [`docs/adr/0006-artifact-trust-isolation.md`](docs/adr/0006-artifact-trust-isolation.md)
+> and [`docs/adr/0005-artifact-authenticity.md`](docs/adr/0005-artifact-authenticity.md).
 
 **`docs/ARTIFACTS.md`, the existing boundary note:** append "See ADR 0006 for
 why key isolation is not a same-UID fix and for the accepted residual."

@@ -130,7 +130,7 @@ Protected against a run-dir-only writer:
 5. **Transparency log / append-only remote witness** for the digest index,
    making storage tampering detectable after the fact.
 
-> **Phase B assessment (2026-11-22).** `docs/adr/0006-artifact-trust-isolation.md`
+> **Phase B assessment (2026-11-22).** [ADR 0006](0006-artifact-trust-isolation.md)
 > evaluates these options against the same-UID shell on the review host. It
 > finds that a bare separate-UID signer (option 2) is a signing oracle, that an
 > OS keychain is not a UID boundary, and that `ctx.permission.assert` is
