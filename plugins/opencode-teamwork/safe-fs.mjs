@@ -45,17 +45,21 @@ const DELETED_SUFFIX = " (deleted)"
  */
 function probeFdMode() {
   if (process.platform !== "linux") return "unsupported"
+  let fd = null
   try {
-    if (!lstatSync(PROC_SELF_FD).isDirectory()) return "fail-closed"
-    const fd = openSync(PROC_SELF_FD, fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY || 0))
-    try {
-      realpathSync(`${PROC_SELF_FD}/${fd}`)
-    } finally {
-      closeSync(fd)
-    }
+    // Open the directory directly: no lstat-then-open check (CodeQL
+    // js/file-system-race). A throw at either step means procfs is unusable.
+    fd = openSync(PROC_SELF_FD, fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY || 0))
+    realpathSync(`${PROC_SELF_FD}/${fd}`)
     return "enforce"
   } catch {
     return "fail-closed"
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd)
+      } catch {}
+    }
   }
 }
 

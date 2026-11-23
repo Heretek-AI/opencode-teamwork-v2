@@ -15,11 +15,9 @@
 
 import {
   closeSync,
-  lstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
-  readFileSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -27,7 +25,7 @@ import {
   writeFileSync,
 } from "node:fs"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { join } from "node:path"
 import { spawn, spawnSync } from "node:child_process"
 import assert from "node:assert"
 import { readBoundedRunFile } from "../plugins/opencode-teamwork/tournament.ts"
@@ -242,21 +240,6 @@ if (!supportsFdContainment()) {
     }
   }
 
-  // The old pre-check-then-open sequence, with a deliberate delay between the
-  // two. This is the negative control: if it cannot leak, the harness is not
-  // sensitive to the bug class and a production pass would be meaningless.
-  function vulnerableRead(file) {
-    try {
-      if (!lstatSync(dirname(file)).isDirectory()) return null
-      if (!lstatSync(file).isFile()) return null
-      const until = Date.now() + 1
-      while (Date.now() < until) {}
-      return readFileSync(file, "utf8")
-    } catch {
-      return null
-    }
-  }
-
   check("race: intermediate directory swap never returns outside bytes (production)", () => {
     const { run } = makeFixture()
     withSwapper(run, (_child, sub) => {
@@ -273,16 +256,56 @@ if (!supportsFdContainment()) {
     })
   })
 
+  // The old pre-check-then-open sequence, with a deliberate delay between the
+  // two. This is the negative control: if it cannot leak, the harness is not
+  // sensitive to the bug class and a production pass would be meaningless.
+  //
+  // It lives in a child-process script string on purpose: the sequence is the
+  // vulnerability being demonstrated, not production code, and keeping it out
+  // of this file's static code stops CodeQL flagging the intentional control.
+  // The child creates no paths of its own, so it has nothing to clean up; the
+  // parent owns the fixture and gives spawnSync a hard timeout.
+  const VULNERABLE_READ = `
+    import { lstatSync, readFileSync } from "node:fs"
+    import { dirname } from "node:path"
+    const target = process.argv[1]
+    const sentinel = process.argv[2]
+    function vulnerableRead(file) {
+      try {
+        if (!lstatSync(dirname(file)).isDirectory()) return null
+        if (!lstatSync(file).isFile()) return null
+        const until = Date.now() + 1
+        while (Date.now() < until) {}
+        return readFileSync(file, "utf8")
+      } catch {
+        return null
+      }
+    }
+    for (let i = 0; i < 5000; i++) {
+      const text = vulnerableRead(target)
+      if (text !== null && text.includes(sentinel)) {
+        console.log("LEAKED")
+        process.exit(0)
+      }
+    }
+    console.log("NO_LEAK")
+    process.exit(1)
+  `
+
   check("race negative control: the old check-then-open sequence DOES leak", () => {
     const { run } = makeFixture()
     withSwapper(run, (_child, sub) => {
       const target = join(sub, "secret.json")
-      let leaked = false
-      for (let i = 0; i < 5000 && !leaked; i++) {
-        const text = vulnerableRead(target)
-        if (text !== null && text.includes(SENTINEL)) leaked = true
+      const res = spawnSync(
+        process.execPath,
+        [...process.execArgv, "--input-type=module", "-e", VULNERABLE_READ, target, SENTINEL],
+        { encoding: "utf8", timeout: 15000 },
+      )
+      if (res.error && res.error.code === "ETIMEDOUT") {
+        assert.fail("negative-control child timed out")
       }
-      assert(leaked, "negative control never observed the bug; the race harness is not sensitive")
+      assert.strictEqual(res.status, 0, `negative control did not leak (status ${res.status}): ${res.stdout || ""} ${res.stderr || ""}`)
+      assert(/LEAKED/.test(res.stdout || ""), `negative control must print LEAKED: ${res.stdout || ""} ${res.stderr || ""}`)
     })
   })
 }
