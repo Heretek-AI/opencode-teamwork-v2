@@ -56,6 +56,11 @@ Commands:
              (--security adds key source, signer/witness, ptrace, groups, DB,
              approval dir and containment; --require-hardened exits 2 on
              any fail/unknown security check)
+  approve    Produce/verify an authenticated prompt approval:
+               approve request --session <runId> [--json]
+               approve sign --request <file|-> --draft <path> [--key <path>]
+                            [--ttl 24h] [--approver uid:<name>|oidc:...|ci:...]
+               approve verify --session <runId> [--json]
   help       Show this help
 
 Options:
@@ -547,6 +552,13 @@ function doctorCommand(options) {
 }
 
 async function main() {
+  // `approve` has its own argv grammar (a request file may be `-`), so it is
+  // dispatched before the installer parser and never routes through `init`.
+  if (process.argv[2] === "approve") {
+    const { approveCommand } = await import("../lib/approve.mjs")
+    process.exitCode = await approveCommand(process.argv.slice(3))
+    return
+  }
   const options = parseArgs(process.argv.slice(2))
   const command = options.command || (options.help ? "help" : "init")
 
