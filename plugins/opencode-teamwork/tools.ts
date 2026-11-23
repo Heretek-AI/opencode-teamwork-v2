@@ -1034,6 +1034,64 @@ function readRunText(run: string, file: string, maxBytes = MAX_RUN_TEXT_BYTES): 
   return res.status === "ok" ? res.text : undefined
 }
 
+/**
+ * True when a run artifact declares `constraints.network: "denied"`. JSON is
+ * read structurally first; the text fallback covers the Markdown spec
+ * (`prompt_draft.md`) where the same constraint is written as prose.
+ */
+function declaresNetworkDenied(text: string): boolean {
+  try {
+    const parsed = JSON.parse(text)
+    const network = parsed?.constraints?.network
+    if (typeof network === "string" && network.trim().toLowerCase() === "denied") return true
+  } catch {
+    // Not JSON: fall through to the text form.
+  }
+  return /network\s*["']?\s*:\s*["']?denied["']?/i.test(text)
+}
+
+/** Bounded, no-follow discovery of per-task spec.json files inside a run. */
+function perTaskSpecFiles(base: string, dir = base, depth = 0, out: string[] = []): string[] {
+  if (depth > 4 || out.length >= 200) return out
+  let entries
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch {
+    return out
+  }
+  for (const entry of entries) {
+    if (out.length >= 200) break
+    if (entry.isSymbolicLink()) continue
+    const full = join(dir, entry.name)
+    if (entry.isDirectory()) {
+      if (entry.name === ".git" || entry.name === "node_modules") continue
+      perTaskSpecFiles(base, full, depth + 1, out)
+      continue
+    }
+    if (!entry.isFile()) continue
+    const relParts = relative(base, full).split(/[\\/]/)
+    const inSpecsDir = relParts.slice(0, -1).includes("specs")
+    if (entry.name === "spec.json" || (inSpecsDir && entry.name.endsWith(".json"))) out.push(full)
+  }
+  return out
+}
+
+/**
+ * Resolve the active run's network policy. `prompt_draft.md` is the run-wide
+ * spec; every per-task `spec.json` is checked too, so a task-scoped denial is
+ * never weaker than the run-wide one. A denied policy is enforced for all
+ * `team/*` agents.
+ */
+function runNetworkDenied(run: string): boolean {
+  const draft = readRunText(run, join(run, "prompt_draft.md"))
+  if (draft && declaresNetworkDenied(draft)) return true
+  for (const file of perTaskSpecFiles(run)) {
+    const text = readRunText(run, file)
+    if (text && declaresNetworkDenied(text)) return true
+  }
+  return false
+}
+
 function readPitfalls(run: string, taskId?: string): string[] {
   try {
     const content = readRunText(run, join(run, "pitfalls.md"))
@@ -6063,15 +6121,18 @@ export async function registerTeamworkHooks(ctx: any, root: string) {
       return
     }
 
-    // Network constraint enforcement for worker/verifier
-    if (event.action === "webfetch" && (event.agent === "team/worker" || event.agent === "team/verifier")) {
+    // Network constraint enforcement for every team agent (sentinel, workers,
+    // verifiers, reviewers, auditors). Prompt text is the run-wide spec; a
+    // task-scoped spec.json is honoured too.
+    if (
+      event.action === "webfetch" &&
+      typeof event.agent === "string" &&
+      event.agent.startsWith("team/")
+    ) {
       const { run } = resolveRun(root)
-      if (run) {
-        const specText = readRunText(run, join(run, "prompt_draft.md"))
-        if (specText && /network:\s*["']?denied["']?/i.test(specText)) {
-          event.effect = "deny"
-          event.message = "Network access is denied by run spec constraints."
-        }
+      if (run && runNetworkDenied(run)) {
+        event.effect = "deny"
+        event.message = "Network access is denied by run spec constraints."
       }
     }
   })
