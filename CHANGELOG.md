@@ -4,6 +4,73 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-11-23
+
+Minor release closing the interview-gate gap: an authenticated approval now
+binds the **prompt draft**, not only the manifest. It bumps the signed
+`run.manifest.json` schema to version 3; versions 1 and 2 stay readable.
+
+### Added
+
+- **Prompt-bound approvals (manifest v3).** A version-3 manifest records
+  `specHash` (unkeyed SHA-256 of the exact `prompt_draft.md` bytes),
+  `specBytes`, `approvalDigest`, `approvalNonce`, `approvalBinding: "prompt"`,
+  `approvedBy`, and `approvedAt`. The approval payload carries
+  `binding: "prompt"`, `promptDraftSha256`, `promptDraftBytes`, `openGaps`,
+  `approvalNonce`, and an optional `planHash`, and no longer carries a
+  manifest digest (the manifest records the approval digest instead). Editing
+  the draft or swapping the approval after the plan is `AUTH_STALE` /
+  `AUTH_APPROVAL_STALE`.
+- **Plan-time verification before any write.** `teamwork_plan` resolves the
+  external approval directory, reads and hashes the draft through the bounded
+  no-follow reader, verifies the Ed25519 approval (distinct key, pinned
+  `approvalKeyId`, identity, freshness), requires the exact draft bytes, and
+  refuses remaining `[OPEN:` gaps — all before `mkdir`/state/preflight writes.
+  Failure codes: `AUTH_APPROVAL_INCOMPLETE`, `AUTH_APPROVAL_STALE`,
+  `AUTH_APPROVAL_MISSING`, `AUTH_APPROVAL_UNTRUSTED`,
+  `AUTH_APPROVAL_NOT_HUMAN`, `AUTH_APPROVAL_REPLAY`.
+- **One-use nonce.** `approvalNonce` must be ≥128 bits and equal
+  `_auth.nonce`. The plugin consumes it once per run under the plan lock and
+  stores `{approvalNonce, approvalDigest, planHash, at}` at
+  `ctx.storage` `auth/approval/<runId>/consumed`; a later different nonce is
+  `AUTH_APPROVAL_REPLAY`.
+- **`opencode-teamwork approve`.** `request` prints the draft digest, byte
+  count, `[OPEN:` count, observed manifest/plan digest, and the exact payload
+  to sign (writes nothing trusted). `sign` re-hashes the raw bytes, refuses a
+  changed draft or remaining gaps (unless `--allow-open` records them), asks
+  for the first 8 hex characters and the word `approve`, and writes the
+  Ed25519 approval atomically `0600` into the approval directory. `verify`
+  re-runs the binding checks and prints them without claiming a human read it.
+- **Signer scope.** The plugin signer and the command signer refuse any
+  `approvals/` path with `AUTH_APPROVAL_SCOPE`; approvals use the approver key
+  directly.
+- **Doctor.** `doctor --security` reports the approver key configuration and
+  whether a configured signer could accept an `approvals/` path.
+- **Parity harness.** `scripts/test-approval.mjs` drives print mode (one child
+  process per turn, disk-only state), the TUI single-process path, the full
+  approved flow to `final_verify` PASS, and the negative matrix (missing,
+  edited, another run, HMAC, run-key, expired, replayed nonce, open gaps, bare
+  approver, in-run approval, wrong plan hash, `approvals/` signer scope).
+- **ADR 0011** records the design, its boundary sentence, and the residuals.
+
+### Changed
+
+- `_auth` canonical format and digest helpers now live in
+  `plugins/opencode-teamwork/approval-format.mjs`, shared by the plugin and the
+  approval CLI so an envelope produced outside the plugin verifies identically.
+- `safe-fs` bounded reads return the exact `bytes` alongside the decoded
+  `text`; `contentSha256Hex` is used for prompt content digests.
+- Version-2 approvals keep their manifestDigest-bound semantics and
+  `approvedAt >= createdAt` rule; version-1 in-run approvals remain readable
+  and are still recorded as `approval_unbound`.
+- `local-hmac`, `external-signer`, `allowUnsignedLegacy`, and `ci-attested`
+  behaviour is otherwise unchanged.
+
+### Tests
+
+- New `test:approval` in the npm chain. Existing engine/doctor/timeline/
+  export/auth/security suites stay green.
+
 ## [0.10.2] - 2026-11-23
 
 Patch release closing two cheap content-integrity loopholes and making the

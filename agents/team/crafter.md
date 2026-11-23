@@ -145,6 +145,13 @@ exists and is non-empty; it cannot prove the user approved it.
 `skipInterview: true` and `requireSpec: false` are caller-controlled and
 recorded, not proof of approval.
 
+If the run uses `trustLevel: "human-approved"` or `"ci-attested"`, the
+approval is bound to the **exact bytes** of this file. Finish every
+`[OPEN: …]` gap before asking anyone to approve; `opencode-teamwork approve
+sign` refuses a draft that still has one (unless `--allow-open` records it,
+which makes the plan refuse that approval). Do not rewrite the file after the
+approver signs it — the plan treats that as `AUTH_STALE`.
+
 You do NOT dispatch agents. The crafter is read-only on the world —
 it produces spec, the sentinel executes.
 

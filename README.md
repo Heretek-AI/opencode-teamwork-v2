@@ -45,10 +45,12 @@ lib/runs.mjs                      # run inspection, DAG visualization, worktree 
 lib/doctor.mjs                    # environment diagnostic health checks
 lib/timeline.mjs                  # chronological run lifecycle builder & renderer
 lib/export.mjs                    # read-only run report builder (HTML / Markdown export)
-bin/opencode-teamwork.mjs         # CLI: init / models / install / status / doctor / runs / inspect / timeline / export / prune
+lib/approve.mjs                   # authenticated prompt-approval producer/verifier (`approve …`)
+bin/opencode-teamwork.mjs         # CLI: init / models / install / status / doctor / runs / inspect / timeline / export / prune / approve
 scripts/lint-prompts.mjs          # prompt linter (run in CI)
 scripts/test-cost.mjs             # session tree consumption tests
 scripts/test-engine.mjs           # DAG engine, security gate & worktree tests
+scripts/test-approval.mjs         # authenticated prompt-approval parity (print + TUI)
 scripts/test-doctor.mjs           # hermetic environment & CLI doctor tests
 scripts/test-timeline.mjs         # timeline hermetic unit tests
 postinstall.mjs                   # asks for models during npm install
@@ -143,7 +145,7 @@ topologies, and the JSON schemas (`spec.json`, `plan.dag.json`, `state.json`,
 
 - `verified_pass` requires a legal lifecycle transition and PASS evidence (an inline PASS verdict or a `PASS` per-task report).
 - A plan writes a signed `run.manifest.json` (the default). Verifier reports, security audit, strict-wave verdicts, victory verdict, and final verdict carry an `_auth` envelope and a `ctx.storage` digest-index entry. `final_verify`/`next` fail as `AUTH_MISSING`, `AUTH_INVALID`, `AUTH_UNKNOWN_KEY`, `AUTH_INDEX_MISSING`, or `AUTH_STALE` when an artifact is forged, copied, edited, or the signed plan/requirements/policy baseline drifts. See [`docs/adr/0005-artifact-authenticity.md`](docs/adr/0005-artifact-authenticity.md).
-- `_auth` supports HMAC-SHA256 (backward-compatible `mac`) and Ed25519 (`sig`). Every new signed run pins a 128-bit `runNonce` and `runKeyId` in the manifest, so a cross-run copy or a rotated re-sign fails. With Ed25519, verification needs only the SPKI public key. `teamwork_plan` also records `trustLevel` (`local-hmac` default, `external-signer`, `human-approved`, `ci-attested`) and optional `requireWitness`; `final_verify` enforces the level, and `OPENCODE_TEAMWORK_SIGNER`/`OPENCODE_TEAMWORK_WITNESS` fail closed (`AUTH_SIGNER_UNAVAILABLE`/`AUTH_WITNESS_UNAVAILABLE`). `human-approved`/`ci-attested` require an Ed25519 approval from `OPENCODE_TEAMWORK_APPROVAL_DIR`, signed by a key distinct from the run key (0.10.2). See [`docs/adr/0008-signer-spi-and-trust-levels.md`](docs/adr/0008-signer-spi-and-trust-levels.md) and [`SECURITY.md`](SECURITY.md).
+- `_auth` supports HMAC-SHA256 (backward-compatible `mac`) and Ed25519 (`sig`). Every new signed run pins a 128-bit `runNonce` and `runKeyId` in the manifest, so a cross-run copy or a rotated re-sign fails. With Ed25519, verification needs only the SPKI public key. `teamwork_plan` also records `trustLevel` (`local-hmac` default, `external-signer`, `human-approved`, `ci-attested`) and optional `requireWitness`; `final_verify` enforces the level, and `OPENCODE_TEAMWORK_SIGNER`/`OPENCODE_TEAMWORK_WITNESS` fail closed (`AUTH_SIGNER_UNAVAILABLE`/`AUTH_WITNESS_UNAVAILABLE`). `human-approved`/`ci-attested` require an Ed25519 approval from `OPENCODE_TEAMWORK_APPROVAL_DIR`, signed by a key distinct from the run key and bound to the **exact bytes of `prompt_draft.md`** plus the run id and a one-use nonce (0.11.0; manifest version 3). The plan verifies it before any `mkdir`, `final_verify` re-hashes the draft, and a re-plan cannot change the binding. The plugin/command signer refuses `approvals/` paths (`AUTH_APPROVAL_SCOPE`). See [`docs/adr/0011-authenticated-prompt-approval.md`](docs/adr/0011-authenticated-prompt-approval.md), [`docs/adr/0008-signer-spi-and-trust-levels.md`](docs/adr/0008-signer-spi-and-trust-levels.md) and [`SECURITY.md`](SECURITY.md).
 - A run completes only with a `PASS` `verify/final.json` stamped by `teamwork_final_verify`; an unstamped report needs the recorded `allowUnstamped` bypass. An unsigned legacy run returns `AUTH_LEGACY` until the recorded `allowUnsignedLegacy` bypass is passed at the completion gate; `benchmark` refuses that bypass, `victoryAudit: "skip"`, and `requireHandoffs: "skip"`.
 - `teamwork_victory_audit`, `teamwork_wave_record`, and `teamwork_report` require the caller session to descend from the plan-time `rootSessionId`, so a top-level `opencode run --agent team/victory-auditor` cannot self-authorize.
 - That PASS also needs a `verify/victory.json` from the independent `team/victory-auditor` reporting `VICTORY CONFIRMED` for every requirement and the current `ORIGINAL_REQUEST.md` hash, unless the plan explicitly recorded `victoryAudit: "skip"` with a non-empty `victorySkipReason` (then `final_verify` records `victory: "SKIPPED (explicit): <reason>"`). A skip without a reason is refused; the legacy no-baseline default is labelled `SKIPPED (legacy default: no requirements baseline)`.
@@ -196,6 +198,9 @@ npx @heretek-ai/opencode-teamwork-v2 inspect   # inspect latest run DAG, tasks, 
 npx @heretek-ai/opencode-teamwork-v2 timeline  # chronological run timeline, task durations & cost
 npx @heretek-ai/opencode-teamwork-v2 export    # export a run report (HTML by default, or --markdown)
 npx @heretek-ai/opencode-teamwork-v2 prune     # prune completed git worktrees
+npx @heretek-ai/opencode-teamwork-v2 approve request --session <id>  # show the draft binding
+npx @heretek-ai/opencode-teamwork-v2 approve sign --request <file> --draft <path> --key <path>
+npx @heretek-ai/opencode-teamwork-v2 approve verify --session <id>   # re-run the plan-time checks
 ```
 
 `opencode-teamwork` and `opencode-teamwork-v2` are aliases for the same CLI. If
@@ -284,6 +289,30 @@ defaults without touching files that already exist.
    `specGate: "bypassed"`. Presence is not proof of user approval:
    `skipInterview` / `requireSpec: false` are caller-controlled and recorded,
    not an approval signature.
+
+   For `trustLevel: "human-approved"` / `"ci-attested"`, produce an
+   authenticated approval **before** the plan, from a process that holds the
+   approver key and writes outside the repo/run:
+
+   ```sh
+   # inspect what will be signed (writes nothing trusted)
+   opencode-teamwork approve request --session <session-id> --approver uid:alice
+
+   # sign the exact draft bytes with the Ed25519 approver key
+   opencode-teamwork approve sign --request request.json \
+     --draft .opencode/teamwork/<session-id>/prompt_draft.md \
+     --key ~/.config/opencode/approver.pem --approver uid:alice --ttl 24h
+
+   # re-run the plan-time checks at any time
+   opencode-teamwork approve verify --session <session-id>
+   ```
+
+   `approve sign` refuses a draft that still contains `[OPEN:` unless
+   `--allow-open` records the gaps (the plan then refuses that approval), and
+   asks the operator to retype the first 8 hex characters of the draft digest
+   and the word `approve`. The approval binds the draft, the run id, and a
+   one-use nonce; it does **not** prove a human read the draft (see
+   [`SECURITY.md`](SECURITY.md)).
 
 5. The run directory `.opencode/teamwork/<session-id>/` holds `plan.dag.json`
    (the task DAG), per-task `verify/report-<task>.json` reports, and

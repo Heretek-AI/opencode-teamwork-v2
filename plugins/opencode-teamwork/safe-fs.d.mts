@@ -4,7 +4,7 @@
 export type FdContainmentMode = "enforce" | "fail-closed" | "unsupported"
 
 export type SafeFsRead =
-  | { status: "ok"; text: string }
+  | { status: "ok"; text: string; bytes?: Buffer }
   | { status: "absent" }
   | { status: "oversize"; size: number; cap: number }
   | { status: "refused"; reason: "symlink" | "not-regular" | "containment" | "unreadable"; message: string }

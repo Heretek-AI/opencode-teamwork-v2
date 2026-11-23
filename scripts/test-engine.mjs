@@ -25,6 +25,8 @@ import { assertSafeUrl, blockedAddressReason } from "../plugins/opencode-teamwor
 import { refreshRunBriefing, MAX_BRIEFING_BYTES, refreshAgentBriefing, readAgentBriefingExcerpt, agentBriefingRelativePath, MAX_AGENT_BRIEFING_DIRS } from "../plugins/opencode-teamwork/briefing.ts"
 import { writeHandoff, MAX_HANDOFF_ENTRIES, MAX_HANDOFF_INDEX_BYTES, HANDOFF_SECTION_LABELS, evaluateHandoffGateChecked } from "../plugins/opencode-teamwork/handoff.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
+import { signApprovalArtifact } from "../lib/approve.mjs"
+import { contentSha256Hex } from "../plugins/opencode-teamwork/approval-format.mjs"
 import {
   currentModels,
   writeModelMap,
@@ -302,13 +304,21 @@ function makeSeedVerifiedRun(tools, ctx, root) {
   return async (
     runId,
     taskIds,
-    { request, integrityMode, auditStatus = "PASS", stampVictory = request !== undefined, victoryAudit, victorySkipReason, verification, allowUnsignedLegacy, requireHandoffs, handoffs = true, trustLevel, requireWitness } = {},
+    { request, integrityMode, auditStatus = "PASS", stampVictory = request !== undefined, victoryAudit, victorySkipReason, verification, allowUnsignedLegacy, requireHandoffs, handoffs = true, trustLevel, requireWitness, spec, beforePlan } = {},
   ) => {
+    // 0.11.0: an approval-bound plan hashes prompt_draft.md before mkdir, so a
+    // fixture must put the exact draft (and its approval) on disk first.
+    if (spec !== undefined) {
+      const draftDir = join(root, ".opencode", "teamwork", runId)
+      mkdirSync(draftDir, { recursive: true })
+      writeFileSync(join(draftDir, "prompt_draft.md"), spec)
+    }
+    if (beforePlan) await beforePlan()
     await tools.plan.execute(
       {
         sessionId: runId,
         topology: "iterative-coding",
-        skipInterview: true,
+        ...(spec === undefined ? { skipInterview: true } : {}),
         ...(request !== undefined ? { request, integrityMode } : {}),
         ...(victoryAudit !== undefined ? { victoryAudit } : {}),
         ...(victoryAudit === "skip"
@@ -7958,17 +7968,13 @@ process.exit(0);
     }
 
     {
-      // 0.10.2 trust honesty: human/CI approvals must come from an external
-      // directory and a distinct Ed25519 approver key.
+      // 0.11.0 authenticated prompt approval: an approval is produced before
+      // the plan, binds the exact prompt_draft.md bytes, and must come from an
+      // external directory with a distinct Ed25519 approver key. These cases
+      // exercise the v3 binding at plan time and at final_verify.
       const approvalsDir = mkdtempSync(join(tmpdir(), "teamwork-approvals-"))
       const pair = generateKeyPairSync("ed25519")
       const approvalPublic = pair.publicKey.export({ format: "der", type: "spki" }).toString("base64url")
-      const approvalPrivate = pair.privateKey.export({ format: "der", type: "pkcs8" }).toString("base64url")
-      const approverAuth = createAuthContext(storageFor(testDir), {
-        OPENCODE_TEAMWORK_ED25519_PRIVATE_KEY: approvalPrivate,
-        OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: approvalPublic,
-        OPENCODE_TEAMWORK_ED25519_KEY_ID: "approver_fixture",
-      })
       const savedApprovalEnv = {}
       const approvalEnv = {
         OPENCODE_TEAMWORK_APPROVAL_DIR: approvalsDir,
@@ -7980,19 +7986,41 @@ process.exit(0);
         process.env[key] = approvalEnv[key]
       }
       setApprovalOwnerUidForTest(typeof process.geteuid === "function" ? process.geteuid() + 1 : 1)
-      const writeExternalApproval = async (runId, payload) => {
-        const file = join(approvalsDir, `${runId}.json`)
-        writeJsonFile(file, await approverAuth.signArtifact(`approvals/${runId}.json`, payload))
-        return file
-      }
-      const approvalPayload = (manifest, runId, trustLevel, overrides = {}) => ({
+      const draftText = "# Approved spec\n\nDeliver fixture A1 exactly.\n"
+      const draftSha = contentSha256Hex(Buffer.from(draftText, "utf8"))
+      const draftBytes = Buffer.byteLength(draftText)
+      const approvalPayload = (runId, trustLevel, overrides = {}) => ({
+        v: 1,
         runId,
         trustLevel,
-        approvedBy: "uid:john",
+        binding: "prompt",
+        promptDraftSha256: draftSha,
+        promptDraftBytes: draftBytes,
+        openGaps: 0,
+        approvalNonce: randomBytes(32).toString("base64url"),
         approvedAt: new Date().toISOString(),
-        manifestDigest: payloadDigest(manifest),
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        ...(trustLevel === "ci-attested" ? { attestedBy: "ci:github/workflows/ci.yml" } : { approvedBy: "uid:john" }),
         ...overrides,
       })
+      const writeExternalApproval = (runId, payload) => {
+        const file = join(approvalsDir, `${runId}.json`)
+        writeJsonFile(file, signApprovalArtifact(payload, { privateKey: pair.privateKey, keyId: "approver_fixture" }))
+        return file
+      }
+      const planApprovalRun = async (runId, trustLevel) =>
+        registeredTools.plan.execute(
+          {
+            sessionId: runId,
+            topology: "iterative-coding",
+            trustLevel,
+            request: `${trustLevel} approval fixture.`,
+            victoryAudit: "skip",
+            victorySkipReason: "fixture: approval-refusal case does not run a victory audit",
+            tasks: [{ id: "A1" }],
+          },
+          { sessionID: FIXTURE_ROOT_SESSION },
+        )
       try {
         // Missing approval directory: the plan is refused before any write.
         for (const key of Object.keys(approvalEnv)) delete process.env[key]
@@ -8018,97 +8046,141 @@ process.exit(0);
         )
         for (const key of Object.keys(approvalEnv)) process.env[key] = approvalEnv[key]
 
+        // A draft without an approval is refused at plan time, before mkdir.
         const runId = "20261123-000023-auth-trust-human-approval"
+        mkdirSync(runFile(testDir, runId, ""), { recursive: true })
+        writeFileSync(runFile(testDir, runId, "prompt_draft.md"), draftText)
+        const missing = await planApprovalRun(runId, "human-approved")
+        assert(
+          missing.content.startsWith("refused:") && missing.content.includes("AUTH_APPROVAL_MISSING"),
+          `a missing human approval must be named at plan time: ${missing.content}`,
+        )
+        assert(!existsSync(runFile(testDir, runId, "plan.dag.json")), "a refused approval plan must not write the plan")
+
+        // An approval inside the run directory is ignored when the external
+        // directory is configured (the old in-run path is version-1 legacy only).
+        writeJsonFile(
+          runFile(testDir, runId, `approvals/${runId}.json`),
+          signApprovalArtifact(approvalPayload(runId, "human-approved"), { privateKey: pair.privateKey, keyId: "approver_fixture" }),
+        )
+        const ignoredInRun = await planApprovalRun(runId, "human-approved")
+        assert(
+          ignoredInRun.content.includes("AUTH_APPROVAL_MISSING"),
+          `an in-run approval must be ignored for a version 3 plan: ${ignoredInRun.content}`,
+        )
+        rmSync(runFile(testDir, runId, "approvals"), { recursive: true, force: true })
+
+        // A bare role label is not a human/CI principal.
+        writeExternalApproval(runId, approvalPayload(runId, "human-approved", { approvedBy: "team/sentinel" }))
+        const bareLabel = await planApprovalRun(runId, "human-approved")
+        assert(
+          bareLabel.content.includes("AUTH_APPROVAL_NOT_HUMAN"),
+          `a bare team/... approver label must be refused at plan time: ${bareLabel.content}`,
+        )
+
+        // An approval granted while [OPEN:] gaps remained is refused.
+        writeExternalApproval(runId, approvalPayload(runId, "human-approved", { openGaps: 1 }))
+        const openGaps = await planApprovalRun(runId, "human-approved")
+        assert(
+          openGaps.content.includes("AUTH_APPROVAL_INCOMPLETE"),
+          `an approval with recorded gaps must be refused: ${openGaps.content}`,
+        )
+
+        // A distinct Ed25519 approver with a uid identity is accepted and the
+        // signed manifest records the prompt binding.
+        writeExternalApproval(runId, approvalPayload(runId, "human-approved"))
         await seedVerifiedRun(runId, ["A1"], {
           request: "Trust level human-approved fixture.",
           victoryAudit: "skip",
           trustLevel: "human-approved",
+          spec: draftText,
         })
         const manifest = readJsonFile(runFile(testDir, runId, "run.manifest.json"))
-        assert.strictEqual(manifest.version, 2, "0.10.2 plans must write manifest version 2")
+        assert.strictEqual(manifest.version, 3, "0.11.0 plans must write manifest version 3")
         assert.strictEqual(manifest.approvalPolicy, "external-dir")
         assert.strictEqual(manifest.approvalKeyId, "approver_fixture")
+        assert.strictEqual(manifest.approvalBinding, "prompt")
+        assert.strictEqual(manifest.specHash, draftSha, "the manifest must record the exact draft digest")
+        assert.strictEqual(manifest.specBytes, draftBytes)
+        assert.strictEqual(manifest.approvedBy, "uid:john")
+        const approved = await registeredTools.final_verify.execute({ sessionId: runId })
+        assert.strictEqual(approved.status, "PASS", `a prompt-bound Ed25519 approval must complete: ${approved.content}`)
+        const createdEvent = readFileSync(runFile(testDir, runId, "events.jsonl"), "utf8")
+          .trim()
+          .split("\n")
+          .map((line) => JSON.parse(line))
+          .find((e) => e.event === "run_created")
+        assert.strictEqual(createdEvent.promptDraftSha256, draftSha)
+        assert.strictEqual(createdEvent.binding, "prompt")
+        assert.strictEqual(createdEvent.approvalKeyId, "approver_fixture")
+        assert(createdEvent.approvalDigest && createdEvent.approvedBy === "uid:john", JSON.stringify(createdEvent))
 
-        const missing = await registeredTools.final_verify.execute({ sessionId: runId })
-        assert.strictEqual(missing.status, "FAIL")
+        // Editing the draft after approval is AUTH_APPROVAL_STALE.
+        writeFileSync(runFile(testDir, runId, "prompt_draft.md"), `${draftText}\nextra\n`)
+        const editedDraft = await registeredTools.final_verify.execute({ sessionId: runId })
+        assert.strictEqual(editedDraft.status, "FAIL", "an edited approved draft must fail final_verify")
         assert(
-          missing.reasons.some((r) => r.includes("AUTH_APPROVAL_MISSING")),
-          `a missing human approval must be named: ${JSON.stringify(missing.reasons)}`,
+          editedDraft.reasons.some((r) => r.includes("AUTH_APPROVAL_STALE")),
+          `an edited draft must be named stale: ${JSON.stringify(editedDraft.reasons)}`,
         )
-
-        // An approval inside the run directory is ignored when the external
-        // dir is configured (the old in-run path is version-1 legacy only).
-        writeJsonFile(
-          runFile(testDir, runId, `approvals/${runId}.json`),
-          await authFor(testDir).signArtifact(`approvals/${runId}.json`, approvalPayload(manifest, runId, "human-approved"), {
-            nonce: manifest.runNonce,
-          }),
+        // A re-plan with the edited draft is also refused.
+        const replanEdited = await registeredTools.plan.execute(
+          { sessionId: runId, topology: "iterative-coding", tasks: [{ id: "A1" }] },
+          { sessionID: FIXTURE_ROOT_SESSION },
         )
-        const ignoredInRun = await registeredTools.final_verify.execute({ sessionId: runId })
-        assert.strictEqual(ignoredInRun.status, "FAIL", "an in-run approval must be ignored for a version 2 manifest")
-        assert(ignoredInRun.reasons.some((r) => r.includes("AUTH_APPROVAL_MISSING")), JSON.stringify(ignoredInRun.reasons))
-
-        // HMAC approval (the run's own key) is not a human approval.
-        writeJsonFile(
-          join(approvalsDir, `${runId}.json`),
-          await authFor(testDir).signArtifact(`approvals/${runId}.json`, approvalPayload(manifest, runId, "human-approved")),
-        )
-        const hmacApproval = await registeredTools.final_verify.execute({ sessionId: runId })
-        assert.strictEqual(hmacApproval.status, "FAIL", "an HMAC approval must not satisfy human-approved")
         assert(
-          hmacApproval.reasons.some((r) => r.includes("AUTH_APPROVAL_NOT_HUMAN")),
-          `an HMAC approval must be named not-human: ${JSON.stringify(hmacApproval.reasons)}`,
+          replanEdited.content.includes("AUTH_APPROVAL_STALE") || replanEdited.content.includes("AUTH_STALE"),
+          `a re-plan after a draft edit must be refused: ${replanEdited.content}`,
         )
+        writeFileSync(runFile(testDir, runId, "prompt_draft.md"), draftText)
 
-        // A bare role label is not a human/CI principal.
-        await writeExternalApproval(runId, approvalPayload(manifest, runId, "human-approved", { approvedBy: "team/sentinel" }))
-        const bareLabel = await registeredTools.final_verify.execute({ sessionId: runId })
-        assert.strictEqual(bareLabel.status, "FAIL", "a bare team/... approver label must be refused")
-        assert(
-          bareLabel.reasons.some((r) => r.includes("AUTH_APPROVAL_NOT_HUMAN")),
-          JSON.stringify(bareLabel.reasons),
-        )
-
-        // Stale approval: expiresAt in the past.
-        await writeExternalApproval(
+        // Expired approval after the plan is AUTH_APPROVAL_STALE.
+        writeExternalApproval(
           runId,
-          approvalPayload(manifest, runId, "human-approved", {
-            approvedAt: manifest.createdAt,
-            expiresAt: new Date(Date.parse(manifest.createdAt) + 10).toISOString(),
+          approvalPayload(runId, "human-approved", {
+            approvalNonce: manifest.approvalNonce,
+            approvedAt: new Date(Date.now() - 7_200_000).toISOString(),
+            expiresAt: new Date(Date.now() - 3_600_000).toISOString(),
           }),
         )
         const expired = await registeredTools.final_verify.execute({ sessionId: runId })
         assert.strictEqual(expired.status, "FAIL", "an expired approval must fail")
-        assert(expired.reasons.some((r) => r.includes("AUTH_APPROVAL_STALE")), JSON.stringify(expired.reasons))
-
-        // approvedAt before the manifest baseline is stale.
-        await writeExternalApproval(
-          runId,
-          approvalPayload(manifest, runId, "human-approved", {
-            approvedAt: new Date(Date.parse(manifest.createdAt) - 1000).toISOString(),
-          }),
+        assert(
+          expired.reasons.some((r) => r.includes("AUTH_APPROVAL_STALE")),
+          `an expired approval must be named stale: ${JSON.stringify(expired.reasons)}`,
         )
-        const beforeManifest = await registeredTools.final_verify.execute({ sessionId: runId })
-        assert.strictEqual(beforeManifest.status, "FAIL")
-        assert(beforeManifest.reasons.some((r) => r.includes("AUTH_APPROVAL_STALE")), JSON.stringify(beforeManifest.reasons))
 
-        // A distinct Ed25519 approver with a uid identity is accepted.
-        await writeExternalApproval(runId, approvalPayload(manifest, runId, "human-approved", { approvedBy: "uid:john" }))
-        const approved = await registeredTools.final_verify.execute({ sessionId: runId })
-        assert.strictEqual(approved.status, "PASS", `a distinct Ed25519 approval must complete: ${approved.content}`)
+        // A different nonce after the plan is replay.
+        writeExternalApproval(runId, approvalPayload(runId, "human-approved"))
+        const replayed = await registeredTools.final_verify.execute({ sessionId: runId })
+        assert.strictEqual(replayed.status, "FAIL", "a different approval nonce must fail")
+        assert(
+          replayed.reasons.some((r) => r.includes("AUTH_APPROVAL_REPLAY")),
+          `a replayed nonce must be named: ${JSON.stringify(replayed.reasons)}`,
+        )
 
-        // Same-UID approval ownership is refused (the seam simulates the
+        // A same-UID approval directory is refused (the seam simulates the
         // normal single-UID host here).
+        writeExternalApproval(
+          runId,
+          approvalPayload(runId, "human-approved", { approvalNonce: manifest.approvalNonce }),
+        )
         setApprovalOwnerUidForTest(null)
         const sameOwner = await registeredTools.final_verify.execute({ sessionId: runId })
         assert.strictEqual(sameOwner.status, "FAIL", "a same-UID approval directory must be refused")
-        assert(sameOwner.reasons.some((r) => r.includes("AUTH_APPROVAL_UNTRUSTED")), JSON.stringify(sameOwner.reasons))
+        assert(
+          sameOwner.reasons.some((r) => r.includes("AUTH_APPROVAL_UNTRUSTED")),
+          JSON.stringify(sameOwner.reasons),
+        )
         setApprovalOwnerUidForTest(typeof process.geteuid === "function" ? process.geteuid() + 1 : 1)
 
         // A tampered (unsigned) field is AUTH_INVALID.
-        const tampered = readJsonFile(join(approvalsDir, `${runId}.json`))
-        tampered.manifestDigest = "0".repeat(64)
-        writeJsonFile(join(approvalsDir, `${runId}.json`), tampered)
+        const validArtifact = signApprovalArtifact(
+          approvalPayload(runId, "human-approved", { approvalNonce: manifest.approvalNonce }),
+          { privateKey: pair.privateKey, keyId: "approver_fixture" },
+        )
+        validArtifact.approvedBy = "uid:attacker"
+        writeJsonFile(join(approvalsDir, `${runId}.json`), validArtifact)
         const stale = await registeredTools.final_verify.execute({ sessionId: runId })
         assert.strictEqual(stale.status, "FAIL", "a tampered approval must fail")
         assert(
@@ -8116,64 +8188,20 @@ process.exit(0);
           `a tampered approval must be named: ${JSON.stringify(stale.reasons)}`,
         )
 
-        // Pre-0.10.2 (manifest version 1) keeps the in-run approval readable,
-        // and records that it was unbound.
-        const legacyRunId = "20261123-000023-auth-approval-legacy-v1"
-        await seedVerifiedRun(legacyRunId, ["A1"], {
-          request: "Trust level legacy approval fixture.",
-          victoryAudit: "skip",
-          trustLevel: "human-approved",
-        })
-        const legacyManifest = readJsonFile(runFile(testDir, legacyRunId, "run.manifest.json"))
-        legacyManifest.version = 1
-        delete legacyManifest.approvalPolicy
-        delete legacyManifest.approvalKeyId
-        writeJsonFile(
-          runFile(testDir, legacyRunId, "run.manifest.json"),
-          await authFor(testDir).signRunArtifact(legacyRunId, "run.manifest.json", legacyManifest),
-        )
-        const legacyApproval = {
-          runId: legacyRunId,
-          trustLevel: "human-approved",
-          approvedBy: "fixture-human",
-          at: new Date().toISOString(),
-          manifestDigest: payloadDigest(legacyManifest),
-        }
-        writeJsonFile(
-          runFile(testDir, legacyRunId, `approvals/${legacyRunId}.json`),
-          await authFor(testDir).signArtifact(`approvals/${legacyRunId}.json`, legacyApproval, {
-            nonce: legacyManifest.runNonce,
-          }),
-        )
-        const legacyFinal = await registeredTools.final_verify.execute({ sessionId: legacyRunId })
-        assert.strictEqual(legacyFinal.status, "PASS", `a pre-0.10.2 in-run approval must stay readable: ${legacyFinal.content}`)
-        const legacyEvents = readFileSync(runFile(testDir, legacyRunId, "events.jsonl"), "utf8")
-          .trim()
-          .split("\n")
-          .map((line) => JSON.parse(line))
-        assert(
-          legacyEvents.some((e) => e.event === "approval_unbound"),
-          `the legacy path must record approval_unbound: ${JSON.stringify(legacyEvents.slice(-3))}`,
-        )
-
-        // ci-attested uses the same directory/key rules with attestedBy.
+        // ci-attested uses the same prompt binding with attestedBy.
         const ciRunId = "20261123-000027-auth-trust-ci-attested"
+        mkdirSync(runFile(testDir, ciRunId, ""), { recursive: true })
+        writeFileSync(runFile(testDir, ciRunId, "prompt_draft.md"), draftText)
+        writeExternalApproval(ciRunId, approvalPayload(ciRunId, "ci-attested"))
         await seedVerifiedRun(ciRunId, ["A1"], {
           request: "Trust level ci-attested fixture.",
           victoryAudit: "skip",
           trustLevel: "ci-attested",
+          spec: draftText,
         })
-        const ciMissing = await registeredTools.final_verify.execute({ sessionId: ciRunId })
-        assert.strictEqual(ciMissing.status, "FAIL")
-        assert(ciMissing.reasons.some((r) => r.includes("AUTH_APPROVAL_MISSING")))
         const ciManifest = readJsonFile(runFile(testDir, ciRunId, "run.manifest.json"))
-        await writeExternalApproval(ciRunId, {
-          runId: ciRunId,
-          trustLevel: "ci-attested",
-          attestedBy: "ci:github/workflows/ci.yml",
-          approvedAt: new Date().toISOString(),
-          manifestDigest: payloadDigest(ciManifest),
-        })
+        assert.strictEqual(ciManifest.approvedBy, "ci:github/workflows/ci.yml")
+        assert.strictEqual(ciManifest.approvalBinding, "prompt")
         const attested = await registeredTools.final_verify.execute({ sessionId: ciRunId })
         assert.strictEqual(attested.status, "PASS", `a signed CI attestation must complete: ${attested.content}`)
       } finally {
@@ -8185,7 +8213,6 @@ process.exit(0);
         rmSync(approvalsDir, { recursive: true, force: true })
       }
     }
-
     {
       // End-to-end Ed25519 at the tool layer: plan, seed, and final_verify all
       // sign with a local Ed25519 key, so trustLevel external-signer completes.

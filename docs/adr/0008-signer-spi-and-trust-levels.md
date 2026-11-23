@@ -225,7 +225,18 @@ root-equivalent groups, caller-owned signer/approval paths, DB group/other bits,
 non-pinned containment while asserting approval/witness) are `fail`, not
 warning, and `doctor --security --require-hardened` exits 2 on `fail`/`unknown`.
 
-## 7. References
+## 7. Amendment — 0.11.0 prompt binding
+
+[ADR 0011](0011-authenticated-prompt-approval.md) supersedes the version-2
+manifestDigest-bound approval for new plans. Version 3 manifests bind the exact
+`prompt_draft.md` bytes (`specHash`/`specBytes`), the approval payload digest,
+its one-use nonce, the approver, and `approvedAt`; the plan verifies the
+approval before any mkdir and consumes the nonce. Version 1/2 manifests keep
+the semantics described in §6. The envelope, key ring, signer SPI and level
+names are unchanged; the plugin/command signer now also refuses `approvals/`
+paths (`AUTH_APPROVAL_SCOPE`).
+
+## 8. References
 
 - ADR 0005: artifact authenticity, canonical JSON, digest index, signed baseline.
 - ADR 0006: same-UID isolation feasibility and the missing non-oracle primitive.

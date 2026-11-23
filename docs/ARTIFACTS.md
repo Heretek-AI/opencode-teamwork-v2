@@ -189,7 +189,7 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
 
 ```json
 {
-  "version": 2,
+  "version": 3,
   "sessionId": "20261122-120000-abcd",
   "rootSessionId": "ses_...",
   "integrityMode": "development|demo|benchmark",
@@ -207,6 +207,13 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
   "requireWitness": false,
   "approvalPolicy": "external-dir|in-run-legacy|none",
   "approvalKeyId": "approval_... | null",
+  "specHash": "sha256 of the exact prompt_draft.md bytes | null",
+  "specBytes": 2089,
+  "approvalDigest": "sha256 of the approval payload without _auth | null",
+  "approvalNonce": "base64url >=128-bit one-use nonce | null",
+  "approvalBinding": "prompt",
+  "approvedBy": "uid:<name>|oidc:<issuer>#<sub>|ci:<workflow> | null",
+  "approvedAt": "2026-11-22T11:59:00.000Z",
   "createdAt": "2026-11-22T12:00:00.000Z",
   "_auth": {
     "v": 1,
@@ -220,12 +227,24 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
 }
 ```
 
-- Version 2 is written by 0.10.2+. Version 1 manifests remain readable;
-  their in-run `approvals/<runId>.json` is honoured only for those pre-0.10.2
-  runs and is recorded as `approval_unbound`.
-- `approvalPolicy`/`approvalKeyId` are part of the signed baseline and drift
-  checks. `human-approved`/`ci-attested` pin `external-dir` and the configured
-  verify-only approver key; a re-plan cannot remove or change either.
+- Version 3 is written by 0.11.0+. Version 2 (0.10.2) and version 1
+  (pre-0.10.2) manifests remain readable. Version 1 in-run
+  `approvals/<runId>.json` is honoured only for those runs and is recorded as
+  `approval_unbound`; version 2 keeps its manifestDigest-bound approval
+  semantics.
+- `specHash` is an **unkeyed SHA-256 of the exact file bytes** (not the keyed
+  artifact digest), and `specBytes` is the byte length. `teamwork_plan` reads
+  the draft through the bounded no-follow run reader before any `mkdir`, so a
+  symlinked, non-regular, or edited draft cannot be planned against a different
+  text. A version-3 plan records `specHash`/`specBytes` whenever a draft exists,
+  including `local-hmac` runs; editing the draft later is `AUTH_STALE`.
+- `approvalPolicy`/`approvalKeyId`/`specHash`/`specBytes`/`approvalDigest`/
+  `approvalNonce`/`approvalBinding`/`approvedBy`/`approvedAt` are part of the
+  signed baseline and drift checks. `human-approved`/`ci-attested` pin
+  `external-dir` and the configured verify-only approver key; a re-plan cannot
+  remove or change either. For a version-3 approval, the manifest records the
+  approval payload digest (never a digest of the manifest inside the approval),
+  which removes the old circular manifestDigest requirement.
 
 - `rootSessionId` is the plan-time caller session. `teamwork_victory_audit`,
   `teamwork_wave_record`, and `teamwork_report` require the caller session to
@@ -297,21 +316,101 @@ stored at `auth/witness/<runId>/<relPath>`.
 `final_verify` enforces them: `external-signer` refuses HMAC envelopes
 (`AUTH_TRUST_LEVEL`), `human-approved`/`ci-attested` require an Ed25519
 `approvals/<runId>.json` from `OPENCODE_TEAMWORK_APPROVAL_DIR` signed by a key
-distinct from `runKeyId` and bound to the manifest digest
+distinct from `runKeyId` and bound to the exact prompt draft and this run
 (`AUTH_APPROVAL_MISSING`, `AUTH_APPROVAL_DIR`, `AUTH_APPROVAL_UNTRUSTED`,
-`AUTH_APPROVAL_STALE`, `AUTH_APPROVAL_NOT_HUMAN`), and a required witness
+`AUTH_APPROVAL_STALE`, `AUTH_APPROVAL_NOT_HUMAN`,
+`AUTH_APPROVAL_INCOMPLETE`, `AUTH_APPROVAL_REPLAY`), and a required witness
 without a receipt fails `AUTH_WITNESS_UNAVAILABLE`. Version 1 (pre-0.10.2)
 manifests keep the in-run approval path readable and record
-`approval_unbound`. The signed manifest is version 2 and pins `approvalKeyId`
-and `approvalPolicy`; a re-plan cannot change either.
-`OPENCODE_TEAMWORK_SIGNER` that is configured but unavailable/malformed fails
-`AUTH_SIGNER_UNAVAILABLE`; there is no fallback to local HMAC.
+`approval_unbound`. The signed manifest is version 3 and pins `approvalKeyId`,
+`approvalPolicy`, and the prompt/approval binding; a re-plan cannot change any
+of them. `OPENCODE_TEAMWORK_SIGNER` that is configured but
+unavailable/malformed fails `AUTH_SIGNER_UNAVAILABLE`; there is no fallback to
+local HMAC. The plugin signer and command signer refuse an `approvals/` path
+with `AUTH_APPROVAL_SCOPE`; approvals are produced only by the approver key
+holder.
+
+### `approvals/<runId>.json` — authenticated prompt approval (ADR 0011)
+
+Written outside the run and repository, in an absolute
+`OPENCODE_TEAMWORK_APPROVAL_DIR` owned by a different UID, by
+`opencode-teamwork approve sign` (or an equivalent CI job) using the approver's
+Ed25519 private key directly. The plugin verifies it with
+`OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY` and never signs it itself.
+
+```json
+{
+  "v": 1,
+  "runId": "20261122-120000-abcd",
+  "trustLevel": "human-approved|ci-attested",
+  "binding": "prompt",
+  "promptDraftSha256": "unkeyed sha256 of the exact prompt_draft.md bytes",
+  "promptDraftBytes": 2089,
+  "openGaps": 0,
+  "approvalNonce": "base64url >=128-bit, one use per run",
+  "approvedAt": "2026-11-22T11:59:00.000Z",
+  "expiresAt": "2026-11-23T11:59:00.000Z",
+  "planHash": "optional pre-commitment to an existing plan | null",
+  "approvedBy": "uid:<name>|oidc:<issuer>#<sub>|ci:<workflow>",
+  "_auth": {
+    "v": 1,
+    "alg": "ed25519",
+    "keyId": "approval_...",
+    "path": "approvals/20261122-120000-abcd.json",
+    "digest": "sha256 of the payload without _auth",
+    "sig": "base64url Ed25519 signature",
+    "nonce": "must equal approvalNonce",
+    "at": "2026-11-22T11:59:01.000Z"
+  }
+}
+```
+
+- `ci-attested` uses `attestedBy` (usually `ci:<workflow>`) instead of
+  `approvedBy`; the binding fields are identical.
+- `approvedAt`/`expiresAt` are validated at plan time and again at
+  `final_verify`: the default lifetime is 24 h
+  (`OPENCODE_TEAMWORK_APPROVAL_TTL_MS`, hard cap 7 days), and a prompt-bound
+  approval must still be live when the manifest was written.
+- `openGaps` must be `0`. `approve sign --allow-open` records a nonzero count
+  (so an operator can document that gaps remained) and the plan then refuses
+  the approval with `AUTH_APPROVAL_INCOMPLETE`; a draft containing `[OPEN:` is
+  refused even if the approval claims zero.
+- `planHash` is optional. `null` approves any plan for the exact draft; a
+  non-null value must equal an existing run's `plan.dag.json` baseline, so a
+  re-approval is tied to the plan it was shown.
+- `approvalNonce` must be at least 128 bits and equal `_auth.nonce`. The plugin
+  consumes it once per run under the plan lock and stores
+  `{approvalNonce, approvalDigest, planHash, at, runId}` at
+  `ctx.storage` key `auth/approval/<runId>/consumed`. A later plan with a
+  different nonce is `AUTH_APPROVAL_REPLAY`. The nonce is only consumed after
+  every plan-time refusal path has passed.
+- The approval does **not** contain a manifest digest: the manifest records its
+  `approvalDigest`, so the two cannot reference each other circularly.
+- `human-approved`/`ci-attested` are refused when the approval directory is
+  inside the run/repo, is a symlink, or is owned by the run process's UID
+  (`AUTH_APPROVAL_UNTRUSTED`). The approval file itself must be a regular file
+  owned by the directory's UID.
 
 Failure vocabulary: `AUTH_UNAVAILABLE`, `AUTH_KEY_CORRUPT`, `AUTH_MISSING`,
 `AUTH_INVALID`, `AUTH_UNKNOWN_KEY`, `AUTH_INDEX_MISSING`, `AUTH_STALE`,
 `AUTH_LEGACY`, `AUTH_SIGNER_UNAVAILABLE`, `AUTH_WITNESS_UNAVAILABLE`,
 `AUTH_TRUST_LEVEL`, `AUTH_APPROVAL_MISSING`, `AUTH_APPROVAL_DIR`,
-`AUTH_APPROVAL_UNTRUSTED`, `AUTH_APPROVAL_STALE`, `AUTH_APPROVAL_NOT_HUMAN`.
+`AUTH_APPROVAL_UNTRUSTED`, `AUTH_APPROVAL_STALE`, `AUTH_APPROVAL_NOT_HUMAN`,
+`AUTH_APPROVAL_INCOMPLETE`, `AUTH_APPROVAL_REPLAY`, `AUTH_APPROVAL_SCOPE`.
+
+Plan-time approval order (all before `mkdir` / any state write):
+1. resolve the external directory and its ownership;
+2. read `prompt_draft.md` through the bounded no-follow reader and hash the
+   exact bytes;
+3. verify the approval envelope (Ed25519, distinct key, pinned
+   `approvalKeyId`) and its `runId`/`trustLevel`/`binding`;
+4. require `promptDraftSha256`/`promptDraftBytes` to equal the current bytes,
+   `openGaps: 0`, and no remaining `[OPEN:` marker;
+5. require a fresh `approvedAt`/`expiresAt` and an unused
+   `approvalNonce == _auth.nonce`.
+
+`final_verify` repeats steps 2-5, then compares the approval payload digest,
+nonce, approver, and `approvedAt` with the signed manifest.
 
 > **Boundary.** A same-UID shell with read access to `opencode.db` / the plugin
 > KV store can read a local HMAC or Ed25519 private key and mint envelopes, and
@@ -923,6 +1022,14 @@ approval**. With no spec and neither override, the call is refused with an
 actionable message naming the expected path, `/teamwork-craft`, and
 `skipInterview: true`. A whitespace-only `prompt_draft.md` counts as no spec.
 
+`human-approved`/`ci-attested` go beyond the presence gate: a version-3 plan
+requires the external approval to bind the **exact draft bytes**
+(`specHash`/`specBytes`), the run id, and a one-use nonce. `skipInterview` does
+not bypass that binding (the approval is refused with
+`AUTH_APPROVAL_INCOMPLETE` when no draft exists), and a draft containing
+`[OPEN:` cannot be planned. The approval can be produced with
+`opencode-teamwork approve request`/`sign` **before** the plan; see ADR 0011.
+
 **Request record & integrity mode (`teamwork_plan`).** Two additive, optional inputs:
 
 | Input | Type | Default | Meaning |
@@ -1288,7 +1395,11 @@ The event kinds:
   (`"satisfied" | "bypassed" | "not_required"`) and, only when satisfied,
   `specPath` (the `prompt_draft.md` path, ≤200 chars). These two fields appear
   **only** on `run_created`; every other event keeps the fields above.
-  `specGate` and `specPath` also go through `clean()`. The field records what the caller did; it is not proof that a user approved the spec. The timeline view parses
+  `specGate` and `specPath` also go through `clean()`. The field records what the caller did; it is not proof that a user approved the spec. On a
+  version-3 approval run `run_created` also records the approval summary:
+  `approvalDigest`, `approvalKeyId`, `approvedBy`, `promptDraftSha256`, and
+  `binding: "prompt"` (each sanitised and capped). The event is a record of
+  what the gate accepted, not another signature. The timeline view parses
   events field by field and does not surface `specGate` (it is visible in
   `events.jsonl` itself). When the input-preflight gate was bypassed with
   `allowMissingInputs: true`, `run_created` also carries `note` (e.g.

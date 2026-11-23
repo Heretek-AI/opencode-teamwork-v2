@@ -340,7 +340,7 @@ export function ensureSafeRunSubpath(
 }
 
 export type BoundedReadResult =
-  | { status: "ok"; text: string }
+  | { status: "ok"; text: string; bytes?: Buffer }
   | { status: "absent" }
   | { status: "error"; error: string }
 
@@ -363,7 +363,7 @@ export function readBoundedFileNoFollow(file: string, maxBytes: number): Bounded
 }
 
 function toBoundedResult(r: SafeFsRead, file: string, maxBytes: number): BoundedReadResult {
-  if (r.status === "ok") return { status: "ok", text: r.text }
+  if (r.status === "ok") return { status: "ok", text: r.text, ...(r.bytes ? { bytes: r.bytes } : {}) }
   if (r.status === "absent") return { status: "absent" }
   if (r.status === "oversize") {
     return { status: "error", error: `refused: "${basename(file)}" exceeds ${maxBytes} byte read cap` }
