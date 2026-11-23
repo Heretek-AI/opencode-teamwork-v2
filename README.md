@@ -358,6 +358,13 @@ using **npm Trusted Publishing** (OIDC, no long-lived token). One-time setup:
    git push --follow-tags   # triggers the workflow
    ```
 
+Release tags are provenance-checked before publish:
+`scripts/check-release-tag.mjs` requires the tag's commit to be an ancestor of
+`origin/main`. The historical `v0.6.0` and `v0.7.0` tags are sibling release
+commits with trees identical to their `main` release commits; they predate this
+guard. Every future `v*` tag push must point at a commit already on `main`, and
+published tags are never rewritten.
+
 Note that npm is restricting bypass-2FA tokens from January 2027, so Trusted
 Publishing is the durable option.
 
