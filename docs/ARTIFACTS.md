@@ -1095,15 +1095,30 @@ and every path under `tournament/` enforces segment-wise `lstatSync` symlink ref
 `O_CREAT | O_EXCL` temp files (a planted symlink/hard link at a temp path cannot
 redirect an atomic write).
 
-**Known limitations (same threat model).** `O_NOFOLLOW` covers only the final path
-component: an intermediate directory swapped for a symlink between the segment
-checks and the open is still a race. Closing it fully needs component-by-component
-`openat`/`O_PATH` traversal, which is not implemented. The run-context line injected
-by `describeRun` is sanitised (`clean()`, bounded reads that refuse symlinks and
-non-regular files) but not authenticated: a writer that can already modify the run
-directory can influence what agents read there. Verdicts are not affected — they are
-recomputed from the evidence artifacts, not from injected context. `events.jsonl`
-remains a best-effort, fail-open path with the same final-component TOCTOU caveat.
+**Known limitations (same threat model).** Run-artifact reads go through the
+shared `plugins/opencode-teamwork/safe-fs.mjs` primitive: open → `fstat` →
+regular-file → size cap → **fd containment** → bounded read. On **Linux with a
+usable `/proc/self/fd`**, the opened descriptor's real path must stay under the
+run's realpath, so an intermediate directory swapped for a symlink between the
+segment checks and the open cannot return outside bytes. On Linux where
+`/proc/self/fd` is absent or unusable, existing-file reads fail closed. On
+**macOS and Windows** Node core exposes no fd-to-path primitive, so the check is
+unavailable: those platforms keep `O_NOFOLLOW`/`lstat`, `O_NONBLOCK`, `fstat`,
+the byte cap and the intermediate-component residual race. The guarantee is not
+portable. `O_NOFOLLOW` itself still covers only the final path component. The
+run-context line injected by `describeRun` is sanitised (`clean()`, bounded
+reads that refuse symlinks and non-regular files) but not authenticated: a
+writer that can already modify the run directory can influence what agents read
+there. Verdicts are not affected — they are recomputed from the evidence
+artifacts, not from injected context. `events.jsonl` remains a best-effort,
+fail-open path with the same guarantee boundary.
+
+**Write path.** ADR 0004 intentionally does **not** claim write containment.
+`writeSafeRunFile` and `writeTextSafe`/`writeJsonSafe` validate the target by
+path, then `mkdir`/create/`rename` by path; a raced intermediate directory can
+still redirect a write outside the run. The random `wx` temp plus rename does
+prevent a planted temp-path symlink or hard link from overwriting a victim.
+Closing the remaining write race needs the same component-wise primitive.
 
 - `tournament/manifest.json`: 5-phase bounded state machine (`PROPOSE → FALSIFY_PRUNE → MERGE → REFEREE_SCORE → VICTORY_AUDIT` → `COMPLETED | FAILED | CANCELLED | BUDGET_HALTED`), `optInProof`, `budgetEstimate`, `candidates`, and deterministic `rankedCandidates`.
 - `tournament/verdict.json`: written by `team/referee` on `audit` (`ACCEPT`/`REJECT`) or by `finalizeTournamentPartial` on cancellation/budget halt (`PARTIAL`).
