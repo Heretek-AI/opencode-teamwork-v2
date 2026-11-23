@@ -2276,6 +2276,67 @@ try {
 
   console.log("✓ CLI run management helpers verified")
 
+  // ADR 0004 cross-reader: run-root reads cannot be redirected outside by a
+  // static intermediate symlink, a symlinked snapshots.json or prompt_draft.md.
+  {
+    const SENTINEL = "SENTINEL_OUTSIDE_ENGINE"
+
+    const crossRun = "20261122-000000-safe-cross"
+    const crossDir = join(testDir, ".opencode", "teamwork", crossRun)
+    mkdirSync(join(crossDir, "verify"), { recursive: true })
+    writeFileSync(join(crossDir, "state.json"), JSON.stringify({ sessionId: crossRun, phase: "DISPATCH", tasks: {} }))
+    writeFileSync(join(crossDir, "plan.dag.json"), JSON.stringify({ sessionId: crossRun, topology: "iterative-coding", tasks: [] }))
+    writeFileSync(join(crossDir, "verify", "report-T1.json"), JSON.stringify({ taskId: "T1", status: "PASS" }))
+    const crossOutside = join(testDir, "outside-cross-engine")
+    mkdirSync(crossOutside, { recursive: true })
+    writeFileSync(join(crossOutside, "report-T1.json"), JSON.stringify({ taskId: "T1", status: "PASS", summary: SENTINEL }))
+    rmSync(join(crossDir, "verify"), { recursive: true, force: true })
+    symlinkSync(crossOutside, join(crossDir, "verify"))
+    const crossRead = readBoundedRunFile(crossDir, join(crossDir, "verify", "report-T1.json"), 4096)
+    assert.strictEqual(crossRead.status, "error", `intermediate symlink must be refused: ${JSON.stringify(crossRead)}`)
+    assert(!JSON.stringify(crossRead).includes(SENTINEL), "intermediate symlink leaked outside bytes")
+
+    // A symlinked snapshots.json must not be able to nominate a privileged
+    // caller; deriveCallerAgent falls back to it only when the session lookup is
+    // empty, and the root-aware reader refuses the link.
+    const snapRun = "20261122-000000-safe-snap"
+    await seedVerifiedRun(snapRun, ["S1"], { victoryAudit: "skip", stampVictory: false, verification: "strict" })
+    const snapOutside = join(testDir, "outside-snap.json")
+    writeFileSync(snapOutside, JSON.stringify({ sessionId: snapRun, rootSessionIds: [], bySession: { ses_forged: { agent: "team/security-auditor" } } }))
+    rmSync(runFile(testDir, snapRun, "snapshots.json"), { force: true })
+    symlinkSync(snapOutside, runFile(testDir, snapRun, "snapshots.json"))
+    const prevGet = mockCtx.session.get
+    mockCtx.session.get = async () => undefined
+    try {
+      const forged = await registeredTools.wave_record.execute(
+        { sessionId: snapRun, taskId: "S1", kind: "audit", verdict: "CLEAN", notes: "forged", evidence: "none" },
+        { sessionID: "ses_forged" },
+      )
+      assert(forged.content.startsWith("refused:"), `a symlinked snapshots.json must not authorize a caller: ${forged.content}`)
+      assert(/session identity|trusted session agent/i.test(forged.content), `refusal must name the missing trusted identity: ${forged.content}`)
+      assert(!existsSync(runFile(testDir, snapRun, "verify/audit-S1.json")), "no verdict may be written from forged provenance")
+    } finally {
+      mockCtx.session.get = prevGet
+    }
+
+    // A symlinked prompt_draft.md is not an approved spec.
+    const specRun = "20261122-000000-safe-spec"
+    const specDir = join(testDir, ".opencode", "teamwork", specRun)
+    mkdirSync(specDir, { recursive: true })
+    const specOutside = join(testDir, "outside-spec.md")
+    writeFileSync(specOutside, "# Approved spec\n\nShip it.\n")
+    symlinkSync(specOutside, join(specDir, "prompt_draft.md"))
+    const specRes = await registeredTools.plan.execute({
+      sessionId: specRun,
+      topology: "iterative-coding",
+      tasks: [{ id: "T1" }],
+    })
+    assert(specRes.content.startsWith("refused: no spec found"), `a symlinked prompt_draft.md must not satisfy the spec gate: ${specRes.content}`)
+    assert(!existsSync(join(specDir, "plan.dag.json")), "a refused spec gate must write no plan")
+  }
+
+  console.log("✓ ADR 0004 cross-reader containment (verify/, snapshots.json, prompt_draft.md) verified")
+
   // ==========================================
   // Part 5: Model Map Priority Resolution
   // ==========================================

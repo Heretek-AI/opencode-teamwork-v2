@@ -50,6 +50,7 @@ process.env.XDG_CONFIG_HOME = join(emptyHome, ".config")
 const SESSION = "20261018-100000-ex01"
 const MISSING = "20261018-999999-none"
 const XSS = "<script>alert(1)</script>"
+const SENTINEL = "SENTINEL_OUTSIDE_EXPORT"
 
 let passed = 0
 let failed = 0
@@ -824,6 +825,42 @@ await check("reader: a symlinked events.jsonl is never followed", () => {
   assert.strictEqual(data.timing, "unknown", "a symlinked events file must not produce events timing")
   assert(data.warnings.some((w) => w.includes("events.jsonl") && w.includes("not a regular file")), `symlink must be reported: ${data.warnings}`)
   assert(!renderExport(data, { format: "html" }).includes("outside-events.jsonl"), "the link target must not be read")
+})
+
+await check("reader: an intermediate-symlinked verify/ dir never leaks outside bytes", () => {
+  const root = makeRoot()
+  writeRun(root, { events: null })
+  const dir = runDirOf(root, SESSION)
+  rmSync(join(dir, "verify"), { recursive: true, force: true })
+  const outside = join(testDir, "outside-verify-dir")
+  mkdirSync(outside, { recursive: true })
+  writeJson(join(outside, "security-audit.json"), { status: "PASS", summary: SENTINEL })
+  writeJson(join(outside, "final.json"), { status: "PASS", summary: SENTINEL })
+  symlinkSync(outside, join(dir, "verify"))
+  const data = buildExportData(root, SESSION)
+  const html = renderExport(data, { format: "html" })
+  const md = renderExport(data, { format: "markdown" })
+  assert(!html.includes(SENTINEL), "HTML must not contain outside bytes")
+  assert(!md.includes(SENTINEL), "Markdown must not contain outside bytes")
+  assert(data.warnings.some((w) => w.includes("verify/") && w.includes("symlink")), `verify/ symlink must be reported: ${data.warnings}`)
+  assert.strictEqual(data.security, null, "a symlinked verify/ dir must not supply an audit")
+})
+
+await check("reader: an intermediate-symlinked lemma/ dir never leaks outside bytes", () => {
+  const root = makeRoot()
+  writeRun(root, { events: null })
+  const dir = runDirOf(root, SESSION)
+  const outside = join(testDir, "outside-lemma-dir")
+  mkdirSync(outside, { recursive: true })
+  writeJson(join(outside, "manifest.json"), { phase: SENTINEL, nodes: {} })
+  writeJson(join(outside, "formalization-review.json"), { final: { verdict: SENTINEL } })
+  symlinkSync(outside, join(dir, "lemma"))
+  const data = buildExportData(root, SESSION)
+  const html = renderExport(data, { format: "html" })
+  const md = renderExport(data, { format: "markdown" })
+  assert(!html.includes(SENTINEL) && !md.includes(SENTINEL), "lemma/ symlink must not leak outside bytes")
+  assert(!("lemma" in data), "a symlinked lemma/ dir must not populate data.lemma")
+  assert(data.warnings.some((w) => w.includes("lemma/") && w.includes("symlink")), `lemma/ symlink must be reported: ${data.warnings}`)
 })
 
 await check("reader: an oversize pitfalls.md is reported as oversize, never absent", () => {

@@ -10,6 +10,7 @@
 // make the process exit non-zero.
 
 import { buildTimeline, renderTimeline, timelineWarnings } from "../lib/timeline.mjs"
+import { inspectTeamworkRun, listTeamworkRuns } from "../lib/runs.mjs"
 import { registerTeamworkTools } from "../plugins/opencode-teamwork/tools.ts"
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, utimesSync, symlinkSync, truncateSync, existsSync, lstatSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -39,6 +40,7 @@ process.env.XDG_CONFIG_HOME = join(emptyHome, ".config")
 
 const SESSION = "20261018-100000-tl01"
 const SESSION_TWO = "20261018-110000-tl02"
+const SENTINEL = "SENTINEL_OUTSIDE_TIMELINE"
 
 let passed = 0
 let failed = 0
@@ -1212,6 +1214,39 @@ await check("tournament: symlinked tournament/ dir is refused with diagnostic wa
   const warns = timelineWarnings(tl)
   assert(warns.some((w) => w.includes("tournament/") && w.includes("symlink")), `must record symlink warning: ${JSON.stringify(warns)}`)
 })
+await check("containment: an intermediate-symlinked lemma/ dir never leaks outside bytes", () => {
+  const root = makeRun({ events: null })
+  const dir = runDirOf(root, SESSION)
+  const outside = uniq("outside-lemma")
+  writeJson(join(outside, "manifest.json"), { phase: SENTINEL, nodes: {} })
+  writeJson(join(outside, "formalization-review.json"), { preSearch: { verdict: SENTINEL }, final: { verdict: SENTINEL } })
+  symlinkSync(outside, join(dir, "lemma"))
+  const tl = buildTimeline(root, SESSION)
+  const out = renderTimeline(tl).join("\n")
+  assert(!("lemma" in tl), "a symlinked lemma/ dir must not populate tl.lemma")
+  assert(!out.includes(SENTINEL), "renderTimeline must not contain outside bytes")
+  assert(timelineWarnings(tl).some((w) => w.includes("lemma/") && w.includes("symlink")), `lemma/ symlink must be reported: ${timelineWarnings(tl)}`)
+})
+
+await check("containment: lib/runs inspect and list never leak symlinked artifacts", () => {
+  const root = makeRun({ events: null })
+  const dir = runDirOf(root, SESSION)
+  const outside = uniq("outside-runs-artifacts")
+  mkdirSync(outside, { recursive: true })
+  writeJson(join(outside, "security-audit.json"), { status: "PASS", summary: SENTINEL })
+  writeFileSync(join(outside, "pitfalls.md"), `- ${SENTINEL}\n`)
+  rmSync(join(dir, "verify"), { recursive: true, force: true })
+  symlinkSync(outside, join(dir, "verify"))
+  symlinkSync(join(outside, "pitfalls.md"), join(dir, "pitfalls.md"))
+
+  const listed = listTeamworkRuns(root)
+  const inspected = inspectTeamworkRun(root, SESSION)
+  assert(!JSON.stringify(listed).includes(SENTINEL), "listTeamworkRuns leaked outside bytes")
+  assert(!JSON.stringify(inspected).includes(SENTINEL), "inspectTeamworkRun leaked outside bytes")
+  assert.deepStrictEqual(inspected.pitfalls, [], "a symlinked pitfalls.md must contribute no entries")
+  assert.strictEqual(inspected.audit, undefined, "a symlinked verify/ dir must not supply an audit")
+})
+
 // ==========================================
 // 12. Bounded reader: a FIFO is refused without blocking
 // ==========================================
