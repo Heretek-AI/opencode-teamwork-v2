@@ -134,6 +134,7 @@ import {
 } from "./victory.ts"
 import {
   AuthError,
+  approvalKeyIdFromEnv,
   canonicalJson,
   createAuthContext,
   payloadDigest,
@@ -739,6 +740,23 @@ const DEFAULT_TRUST_LEVEL: TrustLevel = "local-hmac"
 function normalizeTrustLevel(value: unknown): TrustLevel | undefined {
   const v = String(value ?? "").trim()
   return (TRUST_LEVELS as readonly string[]).includes(v) ? (v as TrustLevel) : undefined
+}
+
+/** Trust levels that require an approval artifact from a different principal. */
+function requiresApproval(trustLevel: TrustLevel): boolean {
+  return trustLevel === "human-approved" || trustLevel === "ci-attested"
+}
+
+function approvalPolicyFor(trustLevel: TrustLevel, version: number): ApprovalPolicy {
+  if (!requiresApproval(trustLevel)) return "none"
+  return version < RUN_MANIFEST_VERSION ? "in-run-legacy" : "external-dir"
+}
+
+function normalizeApprovalPolicy(value: unknown, version: number): ApprovalPolicy {
+  if (version < RUN_MANIFEST_VERSION) return "in-run-legacy"
+  return value === "external-dir" || value === "none" || value === "in-run-legacy"
+    ? (value as ApprovalPolicy)
+    : "none"
 }
 
 /**
@@ -2183,6 +2201,40 @@ function validateVerifierReportBinding(
   return { ok: true, ...(warnings.size ? { warning: Array.from(warnings).join(",") } : {}) }
 }
 
+/**
+ * Re-check a verifier report's PASS evidence from its content. `teamwork_report`
+ * writes these invariants, but final_verify must not trust a hand-forged file
+ * that was signed through some other path: every check passed, no fatal
+ * findings, some evidence, and each output hash matches the output bytes.
+ */
+function verifierReportIntegrityProblems(report: any): string[] {
+  const problems: string[] = []
+  if (!report || typeof report !== "object") return ["report is not an object"]
+  const checks = Array.isArray(report.checks) ? report.checks : []
+  if (report.checks !== undefined && !Array.isArray(report.checks)) {
+    problems.push("checks is not an array")
+  }
+  checks.forEach((check: any, index: number) => {
+    const name = typeof check?.name === "string" && check.name ? check.name : `#${index + 1}`
+    if (!check || typeof check !== "object" || check.passed !== true) {
+      problems.push(`check ${name} did not pass`)
+    }
+    const output = typeof check?.output === "string" ? check.output : ""
+    if (output !== "") {
+      const expected = typeof check?.outputSha256 === "string" ? check.outputSha256 : ""
+      if (expected !== sha256Hex(output)) problems.push(`check ${name} outputSha256 does not match its output`)
+    } else if (check?.outputSha256 !== undefined) {
+      problems.push(`check ${name} has outputSha256 without output`)
+    }
+  })
+  if (Array.isArray(report.fatalFindings) && report.fatalFindings.length > 0) {
+    problems.push("fatalFindings is non-empty")
+  }
+  const summary = typeof report.summary === "string" ? report.summary.trim() : ""
+  if (summary === "" && checks.length === 0) problems.push("no summary and no checks")
+  return problems
+}
+
 function isSentinelAgent(agent: string | undefined): boolean {
   return agent === "team/sentinel" || agent === "team/orchestrator"
 }
@@ -3174,10 +3226,20 @@ function readRegularJson<T>(run: string, targetFile: string): { ok: true; data: 
 // ---------------------------------------------------------------------------
 
 const RUN_MANIFEST = "run.manifest.json"
-const RUN_MANIFEST_VERSION = 1
+/**
+ * 0.10.2 bumps the signed manifest to version 2: approvals must come from an
+ * external approval directory with a distinct Ed25519 approver key. Version 1
+ * manifests stay readable; their in-run approval path is honoured only for
+ * those pre-0.10.2 runs and is recorded as `approval_unbound`.
+ */
+const RUN_MANIFEST_VERSION = 2
+const SUPPORTED_RUN_MANIFEST_VERSIONS = [1, 2] as const
+type RunManifestVersion = (typeof SUPPORTED_RUN_MANIFEST_VERSIONS)[number]
+
+type ApprovalPolicy = "external-dir" | "in-run-legacy" | "none"
 
 type RunManifest = {
-  version: 1
+  version: RunManifestVersion
   sessionId: string
   rootSessionId: string
   integrityMode: IntegrityMode
@@ -3199,6 +3261,10 @@ type RunManifest = {
   runNonce?: string
   trustLevel?: TrustLevel
   requireWitness?: boolean
+  /** Expected verify-only Ed25519 key id for human/CI approvals (0.10.2). */
+  approvalKeyId?: string | null
+  /** Approval policy pinned at plan time: external-dir, in-run-legacy, or none. */
+  approvalPolicy?: ApprovalPolicy
   createdAt: string
   _auth?: AuthEnvelope
 }
@@ -3270,7 +3336,11 @@ async function readRunManifest(run: string, auth?: AuthContext): Promise<Manifes
     }
   }
   const value = res.data
-  if (!value || typeof value !== "object" || value.version !== RUN_MANIFEST_VERSION) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    !(SUPPORTED_RUN_MANIFEST_VERSIONS as readonly unknown[]).includes(value.version)
+  ) {
     return { ok: false, failure: { code: "AUTH_INVALID", message: "run.manifest.json has an invalid schema version" } }
   }
   if (!auth) {
@@ -3334,6 +3404,12 @@ function manifestDriftReason(drift: string): string {
   if (drift.startsWith("requireWitness")) {
     return `[AUTH_STALE] witness requirement downgrade/change refused (${drift})`
   }
+  if (drift.startsWith("approvalKeyId")) {
+    return `[AUTH_STALE] approval approver key change refused (${drift})`
+  }
+  if (drift.startsWith("approvalPolicy")) {
+    return `[AUTH_STALE] approval policy change refused (${drift})`
+  }
   if (drift.startsWith("planHash")) {
     return `[AUTH_STALE] plan baseline changed (${drift})`
   }
@@ -3375,6 +3451,16 @@ function manifestDrift(manifest: RunManifest, current: Omit<RunManifest, "versio
   if (baselineWitness !== currentWitness) {
     drift.push(`requireWitness drifted: manifest=${baselineWitness} current=${currentWitness}`)
   }
+  const baselineApprovalPolicy = normalizeApprovalPolicy(manifest.approvalPolicy, manifest.version)
+  const currentApprovalPolicy = normalizeApprovalPolicy(current.approvalPolicy, manifest.version)
+  if (baselineApprovalPolicy !== currentApprovalPolicy) {
+    drift.push(`approvalPolicy drifted: manifest=${baselineApprovalPolicy} current=${currentApprovalPolicy}`)
+  }
+  const baselineApprovalKey = manifest.approvalKeyId ?? null
+  const currentApprovalKey = current.approvalKeyId ?? null
+  if (baselineApprovalKey !== currentApprovalKey) {
+    drift.push(`approvalKeyId drifted (manifest=${baselineApprovalKey ?? "null"} current=${currentApprovalKey ?? "null"})`)
+  }
   // Only a signed→legacy downgrade is drift; a 0.8.0 manifest (absent = legacy)
   // may be re-planned into a signed run.
   const baselineHandoffAuth = manifest.handoffAuth ?? "legacy"
@@ -3392,6 +3478,9 @@ function manifestDrift(manifest: RunManifest, current: Omit<RunManifest, "versio
 
 /** Recompute the signed-baseline comparison from the current run artifacts. */
 function currentManifestDrift(manifest: RunManifest, plan: any, state: any, run: string): string[] {
+  const currentTrust = normalizeTrustLevel(plan?.trustLevel ?? state?.trustLevel) ?? DEFAULT_TRUST_LEVEL
+  const currentApprovalKey =
+    manifest.version < RUN_MANIFEST_VERSION ? manifest.approvalKeyId ?? null : approvalKeyIdFromEnv(process.env) ?? null
   return manifestDrift(manifest, {
     integrityMode: normalizeIntegrityMode(plan?.integrityMode ?? state?.integrityMode) ?? DEFAULT_INTEGRITY_MODE,
     verification: resolveVerificationMode(plan, state).mode,
@@ -3399,8 +3488,10 @@ function currentManifestDrift(manifest: RunManifest, plan: any, state: any, run:
     victorySkipReason:
       recordedVictorySkipReason(plan?.victorySkipReason) ?? recordedVictorySkipReason(state?.victorySkipReason),
     requireHandoffs: resolveHandoffMode(plan, state).mode,
-    trustLevel: normalizeTrustLevel(plan?.trustLevel ?? state?.trustLevel) ?? DEFAULT_TRUST_LEVEL,
+    trustLevel: currentTrust,
     requireWitness: (plan?.requireWitness ?? state?.requireWitness) === true,
+    approvalPolicy: approvalPolicyFor(currentTrust, manifest.version),
+    approvalKeyId: currentApprovalKey,
     handoffAuth: plan?.allowUnsignedLegacy === true || state?.allowUnsignedLegacy === true ? "legacy" : "signed",
     requestHash: originalRequestHash(run),
     requirementsHash: currentRequirementsHash(run),
@@ -3409,12 +3500,413 @@ function currentManifestDrift(manifest: RunManifest, plan: any, state: any, run:
   })
 }
 
+// ---------------------------------------------------------------------------
+// Human/CI approvals (0.10.2)
+//
+// An approval is the same `_auth`-signed artifact format as every other
+// control-plane artifact, but it is read from an external approval directory
+// and must be signed by an Ed25519 key that is NOT the run's `runKeyId`.
+// "human-approved" records who claims to have approved and when; it does not
+// prove that a human read the diff (see SECURITY.md).
+// ---------------------------------------------------------------------------
+
+const ENV_APPROVAL_DIR = "OPENCODE_TEAMWORK_APPROVAL_DIR"
+const ENV_APPROVAL_TTL_MS = "OPENCODE_TEAMWORK_APPROVAL_TTL_MS"
+const APPROVAL_TTL_DEFAULT_MS = 24 * 60 * 60 * 1000
+const APPROVAL_TTL_MAX_MS = 7 * 24 * 60 * 60 * 1000
+const APPROVAL_FILE_MAX_BYTES = 256 * 1024
+/** `uid:<name>`, `oidc:<issuer>#<sub>`, or `ci:<workflow>`; free labels are refused. */
+const APPROVER_ID_RE =
+  /^(?:uid:[A-Za-z0-9._-]{1,64}|oidc:[^\s#\u0000-\u001f]{1,200}#[^\s#\u0000-\u001f]{1,200}|ci:[A-Za-z0-9._/-]{1,120})$/
+const approvalUnboundEmitted = new Set<string>()
+
+let approvalOwnerUidOverride: number | null = null
+
+/**
+ * Test-only seam. A real different-principal approval directory is owned by a
+ * different UID, which a single-UID test process cannot create. Production
+ * never calls this; the default is `process.geteuid()`.
+ */
+export function setApprovalOwnerUidForTest(uid: number | null): void {
+  approvalOwnerUidOverride =
+    typeof uid === "number" && Number.isFinite(uid) ? Math.trunc(uid) : null
+}
+
+function expectedApprovalOwnerUid(): number | undefined {
+  if (approvalOwnerUidOverride !== null) return approvalOwnerUidOverride
+  try {
+    return typeof process.geteuid === "function" ? process.geteuid() : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** True when `child` is `parent` or inside it (separator-aware). */
+function pathWithinOrEqual(parent: string, child: string): boolean {
+  const rel = relative(parent, child)
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel))
+}
+
+function approvalTtlMs(env: Record<string, string | undefined>): number {
+  const raw = String(env[ENV_APPROVAL_TTL_MS] ?? "").trim()
+  if (!raw) return APPROVAL_TTL_DEFAULT_MS
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) return APPROVAL_TTL_DEFAULT_MS
+  return Math.min(Math.trunc(parsed), APPROVAL_TTL_MAX_MS)
+}
+
+type ApprovalDirResult =
+  | { ok: true; dir: string }
+  | { ok: false; code: AuthFailure["code"]; message: string }
+
+/**
+ * Resolve and validate `OPENCODE_TEAMWORK_APPROVAL_DIR`: absolute, an existing
+ * real directory (never a symlink), outside the run directory and outside the
+ * repo, and not owned by the run's UID.
+ */
+function resolveApprovalDir(
+  root: string,
+  run: string,
+  env: Record<string, string | undefined>,
+): ApprovalDirResult {
+  const raw = String(env[ENV_APPROVAL_DIR] ?? "").trim()
+  if (!raw) {
+    return {
+      ok: false,
+      code: "AUTH_APPROVAL_DIR",
+      message: `${ENV_APPROVAL_DIR} is not set; human-approved/ci-attested require an external approval directory`,
+    }
+  }
+  if (!isAbsolute(raw)) {
+    return {
+      ok: false,
+      code: "AUTH_APPROVAL_DIR",
+      message: `${ENV_APPROVAL_DIR} must be an absolute path (got "${clean(raw, 200)}")`,
+    }
+  }
+  let dir: string
+  let st: ReturnType<typeof lstatSync>
+  try {
+    st = lstatSync(raw)
+    if (st.isSymbolicLink() || !st.isDirectory()) {
+      return {
+        ok: false,
+        code: "AUTH_APPROVAL_DIR",
+        message: `${ENV_APPROVAL_DIR} must be a real directory (not a symlink): ${clean(raw, 200)}`,
+      }
+    }
+    dir = realpathSync(raw)
+  } catch (err: any) {
+    return {
+      ok: false,
+      code: "AUTH_APPROVAL_DIR",
+      message: `${ENV_APPROVAL_DIR} is not readable as a directory (${err?.code ?? "error"}): ${clean(raw, 200)}`,
+    }
+  }
+  let runReal = resolve(run)
+  try {
+    if (existsSync(run)) runReal = realpathSync(run)
+  } catch {}
+  let repoReal = resolve(root)
+  try {
+    repoReal = realpathSync(root)
+  } catch {}
+  if (pathWithinOrEqual(runReal, dir)) {
+    return {
+      ok: false,
+      code: "AUTH_APPROVAL_UNTRUSTED",
+      message: `approval directory ${clean(dir, 200)} is inside the run directory`,
+    }
+  }
+  if (pathWithinOrEqual(repoReal, dir)) {
+    return {
+      ok: false,
+      code: "AUTH_APPROVAL_UNTRUSTED",
+      message: `approval directory ${clean(dir, 200)} is inside the repository`,
+    }
+  }
+  const owner = expectedApprovalOwnerUid()
+  if (owner === undefined) {
+    return {
+      ok: false,
+      code: "AUTH_APPROVAL_UNTRUSTED",
+      message: "cannot determine the process euid; approval ownership cannot be checked",
+    }
+  }
+  if (st.uid === owner) {
+    return {
+      ok: false,
+      code: "AUTH_APPROVAL_UNTRUSTED",
+      message: `approval directory ${clean(dir, 200)} is owned by the run UID; approvals must come from a different principal`,
+    }
+  }
+  return { ok: true, dir }
+}
+
+type ApprovalReadResult =
+  | { ok: true; data: any }
+  | { ok: false; code: AuthFailure["code"]; message: string }
+
+/** Read one approval file without following a symlink and without trusting its owner. */
+function readApprovalDocument(file: string, owner: number | undefined): ApprovalReadResult {
+  let before: ReturnType<typeof lstatSync>
+  try {
+    before = lstatSync(file)
+  } catch (err: any) {
+    return {
+      ok: false,
+      code: err?.code === "ENOENT" ? "AUTH_APPROVAL_MISSING" : "AUTH_APPROVAL_UNTRUSTED",
+      message:
+        err?.code === "ENOENT"
+          ? `approval artifact ${clean(file, 200)} does not exist`
+          : `approval artifact ${clean(file, 200)} cannot be inspected (${err?.code ?? "error"})`,
+    }
+  }
+  if (before.isSymbolicLink()) {
+    return { ok: false, code: "AUTH_APPROVAL_UNTRUSTED", message: `approval artifact ${clean(file, 200)} is a symlink` }
+  }
+  if (!before.isFile()) {
+    return { ok: false, code: "AUTH_APPROVAL_UNTRUSTED", message: `approval artifact ${clean(file, 200)} is not a regular file` }
+  }
+  if (before.size > APPROVAL_FILE_MAX_BYTES) {
+    return {
+      ok: false,
+      code: "AUTH_APPROVAL_UNTRUSTED",
+      message: `approval artifact ${clean(file, 200)} is larger than ${APPROVAL_FILE_MAX_BYTES} bytes`,
+    }
+  }
+  if (owner === undefined || before.uid === owner) {
+    return {
+      ok: false,
+      code: "AUTH_APPROVAL_UNTRUSTED",
+      message: `approval artifact ${clean(file, 200)} is owned by the run UID; approvals must come from a different principal`,
+    }
+  }
+  let fd: number | undefined
+  try {
+    fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
+    const after = fstatSync(fd)
+    if (
+      !after.isFile() ||
+      after.uid !== before.uid ||
+      after.dev !== before.dev ||
+      after.ino !== before.ino
+    ) {
+      return {
+        ok: false,
+        code: "AUTH_APPROVAL_UNTRUSTED",
+        message: `approval artifact ${clean(file, 200)} changed identity while it was opened`,
+      }
+    }
+    if (after.size > APPROVAL_FILE_MAX_BYTES) {
+      return {
+        ok: false,
+        code: "AUTH_APPROVAL_UNTRUSTED",
+        message: `approval artifact ${clean(file, 200)} grew beyond ${APPROVAL_FILE_MAX_BYTES} bytes while it was opened`,
+      }
+    }
+    const text = readFileSync(fd, "utf8")
+    let data: any
+    try {
+      data = JSON.parse(text)
+    } catch {
+      return { ok: false, code: "AUTH_APPROVAL_UNTRUSTED", message: `approval artifact ${clean(file, 200)} is not valid JSON` }
+    }
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      return { ok: false, code: "AUTH_APPROVAL_UNTRUSTED", message: `approval artifact ${clean(file, 200)} is not an object` }
+    }
+    return { ok: true, data }
+  } catch (err: any) {
+    return {
+      ok: false,
+      code: "AUTH_APPROVAL_UNTRUSTED",
+      message: `approval artifact ${clean(file, 200)} could not be read (${err?.code ?? "error"})`,
+    }
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd)
+      } catch {}
+    }
+  }
+}
+
+type ApprovalArtifactCheck = { reasons: string[]; legacy: boolean }
+
+/**
+ * Verify one approval artifact against the signed manifest. Version 1
+ * manifests keep the old in-run `approvals/<runId>.json` path (readable, but
+ * recorded as `approval_unbound`); version 2+ requires the external directory,
+ * an Ed25519 approver key distinct from `runKeyId`, freshness, and a
+ * `uid:`/`oidc:`/`ci:` identity.
+ */
+async function checkApprovalArtifact(
+  run: string,
+  runId: string,
+  manifest: RunManifest,
+  auth: AuthContext | undefined,
+  trustLevel: TrustLevel,
+  repoRoot: string,
+  env: Record<string, string | undefined>,
+): Promise<ApprovalArtifactCheck> {
+  const reasons: string[] = []
+  const relPath = `approvals/${runId}.json`
+  const legacy = manifest.version < RUN_MANIFEST_VERSION
+  let approval: any
+  let label = relPath
+  if (legacy) {
+    const res = readRegularJson<any>(run, join(run, relPath))
+    if (!res.ok) {
+      return {
+        reasons: [
+          `[AUTH_APPROVAL_MISSING] ${relPath} is ${res.reason}; trustLevel ${trustLevel} requires a signed approval artifact`,
+        ],
+        legacy: true,
+      }
+    }
+    approval = res.data
+  } else {
+    const dir = resolveApprovalDir(repoRoot, run, env)
+    if (!dir.ok) return { reasons: [`[${dir.code}] ${dir.message}`], legacy: false }
+    label = join(dir.dir, `${runId}.json`)
+    const read = readApprovalDocument(label, expectedApprovalOwnerUid())
+    if (!read.ok) return { reasons: [`[${read.code}] ${read.message}`], legacy: false }
+    approval = read.data
+  }
+  if (!auth) {
+    return { reasons: ["[AUTH_UNAVAILABLE] no authenticity context is wired to verify the approval artifact"], legacy }
+  }
+  const verified = await auth.verifyArtifact(
+    relPath,
+    approval,
+    legacy
+      ? {
+          ...(manifest.runNonce ? { requireNonce: manifest.runNonce } : {}),
+          expectedKeyId: manifest.runKeyId,
+        }
+      : {},
+  )
+  if (!verified.ok) {
+    return {
+      reasons: [`[${verified.failure.code}] ${clean(label, 200)} failed verification: ${verified.failure.message}`],
+      legacy,
+    }
+  }
+  if (approval.runId !== runId) {
+    reasons.push(`[AUTH_INVALID] ${clean(label, 200)} is bound to run ${clean(approval.runId, 64)} (expected ${runId})`)
+  }
+  if (approval.trustLevel !== trustLevel) {
+    reasons.push(
+      `[AUTH_INVALID] ${clean(label, 200)} records trustLevel ${clean(approval.trustLevel, 32)} (expected ${trustLevel})`,
+    )
+  }
+  if (approval.manifestDigest !== payloadDigest(manifest)) {
+    reasons.push(`[AUTH_INVALID] ${clean(label, 200)} manifestDigest does not match the signed run manifest`)
+  }
+  const approverField = trustLevel === "human-approved" ? "approvedBy" : "attestedBy"
+  const approver = (approval as any)[approverField]
+  if (typeof approver !== "string" || approver.trim() === "") {
+    reasons.push(`[AUTH_APPROVAL_MISSING] ${clean(label, 200)} needs ${approverField}`)
+  }
+  if (legacy) {
+    // Pre-0.10.2 runs predate the external-directory and identity policy. They
+    // stay readable, but the caller records that the approval was unbound.
+    return { reasons, legacy: true }
+  }
+
+  // Distinct-principal rules. An HMAC envelope or the run's own key is not a
+  // human/CI approval; it is the same principal approving itself.
+  if (verified.auth.alg !== "ed25519") {
+    reasons.push(
+      `[AUTH_APPROVAL_NOT_HUMAN] ${clean(label, 200)} is signed with ${verified.auth.alg}; human-approved/ci-attested require an Ed25519 approver key`,
+    )
+  }
+  if (verified.keyId === manifest.runKeyId) {
+    reasons.push(
+      `[AUTH_APPROVAL_NOT_HUMAN] ${clean(label, 200)} is signed by the run key ${clean(manifest.runKeyId, 96)}; approval must use a distinct approver key`,
+    )
+  }
+  if (manifest.approvalKeyId && verified.keyId !== manifest.approvalKeyId) {
+    reasons.push(
+      `[AUTH_APPROVAL_UNTRUSTED] ${clean(label, 200)} approver key ${clean(verified.keyId, 96)} is not the key pinned at plan time (${clean(manifest.approvalKeyId, 96)})`,
+    )
+  }
+  const ttl = approvalTtlMs(env)
+  const approvedAtMs = typeof approval.approvedAt === "string" ? Date.parse(approval.approvedAt) : Number.NaN
+  const manifestAtMs = Date.parse(manifest.createdAt)
+  if (!Number.isFinite(approvedAtMs)) {
+    reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} needs a valid ISO approvedAt`)
+  } else {
+    if (Number.isFinite(manifestAtMs) && approvedAtMs < manifestAtMs) {
+      reasons.push(
+        `[AUTH_APPROVAL_STALE] ${clean(label, 200)} approvedAt precedes the signed manifest createdAt`,
+      )
+    }
+    let expiresAtMs: number
+    if (approval.expiresAt === undefined || approval.expiresAt === null) {
+      expiresAtMs = approvedAtMs + ttl
+    } else {
+      expiresAtMs = typeof approval.expiresAt === "string" ? Date.parse(approval.expiresAt) : Number.NaN
+      if (!Number.isFinite(expiresAtMs)) {
+        reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} has an invalid expiresAt`)
+      } else if (expiresAtMs < approvedAtMs) {
+        reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} expiresAt precedes approvedAt`)
+      } else if (expiresAtMs > approvedAtMs + APPROVAL_TTL_MAX_MS) {
+        reasons.push(
+          `[AUTH_APPROVAL_STALE] ${clean(label, 200)} expiresAt exceeds the ${APPROVAL_TTL_MAX_MS / 3600000}h maximum approval lifetime`,
+        )
+      } else if (expiresAtMs > approvedAtMs + ttl) {
+        reasons.push(
+          `[AUTH_APPROVAL_STALE] ${clean(label, 200)} expiresAt exceeds the configured approval TTL`,
+        )
+      }
+    }
+    if (Number.isFinite(expiresAtMs) && Date.now() > expiresAtMs) {
+      reasons.push(`[AUTH_APPROVAL_STALE] ${clean(label, 200)} expired at ${clean(approval.expiresAt ?? "", 40) || "its TTL"}`)
+    }
+  }
+  if (typeof approver === "string" && approver.trim() !== "" && !APPROVER_ID_RE.test(approver.trim())) {
+    reasons.push(
+      `[AUTH_APPROVAL_NOT_HUMAN] ${clean(label, 200)} ${approverField} must be uid:<name>, oidc:<issuer>#<sub>, or ci:<workflow> (got "${clean(approver, 80)}")`,
+    )
+  }
+  return { reasons, legacy }
+}
+
+/**
+ * Plan-time prerequisites. These run before any mkdir/state write, so a refusal
+ * leaves no run directory. A version 1 run keeps the legacy in-run path.
+ */
+function checkApprovalPrerequisites(
+  root: string,
+  run: string,
+  trustLevel: TrustLevel,
+  version: number,
+  env: Record<string, string | undefined>,
+): { ok: true; approvalKeyId: string | null; approvalPolicy: ApprovalPolicy } | { ok: false; code: AuthFailure["code"]; message: string } {
+  const approvalPolicy = approvalPolicyFor(trustLevel, version)
+  const approvalKeyId = approvalKeyIdFromEnv(env) ?? null
+  if (approvalPolicy !== "external-dir") return { ok: true, approvalKeyId, approvalPolicy }
+  const dir = resolveApprovalDir(root, run, env)
+  if (!dir.ok) return { ok: false, code: dir.code, message: dir.message }
+  if (!approvalKeyId) {
+    return {
+      ok: false,
+      code: "AUTH_APPROVAL_UNTRUSTED",
+      message:
+        "human-approved/ci-attested require OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY so the approval can be verified with a key that is not the run key",
+    }
+  }
+  return { ok: true, approvalKeyId, approvalPolicy }
+}
+
 /**
  * Enforce the run's persisted trust level at completion:
  *   * external-signer — the manifest (and every sampled artifact) must carry a
  *     verified Ed25519 envelope, never HMAC.
- *   * human-approved / ci-attested — a signed `approvals/<run>.json` bound to
- *     this run id and the current manifest digest.
+ *   * human-approved / ci-attested — a signed `approvals/<runId>.json` bound to
+ *     this run id and the current manifest digest, from the external approval
+ *     directory (version 2+) and signed by a distinct Ed25519 approver key.
  *   * requireWitness — a witness receipt must exist for the signed manifest.
  * Returns named refusal reasons; an empty array means the level is satisfied.
  */
@@ -3425,6 +3917,8 @@ async function evaluateTrustGate(
   auth: AuthContext | undefined,
   trustLevel: TrustLevel,
   observedAlgs: Array<string | undefined>,
+  repoRoot: string,
+  env: Record<string, string | undefined>,
 ): Promise<string[]> {
   const reasons: string[] = []
   if (trustLevel === "external-signer") {
@@ -3436,38 +3930,23 @@ async function evaluateTrustGate(
       )
     }
   }
-  if (trustLevel === "human-approved" || trustLevel === "ci-attested") {
-    const relPath = `approvals/${runId}.json`
-    const res = readRegularJson<any>(run, join(run, relPath))
-    if (!res.ok) {
-      reasons.push(`[AUTH_APPROVAL_MISSING] ${relPath} is ${res.reason}; trustLevel ${trustLevel} requires a signed approval artifact`)
-    } else if (!auth) {
-      reasons.push("[AUTH_UNAVAILABLE] no authenticity context is wired to verify the approval artifact")
-    } else {
-      const approval = res.data
-      const verified = await auth.verifyArtifact(relPath, approval, {
-        ...(manifest.runNonce ? { requireNonce: manifest.runNonce } : {}),
-        expectedKeyId: manifest.runKeyId,
-      })
-      if (!verified.ok) {
-        reasons.push(`[${verified.failure.code}] ${relPath} failed verification: ${verified.failure.message}`)
-      } else {
-        if (approval.runId !== runId) {
-          reasons.push(`[AUTH_INVALID] ${relPath} is bound to run ${clean(approval.runId, 64)} (expected ${runId})`)
-        }
-        if (approval.trustLevel !== trustLevel) {
-          reasons.push(`[AUTH_INVALID] ${relPath} records trustLevel ${clean(approval.trustLevel, 32)} (expected ${trustLevel})`)
-        }
-        if (approval.manifestDigest !== payloadDigest(manifest)) {
-          reasons.push(`[AUTH_INVALID] ${relPath} manifestDigest does not match the signed run manifest`)
-        }
-        const approver = trustLevel === "human-approved" ? approval.approvedBy : approval.attestedBy
-        if (typeof approver !== "string" || approver.trim() === "") {
-          reasons.push(
-            `[AUTH_APPROVAL_MISSING] ${relPath} needs ${trustLevel === "human-approved" ? "approvedBy" : "attestedBy"}`,
-          )
-        }
-      }
+  if (requiresApproval(trustLevel)) {
+    const check = await checkApprovalArtifact(run, runId, manifest, auth, trustLevel, repoRoot, env)
+    reasons.push(...check.reasons)
+    if (check.legacy && check.reasons.length === 0 && !approvalUnboundEmitted.has(run)) {
+      approvalUnboundEmitted.add(run)
+      try {
+        await appendEvent(run, {
+          event: "approval_unbound",
+          sessionId: runId,
+          taskId: null,
+          to: trustLevel,
+          round: 0,
+          agent: null,
+          phase: null,
+          note: "pre-0.10.2 manifest: approvals/<runId>.json was read from the run directory and is not bound to a distinct external approver",
+        })
+      } catch {}
     }
   }
   if (manifest.requireWitness === true) {
@@ -3983,6 +4462,18 @@ async function createPlanRun(
           "refused: [AUTH_SIGNER_UNAVAILABLE] trustLevel \"external-signer\" requires an Ed25519 key or an OPENCODE_TEAMWORK_SIGNER=command:<path> signer; only a local HMAC key is configured. Nothing was written.",
         refused: "AUTH_SIGNER_UNAVAILABLE",
       }
+    }
+  }
+  // Human/CI approval prerequisites are checked before any mkdir/state write,
+  // so a refused plan leaves no run directory. A version 1 manifest is a
+  // pre-0.10.2 run and keeps its in-run legacy approval path.
+  const manifestVersion = existingManifest?.version ?? RUN_MANIFEST_VERSION
+  const approvalPrereq = checkApprovalPrerequisites(root, run, trustLevel, manifestVersion, process.env)
+  if (!approvalPrereq.ok) {
+    return {
+      ok: false,
+      content: `refused: [${approvalPrereq.code}] ${approvalPrereq.message}. Nothing was written.`,
+      refused: approvalPrereq.code,
     }
   }
   // The request record is verbatim, so refuse rather than truncate. The
@@ -4519,6 +5010,11 @@ async function createPlanRun(
       victoryAudit: victoryAuditMode,
       victorySkipReason,
       requireHandoffs: requireHandoffsMode,
+      trustLevel,
+      requireWitness,
+      approvalPolicy: approvalPrereq.approvalPolicy,
+      approvalKeyId:
+        manifestVersion < RUN_MANIFEST_VERSION ? existingManifest?.approvalKeyId ?? null : approvalPrereq.approvalKeyId,
       handoffAuth: allowUnsignedLegacy ? "legacy" : "signed",
       requestHash: baselineRequestHash,
       requirementsHash: baselineRequirementsHash,
@@ -4555,7 +5051,7 @@ async function createPlanRun(
       const boundKey = await auth.bindRunKeyId(sessionId, authReady.keyId)
       if (!boundKey.ok) throw new AuthError(boundKey.failure)
       const manifest: RunManifest = {
-        version: RUN_MANIFEST_VERSION,
+        version: manifestVersion,
         sessionId,
         rootSessionId,
         integrityMode,
@@ -4563,6 +5059,9 @@ async function createPlanRun(
         victoryAudit: victoryAuditMode,
         trustLevel,
         requireWitness,
+        approvalPolicy: approvalPrereq.approvalPolicy,
+        approvalKeyId:
+          manifestVersion < RUN_MANIFEST_VERSION ? existingManifest?.approvalKeyId ?? null : approvalPrereq.approvalKeyId,
         ...(victorySkipReason ? { victorySkipReason } : {}),
         requireHandoffs: requireHandoffsMode,
         ...(runNonce ? { runNonce } : {}),
@@ -4742,7 +5241,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           trustLevel: {
             type: "string",
             description:
-              "local-hmac | external-signer | human-approved | ci-attested. Default local-hmac. Persisted in plan.dag.json, state.json and the signed run.manifest.json; a re-plan may repeat but not change it. external-signer requires an Ed25519 key (local key ring or OPENCODE_TEAMWORK_SIGNER=command:<path>) and final_verify refuses an HMAC envelope. human-approved requires a signed approvals/<run>.json bound to the run manifest; ci-attested requires a signed CI attestation artifact. Benchmark refuses an explicit local-hmac.",
+              "local-hmac | external-signer | human-approved | ci-attested. Default local-hmac. Persisted in plan.dag.json, state.json and the signed run.manifest.json; a re-plan may repeat but not change it. external-signer requires an Ed25519 key (local key ring or OPENCODE_TEAMWORK_SIGNER=command:<path>) and final_verify refuses an HMAC envelope. human-approved requires an Ed25519 approval in OPENCODE_TEAMWORK_APPROVAL_DIR (absolute, outside the run/repo, owned by another UID) signed by a key distinct from the run key, with approvedAt >= manifest.createdAt, a bounded expiresAt and approvedBy as uid:/oidc:/ci:<name>; ci-attested is the same with attestedBy. The plan refuses before writing when the directory or OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY is missing. Benchmark refuses an explicit local-hmac.",
           },
           requireWitness: {
             type: "boolean",
@@ -7510,6 +8009,13 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         // baseline are resolved before the lock so the critical section stays a
         // short read-modify-write.
         const preState = readJson<any>(run, stateFile, undefined)
+        // 0.10.2: `verified_pass` needs a verified PASS report on a signed run.
+        // The inline `verification.status` shortcut survives only for explicit
+        // allowUnsignedLegacy runs, and its use is recorded.
+        const evidenceManifest = await readRunManifest(run, auth)
+        const signedEvidenceRun = evidenceManifest.ok ? evidenceManifest.signed : true
+        const legacyInlineAllowed =
+          !signedEvidenceRun && (plan?.allowUnsignedLegacy === true || preState?.allowUnsignedLegacy === true)
         const preProtocol = claimProtocolOf(preState)
         const preTask = preState?.tasks && typeof preState.tasks === "object" ? preState.tasks[taskId] : undefined
         const preClaim = normalizeClaim(preTask?.claim)
@@ -7750,21 +8256,53 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
 
-          // `verified_pass` needs evidence: either an inline PASS verdict or an
-          // on-disk verifier report for THIS task. `verified_fail` needs none.
+          // `verified_pass` needs evidence: a verified on-disk PASS verifier
+          // report for THIS task. The inline `verification.status` shortcut is
+          // accepted only on an explicit allowUnsignedLegacy run; a signed run
+          // must have a report. `verified_fail` needs none.
           // Protocol 2 also binds the report to the current round/fence/branch;
           // a bound report whose branch moved is refused with BRANCH_MOVED.
           let reportWarning: string | undefined
+          let inlineEvidenceUsed = false
           if (status === "verified_pass") {
-            const inlinePass = input.verification?.status === "PASS"
+            const inlineRequested = input.verification?.status === "PASS"
             const reportFile = isSafeTaskId(taskId) ? join(run, "verify", `report-${taskId}.json`) : undefined
             const report = reportFile && existsSync(reportFile) ? readJson<any>(run, reportFile, undefined) : undefined
+            const inlinePass = inlineRequested && legacyInlineAllowed
+            if (inlineRequested && !legacyInlineAllowed && report?.status !== "PASS") {
+              return {
+                status: "REPORT_MISSING",
+                content: signedEvidenceRun
+                  ? `Error: Refusing verified_pass for task "${taskId}": the inline verification.status = "PASS" shortcut is not accepted on a signed run. Write a verifier report at ${isSafeTaskId(taskId) ? join(run, "verify", `report-${taskId}.json`) : "verify/report-<taskId>.json"} with "status": "PASS".`
+                  : `Error: [AUTH_LEGACY] Refusing verified_pass for task "${taskId}": this unsigned run did not record allowUnsignedLegacy, so inline evidence is not accepted. Re-plan with allowUnsignedLegacy: true or write a verifier report.`,
+              }
+            }
             if (!inlinePass && report?.status !== "PASS") {
               return {
                 status: "REPORT_MISSING",
-                content: `Error: Refusing verified_pass for task "${taskId}" without PASS evidence. Provide input.verification.status = "PASS", or write a verifier report at ${reportFile ?? "verify/report-<taskId>.json"} with "status": "PASS".`,
+                content: `Error: Refusing verified_pass for task "${taskId}" without evidence. Write a verifier report at ${reportFile ?? "verify/report-<taskId>.json"} with "status": "PASS" (signed runs require a verified report; the inline shortcut is legacy-only).`,
               }
             }
+            if (report?.status === "PASS" && signedEvidenceRun) {
+              const reportRel = `verify/report-${taskId}.json`
+              const check = auth
+                ? await auth.verifyRunArtifact(runId, reportRel, report)
+                : {
+                    status: "unknown" as const,
+                    failure: { code: "AUTH_UNAVAILABLE" as const, message: "no authenticity context is wired for this run" },
+                  }
+              if (check.status !== "signed") {
+                const failure =
+                  check.status === "unsigned"
+                    ? { code: "AUTH_MISSING", message: `${reportRel} has no _auth envelope (a signed run requires one)` }
+                    : check.failure ?? { code: "AUTH_INVALID", message: `${reportRel} failed verification` }
+                return {
+                  status: "REPORT_UNVERIFIED",
+                  content: `REPORT_UNVERIFIED: refusing verified_pass for task "${taskId}" — [${failure.code}] ${failure.message}. Re-write the report through teamwork_report for the current round.`,
+                }
+              }
+            }
+            inlineEvidenceUsed = inlinePass
             if (protocol >= CLAIM_PROTOCOL && report?.status === "PASS") {
               // Cheap movement check under the lock: the expensive base/head
               // diff was read before it. A moved branch still refuses.
@@ -7829,6 +8367,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             ...(input.worktree ? { worktree: clean(input.worktree, 200) } : {}),
             ...(input.summary ? { summary: clean(input.summary, 300) } : {}),
             ...(feedbackText ? { feedback: feedbackText } : {}),
+            ...(inlineEvidenceUsed ? { verificationSource: "inline-legacy" } : {}),
             // Only tasks that have ledger entries gain the field: the state.json
             // shape of a task that never failed stays exactly as before.
             ...(feedbackLog.length || Array.isArray(current.feedbackLog) ? { feedbackLog } : {}),
@@ -7929,6 +8468,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             fence: protocol >= CLAIM_PROTOCOL ? nextTask.fence : undefined,
             protocol,
             reportWarning,
+            inlineEvidenceUsed,
           }
         })
 
@@ -7959,6 +8499,18 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             agent: recordedAgent,
             agentSource,
             note: outcome.claimNote ?? outcome.claimEvent,
+          })
+        }
+        if (outcome.inlineEvidenceUsed) {
+          await appendEvent(run, {
+            event: "verification_inline_legacy",
+            sessionId: basename(run),
+            taskId,
+            to: outcome.status,
+            round: outcome.round,
+            agent: recordedAgent,
+            agentSource,
+            note: "allowUnsignedLegacy run accepted inline verification.status=PASS; no signed verifier report was required",
           })
         }
         if (outcome.claimReleased && outcome.protocol >= 2) {
@@ -8804,7 +9356,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     editor.add({
       name: "report",
       description:
-        "Trusted writer for verify/report-<taskId>.json. Only a session whose trusted agent is team/verifier, descending from the run root, may call it. The task must exist in plan.dag.json and a PASS report must carry evidence (a summary or checks). The report is signed for a signed run (run.manifest.json) and indexed in ctx.storage; final_verify requires that signature. A wrong agent, a missing task, or evidence-free PASS is refused.",
+        "Trusted writer for verify/report-<taskId>.json. Only a session whose trusted agent is team/verifier, descending from the run root, may call it. The task must exist in plan.dag.json and a PASS report must carry evidence (a summary or checks, every check passed, no fatal findings). The report is signed for a signed run (run.manifest.json) and indexed in ctx.storage; final_verify re-checks the signature and the PASS evidence. A wrong agent, a missing task, or an inconsistent PASS is refused.",
       input: {
         type: "object",
         properties: {
@@ -8821,6 +9373,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 name: { type: "string" },
                 type: { type: "string" },
                 passed: { type: "boolean" },
+                output: { type: "string", description: "Optional captured output (max 2000 chars); stored and hashed as outputSha256." },
+                error: { type: "string", description: "Optional captured error output (max 2000 chars)." },
+                exitCode: { type: "number", description: "Optional process/check exit code (integer)." },
+                outputSha256: { type: "string", description: "Engine-computed. Ignored on input; final_verify recomputes it from output." },
               },
               required: ["name", "passed"],
               additionalProperties: true,
@@ -8891,13 +9447,38 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           return { content: `refused: task "${clean(taskId, 64)}" is not in plan.dag.json; nothing was written` }
         }
         const checks = Array.isArray(input?.checks)
-          ? input.checks.slice(0, 100).map((c: any) => ({
-              name: clean(c?.name, 200),
-              type: clean(c?.type, 64) || "check",
-              passed: c?.passed === true,
-            }))
+          ? input.checks.slice(0, 100).map((c: any) => {
+              const output = typeof c?.output === "string" ? cleanBlock(c.output, 2000).trim() : ""
+              const error = typeof c?.error === "string" ? cleanBlock(c.error, 2000).trim() : ""
+              const exitCode = Number.isInteger(c?.exitCode) ? Number(c.exitCode) : undefined
+              return {
+                name: clean(c?.name, 200),
+                type: clean(c?.type, 64) || "check",
+                passed: c?.passed === true,
+                ...(output ? { output, outputSha256: sha256Hex(output) } : {}),
+                ...(error ? { error } : {}),
+                ...(exitCode !== undefined ? { exitCode } : {}),
+              }
+            })
           : []
         const summary = typeof input?.summary === "string" ? cleanBlock(input.summary, 2000).trim() : ""
+        const fatalFindings = Array.isArray(input?.fatalFindings)
+          ? input.fatalFindings.slice(0, 50).map((f: any) => ({
+              where: clean(f?.where, 200),
+              why: clean(f?.why, 500),
+              fix: clean(f?.fix, 500),
+            }))
+          : []
+        if (status === "PASS" && fatalFindings.length > 0) {
+          return {
+            content: "refused: a PASS report cannot carry fatalFindings — record status: \"FAIL\" or resolve the findings; nothing was written",
+          }
+        }
+        if (status === "PASS" && checks.some((c: any) => c.passed !== true)) {
+          return {
+            content: "refused: a PASS report requires every checks[].passed to be true; nothing was written",
+          }
+        }
         if (status === "PASS" && summary === "" && checks.length === 0) {
           return { content: "refused: a PASS report needs evidence — provide a non-empty summary or at least one check; nothing was written" }
         }
@@ -8971,13 +9552,6 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             ? clean(input.checkpoint.headSha, 64).trim()
             : ""
         await renewClaimFor(run, taskId, authz.sessionID, ctx, "report")
-        const fatalFindings = Array.isArray(input?.fatalFindings)
-          ? input.fatalFindings.slice(0, 50).map((f: any) => ({
-              where: clean(f?.where, 200),
-              why: clean(f?.why, 500),
-              fix: clean(f?.fix, 500),
-            }))
-          : []
         const report: any = {
           taskId,
           status,
@@ -9146,6 +9720,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const tasks: Array<{ id: string; status: string; report: string | null; reportStatus: string }> = []
           const reportDigests: Record<string, string | null> = Object.create(null)
           const authReasons: string[] = []
+          const contentIntegrityReasons: string[] = []
           for (const id of ids) {
             const safe = isSafeTaskId(id)
             const reportRel = safe ? `verify/report-${id}.json` : null
@@ -9158,6 +9733,14 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               reportStatus:
                 report?.status === "PASS" ? "PASS" : report?.status === "FAIL" ? "FAIL" : "MISSING",
             })
+            if (reportRel && report?.status === "PASS") {
+              const problems = verifierReportIntegrityProblems(report)
+              if (problems.length > 0) {
+                contentIntegrityReasons.push(
+                  `task ${id}: report ${reportRel} is not a valid PASS (${problems.join("; ")})`,
+                )
+              }
+            }
             if (reportRel) {
               const raw = readBoundedRunFile(run, join(run, reportRel), MAX_RUN_FILE_BYTES)
               reportDigests[clean(id, 64)] =
@@ -9218,9 +9801,19 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
           if (securityAudit.status !== "PASS") reasons.push(`security audit: ${securityAudit.status}`)
           reasons.push(...authReasons)
+          reasons.push(...contentIntegrityReasons)
           if (signedRun) {
             reasons.push(
-              ...(await evaluateTrustGate(run, basename(run), manifestCheck.manifest, auth, trustLevel, observedAlgs)),
+              ...(await evaluateTrustGate(
+                run,
+                basename(run),
+                manifestCheck.manifest,
+                auth,
+                trustLevel,
+                observedAlgs,
+                root,
+                process.env,
+              )),
             )
           }
 

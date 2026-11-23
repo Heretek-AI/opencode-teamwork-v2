@@ -79,6 +79,13 @@ export const ENV_SIGNER_KEY_ID = "OPENCODE_TEAMWORK_SIGNER_KEY_ID"
 export const ENV_SIGNER_TIMEOUT_MS = "OPENCODE_TEAMWORK_SIGNER_TIMEOUT_MS"
 export const ENV_WITNESS = "OPENCODE_TEAMWORK_WITNESS"
 export const ENV_WITNESS_TIMEOUT_MS = "OPENCODE_TEAMWORK_WITNESS_TIMEOUT_MS"
+/**
+ * Verify-only approval key (0.10.2). A human/CI approval must be signed by a
+ * key distinct from the run's `runKeyId`; this public key is how the verifier
+ * learns that key without making it the run's signing key.
+ */
+export const ENV_APPROVAL_PUBLIC_KEY = "OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY"
+export const ENV_APPROVAL_KEY_ID = "OPENCODE_TEAMWORK_APPROVAL_KEY_ID"
 const KEY_RING_MAX_KEYS = 3
 const SIGNATURE_DOMAIN = "teamwork-artifact-v1"
 const DEFAULT_TIMEOUT_MS = 5000
@@ -97,6 +104,10 @@ export type AuthFailureCode =
   | "AUTH_WITNESS_UNAVAILABLE"
   | "AUTH_TRUST_LEVEL"
   | "AUTH_APPROVAL_MISSING"
+  | "AUTH_APPROVAL_DIR"
+  | "AUTH_APPROVAL_UNTRUSTED"
+  | "AUTH_APPROVAL_STALE"
+  | "AUTH_APPROVAL_NOT_HUMAN"
 
 export interface AuthFailure {
   code: AuthFailureCode
@@ -358,6 +369,18 @@ function publicKeyFromPrivate(privateKey: string): string | undefined {
 
 function makeKeyId(): string {
   return `k_${randomBytes(8).toString("hex")}`
+}
+
+/**
+ * Key id of the configured verify-only approval key, or undefined when no
+ * `OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY` is set. This key never signs run
+ * artifacts; it only verifies human/CI approvals.
+ */
+export function approvalKeyIdFromEnv(env: Record<string, string | undefined>): string | undefined {
+  const publicKey = String(env[ENV_APPROVAL_PUBLIC_KEY] ?? "").trim()
+  if (!publicKey) return undefined
+  const configured = String(env[ENV_APPROVAL_KEY_ID] ?? "").trim()
+  return configured || deriveKeyId("approval", publicKey)
 }
 
 function corruptRing(message: string): never {
@@ -952,6 +975,13 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
     if (envPublic) {
       const id = (env[ENV_ED25519_KEY_ID] || deriveKeyId("ed25519", envPublic)).trim()
       candidates.push({ keyId: id, publicKey: envPublic })
+    }
+    // A verify-only approval key is a separate principal: it is never used to
+    // sign run artifacts, only to verify the human/CI approval envelope.
+    const approvalPublic = env[ENV_APPROVAL_PUBLIC_KEY]?.trim()
+    if (approvalPublic) {
+      const id = approvalKeyIdFromEnv(env)
+      if (id) candidates.push({ keyId: id, publicKey: approvalPublic })
     }
     try {
       const res = await pullRing()

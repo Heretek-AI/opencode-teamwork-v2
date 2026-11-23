@@ -31,7 +31,7 @@ import {
   writeSafeRunFile,
 } from "./tournament.ts"
 import { evaluateStrictGate, normalizeVerificationMode } from "./strict.ts"
-import { evaluateVictoryGate, recordedVictorySkipReason, resolveVictoryAuditMode } from "./victory.ts"
+import { evaluateVictoryGate, readVictoryVerdict, recordedVictorySkipReason, resolveVictoryAuditMode } from "./victory.ts"
 
 export const BRIEFING_FILE = "BRIEFING.md"
 /** Hard cap for the on-disk briefing, in UTF-8 bytes. */
@@ -224,9 +224,18 @@ function strictGateStatus(run: string, ids: string[], stateTasks: any): string {
   return gate.status
 }
 
-function victoryStatusLabel(gate: ReturnType<typeof evaluateVictoryGate>): string {
+function victoryStatusLabel(
+  gate: ReturnType<typeof evaluateVictoryGate>,
+  envelope: "none" | "present",
+): string {
   if (gate.skipped) return gate.reason ? `SKIPPED (explicit): ${gate.reason}` : "SKIPPED (legacy default)"
-  if (gate.status === "CONFIRMED") return "CONFIRMED"
+  if (gate.status === "CONFIRMED") {
+    // The briefing is semantic-only and does not verify envelopes. Never render
+    // an unsigned or unverified victory.json as a plain CONFIRMED.
+    return envelope === "present"
+      ? "CONFIRMED (envelope present; not verified by the briefing)"
+      : "CONFIRMED (unverified envelope)"
+  }
   if (gate.status === "REJECTED") return "REJECTED"
   return "PENDING"
 }
@@ -271,7 +280,17 @@ export function buildBriefing(
     identity.verification === "strict"
       ? `- Gate (strict): ${strictGateStatus(run, safeIds, state?.tasks)}`
       : undefined
-  const victory = victoryStatusLabel(evaluateVictoryGate(run, identity.victoryMode, identity.victorySkipReason))
+  const victoryRecord = readVictoryVerdict(run)
+  const victoryEnvelope: "none" | "present" =
+    victoryRecord &&
+    typeof (victoryRecord as any)._auth === "object" &&
+    (victoryRecord as any)._auth !== null
+      ? "present"
+      : "none"
+  const victory = victoryStatusLabel(
+    evaluateVictoryGate(run, identity.victoryMode, identity.victorySkipReason),
+    victoryEnvelope,
+  )
   const artifacts = ARTIFACT_INDEX.filter((rel) => isRegularRunFile(run, rel))
 
   const lines: string[] = [

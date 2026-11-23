@@ -4,6 +4,76 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.2] - 2026-11-23
+
+Patch release closing two cheap content-integrity loopholes and making the
+declared trust levels honest. It bumps the signed `run.manifest.json` schema to
+version 2; version 1 manifests stay readable.
+
+### Changed
+
+- **`human-approved` / `ci-attested` require a different principal.**
+  Approvals are read from `OPENCODE_TEAMWORK_APPROVAL_DIR` (absolute, outside
+  the run and repo, real directory owned by another UID). The approval envelope
+  must be Ed25519 and its `_auth.keyId` must differ from the manifest's
+  `runKeyId`; HMAC or run-key approvals fail `AUTH_APPROVAL_NOT_HUMAN`.
+  `OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY` (+ `_KEY_ID`) configures the
+  verify-only approver key, which is pinned as `approvalKeyId` in the signed
+  manifest together with `approvalPolicy` and covered by drift checks.
+- **Freshness, identity and plan ordering.** An approval needs
+  `approvedAt >= manifest.createdAt` and a bounded `expiresAt` (default 24 h;
+  `OPENCODE_TEAMWORK_APPROVAL_TTL_MS`, max 7 d) or fails
+  `AUTH_APPROVAL_STALE`. `approvedBy`/`attestedBy` must be `uid:<name>`,
+  `oidc:<issuer>#<sub>`, or `ci:<workflow>`; bare `team/...`/`ses_...` labels
+  are refused. Missing approval prerequisites now refuse the plan **before**
+  any run directory or state write. Pre-0.10.2 (version 1) runs keep the in-run
+  `approvals/<run>.json` path, recorded with an `approval_unbound` event.
+- **`doctor --security --require-hardened`.** Security checks can report
+  `fail`, and `report.ok` is false when any check fails. Knowable facts fail
+  instead of warning: `ptrace_scope=0`, root-equivalent group membership, a
+  caller-owned/writable signer path, a caller-owned/writable or in-repo approval
+  directory, and DB/`-wal`/`-shm` group/other bits. A new `containment` check
+  reports `fdTraversalMode()`/`supportsFdContainment()`, and fails when an
+  approval/witness trust level is asserted on a non-pinned host.
+  `--require-hardened` exits 2 on any `fail` or `unknown`; plain
+  `doctor --security` stays advisory.
+
+### Fixed
+
+- **Signed runs refuse the inline `verified_pass` shortcut.** `task_update` to
+  `verified_pass` now requires a verified `verify/report-<taskId>.json` with
+  `status: "PASS"` and a valid `_auth`. The inline `verification.status`
+  shortcut survives only on explicit `allowUnsignedLegacy` runs, where it is
+  recorded as a `verification_inline_legacy` event and
+  `verificationSource: "inline-legacy"`.
+- **PASS evidence is recomputed.** The report writer keeps
+  `checks[].output`/`checks[].error`, adds `checks[].exitCode` and an
+  engine-computed `checks[].outputSha256`, and refuses a PASS with any
+  `checks[].passed !== true`, non-empty `fatalFindings`, or no summary/check.
+  `final_verify` re-checks the same invariants (including the output hash) so a
+  hand-forged, validly signed file cannot bypass them.
+- **Briefing honesty.** `BRIEFING.md` no longer renders an unsigned/unverified
+  `verify/victory.json` as plain `CONFIRMED`; it says
+  `CONFIRMED (unverified envelope)` (or notes that an envelope is present but
+  the briefing does not verify it).
+
+### Tests
+
+- Approvals: run-key/HMAC approvals fail `AUTH_APPROVAL_NOT_HUMAN`; a distinct
+  Ed25519 approver accepted; in-run approvals ignored for version 2; missing
+  approval dir refuses the plan with no run directory; version 1 in-run approval
+  still readable and emits `approval_unbound`; expired and pre-manifest
+  approvals fail `AUTH_APPROVAL_STALE`; `team/sentinel` refused, `uid:john`
+  accepted.
+- Doctor: `fail` propagates to exit 2 under `--require-hardened`; caller-owned
+  signer and approval dirs fail; non-Linux/unknown refuses; an all-pass fixture
+  exits 0; plain `--security` stays exit 0.
+- Content integrity: signed-run inline PASS refused; legacy inline PASS recorded;
+  inconsistent PASS refused at write and at `final_verify`; `outputSha256`
+  mismatch refused; a consistent PASS still passes.
+- Briefing renders an unsigned victory as unverified. Existing engine/cost/
+  safe-fs/export/auth/security suites stay green.
+
 ## [0.10.1] - 2026-11-23
 
 Patch release for defects shipped in 0.10.0. No protocol bump: state written by

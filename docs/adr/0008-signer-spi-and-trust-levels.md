@@ -195,7 +195,37 @@ path, missing public key), command/HTTP witnesses, and rotation.
 `scripts/test-security.mjs` covers doctor `--security`/`--json` and the claim
 lint. All existing HMAC and engine suites remain green.
 
-## 6. References
+## 6. Amendment — 0.10.2 trust honesty
+
+0.10.2 keeps the envelope, key ring, signer SPI and level names, and tightens
+what the two policy levels actually establish:
+
+- **Approval location.** Version 2 manifests (new plans) read
+  `approvals/<runId>.json` only from `OPENCODE_TEAMWORK_APPROVAL_DIR`: an
+  absolute real directory outside `<run>/` and the repo, owned by a different
+  UID. A missing directory or approver key refuses the plan before any mkdir
+  or state write (`AUTH_APPROVAL_DIR`, `AUTH_APPROVAL_UNTRUSTED`). Version 1
+  manifests keep the in-run path readable and emit `approval_unbound`.
+- **Approval principal.** The approval envelope must be Ed25519 and its
+  `_auth.keyId` must not equal `runKeyId` (`AUTH_APPROVAL_NOT_HUMAN`). The
+  verify-only approver public key is configured with
+  `OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY`; its key id is pinned as
+  `approvalKeyId` in the signed manifest, next to `approvalPolicy`, and both are
+  drift-checked.
+- **Freshness and identity.** `approvedAt >= manifest.createdAt`; the lifetime
+  defaults to 24 h (`OPENCODE_TEAMWORK_APPROVAL_TTL_MS`, max 7 d); stale or
+  over-long approvals fail `AUTH_APPROVAL_STALE`. `approvedBy`/`attestedBy`
+  must be `uid:<name>`, `oidc:<issuer>#<sub>`, or `ci:<workflow>`.
+- **Honest scope.** The approval binds a distinct configured key to the exact
+  signed manifest digest. It does not prove a human read the diff: the identity
+  is a claimed name, and the approval body is not evidence of review.
+
+The doctor half of this amendment is in § 2.6: knowable facts (`ptrace_scope=0`,
+root-equivalent groups, caller-owned signer/approval paths, DB group/other bits,
+non-pinned containment while asserting approval/witness) are `fail`, not
+warning, and `doctor --security --require-hardened` exits 2 on `fail`/`unknown`.
+
+## 7. References
 
 - ADR 0005: artifact authenticity, canonical JSON, digest index, signed baseline.
 - ADR 0006: same-UID isolation feasibility and the missing non-oracle primitive.
