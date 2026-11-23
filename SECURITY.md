@@ -57,8 +57,10 @@ public key before the artifact is accepted.
 
 `opencode-teamwork doctor --security` prints the relevant host facts (key
 source/algorithm, signer/witness config, `ptrace_scope`, root-equivalent group
-membership, DB mode including `-wal`/`-shm`, config/plugin writability, the
-approval directory, write-containment mode, SELinux). A knowable problem is a
+membership, DB mode including `-wal`/`-shm`, config/plugin writability, whether
+an approver key is configured, whether a configured signer could accept an
+`approvals/` path, the approval directory and its owner, write-containment
+mode, SELinux). A knowable problem is a
 `fail`; an uninspectable fact is `unknown`, never "safe".
 `doctor --security --require-hardened` exits 2 when any check is `fail` or
 `unknown`; plain `doctor --security` is advisory (exit 0 with a warning
@@ -75,45 +77,77 @@ enforces it.
 | --- | --- | --- |
 | `local-hmac` | HMAC-SHA256 key ring in plugin storage (or `OPENCODE_TEAMWORK_HMAC_KEY`) | A verified HMAC envelope and index entry. |
 | `external-signer` | Local Ed25519 key or `OPENCODE_TEAMWORK_SIGNER=command:<path>` | Verified **Ed25519** envelopes only; an HMAC envelope fails `AUTH_TRUST_LEVEL`. |
-| `human-approved` | Any configured run source | An Ed25519 approval in `OPENCODE_TEAMWORK_APPROVAL_DIR` bound to the run id and signed-manifest digest, with `approvedBy` and a fresh bounded lifetime. |
-| `ci-attested` | Any configured run source | The same approval with `attestedBy` and `trustLevel: "ci-attested"`. |
+| `human-approved` | Any configured run source | An Ed25519 approval in `OPENCODE_TEAMWORK_APPROVAL_DIR` bound to the exact `prompt_draft.md` bytes, the run id, and a one-use nonce, with `approvedBy` and a fresh bounded lifetime. |
+| `ci-attested` | Any configured run source | The same prompt-bound approval with `attestedBy` and `trustLevel: "ci-attested"`. |
 
 ### What `human-approved` / `ci-attested` establish
 
-An approval is a separate `_auth` envelope over
-`{runId, trustLevel, approvedBy|attestedBy, approvedAt, expiresAt?, manifestDigest}`:
+An approval is a separate Ed25519 `_auth` envelope over
+`{runId, trustLevel, binding: "prompt", promptDraftSha256, promptDraftBytes,
+openGaps, approvalNonce, approvedAt, expiresAt, planHash?, approvedBy|attestedBy}`.
+Since 0.11.0 it binds the **prompt draft**, not only the manifest. The
+manifest (version 3) records `specHash`, `specBytes`, `approvalDigest`,
+`approvalNonce`, `approvalBinding`, `approvedBy`, and `approvedAt`; a re-plan
+that changes any of them is `AUTH_STALE`.
 
 - It must be read from an **absolute approval directory** outside the run and
   the repository, a real directory (never a symlink), owned by a **different
   UID** than the run process. A file must be a regular file, not a symlink, also
-  owned by that other UID.
+  owned by that other UID. A same-UID directory fails
+  `AUTH_APPROVAL_UNTRUSTED`; the sandbox cannot satisfy this on one UID.
 - Its envelope must be **Ed25519**, and its `_auth.keyId` must be **different**
   from the manifest's `runKeyId`. An HMAC approval or an approval signed with
   the run key fails `AUTH_APPROVAL_NOT_HUMAN`. Configure the verify-only
   approver key with `OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY` (and optionally
   `_KEY_ID`); the key id is pinned in the signed manifest as `approvalKeyId`.
-- It must bind the current signed `manifestDigest` and `runId`, have
-  `approvedAt >= manifest.createdAt`, and not be expired. The default lifetime
-  is 24 hours (`OPENCODE_TEAMWORK_APPROVAL_TTL_MS`, capped at 7 days); a stale
-  or over-long approval fails `AUTH_APPROVAL_STALE`.
+- It must bind the exact `prompt_draft.md` bytes
+  (`promptDraftSha256 === specHash`, `promptDraftBytes === specBytes`), the
+  `runId`, and `binding: "prompt"`. An edited draft, another run's approval, or
+  a missing field fails `AUTH_APPROVAL_STALE` / `AUTH_APPROVAL_INCOMPLETE`.
+- `openGaps` must be `0` and the draft must contain no `[OPEN:` marker.
+  `approve sign --allow-open` records a nonzero count, which the plan then
+  refuses (`AUTH_APPROVAL_INCOMPLETE`).
+- `approvalNonce` must be at least 128 bits, equal `_auth.nonce`, and unused for
+  the run. The plugin consumes it once at plan time and stores
+  `{approvalNonce, approvalDigest, planHash, at}` at
+  `ctx.storage` `auth/approval/<runId>/consumed`; a later different nonce is
+  `AUTH_APPROVAL_REPLAY`.
+- `approvedAt`/`expiresAt` must be fresh. The default lifetime is 24 hours
+  (`OPENCODE_TEAMWORK_APPROVAL_TTL_MS`, capped at 7 days); a stale, expired, or
+  over-long approval fails `AUTH_APPROVAL_STALE`. A prompt-bound approval is
+  produced before the plan, so it must still be live when the manifest was
+  written.
 - `approvedBy`/`attestedBy` must look like a principal: `uid:<name>`,
   `oidc:<issuer>#<sub>`, or `ci:<workflow>`. A bare `team/...` or `ses_...`
   label fails `AUTH_APPROVAL_NOT_HUMAN`.
+- The plugin signer and any `command:` signer refuse an `approvals/` path with
+  `AUTH_APPROVAL_SCOPE`. Approvals are produced only by
+  `opencode-teamwork approve sign` (or an equivalent CI job) holding the
+  approver private key directly.
 
-This establishes that a **different configured principal signed this exact
-manifest digest while the approval was fresh**. It does **not** establish that
-a human read the code, understood the diff, or approves the behaviour: the
-identity is a claimed label, not an identity proof, and approval content is not
-validated. The run process must still be configured so that the approver key
-and directory are outside the agent's write reach; a same-UID approver is not a
-boundary.
+This establishes that a **different configured principal signed these exact
+draft bytes and this run while the approval was fresh**. It does **not**
+establish that a human read the draft, understood it, or approves the
+behaviour: the identity is a claimed label, not an identity proof, the CLI
+cannot prove that the text displayed to the approver was the text hashed, and
+approval content is not validated. The run process must still be configured so
+that the approver key and directory are outside the agent's write reach; a
+same-UID approver is not a boundary and cannot satisfy the gate.
+
+> `human-approved` means the approval artifact verifies under an Ed25519 key
+> the agent's process does not hold and cannot ask to sign, and is bound to the
+> exact bytes of prompt_draft.md and this run. It does not establish that a
+> human read the draft, that the displayed text matched the bytes hashed, or
+> that the approver understood it. Treat it as provenance, not comprehension.
 
 A new plan with `human-approved`/`ci-attested` refuses **before writing
-anything** when the directory or approver key is missing
-(`AUTH_APPROVAL_DIR` / `AUTH_APPROVAL_UNTRUSTED`). Manifests written by 0.10.1
-and earlier (version 1) keep their old in-run `approvals/<run>.json` path
-readable, but `final_verify` records `approval_unbound` and does not claim a
-distinct principal for it.
+anything** when the directory, approver key, draft, or approval is missing or
+incomplete (`AUTH_APPROVAL_DIR` / `AUTH_APPROVAL_UNTRUSTED` /
+`AUTH_APPROVAL_INCOMPLETE`). Manifests written by 0.10.1 and earlier
+(version 1) keep their old in-run `approvals/<run>.json` path readable, but
+`final_verify` records `approval_unbound` and does not claim a distinct
+principal for it. Version 2 (0.10.2) keeps its manifestDigest-bound approval
+semantics.
 
 Benchmark integrity refuses an explicit `local-hmac` trust level and warns when
 the default is used.
@@ -163,6 +197,8 @@ that boundary in-process.
 | `OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY` | SPKI Ed25519 public key of the approver (verify-only). Pinned as `approvalKeyId` at plan time. |
 | `OPENCODE_TEAMWORK_APPROVAL_KEY_ID` | Optional approval key id; defaults to a digest of the approval public key. |
 | `OPENCODE_TEAMWORK_APPROVAL_TTL_MS` | Default approval lifetime when `expiresAt` is omitted (24 h; max 7 days). |
+| `OPENCODE_TEAMWORK_APPROVAL_PRIVATE_KEY` | PKCS#8 Ed25519 private key (base64url DER) used **only by the approver's own process** (`approve sign`). Never give it to the agent's process. |
+| `OPENCODE_TEAMWORK_APPROVAL_KEY_FILE` | Path to a PEM or base64url PKCS#8 approver key for `approve sign` (alternative to the env/`--key`). |
 
 The command signer receives `{v, alg, keyId, path, digest, nonce, at, message}`
 and must return `{alg: "ed25519", keyId, sig}`. The plugin verifies the returned
@@ -182,9 +218,20 @@ unavailable, malformed, timing-out, or non-verifying signer fails closed with
   plugin storage. A same-UID writer can rewrite them; the witness is the
   optional cross-check.
 - **Approval artifact.** `approvals/<runId>.json` is verified with the
-  configured approval key. With `local-hmac`, a same-UID writer can mint a run
-  envelope; that is why 0.10.2 requires an Ed25519 approver key distinct from
-  `runKeyId` and an approval directory owned by another UID. The approval proves
-  which configured key signed which manifest digest; it does not prove the
-  approver's real-world identity, that a human read the change, or that the
-  approval content is accurate.
+  configured approval key. The plugin refuses to sign an `approvals/` path, and
+  0.11.0 requires an Ed25519 approver key distinct from `runKeyId` and an
+  approval directory owned by another UID. The approval proves which configured
+  key signed which exact draft bytes and run id; it does not prove the
+  approver's real-world identity, that a human read the draft, that the text
+  displayed to the approver matched the bytes hashed, or that the approval
+  content is accurate.
+- **Approval content is a name, not a proof.** `approvedBy` is a claimed label.
+  A compromised or careless approver process can sign any draft, and a
+  same-UID key holder (including a single-UID sandbox) cannot satisfy the
+  distinct-principal requirement at all. There is no human-presence enforcement:
+  the CLI asks for a typed digest prefix and the word `approve`, but a script
+  holding the key can reproduce both.
+- **Display spoofing.** The CLI hashes the bytes on disk and prints the digest.
+  It cannot prove that the approver's review surface showed those same bytes; a
+  redirect, a different checkout, or a renderer that hides text is outside the
+  boundary.

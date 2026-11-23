@@ -106,6 +106,15 @@ The interviewer's step-9 relay instructions make the last row concrete: they tel
 
 This distinction matters for any reimplementation: matching the prefix is enough to unlock routing in the observed client, and the record cannot be used as an audit trail of who approved what.
 
+**0.11.0 note (this repository).** The gap this record names is addressed for
+the plugin's own gate by [ADR 0011](../../adr/0011-authenticated-prompt-approval.md):
+`human-approved`/`ci-attested` now require an external Ed25519 approval bound to
+the exact `prompt_draft.md` bytes, the run id, and a one-use nonce, verified
+before the plan writes anything. That still does not establish that a human read
+the draft; it makes the procedural string match insufficient, not the approval
+comprehended. This research document remains a record of the observed
+Antigravity client, not of the plugin's gate.
+
 ---
 
 ## 6. The `## Parameters` absence
