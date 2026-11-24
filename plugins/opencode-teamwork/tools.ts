@@ -4807,12 +4807,32 @@ async function evaluateTrustGate(
     }
   }
   if (manifest.requireWitness === true) {
-    const hasReceipt = auth ? await auth.hasWitnessReceipt(runId, RUN_MANIFEST) : false
-    if (!hasReceipt) {
+    // A required witness is checked, not merely counted: when a witness
+    // public key is configured the receipt signature must cover this run,
+    // path, digest and nonce. With no public key the receipt stays
+    // `unverified` (detection-only), which is the pre-0.14 behavior.
+    const check = auth
+      ? await auth.verifyWitnessReceipt(runId, RUN_MANIFEST, {
+          digest: manifest._auth?.digest,
+          nonce: manifest._auth?.nonce ?? manifest.runNonce,
+        })
+      : {
+          status: "unknown" as const,
+          failure: { code: "AUTH_UNAVAILABLE" as const, message: "no authenticity context is wired for this run" },
+        }
+    if (check.status === "missing" || check.status === "unknown") {
       reasons.push(
-        "[AUTH_WITNESS_UNAVAILABLE] requireWitness is set but no witness receipt was recorded for run.manifest.json",
+        `[${check.failure?.code ?? "AUTH_WITNESS_UNAVAILABLE"}] requireWitness is set but no usable witness receipt was recorded for run.manifest.json${
+          check.failure?.message ? ` (${check.failure.message})` : ""
+        }`,
+      )
+    } else if (check.status === "invalid") {
+      reasons.push(
+        `[${check.failure?.code ?? "AUTH_INVALID"}] the witness receipt for run.manifest.json is not valid: ${check.failure?.message ?? "verification failed"}`,
       )
     }
+    // `unverified` is accepted only because no witness public key is
+    // configured; final_verify records that label in its evidence.
   }
   return reasons
 }
@@ -11648,6 +11668,31 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             : victoryGate.ok
               ? "CONFIRMED"
               : "FAILED"
+          // Witness evidence is reported, not implied. A receipt with no
+          // configured witness public key is labelled `unverified`; only a
+          // signature over this run/path/digest/nonce is `verified`.
+          let witnessEvidence: Record<string, unknown> | undefined
+          if (signedRun) {
+            const witnessCheck = auth
+              ? await auth.verifyWitnessReceipt(basename(run), RUN_MANIFEST, {
+                  digest: manifestCheck.manifest._auth?.digest,
+                  nonce: manifestCheck.manifest._auth?.nonce ?? manifestCheck.manifest.runNonce,
+                })
+              : {
+                  status: "unknown" as const,
+                  failure: { code: "AUTH_UNAVAILABLE" as const, message: "no authenticity context is wired for this run" },
+                }
+            const required = manifestCheck.manifest.requireWitness === true
+            if (required || (witnessCheck.status !== "missing" && witnessCheck.status !== "unknown")) {
+              witnessEvidence = {
+                required,
+                status: witnessCheck.status,
+                ...(witnessCheck.keyId ? { keyId: witnessCheck.keyId } : {}),
+                ...(witnessCheck.at ? { at: witnessCheck.at } : {}),
+                ...(witnessCheck.failure ? { failure: witnessCheck.failure.code } : {}),
+              }
+            }
+          }
           const finalPayload: any = {
             status,
             generatedBy: { agent: caller?.agent ?? null, session: callSession || basename(run) },
@@ -11677,6 +11722,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               ...(documentReviewEvidence ? { documentReview: documentReviewEvidence } : {}),
               ...(lemmaEvidence ? { lemma: lemmaEvidence } : {}),
               ...(tournamentEvidence ? { tournament: tournamentEvidence } : {}),
+              ...(witnessEvidence ? { witness: witnessEvidence } : {}),
               handoffs: handoffGate.skipped
                 ? { mode: "skip", status: "SKIPPED", required: [], entries: [], reasons: [] }
                 : {

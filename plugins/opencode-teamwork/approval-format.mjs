@@ -30,6 +30,8 @@ const DIGEST_DOMAIN_KEY = Buffer.from([
 ])
 
 export const SIGNATURE_DOMAIN = "teamwork-artifact-v1"
+export const WITNESS_DOMAIN = "teamwork-witness-v1"
+export const SIGNER_APPROVAL_DOMAIN = "teamwork-signer-approval-v1"
 export const AUTH_ED25519 = "ed25519"
 export const AUTH_HMAC = "hmac-sha256"
 
@@ -125,6 +127,28 @@ export function approvalKeyIdFromPublicKey(publicKey, configured) {
   const id = String(configured ?? "").trim()
   return id || `approval_${sha256Hex(key).slice(0, 16)}`
 }
+
+/**
+ * Witness receipt signature input (v2 witness protocol, 0.14.0). The witness
+ * signs the run id, path, digest, nonce and time it actually observed, so a
+ * receipt copied to another path/digest/run is detectable at final_verify.
+ * `at` is the artifact envelope time, not a trusted clock; it is covered by the
+ * signature so it cannot be edited after the fact.
+ */
+export function witnessSignatureInput(runId, path, digest, nonce, at) {
+  return `${WITNESS_DOMAIN}\0${runId}\0${path}\0${digest}\0${nonce}\0${at}`
+}
+
+/**
+ * Signer-approval signature input (§4.3 of docs/SIGNER-PROTOCOL.md). A distinct
+ * domain keeps an artifact signature from being replayable as an approval and
+ * vice versa. The canonical payload carries `approvedAt`; `expiresAt` is both
+ * inside the payload and repeated here so a signer can compare it separately.
+ */
+export function signerApprovalSignatureInput({ runId, path, digest, nonce, expiresAt, payload }) {
+  return `${SIGNER_APPROVAL_DOMAIN}\0${runId}\0${path}\0${digest}\0${nonce}\0${expiresAt}\0${canonicalJson(withoutAuth(payload))}`
+}
+
 
 /** Base64url with at least 16 bytes of entropy (128 bits). */
 export function isApprovalNonce(value) {

@@ -76,9 +76,38 @@ function witnessScript(mode) {
 import { readFileSync } from "node:fs"
 const request = JSON.parse(readFileSync(0, "utf8"))
 if (${JSON.stringify(mode)} === "missing") process.stdout.write("{}")
+else if (${JSON.stringify(mode)} === "unsigned") process.stdout.write(JSON.stringify({ receipt: "unsigned:" + request.path }))
 else process.stdout.write(JSON.stringify({ receipt: "fixture-receipt:" + request.runId + ":" + request.path }))
 `,
   )
+}
+
+/** A witness that signs the v2 receipt with its own Ed25519 key. */
+function signingWitnessScript(privateKey, keyId) {
+  return writeScript(
+    "witness-signing.mjs",
+    `#!/usr/bin/env node
+import { readFileSync } from "node:fs"
+import { createPrivateKey, sign } from "node:crypto"
+const request = JSON.parse(readFileSync(0, "utf8"))
+if (request.v !== 2) {
+  process.stderr.write("expected v2")
+  process.exit(2)
+}
+const input = "teamwork-witness-v1\\0" + request.runId + "\\0" + request.path + "\\0" + request.digest + "\\0" + request.nonce + "\\0" + request.at
+const key = createPrivateKey({ key: Buffer.from(${JSON.stringify(privateKey)}, "base64url"), format: "der", type: "pkcs8" })
+process.stdout.write(JSON.stringify({
+  receipt: "signed:" + request.runId + ":" + request.path,
+  alg: "ed25519",
+  keyId: ${JSON.stringify(keyId)},
+  sig: sign(null, Buffer.from(input, "utf8"), key).toString("base64url"),
+}))
+`,
+  )
+}
+
+function witnessKeyId(publicKey) {
+  return `witness_${sha256Hex(publicKey).slice(0, 16)}`
 }
 
 const created = []
@@ -355,6 +384,106 @@ try {
 
     console.log("✓ command and HTTP witnesses record receipts; a missing receipt fails AUTH_WITNESS_UNAVAILABLE")
   }
+
+  // ==========================================================================
+  // 4b. Signed witness receipts (v2): verify, forge, foreign path/digest
+  // ==========================================================================
+  {
+    console.log("Testing signed witness receipts...")
+    if (process.platform === "win32") {
+      console.log("SKIP: a command witness needs a shebang-executable script; this runner cannot execute one. Recorded.")
+    } else {
+      const keys = generatedEd25519()
+      const witnessKeys = generatedEd25519()
+      const wKeyId = witnessKeyId(witnessKeys.publicKey)
+      const signingWitness = signingWitnessScript(witnessKeys.privateKey, wKeyId)
+      const signedEnv = {
+        OPENCODE_TEAMWORK_ED25519_PRIVATE_KEY: keys.privateKey,
+        OPENCODE_TEAMWORK_WITNESS: `command:${signingWitness}`,
+        OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY: witnessKeys.publicKey,
+        OPENCODE_TEAMWORK_WITNESS_KEY_ID: wKeyId,
+      }
+      const fixture = context(signedEnv)
+      const auth = fixture.auth
+      await auth.bindRunNonce("run-w3", NONCE_A)
+      await auth.signRunArtifact("run-w3", "run.manifest.json", { n: 1 })
+
+      const good = await auth.verifyWitnessReceipt("run-w3", "run.manifest.json")
+      assert.strictEqual(good.status, "verified", `a signed receipt must verify: ${JSON.stringify(good)}`)
+      assert.strictEqual(good.keyId, wKeyId)
+
+      const storedKey = "auth/witness/run-w3/run.manifest.json"
+      const pristine = JSON.parse(JSON.stringify(fixture.storage.map.get(storedKey)))
+      assert.strictEqual(pristine.alg, "ed25519", "the record stores the witness algorithm")
+      assert.strictEqual(typeof pristine.sig, "string")
+      assert.strictEqual(pristine.at, pristine.record.at)
+      assert.strictEqual(pristine.verified, true)
+
+      // A forged KV record with a signature that does not verify fails.
+      const forged = JSON.parse(JSON.stringify(pristine))
+      forged.sig = Buffer.alloc(64).toString("base64url")
+      fixture.storage.map.set(storedKey, forged)
+      const forgedCheck = await auth.verifyWitnessReceipt("run-w3", "run.manifest.json")
+      assert.strictEqual(forgedCheck.status, "invalid", JSON.stringify(forgedCheck))
+      assert.strictEqual(forgedCheck.failure.code, "AUTH_INVALID")
+
+      // A valid receipt copied to another path is foreign.
+      fixture.storage.map.set("auth/witness/run-w3/verify/report-A1.json", pristine)
+      const foreignPath = await auth.verifyWitnessReceipt("run-w3", "verify/report-A1.json")
+      assert.strictEqual(foreignPath.status, "invalid", JSON.stringify(foreignPath))
+      assert.strictEqual(foreignPath.failure.code, "AUTH_INVALID")
+
+      // A receipt whose recorded digest differs from the artifact digest fails.
+      fixture.storage.map.set(storedKey, pristine)
+      const otherDigest = await auth.verifyWitnessReceipt("run-w3", "run.manifest.json", {
+        digest: "0".repeat(64),
+        nonce: NONCE_A,
+      })
+      assert.strictEqual(otherDigest.status, "invalid", JSON.stringify(otherDigest))
+      assert(/different digest\/nonce/.test(otherDigest.failure.message), otherDigest.failure.message)
+
+      // A receipt for a different nonce fails the same way.
+      const otherNonce = await auth.verifyWitnessReceipt("run-w3", "run.manifest.json", {
+        digest: pristine.record.digest,
+        nonce: NONCE_B,
+      })
+      assert.strictEqual(otherNonce.status, "invalid", JSON.stringify(otherNonce))
+
+      // No receipt at all with a configured key: unavailable, never a pass.
+      const missing = await auth.verifyWitnessReceipt("run-w3", "verify/absent.json")
+      assert.strictEqual(missing.status, "missing")
+      assert.strictEqual(missing.failure.code, "AUTH_WITNESS_UNAVAILABLE")
+
+      // An unsigned witness response cannot satisfy a configured witness key.
+      const unsigned = context({
+        OPENCODE_TEAMWORK_ED25519_PRIVATE_KEY: keys.privateKey,
+        OPENCODE_TEAMWORK_WITNESS: `command:${witnessScript("unsigned")}`,
+        OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY: witnessKeys.publicKey,
+        OPENCODE_TEAMWORK_WITNESS_KEY_ID: wKeyId,
+      }).auth
+      await unsigned.bindRunNonce("run-w4", NONCE_A)
+      let unsignedCode
+      try {
+        await unsigned.signRunArtifact("run-w4", "run.manifest.json", { n: 1 })
+      } catch (err) {
+        unsignedCode = err?.failure?.code
+      }
+      assert.strictEqual(unsignedCode, "AUTH_WITNESS_UNAVAILABLE", "an unsigned receipt must fail closed when a key is configured")
+
+      // No witness public key: keep today's behavior, labelled unverified.
+      const legacy = context({
+        OPENCODE_TEAMWORK_ED25519_PRIVATE_KEY: keys.privateKey,
+        OPENCODE_TEAMWORK_WITNESS: `command:${witnessScript("ok")}`,
+      }).auth
+      await legacy.bindRunNonce("run-w5", NONCE_A)
+      await legacy.signRunArtifact("run-w5", "run.manifest.json", { n: 1 })
+      const unverified = await legacy.verifyWitnessReceipt("run-w5", "run.manifest.json")
+      assert.strictEqual(unverified.status, "unverified", JSON.stringify(unverified))
+      assert.strictEqual(unverified.failure, undefined)
+    }
+    console.log("✓ signed receipts verify; forged/foreign/different-digest records fail; no key means unverified; missing fails closed")
+  }
+
 
   // ==========================================================================
   // 5. Rotation to an Ed25519 ring keeps old HMAC artifacts verifiable
