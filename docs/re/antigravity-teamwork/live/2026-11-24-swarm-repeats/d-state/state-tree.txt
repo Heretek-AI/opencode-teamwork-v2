@@ -1,0 +1,4 @@
+d         40 teamwork_swe_1
+d         60 sentinel
+f       1897 sentinel/BRIEFING.md
+f        368 ORIGINAL_REQUEST.md

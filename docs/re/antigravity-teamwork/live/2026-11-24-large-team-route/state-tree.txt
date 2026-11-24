@@ -1,0 +1,4 @@
+d         40 teamwork_proof_1
+d         60 sentinel
+f       2193 sentinel/BRIEFING.md
+f        319 ORIGINAL_REQUEST.md
