@@ -75,6 +75,7 @@ import {
   TOURNAMENT_PHASES,
   MAX_MANIFEST_BYTES,
   MAX_REPORT_BYTES,
+  MAX_VERIFIER_REPORT_BYTES,
   assertRunRootIdentity,
   auditTournament,
   classifyRoute as classifyTournamentRoute,
@@ -160,7 +161,9 @@ import {
 } from "./handoff.ts"
 import type { HandoffGate, HandoffMode, HandoffTaskRef } from "./handoff.ts"
 import { withCrossProcessLock, withFileLock, withPinnedCrossProcessLock, recentLockDiagnostics } from "./locks.ts"
+import { BLOCKING_CLAIM_STATES, deriveClaimStateFromClaim } from "./claim-state.mjs"
 import {
+  acknowledgeWriteAnomalies,
   appendLineWithin,
   createDirWithin,
   fdWithin,
@@ -169,8 +172,10 @@ import {
   setRunRequirePinnedWrites,
   supportsFdContainment,
   touchWithin,
+  unacknowledgedWriteAnomalies,
   writeFileAtomicWithin,
   writeOnceWithin,
+  writeAnomaliesForRun,
 } from "./safe-fs.mjs"
 
 // ---------------------------------------------------------------------------
@@ -905,7 +910,7 @@ function detectEvidenceContradictions(opts: {
   // 4. A strict wave verdict bound to the current hash of a FAIL report.
   for (const task of opts.strictGate?.tasks ?? []) {
     if (task.reportStatus !== "FAIL") continue
-    const raw = readBoundedRunFile(run, join(run, `verify/report-${task.id}.json`), MAX_RUN_FILE_BYTES)
+    const raw = readBoundedRunFile(run, join(run, `verify/report-${task.id}.json`), MAX_VERIFIER_REPORT_BYTES)
     const digest = raw.status === "ok" ? contentSha256Hex(raw.text) : null
     if (!digest) continue
     const wave = [task.challenge, task.audit].find(
@@ -1768,12 +1773,45 @@ function claimLeaseOf(state: any): number {
 function runHostOf(state: any, plan?: any): string {
   if (typeof state?.host === "string" && state.host.trim()) return clean(state.host, 80).trim()
   if (typeof plan?.host === "string" && plan.host.trim()) return clean(plan.host, 80).trim()
-  return SELF_HOST
+  // A claim-protocol-1 run predates the host field entirely, so it keeps the
+  // legacy local behaviour. For protocol 2 a missing host is not assumed to be
+  // local: the run is reported as an unknown host (fail closed), and a missing
+  // claim.host is cross-host in deriveClaimState.
+  if (claimProtocolOf(state) < CLAIM_PROTOCOL) return SELF_HOST
+  return "unknown"
+}
+
+/** A claim with no recorded host is cross-host (fail closed), never local. */
+function claimIsCrossHost(claim: any): boolean {
+  const host = typeof claim?.host === "string" ? claim.host.trim() : ""
+  return host === "" || host !== SELF_HOST
 }
 
 function appendClaimHistory(history: any[], entry: any): any[] {
   const next = [...(Array.isArray(history) ? history : []), entry]
   return next.slice(-CLAIM_HISTORY_MAX)
+}
+
+/**
+ * Merge history lists without losing a claimant. `claim.history` (embedded in
+ * the current claim) and `task.claimHistory` (task-level, survives release)
+ * are two views of the same chain; before a claim is deleted both are merged
+ * into the task-level list. Duplicate (by, at, event) entries collapse and the
+ * 5-entry bound is kept.
+ */
+function mergeClaimHistory(...lists: any[]): any[] {
+  const merged: any[] = []
+  const seen = new Set<string>()
+  for (const list of lists) {
+    for (const entry of normalizeHistory(list)) {
+      const key = `${entry.by}|${entry.at}|${entry.event}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      merged.push(entry)
+    }
+  }
+  // normalizeHistory bounds each input; the union may still exceed the cap.
+  return merged.slice(-CLAIM_HISTORY_MAX)
 }
 
 /** The exact 0.9.0 claim shape, for a claimProtocol 1 run. */
@@ -1792,7 +1830,16 @@ function makeTaskClaim(
   by: string,
   now: number,
   previous: any,
-  opts: { host: string; runHost?: string; leaseMs: number; epoch: number; event?: string; reason?: string },
+  opts: {
+    host: string
+    runHost?: string
+    leaseMs: number
+    epoch: number
+    event?: string
+    reason?: string
+    /** The task-level chain to rehydrate a later claim from. */
+    priorHistory?: any[]
+  },
 ): any {  const at = new Date(now).toISOString()
   const claim: any = {
     by: clean(by, 80),
@@ -1806,18 +1853,18 @@ function makeTaskClaim(
     renewals: 0,
   }
   const prev = normalizePreviousClaimant(previous)
+  const seeded = mergeClaimHistory(opts.priorHistory, previous?.history)
   if (prev && prev.by !== claim.by) {
     claim.previousClaimant = prev
-    claim.history = appendClaimHistory(normalizeHistory(previous?.history), {
+    claim.history = appendClaimHistory(seeded, {
       by: prev.by,
       at: prev.at,
       leaseUntil: prev.leaseUntil,
       event: opts.event ?? "reclaimed",
       ...(opts.reason ? { reason: clean(opts.reason, 200) } : {}),
     })
-  } else if (previous) {
-    const history = normalizeHistory(previous.history)
-    if (history.length) claim.history = history
+  } else if (seeded.length) {
+    claim.history = seeded
   }
   return claim
 }
@@ -1887,6 +1934,7 @@ type DerivedClaimState = "none" | "live" | "expired" | "stale" | "needs-inspecti
 function deriveClaimState(
   task: any,
   now = Date.now(),
+  options: { legacyHostless?: boolean } = {},
 ): {
   state: DerivedClaimState
   remainingMs: number
@@ -1896,19 +1944,23 @@ function deriveClaimState(
 } {
   const claim = normalizeClaim(task?.claim)
   if (!claim) return { state: "none", remainingMs: 0, crossHost: false, needsInspection: false }
-  const until = Date.parse(claim.leaseUntil)
-  const remainingMs = Number.isFinite(until) ? until - now : 0
-  const hb = claim.heartbeatAt ? Date.parse(claim.heartbeatAt) : NaN
-  const heartbeatAgeMs = Number.isFinite(hb) ? Math.max(0, now - hb) : undefined
-  const crossHost = !!claim.host && claim.host !== SELF_HOST
-  const flagged = task?.claim?.needsInspection === true
-  let state: DerivedClaimState
-  if (remainingMs > 0) state = crossHost ? "cross-host" : "live"
-  else if (crossHost) state = "cross-host"
-  else if (flagged) state = "needs-inspection"
-  else if (Number.isFinite(until) && now < until + CLAIM_GRACE_MS) state = "expired"
-  else state = "stale"
-  return { state, remainingMs, heartbeatAgeMs, crossHost, needsInspection: state === "needs-inspection" }
+  // One shared predicate (claim-state.mjs) so prune, cleanup, status and the
+  // claim engine cannot disagree. Missing host is cross-host (protocol 2); a
+  // flagged claim is needs-inspection even while its lease is live.
+  const derived = deriveClaimStateFromClaim(claim, {
+    now,
+    selfHost: SELF_HOST,
+    graceMs: CLAIM_GRACE_MS,
+    flagged: task?.claim?.needsInspection === true,
+    legacyHostless: options.legacyHostless === true,
+  })
+  return {
+    state: derived.state as DerivedClaimState,
+    remainingMs: derived.remainingMs,
+    ...(derived.heartbeatAgeMs !== undefined ? { heartbeatAgeMs: derived.heartbeatAgeMs } : {}),
+    crossHost: derived.crossHost,
+    needsInspection: derived.needsInspection,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2365,7 +2417,14 @@ interface ReportBindingCheck {
  */
 function validateVerifierReportBinding(
   report: any,
-  opts: { taskId: string; round: number; fence: number; root: string; runId: string },
+  opts: {
+    taskId: string
+    round: number
+    fence: number
+    root: string
+    runId: string
+    requireReportBinding?: boolean
+  },
   evidence?: { headSha?: string; baseSha?: string; diffHash?: string },
 ): ReportBindingCheck {
   if (!report || typeof report !== "object") {
@@ -2417,7 +2476,17 @@ function validateVerifierReportBinding(
       }
     }
   }
-  if (report.headSha === undefined || report.diffHash === undefined) warnings.add("legacy_unbound_report")
+  if (opts.requireReportBinding === true) {
+    if (typeof report.headSha !== "string" || report.headSha === "" || typeof report.diffHash !== "string" || report.diffHash === "") {
+      return {
+        ok: false,
+        code: "REPORT_UNBOUND",
+        reason: "requireReportBinding is asserted, but the report carries no headSha/diffHash",
+      }
+    }
+  } else if (report.headSha === undefined || report.diffHash === undefined) {
+    warnings.add("legacy_unbound_report")
+  }
   return { ok: true, ...(warnings.size ? { warning: Array.from(warnings).join(",") } : {}) }
 }
 
@@ -2445,6 +2514,19 @@ function verifierReportIntegrityProblems(report: any): string[] {
       if (expected !== sha256Hex(output)) problems.push(`check ${name} outputSha256 does not match its output`)
     } else if (check?.outputSha256 !== undefined) {
       problems.push(`check ${name} has outputSha256 without output`)
+    }
+    // D4: an exit code is a second, independent signal. `passed: true` with a
+    // non-zero exitCode (or `passed: false` with 0) contradicts the verdict and
+    // is refused by name instead of being ignored.
+    if (check?.exitCode !== undefined && check?.exitCode !== null) {
+      const exitCode = Number(check.exitCode)
+      if (!Number.isInteger(exitCode)) {
+        problems.push(`check ${name} exitCode is not an integer`)
+      } else if (check.passed === true && exitCode !== 0) {
+        problems.push(`CHECK_EXIT_CONFLICT: check ${name} passed=true but exitCode=${exitCode}`)
+      } else if (check.passed !== true && exitCode === 0) {
+        problems.push(`CHECK_EXIT_CONFLICT: check ${name} passed=false but exitCode=0`)
+      }
     }
   })
   if (Array.isArray(report.fatalFindings) && report.fatalFindings.length > 0) {
@@ -2651,10 +2733,27 @@ async function claimReadyTasks(
         return
       }
       const existing = normalizeClaim(st.claim)
-      const derivedExisting = existing ? deriveClaimState(st, now) : undefined
+      const derivedExisting = existing
+        ? deriveClaimState(st, now, { legacyHostless: protocol < CLAIM_PROTOCOL })
+        : undefined
       const heldLive =
         derivedExisting?.state === "live" ||
         (protocol < CLAIM_PROTOCOL && derivedExisting?.state === "cross-host")
+      // A cross-host claim is never renewed or re-dispatched, even when the
+      // claimant string matches this session: the same session id on another
+      // host is not this live process. A missing host is cross-host.
+      if (existing && protocol >= CLAIM_PROTOCOL && derivedExisting?.state === "cross-host") {
+        skipped.push({
+          id: candidate.id,
+          status: "claimed",
+          round: Number(st.round) || 0,
+          claim: publicClaim(existing),
+          claimState: "cross-host",
+          fence: nextFence(st),
+          reason: `claim was made on host ${existing.host ?? "unknown"}; cross-host claims are never auto-reclaimed`,
+        })
+        return
+      }
       if (existing && existing.by !== callSession && heldLive) {
         skipped.push({
           id: candidate.id,
@@ -2722,7 +2821,7 @@ async function claimReadyTasks(
       }
 
       if (existing && protocol >= CLAIM_PROTOCOL) {
-        const derived = deriveClaimState(st, now)
+        const derived = deriveClaimState(st, now, { legacyHostless: protocol < CLAIM_PROTOCOL })
         if (derived.crossHost) {
           skipped.push({
             id: candidate.id,
@@ -2829,6 +2928,7 @@ async function claimReadyTasks(
               leaseMs,
               epoch: (Number(existing?.epoch) || 0) + 1,
               event: previous ? "reclaimed" : "claimed",
+              priorHistory: st.claimHistory,
             })
           : makeLegacyTaskClaim(callSession, now, previous)
       st.claim = claim
@@ -3169,6 +3269,10 @@ onWriteAnomaly((anomaly: any) => {
   if (writeAnomalySinkBusy) return
   const run = typeof anomaly?.run === "string" ? anomaly.run : ""
   if (!run) return
+  // Policy and lock anomalies go to stderr and the config-dir audit (already
+  // written by safe-fs). Appending them to events.jsonl would be a write the
+  // policy itself refuses, so that path is skipped explicitly.
+  if (anomaly?.kind === "containment-mode" || anomaly?.kind === "detective-lock") return
   writeAnomalySinkBusy = true
   try {
     const kind = clean(anomaly.kind, 32)
@@ -4880,6 +4984,19 @@ async function createPlanRun(
   }
   const requirePinnedWrites = persistedRequirePinnedWrites || input.requirePinnedWrites === true
   setRunRequirePinnedWrites(run, requirePinnedWrites)
+  // D2: opt-in report/head binding. Same sticky rule as requirePinnedWrites: a
+  // re-plan may assert it but cannot turn an asserted run back off.
+  if (input.requireReportBinding !== undefined && typeof input.requireReportBinding !== "boolean") {
+    return { ok: false, content: "refused: requireReportBinding must be a boolean; nothing was written." }
+  }
+  const persistedRequireReportBinding = persistedPlan?.requireReportBinding === true
+  if (persistedRequireReportBinding && input.requireReportBinding === false) {
+    return {
+      ok: false,
+      content: "refused: requireReportBinding is already persisted for this run and cannot be disabled by a re-plan; start a new session. Nothing was written.",
+    }
+  }
+  const requireReportBinding = persistedRequireReportBinding || input.requireReportBinding === true
   const rawRoute = typeof input.route === "string" ? clean(input.route, 32).trim().toLowerCase() : ""
   const isLemma = input.lemmaMode === true || rawRoute === "lemma"
   if (input.lemmaMode === true && rawRoute && rawRoute !== "lemma") {
@@ -5716,6 +5833,7 @@ async function createPlanRun(
     requireHandoffs: requireHandoffsMode,
     requireHandoffsSource,
     ...(requirePinnedWrites ? { requirePinnedWrites: true } : {}),
+    ...(requireReportBinding ? { requireReportBinding: true } : {}),
     claimProtocol: CLAIM_PROTOCOL,
     claimLeaseMs,
     host: planHost,
@@ -5762,6 +5880,7 @@ async function createPlanRun(
         ...(victorySkipReason ? { victorySkipReason } : {}),
         requireHandoffs: requireHandoffsMode,
         ...(requirePinnedWrites ? { requirePinnedWrites: true } : {}),
+        ...(requireReportBinding ? { requireReportBinding: true } : {}),
         claimProtocol: CLAIM_PROTOCOL,
         claimLeaseMs,
         host: planHost,
@@ -5791,6 +5910,7 @@ async function createPlanRun(
             state.victorySkipReason !== victorySkipReason ||
             state.requireHandoffs !== requireHandoffsMode ||
             (requirePinnedWrites && state.requirePinnedWrites !== true) ||
+            (requireReportBinding && state.requireReportBinding !== true) ||
             state.rootSessionId !== rootSessionId ||
             (allowUnsignedLegacy && state.allowUnsignedLegacy !== true) ||
             (state.claimProtocol >= CLAIM_PROTOCOL &&
@@ -5806,6 +5926,7 @@ async function createPlanRun(
           else delete state.victorySkipReason
           state.requireHandoffs = requireHandoffsMode
           if (requirePinnedWrites) state.requirePinnedWrites = true
+          if (requireReportBinding) state.requireReportBinding = true
           state.rootSessionId = rootSessionId
           if (allowUnsignedLegacy) state.allowUnsignedLegacy = true
           if (state.claimProtocol >= CLAIM_PROTOCOL) {
@@ -6141,6 +6262,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             type: "boolean",
             description:
               "Default false. When true, final_verify requires a recorded witness receipt for the run manifest (OPENCODE_TEAMWORK_WITNESS=command:<path> or http(s)://<url>). A configured witness is appended on every signed artifact write; an unavailable/malformed witness fails closed with AUTH_WITNESS_UNAVAILABLE. A local file witness is detection-only.",
+          },
+          requirePinnedWrites: {
+            type: "boolean",
+            description:
+              "Default false. When true this run only accepts pinned control-plane writes; on a non-pinned host (macOS/Windows detective, or Linux without procfs) the writer refuses with reason containment-mode. Sticky: a re-plan cannot disable it.",
+          },
+          requireReportBinding: {
+            type: "boolean",
+            description:
+              "Default false (compatibility). When true, a PASS verifier report must carry headSha and diffHash computed by the engine; teamwork_report and final_verify refuse an unbound PASS with REPORT_UNBOUND. Sticky: a re-plan cannot disable it.",
           },
           requireSameHost: {
             type: "boolean",
@@ -6896,8 +7027,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "status",
-      description: "Read the active (or given) Teamwork run and summarize per-task progress.",
-      input: { type: "object", properties: { sessionId: { type: "string" } }, additionalProperties: false },
+      description:
+        "Read the active (or given) Teamwork run and summarize per-task progress. Lists unacknowledged write anomalies; a run with one reports needs-inspection. acknowledgeAnomalies: true records an explicit operator acknowledgement in the config-dir audit (never a run write).",
+      input: {
+        type: "object",
+        properties: {
+          sessionId: { type: "string" },
+          acknowledgeAnomalies: { type: "boolean" },
+        },
+        additionalProperties: false,
+      },
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -6918,9 +7057,15 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         }
         const needsInspection: string[] = []
         const claims: any[] = []
+        // Durable write-anomaly audit (A5). Only a refusal recorded for this
+        // run blocks it; `detective_mode`/`detective-lock` are fallback
+        // diagnostics. An acknowledgement is an operator record, not a run write.
+        if (input?.acknowledgeAnomalies === true) acknowledgeWriteAnomalies(run)
+        const writeAnomalies = writeAnomaliesForRun(run)
+        const unacknowledgedAnomalies = writeAnomalies.filter((entry: any) => entry.acknowledged !== true)
         const lines = Object.entries(tasks).map(([id, t]: any) => {
           const claim = publicClaim(t?.claim)
-          const derived = deriveClaimState(t, now)
+          const derived = deriveClaimState(t, now, { legacyHostless: protocol < CLAIM_PROTOCOL })
           let claimState: string = derived.state
           let fingerprintChanged = false
           if (
@@ -6960,16 +7105,30 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const inspectionText = needsInspection.length
           ? `\nNeeds inspection (${needsInspection.length}): ${needsInspection.join(", ")} — run teamwork_recover { action: "inspect", taskId } before reclaiming.`
           : ""
+        const anomalyText = writeAnomalies.length
+          ? `\nWrite anomalies (${writeAnomalies.length}, ${unacknowledgedAnomalies.length} unacknowledged): ${writeAnomalies
+              .slice(-10)
+              .map((entry: any) => `${clean(entry.kind, 32)}${entry.acknowledged ? " (acknowledged)" : ""}`)
+              .join(", ")}`
+          : ""
+        const writeAnomalyState = unacknowledgedAnomalies.length ? "needs-inspection" : "ok"
         return {
           content: `Run ${basename(run)} — phase ${PHASES.has(state.phase) ? state.phase : "UNKNOWN"} (claim protocol ${protocol}, lease ${
             protocol >= CLAIM_PROTOCOL ? leaseMs : LEGACY_CLAIM_LEASE_MS
-          }ms, host ${clean(host, 80)})\n${pass}/${lines.length} pass\n${lines.join("\n")}${warningText}${inspectionText}`,
+          }ms, host ${clean(host, 80)})\n${pass}/${lines.length} pass\n${lines.join("\n")}${warningText}${inspectionText}${anomalyText}${
+            unacknowledgedAnomalies.length
+              ? `\nWRITE ANOMALY NEEDS INSPECTION: ${unacknowledgedAnomalies.length} unacknowledged write anomaly(ies); teamwork_final_verify will refuse this run. Inspect the config-dir audit, then acknowledge explicitly.`
+              : ""
+          }`,
           claims,
           needsInspection,
           claimProtocol: protocol,
           claimLeaseMs: protocol >= CLAIM_PROTOCOL ? leaseMs : LEGACY_CLAIM_LEASE_MS,
           host,
           warnings,
+          writeAnomalies,
+          unacknowledgedWriteAnomalies: unacknowledgedAnomalies.length,
+          runState: writeAnomalyState,
           ...(protocol >= CLAIM_PROTOCOL ? { storage: state.storage ?? null, lockDiagnostics: recentLockDiagnostics(5) } : {}),
         }
       },
@@ -6992,7 +7151,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (!open.length) return { content: `Run ${basename(run)} is complete (all tasks pass).` }
         const openDetails = open.map(([id, t]: any) => {
           const claim = publicClaim(t?.claim)
-          const derived = deriveClaimState(t, now)
+          const derived = deriveClaimState(t, now, { legacyHostless: protocol < CLAIM_PROTOCOL })
           const claimText = claim
             ? ` claim=${claim.by}/${derived.state}${derived.remainingMs > 0 ? ` (${Math.max(0, derived.remainingMs)}ms left)` : ` (${claim.leaseUntil})`}`
             : ""
@@ -8604,7 +8763,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             if (recordedDigests && typeof recordedDigests === "object") {
               for (const [id, digest] of Object.entries(recordedDigests)) {
                 if (!isSafeTaskId(id)) continue
-                const raw = readBoundedRunFile(run, join(run, `verify/report-${id}.json`), MAX_RUN_FILE_BYTES)
+                const raw = readBoundedRunFile(run, join(run, `verify/report-${id}.json`), MAX_VERIFIER_REPORT_BYTES)
                 const current = raw.status === "ok" ? sha256Hex(raw.text) : null
                 if (current !== digest) {
                   drift.push(`report ${id} changed since final verification`)
@@ -9195,20 +9354,21 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // override with a recorded reason.
           const existingClaim = normalizeClaim((current as any).claim)
           const nowMs = Date.now()
-          const derivedCurrent = deriveClaimState(current, nowMs)
+          const derivedCurrent = deriveClaimState(current, nowMs, { legacyHostless: protocol < CLAIM_PROTOCOL })
           const claimLive =
             derivedCurrent.state === "live" || derivedCurrent.state === "cross-host"
-          // A flagged claim always wins: no transition may resume it in place,
-          // even if the fingerprint happens to match. Inspect + recover first.
+          // A flagged claim always wins: no task transition may change it in
+          // place (not only worker_active), even if the fingerprint happens to
+          // match. Every flagged claim reports needs-inspection, including one
+          // whose lease is still live. Inspect + recover first.
           if (
             protocol >= CLAIM_PROTOCOL &&
-            status === "worker_active" &&
-            canonicalFrom !== "worker_active" &&
-            (existingClaim?.needsInspection === true || derivedCurrent.state === "needs-inspection")
+            existingClaim &&
+            (existingClaim.needsInspection === true || derivedCurrent.state === "needs-inspection")
           ) {
             return {
               status: "CLAIM_NEEDS_INSPECTION",
-              content: `CLAIM_NEEDS_INSPECTION: task "${taskId}" is flagged for inspection (${existingClaim?.by ?? "unknown"}); run teamwork_recover { action: "inspect" } and adopt/requeue/block before resuming. State was not changed.`,
+              content: `CLAIM_NEEDS_INSPECTION: task "${taskId}" is flagged for inspection (${existingClaim.by}); run teamwork_recover { action: "inspect" } and adopt/requeue/block/release before any transition. State was not changed.`,
               claim: publicClaim(existingClaim),
               fence: currentFence,
             }
@@ -9221,7 +9381,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 : preClaim && preClaim.by === existingClaim.by
                   ? preRelation
                   : "none"
-          const claimOwnedByCaller = relation === "same" || relation === "descendant"
+          // A cross-host claim (including a missing host) is never mutable by
+          // this process, even when the claimant string looks like this session.
+          const claimOwnedByCaller =
+            (relation === "same" || relation === "descendant") &&
+            !(protocol >= CLAIM_PROTOCOL && derivedCurrent.crossHost)
           let claimNote: string | undefined
           let claimForState: any | undefined
           let claimEvent: "claim_override" | "claim_reclaimed" | undefined
@@ -9258,7 +9422,14 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 }
                 claimNote = `sentinel override: ${authz.caller?.agent} started task without a teamwork_next claim`
                 claimForState = {
-                  ...makeTaskClaim(callSession!, nowMs, undefined, { host: SELF_HOST, runHost: host, leaseMs, epoch: 1, event: "override" }),
+                  ...makeTaskClaim(callSession!, nowMs, undefined, {
+                    host: SELF_HOST,
+                    runHost: host,
+                    leaseMs,
+                    epoch: 1,
+                    event: "override",
+                    priorHistory: current.claimHistory,
+                  }),
                   override: "sentinel",
                 }
               } else if (claimOwnedByCaller) {
@@ -9278,6 +9449,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                     epoch: (Number(existingClaim.epoch) || 0) + 1,
                     event: "override",
                     reason: reasonText,
+                    priorHistory: current.claimHistory,
                   }),
                   override: "sentinel",
                 }
@@ -9377,6 +9549,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                   fence: currentFence,
                   root,
                   runId,
+                  requireReportBinding: plan?.requireReportBinding === true || state?.requireReportBinding === true,
                 },
                 reportEvidence,
               )
@@ -9440,12 +9613,15 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (claimReleased && protocol >= CLAIM_PROTOCOL) {
             // A released claim is still evidence: keep its bounded history on
             // the task so release/adopt/requeue/block never erase who held it.
-            nextTask.claimHistory = appendClaimHistory(normalizeHistory(current.claimHistory), {
-              by: existingClaim.by,
-              at: existingClaim.at,
-              leaseUntil: existingClaim.leaseUntil,
-              event: "released",
-            })
+            nextTask.claimHistory = appendClaimHistory(
+              mergeClaimHistory(current.claimHistory, existingClaim.history),
+              {
+                by: existingClaim.by,
+                at: existingClaim.at,
+                leaseUntil: existingClaim.leaseUntil,
+                event: "released",
+              },
+            )
           }
           if (keepClaim) {
             // Any other owner-authorized transition renews the heartbeat too.
@@ -9465,9 +9641,17 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
           if (protocol >= CLAIM_PROTOCOL) {
             // Fence increments once per protocol event: claim/reclaim/override,
-            // release, and round change. A heartbeat — and a renewal of the
-            // same owner/epoch — does not. `next` therefore returns a fence
-            // that the immediate `task_update` can still present.
+            // release, and round change. These are separate events, so a
+            // release that also advances the round increments twice (the round
+            // is a new epoch; the release is a new owner slot). A heartbeat —
+            // and a renewal of the same owner/epoch — does not increment.
+            //
+            // The value returned to the caller is the fence *after* this write,
+            // and the common path (owner and round unchanged: worker_active ->
+            // worker_done -> verifier_active) leaves it unchanged. A caller can
+            // therefore present the fence from `next`/`status`/this response to
+            // the immediate `task_update`; any owner or round change invalidates
+            // an older fence by design.
             const roundChanged = round !== (Number(current.round) || 0)
             const ownerChanged =
               !!claimForState &&
@@ -9658,7 +9842,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const reasonText = typeof input.reason === "string" ? clean(input.reason, 200).trim() : ""
         const now = Date.now()
         const runId = basename(run)
-        const derived = deriveClaimState(task, now)
+        const derived = deriveClaimState(task, now, {
+          legacyHostless: claimProtocolOf(state) < CLAIM_PROTOCOL,
+        })
         if (input.fence !== undefined && input.fence !== null && claimProtocolOf(state) >= CLAIM_PROTOCOL) {
           const presented = Number(input.fence)
           if (!Number.isFinite(presented) || Math.trunc(presented) !== nextFence(task)) {
@@ -9778,13 +9964,13 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 content: `refused: OVERRIDE_REASON_REQUIRED: a Sentinel recovery of another session's claim needs input.reason; nothing was written`,
               }
             }
-            const releaseCrossHost = rawAction === "release" && currentClaim.host && currentClaim.host !== SELF_HOST
+            const releaseCrossHost = rawAction === "release" && claimIsCrossHost(currentClaim)
             if (releaseCrossHost) {
               const allowed = input.allowCrossHost === true || process.env.TEAMWORK_ALLOW_CROSS_HOST === "1"
               if (!allowed) {
                 return {
                   code: "CROSS_HOST_RELEASE_REFUSED",
-                  content: `refused: CROSS_HOST_RELEASE_REFUSED: the claim was recorded on ${clean(currentClaim.host!, 80)}; set allowCrossHost: true or TEAMWORK_ALLOW_CROSS_HOST=1 only after confirming the host is gone. Nothing was written.`,
+                  content: `refused: CROSS_HOST_RELEASE_REFUSED: the claim was recorded on ${clean(currentClaim.host || "unknown", 80)} (a missing host is cross-host); set allowCrossHost: true or TEAMWORK_ALLOW_CROSS_HOST=1 only after confirming the host is gone. Nothing was written.`,
                 }
               }
               if (input.confirm !== true) {
@@ -9799,13 +9985,19 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             // bounded task-level history so release/adopt/requeue/block never
             // erase who held it.
             const preserveReleasedClaim = (event: string) => {
-              t.claimHistory = appendClaimHistory(normalizeHistory(t.claimHistory), {
-                by: currentClaim.by,
-                at: currentClaim.at,
-                leaseUntil: currentClaim.leaseUntil,
-                event,
-                ...(reasonText ? { reason: reasonText } : {}),
-              })
+              // The claim's own `history` and the task-level chain are merged
+              // before the claim is deleted, so release/adopt/requeue/block
+              // never erase an earlier claimant.
+              t.claimHistory = appendClaimHistory(
+                mergeClaimHistory(t.claimHistory, currentClaim.history),
+                {
+                  by: currentClaim.by,
+                  at: currentClaim.at,
+                  leaseUntil: currentClaim.leaseUntil,
+                  event,
+                  ...(reasonText ? { reason: reasonText } : {}),
+                },
+              )
             }
 
             const needsToken = rawAction === "adopt" || rawAction === "requeue" || rawAction === "block"
@@ -10612,6 +10804,21 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             content: "refused: a PASS report requires every checks[].passed to be true; nothing was written",
           }
         }
+        // D4: ignore an exitCode that contradicts `passed` instead of recording
+        // a self-contradictory check. Named refusal, no artifact.
+        const exitConflicts = checks.filter(
+          (c: any) =>
+            c.exitCode !== undefined &&
+            (!Number.isInteger(c.exitCode) || (c.passed === true ? c.exitCode !== 0 : c.exitCode === 0)),
+        )
+        if (exitConflicts.length > 0) {
+          return {
+            status: "CHECK_EXIT_CONFLICT",
+            content: `refused: CHECK_EXIT_CONFLICT: ${exitConflicts
+              .map((c: any) => `check ${clean(c.name, 64)} passed=${c.passed} exitCode=${clean(c.exitCode, 16)}`)
+              .join("; ")}; a check's exitCode must agree with passed; nothing was written`,
+          }
+        }
         if (status === "PASS" && summary === "" && checks.length === 0) {
           return { content: "refused: a PASS report needs evidence — provide a non-empty summary or at least one check; nothing was written" }
         }
@@ -10651,6 +10858,14 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const observedDiff =
           observedHead && observedBase ? execGitCapture(root, ["diff", "--no-color", `${observedBase}..${observedHead}`]) ?? "" : undefined
         const observedDiffHash = observedDiff === undefined ? undefined : sha256Hex(observedDiff)
+        // D2: an opt-in plan flag makes headSha/diffHash mandatory for a PASS.
+        // The values are still computed by the engine, never supplied by input.
+        if (plan?.requireReportBinding === true && status === "PASS" && (!observedHead || observedDiffHash === undefined)) {
+          return {
+            status: "REPORT_UNBOUND",
+            content: `refused: REPORT_UNBOUND: requireReportBinding is asserted but branch ${reportBranch} has no resolvable head/diff to bind; the PASS would not be consumable. Nothing was written.`,
+          }
+        }
         const branchInput = typeof input?.branch === "string" ? clean(input.branch, 120).trim() : ""
         if (branchInput && branchInput !== reportBranch) {
           return {
@@ -10828,6 +11043,24 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               reasons: [authFailureText(manifestCheck.failure)],
             }
           }
+          // A5: a run with an unacknowledged write anomaly is not consumable. A
+          // containment refusal is evidence that a control-plane write may not
+          // have landed where it was reported; re-verify after inspecting and
+          // acknowledging (teamwork_status { acknowledgeAnomalies: true }).
+          const pendingAnomalies = unacknowledgedWriteAnomalies(run)
+          if (pendingAnomalies.length > 0) {
+            return {
+              status: "NEEDS_INSPECTION",
+              content: `FINAL VERIFICATION REFUSED: run ${basename(run)} has ${pendingAnomalies.length} unacknowledged write anomaly(ies): ${pendingAnomalies
+                .slice(-5)
+                .map((entry: any) => clean(entry.kind, 32))
+                .join(", ")}. Inspect the config-dir write-anomaly audit and re-record any refused artifact before final verification; nothing was written.`,
+              reasons: pendingAnomalies.map(
+                (entry: any) => `[WRITE_ANOMALY] ${clean(entry.kind, 32)}${entry.name ? ` ${clean(entry.name, 64)}` : ""}: ${clean(entry.detail, 200)}`,
+              ),
+              unacknowledgedWriteAnomalies: pendingAnomalies.length,
+            }
+          }
           const allowUnsignedLegacy = input?.allowUnsignedLegacy === true
           const signedRun = manifestCheck.signed
           const legacyUnsignedBlock = !signedRun && !allowUnsignedLegacy
@@ -10880,7 +11113,19 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           for (const id of ids) {
             const safe = isSafeTaskId(id)
             const reportRel = safe ? `verify/report-${id}.json` : null
-            const report = reportRel ? readJson<any>(run, join(run, reportRel), undefined) : undefined
+            // D3: one shared cap for the parse and the digest. A report that
+            // cannot be read at that cap is not a PASS the gate can consume.
+            const reportRaw = reportRel
+              ? readBoundedRunFile(run, join(run, reportRel), MAX_VERIFIER_REPORT_BYTES)
+              : undefined
+            let report: any
+            if (reportRaw?.status === "ok") {
+              try {
+                report = JSON.parse(reportRaw.text)
+              } catch {
+                report = undefined
+              }
+            }
             if (report) reportValues[id] = report
             const rawStatus = taskStates[id]?.status
             tasks.push({
@@ -10899,10 +11144,18 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               }
             }
             if (reportRel) {
-              const raw = readBoundedRunFile(run, join(run, reportRel), MAX_RUN_FILE_BYTES)
+              const raw = reportRaw
               reportDigests[clean(id, 64)] =
-                raw.status === "ok" ? sha256Hex(raw.text) : null
-              if (requireSigned && raw.status === "ok" && report) {
+                raw?.status === "ok" ? sha256Hex(raw.text) : null
+              if (report?.status === "PASS" && reportDigests[clean(id, 64)] === null) {
+                contentIntegrityReasons.push(
+                  `[REPORT_DIGEST] task ${id}: a PASS report has no readable sha256 digest (${clean(
+                    raw?.status === "error" ? raw.error : "unreadable or over the shared report cap",
+                    160,
+                  )}); the PASS cannot be bound to its bytes`,
+                )
+              }
+              if (requireSigned && raw?.status === "ok" && report) {
                 const check = auth
                   ? await auth.verifyRunArtifact(basename(run), reportRel, report)
                   : {
@@ -10917,6 +11170,36 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 } else {
                   observedAlgs.push(check.auth?.alg)
                 }
+              }
+            }
+          }
+          // D2: `requireReportBinding: true` (opt-in, default off for
+          // compatibility) makes an unbound PASS unconsumable: a PASS must name
+          // the branch head and diff it verified. Legacy runs keep
+          // `legacy_unbound_report` instead of a hard refusal.
+          const requireReportBinding =
+            plan?.requireReportBinding === true || state?.requireReportBinding === true
+          if (requireReportBinding) {
+            const unbound = tasks.filter((t) => {
+              if (t.reportStatus !== "PASS") return false
+              const value = reportValues[t.id]
+              return (
+                !value ||
+                typeof value.headSha !== "string" ||
+                value.headSha === "" ||
+                typeof value.diffHash !== "string" ||
+                value.diffHash === ""
+              )
+            })
+            if (unbound.length > 0) {
+              return {
+                status: "REPORT_UNBOUND",
+                content: `FINAL VERIFICATION REFUSED: requireReportBinding is asserted but PASS report(s) for ${unbound
+                  .map((t) => t.id)
+                  .join(", ")} carry no headSha/diffHash; re-record the verifier report against the current branch. Nothing was written.`,
+                reasons: unbound.map(
+                  (t) => `[REPORT_UNBOUND] task ${t.id}: PASS report is not bound to a headSha and diffHash`,
+                ),
               }
             }
           }
@@ -11884,17 +12167,18 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // cross-host all block; only a stale claim is recoverable.
           const cleanupState = readJson<any>(run, join(run, "state.json"), undefined)
           const nowMs = Date.now()
-          const BLOCKING_STATES = new Set(["live", "expired", "needs-inspection", "cross-host"])
           const blockingClaims = Object.entries(cleanupState?.tasks ?? {})
             .map(([id, task]: [string, any]) => ({
               id,
               claim: normalizeClaim(task?.claim),
-              claimState: deriveClaimState(task, nowMs).state,
+              claimState: deriveClaimState(task, nowMs, {
+                legacyHostless: claimProtocolOf(cleanupState) < CLAIM_PROTOCOL,
+              }).state,
             }))
             .filter(
               (entry) =>
                 entry.claim &&
-                (BLOCKING_STATES.has(entry.claimState) || entry.claim.needsInspection === true),
+                (BLOCKING_CLAIM_STATES.has(entry.claimState) || entry.claim.needsInspection === true),
             )
           if (blockingClaims.length) {
             return {
