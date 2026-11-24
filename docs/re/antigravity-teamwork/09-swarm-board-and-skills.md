@@ -629,17 +629,17 @@ Because (2) is independently attested, **absence from the allowlist proves nothi
 
 ### 11.3 The persistence question, corrected
 
-`05` §1 and §6 previously called `board.jsonl` a *probable* `/teamwork` artifact, on the strength of a bare literal at binary offset 105,759,229 and no directory binding. The materialised source binds `board.jsonl` to the **native swarm** swarm directory (`main.mjs:134`, `main.mjs:724`). The earlier inference should therefore be withdrawn as unsupported. What changes that picture is runtime, not source: one `/teamwork-preview` invocation produced exactly this directory (`11` §1.6). That is an observed *outcome* of the command, not a binding of the teamwork orchestrator to the board — the `teamwork` path of run 1 never ran. The source binding remains native swarm; whether the command deliberately selects it is `UNKNOWN` (`11` §1.7). [OBSERVED for the source binding and for the one invocation; the selection mechanism is `UNKNOWN`]
+`05` §1 and §6 previously called `board.jsonl` a *probable* `/teamwork` artifact, on the strength of a bare literal at binary offset 105,759,229 and no directory binding. The materialised source binds `board.jsonl` to the **native swarm** swarm directory (`main.mjs:134`, `main.mjs:724`). The earlier inference should therefore be withdrawn as unsupported. What changes that picture is runtime, not source: one **1.5.14** `/teamwork-preview` invocation produced exactly this directory (`11` §1.6). That is an observed *outcome* of the command, not a binding of the teamwork orchestrator to the board — the `teamwork` path of run 1 never ran. The source binding remains native swarm; whether the command deliberately selects it is `UNKNOWN` (`11` §1.7). The 2026-11-24 repeats do **not** extend this: on **1.5.16** `/teamwork-preview` no longer expands, so the two inline runs never entered the subsystem ([`20`](20-live-swarm-repeats.md) §3). [OBSERVED for the source binding and for the one invocation; the selection mechanism is `UNKNOWN`]
 
 ### 11.4 Explicitly not claimed
 
 - **Not claimed:** that `/teamwork-preview`'s orchestrator *uses* this board. The `teamwork` conversation observed in `11` §1 never produced a turn (`11` §1.3).
 - **Not claimed:** that teamwork registry subagents (`teamwork_worker`, `teamwork_reviewer`, …) are swarm members. The one live swarm's members are `coordinator`, `coder`, `monitor` — native-swarm roles, not `AllAgents` registry types (`11` §1.6; `02`).
 - **Not claimed:** that anything *reads* `board.Message.Kind` or `RequestID`. The live writer emits both (§3.1, §3.5); no consumer exists in this tree. An earlier edition of this document said "no consumer exists", which remains true, but was read as "not written" — that part was wrong.
-- **OBSERVED once:** a `/teamwork-preview` invocation **did** create a swarm directory. The live run in `11` §1.6 entered through `/teamwork-preview` and left `.system_generated/swarm/` with no `.agents/teamwork/` anywhere. Whether the entry command itself starts the swarm, or the top-level agent chooses the native-swarm path while handling it, is `UNKNOWN`.
-- **UNKNOWN:** whether the two features can be active in one conversation or turn; what makes one `/teamwork-preview` invocation dispatch a `teamwork` conversation and another produce a native swarm (`11` §1.7); whether any third consumer writes `board.jsonl`. Composition, member names and values observed in the one live swarm are also `UNKNOWN` as universals.
+- **OBSERVED once:** a `/teamwork-preview` invocation **did** create a swarm directory, on **1.5.14**. The live run in `11` §1.6 entered through `/teamwork-preview` and left `.system_generated/swarm/` with no `.agents/teamwork/` anywhere. Whether the entry command itself starts the swarm, or the top-level agent chooses the native-swarm path while handling it, is `UNKNOWN`. The 2026-11-24 repeat attempt did not test this: on **1.5.16** `/teamwork-preview` does not expand, so both repeats were inline ([`20`](20-live-swarm-repeats.md) §3, §5).
+- **UNKNOWN:** whether the two features can be active in one conversation or turn; what makes one `/teamwork-preview` invocation dispatch a `teamwork` conversation and another produce a native swarm (`11` §1.7); whether any third consumer writes `board.jsonl`. Composition, member names and values observed in the one live swarm are also `UNKNOWN` as universals. The 2026-11-24 correct-command sample (2/2 `/teamwork` → SWE Light, 0/2 swarm) is too narrow to narrow this: it holds the prompt, tier and TUI interface constant ([`20`](20-live-swarm-repeats.md) §4).
 
-What *is* established is narrower and useful: the board, its file format, its channels and its wake protocol belong to the **native swarm** feature (`/swarm`), and the `teamwork` path of `/teamwork-preview` coordinates through parent/child subagent dispatch plus the `.agents/teamwork/` file tree (`11` §2–§5). One invocation of the same command took the native-swarm path instead; that divergence is a runtime selection this document does not explain and `11` §1.7 records without resolving. The two should still not be cited for each other.
+What *is* established is narrower and useful: the board, its file format, its channels and its wake protocol belong to the **native swarm** feature (`/swarm`), and the `teamwork` path of `/teamwork-preview` coordinates through parent/child subagent dispatch plus the `.agents/teamwork/` file tree (`11` §2–§5). One 1.5.14 invocation of the same command took the native-swarm path instead; that divergence is a runtime selection this document does not explain and `11` §1.7 records without resolving. The two should still not be cited for each other.
 
 ---
 
@@ -667,7 +667,7 @@ What *is* established is narrower and useful: the board, its file format, its ch
 | `swarm_wait` parks only on `DONE`; `RUNNING` siblings do not hold the turn | OBSERVED | `main.mjs:428-460` |
 | Reads are append-verified (inode + head/tail anchors + remainder) and fall back to a full read | OBSERVED | `board_cache.mjs:78-117`, `:147-162` |
 | Malformed lines are skipped; a torn tail is retried | OBSERVED | `board_cache.mjs:33-46`, `:205-208` |
-| `/teamwork-preview` uses this board | **PARTIAL** — one invocation produced a swarm directory (`11` §1.6); whether the command selects this path, and why, is `UNKNOWN` | §11, `11` §1.7 |
+| `/teamwork-preview` uses this board | **PARTIAL** — one **1.5.14** invocation produced a swarm directory (`11` §1.6); whether the command selects this path, and why, is `UNKNOWN`. On **1.5.16** the command does not expand, so the 2026-11-24 repeats do not test it (`20` §3) | §11, `11` §1.7 |
 
 ### Remaining UNKNOWN (this subject)
 
@@ -681,7 +681,7 @@ What *is* established is narrower and useful: the board, its file format, its ch
 8. **`board.Control`'s Go declaration** — the key names are known from the mirror; the field types and tags are not.
 9. **The live roster's state machine** — `desired_state`, `applied_model` and `phase` are persisted and unread; how they relate to `killed`, `wake_mode` and `board.StateOf` is `UNKNOWN`.
 10. **Swarm composition and values as universals** — one swarm (`coordinator` + `coder` + `monitor`, model `gemini-4-argon-medium`, `workspace_mode:"inherit"`) is a sample, not a default.
-11. **Any runtime relationship between native swarm and the `/teamwork-preview` teamwork path** — including why one invocation chose each (`11` §1.7).
+11. **Any runtime relationship between native swarm and the `/teamwork-preview` teamwork path** — including why one **1.5.14** invocation chose each (`11` §1.7). On 1.5.16 the old command does not expand; the correct-command sample (2/2 SWE Light, 0/2 swarm) is not a selector rule (`20` §4).
 
 ---
 

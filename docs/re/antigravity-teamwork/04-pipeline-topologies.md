@@ -471,6 +471,10 @@ A second caveat: the pipeline prompts use a **Swarm Workspace Convention** that 
 
 On the three "tournament judging candidates" named in the extraction brief: two are now evidenced and one is not. `teamwork_referee` is the Phase 4 combined reviewer @ 115,430,550 and `teamwork_judge` is the Phase 1 gate reviewer @ 115,422,867, so the INFERRED label is superseded for both. `teamwork_victory_auditor` has no tournament role anywhere in the recovered text; it is the route-completion auditor (§4) and is not spawned on this route at all. No edge to `teamwork_victory_auditor` was inferred from its name alone.
 
+**Runtime note (2026-11-24, 1.5.16).** One TUI session selected this route and stopped before fan-out ([`19-live-large-team-route.md`](19-live-large-team-route.md)). The sentinel wrote `ORIGINAL_REQUEST.md`, wrote its briefing with `Path: Math / Proof (Large Team)` (`teamwork_proof`), created an empty `teamwork_proof_1/` folder and was stopped. The briefing corroborates three static edges at **selection** level: T1 (route label and the explicit "extremely large team" rationale), T24 (the ≥60-minute worker-timeout constraint, quoted almost verbatim) and T25 (`Auditor: N/A (teamwork_proof verifies via its own verification phase)`). It does **not** corroborate T2–T23: no `teamwork_layer`, explorer, outliner, solver, referee, gate, `final_proof.tex` or outer iteration exists. The five phases and tournament trees above remain the artifact's specification, not an executed pipeline. [OBSERVED — `19` §4–§6]
+
+**Command note (2026-11-24, 1.5.16).** The two fizzbuzz runs that used `/teamwork-preview` on this build never reached any route: the command did not expand, the model saw ordinary text and executed inline ([`20-live-swarm-repeats.md`](20-live-swarm-repeats.md) §3). They are not topology evidence. The same task under `/teamwork` dispatched teamwork and selected `teamwork_swe` (2/2), not this route, so they are also not Large Team evidence. [OBSERVED — `20` §4]
+
 ---
 
 ### 2.6 SWE Light — `teamwork_swe`

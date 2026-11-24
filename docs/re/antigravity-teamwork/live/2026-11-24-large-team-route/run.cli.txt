@@ -1,0 +1,2 @@
+I1124 16:31:05.774777      28 server.go:2782] Language server version: 1.5.16
+I1124 16:31:16.447035    1054 model_config_manager.go:375] Propagating selected model override to backend: label="Gemini 4 Hydrogen (Medium)"

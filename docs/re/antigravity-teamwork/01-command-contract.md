@@ -16,6 +16,8 @@
 
 **Naming note.** The shipped command identifier is the literal `teamwork-preview` (file offsets 106,155,303 and 116,708,666), with the description string `Preview the multi-agent teamwork workflow.` and the admin-control gate `TeamworkPreviewCommandDisabled`. `/teamwork` is the shorthand used throughout this corpus, and the separate 8-byte `teamwork` token that also exists in the binary is that identifier minus its suffix. `06-config-gates-and-model-tiers.md` carries the full derivation. [OBSERVED for the two literals and the description; INFERRED that the two name forms denote the same command]
 
+**Version scope of the identifier.** The literal above is **1.5.14**. Both `/teamwork` and `/teamwork-preview` reached the subsystem on that build, but on **1.5.16** a zero-token probe shows `/teamwork` expanding client-side and `/teamwork-preview` not expanding at all. The live trigger on the current axis is therefore `/teamwork`; this note's stored-literal claim is not withdrawn, only version-scoped. See [`20-live-swarm-repeats.md`](20-live-swarm-repeats.md) §2 and §5. [OBSERVED — probe; the exact build of the change is `UNKNOWN`]
+
 ---
 
 ## 1. Invocation surface

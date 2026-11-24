@@ -1,6 +1,6 @@
 # Runtime Artifacts — Live Dispatch and the On-Disk Teamwork Contract
 
-**Status: OBSERVED — eight live invocations (one quota-partial, one native swarm, one completed General teamwork run, two SWE Light runs — one interrupted, one completed with `VICTORY CONFIRMED` — one gate-only LEMMA run, one interview-gate run that produced a draft, and one completed Document Review run with `VICTORY CONFIRMED`); second evidence class: the state tree of the user's own prior runs.** Recorded on **2026-11-21**, **2026-11-22**, **2026-11-23** and **2026-11-24**. The 2026-11-21/22 runs ran on `agy --version` **1.5.14**, the static binary analysed throughout this corpus (`00-artifact-identity.md`; `07` §1 re-proves byte identity); the 2026-11-23 gate runs (`15`, `16`) ran on **1.5.15** (then the live axis; now historical). The installed CLI is **1.5.16**, which now has a completed Document Review run (`18`) and a zero-turn config-gate probe (`17`). See [`PROVENANCE.md`](PROVENANCE.md) *version axes*. The completed General run is recorded in full in [`12-live-general-run.md`](12-live-general-run.md) and both SWE Light runs in [`13-live-swe-light-run.md`](13-live-swe-light-run.md); the LEMMA gate is in [`15-live-lemma-gate-observed.md`](15-live-lemma-gate-observed.md), the interview gate's entry in [`16-live-interview-gate-print-mode.md`](16-live-interview-gate-print-mode.md), and the Document Review run in [`18-live-document-review.md`](18-live-document-review.md); a 2026-11-15/16 completed prior run supplies the interview-gate chain, analysed in [`14-interview-gate-observed.md`](14-interview-gate-observed.md). This document uses them to correct the gate and state-root sections below. It does three things the rest of the set could not:
+**Status: OBSERVED — eight live invocations (one quota-partial, one native swarm, one completed General teamwork run, two SWE Light runs — one interrupted, one completed with `VICTORY CONFIRMED` — one gate-only LEMMA run, one interview-gate run that produced a draft, and one completed Document Review run with `VICTORY CONFIRMED`), plus the 2026-11-24 route-selection and command repeats recorded in `19`/`20`; second evidence class: the state tree of the user's own prior runs.** Recorded on **2026-11-21**, **2026-11-22**, **2026-11-23** and **2026-11-24**. The 2026-11-21/22 runs ran on `agy --version` **1.5.14**, the static binary analysed throughout this corpus (`00-artifact-identity.md`; `07` §1 re-proves byte identity); the 2026-11-23 gate runs (`15`, `16`) ran on **1.5.15** (then the live axis; now historical). The installed CLI is **1.5.16**, which now has a completed Document Review run (`18`), a zero-turn config-gate probe (`17`), route-selection evidence (`19`) and command repeats (`20`). See [`PROVENANCE.md`](PROVENANCE.md) *version axes*. The completed General run is recorded in full in [`12-live-general-run.md`](12-live-general-run.md) and both SWE Light runs in [`13-live-swe-light-run.md`](13-live-swe-light-run.md); the LEMMA gate is in [`15-live-lemma-gate-observed.md`](15-live-lemma-gate-observed.md), the interview gate's entry in [`16-live-interview-gate-print-mode.md`](16-live-interview-gate-print-mode.md), and the Document Review run in [`18-live-document-review.md`](18-live-document-review.md); a 2026-11-15/16 completed prior run supplies the interview-gate chain, analysed in [`14-interview-gate-observed.md`](14-interview-gate-observed.md). This document uses them to correct the gate and state-root sections below. It does three things the rest of the set could not:
 
 1. It records a **live `/teamwork-preview` print-mode run** that the client recognised, dispatched to a subagent, lost twice to HTTP 429 quota, and then completed **inline** — §1.1–§1.5.
 2. It records a **second invocation of the same command** that started a lean **native swarm** instead — a `coordinator` + `coder` + `monitor` with a `board.jsonl`, no `.agents/teamwork/` anywhere — and it states the divergence between the two runs with the cause `UNKNOWN` — §1.6–§1.7.
@@ -142,6 +142,35 @@ Two things must not be inferred from this pair:
 - **Not** that native swarm is now the default or the fallback. Two observations cannot establish a default; `07` §3.5 and this section record an existence proof for each path, nothing about their frequencies.
 
 The `/teamwork-preview` ↔ native-swarm question in [`09`](09-swarm-board-and-skills.md) §11 therefore moves from "no runtime evidence" to "one observed instance, mechanism unexplained". The artifact contract in §2–§6 is untouched: it describes the teamwork path, which run 2 did not take.
+
+### 1.8 The 2026-11-24 repeats: the command changed (1.5.16)
+
+The 2026-11-22 swarm is a **1.5.14** observation. An attempt to repeat it on
+**1.5.16** did not test the same command: `/teamwork-preview` no longer expands
+on that build. The record is in [`20-live-swarm-repeats.md`](20-live-swarm-repeats.md);
+the part that bears on this document is:
+
+- Two `/teamwork-preview` repeats of the same fizzbuzz prompt executed **inline**
+  (2/2). Marker-scoped `find` showed only `fizzbuzz.js` and `test.js` created;
+  no `swarm.json`, `members.json`, `plan.json` or `board.jsonl` appeared, and no
+  new `.agents/teamwork/` root was created. The fixtures re-execute cleanly
+  (4/4 and 14/14, exit 0). [OBSERVED — workspace and app-data checks]
+- A zero-token expansion probe shows why: on 1.5.16 `/teamwork` produces
+  `expanded slash command "teamwork" (system)` and `expanded_commands`, while
+  `/teamwork-preview` produces neither and forwards a single item. Both arms
+  took zero model turns. [OBSERVED — `20` §2]
+- Two repeats with the correct command (`/teamwork`, same task, same tier, TUI)
+  **dispatched teamwork and selected SWE Light** (2/2). Both used the
+  `brain/<conversation>/scratch/.agents/teamwork/` root; neither created a
+  `swarm/` board and neither produced an inline result at the snapshot.
+  [OBSERVED — `20` §4]
+
+**What this does not do.** It does not show that the native-swarm path is gone
+on 1.5.16, and it does not explain the 1.5.14 divergence. It shows that the
+2026-11-24 inline runs were an **unexpanded-command** outcome, not a swarm
+decision, and that a correct-command sample of two took the teamwork path. The
+selector remains `UNKNOWN`; the 2/2 is scoped to one prompt, one tier and one
+interface.
 
 ---
 
@@ -464,9 +493,9 @@ For anyone reconciling this corpus: cite the **structure and vocabulary** from t
 | What does `_gen<N>` mark? | **ANSWERED.** `sub_orch_m1_gen2/` is the successor generation of the same milestone sub-orchestrator: its briefing records gen1's two failed iterations and takes over Iteration 3, and its gate file carries the earlier iterations forward to a PASS (§4). The prompt's self-succession rule is the matching mechanism; that the threshold triggered this split is `INFERRED` |
 | Does the state root ever use the `<appDataDir>/scratch/teamwork/<run_id>/` form rather than the `brain/<conv>/scratch/` fallback? | **ANSWERED — both occur.** The primary form is observed in the 2026-11-15 prior run, the 2026-11-22 General run and SWE Light Run 1; the `brain/<conv>/scratch/` fallback is observed in the 39-root sample and SWE Light Run 2 (§2.1, `12` §6, `13` §6, §12.7) |
 | Does a completed run write anything at all into the workspace? | All observed product files are project code/outputs; no teamwork state document appeared in a workspace in either run (§2.3, §1.6) |
-| What selects native swarm over the teamwork path for one `/teamwork-preview` invocation? | Both runs used `--print` and `[skip-interview]` and diverged; no flag, task feature or log line is attributed (§1.7) |
+| What selects native swarm over the teamwork path for one `/teamwork-preview` invocation? | Both 1.5.14 runs used `--print` and `[skip-interview]` and diverged; no flag, task feature or log line is attributed (§1.7). On 1.5.16 the old command does not expand, so the 2026-11-24 inline repeats are a command-deprecation outcome, not a selector datum; two `/teamwork` repeats took SWE Light with no swarm (§1.8) |
 | Is a worker killed on completion by an explicit call or by turn teardown? | `killed:true`, `phase:"KILLED"` observed after the coder's `[done]`; the call is not captured (§1.6) |
 | Is `coordinator` + `coder` + `monitor` a standard lean composition? | One swarm only; no second composition or size observed (§1.6) |
 
-The 2026-11-22 General run (`12`) and the two SWE Light runs (`13` §1–§11 and §12) settle most of these rows at once: both root forms, the bracket block, a four-row General gate, a no-table SWE Light loop, a prose `VICTORY CONFIRMED`, and cron firing. The LEMMA gate (`15`) and the interview gate's entry (`16`) settle two more: the blocking pre-flight and the interviewer dispatch with its gap-marked draft. They do **not** settle the LEMMA `READY` path, the interview **approval** path, the Document Review **generality** (one `.tex` run with three segment layouts, an unexercised PDF branch, and no gate table), the General run's victory verdict (cut by timeout), or whether the native-swarm path competes with teamwork. A second Document Review run — preferably a PDF — or a persistent-session interview is the next route discriminator, and how to force a path choice remains `UNKNOWN` (§1.7).
+The 2026-11-22 General run (`12`) and the two SWE Light runs (`13` §1–§11 and §12) settle most of these rows at once: both root forms, the bracket block, a four-row General gate, a no-table SWE Light loop, a prose `VICTORY CONFIRMED`, and cron firing. The LEMMA gate (`15`) and the interview gate's entry (`16`) settle two more: the blocking pre-flight and the interviewer dispatch with its gap-marked draft. The 2026-11-24 runs settle two narrower points: the **Large Team route label is reachable** on 1.5.16 but stopped before fan-out (`19`), and **`/teamwork-preview` no longer expands** there, so its inline repeats are not selector evidence (`20` §5). They do **not** settle the LEMMA `READY` path, the interview **approval** path, the Document Review **generality** (one `.tex` run with three segment layouts, an unexercised PDF branch, and no gate table), the General run's victory verdict (cut by timeout), the Large Team pipeline, or whether the native-swarm path competes with teamwork. A second Document Review run — preferably a PDF — or a persistent-session interview is the next route discriminator, and how to force a path choice remains `UNKNOWN` (§1.7).
 

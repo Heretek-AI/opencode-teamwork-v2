@@ -1,0 +1,5 @@
+total 8
+drwxr-xr-x. 2 john john  80 Nov 24 16:34 .
+drwxr-xr-x. 4 john john 200 Nov 24 16:35 ..
+-rw-r--r--. 1 john john 291 Nov 24 16:34 fizzbuzz.js
+-rw-r--r--. 1 john john 524 Nov 24 16:34 test.js
