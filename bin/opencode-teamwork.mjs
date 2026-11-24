@@ -60,6 +60,8 @@ Commands:
                       [--fail-on-warning] [--json]
                verify --run-dir <path> ...
                verify --session <id> --hmac-key <b64url> --hmac-key-id <id>
+                      [--rerun --repo <clean-checkout> [--timeout <s>] [--keep-worktree]]
+                      [--json]
   prune      Prune git worktrees for completed Teamwork runs
   doctor     Diagnose config, agents, model sync and git/worktree health
              (--security adds key source, signer/witness, ptrace, groups, DB,
@@ -86,7 +88,9 @@ Options:
       --key-id <id>      Expected Ed25519 key id (defaults to the signed run key)
       --hmac-key <k>     HMAC-SHA256 secret (base64url, 32 bytes) for verify
       --hmac-key-id <id> Expected HMAC key id
-      --repo <path>      Repository for optional branch head/diff checks
+      --repo <path>      Repository for optional branch head/diff checks, and the clean checkout for --rerun
+      --rerun            Re-execute verify/rerun.json commands in a disposable worktree (exit 2 = unverifiable)
+      --timeout <s>      Cap each re-executed command's recorded timeout
       --require-git      Fail as UNKNOWN when git/branch data is unavailable
       --require-index <snapshot>
                          Detect a whole-run rollback against a file snapshot
@@ -200,6 +204,15 @@ function parseArgs(argv) {
         break
       case "--fail-on-warning":
         options.failOnWarning = true
+        break
+      case "--rerun":
+        options.rerun = true
+        break
+      case "--timeout":
+        options.timeout = rest.shift() ?? ""
+        break
+      case "--keep-worktree":
+        options.keepWorktree = true
         break
       case "--witness-public-key":
         options.witnessPublicKey = rest.shift() ?? ""
@@ -600,6 +613,9 @@ async function verifyCommand(options) {
       requireGit: options.requireGit === true,
       allowUnsigned: options.allowUnsigned === true,
       failOnWarning: options.failOnWarning === true,
+      rerun: options.rerun === true,
+      timeout: options.timeout !== undefined && options.timeout !== "" ? Number(options.timeout) : undefined,
+      keepWorktree: options.keepWorktree === true,
       witnessPublicKey: options.witnessPublicKey || undefined,
       witnessKeyId: options.witnessKeyId || undefined,
       witnessReceipt: options.witnessReceipt || undefined,
