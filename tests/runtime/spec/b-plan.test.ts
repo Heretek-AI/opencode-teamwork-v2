@@ -229,7 +229,7 @@ test("B7 a re-plan keeps verification, victoryAudit, requireHandoffs and provena
     const upgraded = await planRun(loaded, root, { sessionId: upgradeRun, request: null, requiredProvenance: "command" })
     expect(upgraded.content.startsWith("Planned ")).toBe(true)
     const manifest = assertSignedManifest(project, upgradeRun, { requiredProvenance: "command" })
-    expect(manifest.version).toBe(4)
+    expect(manifest.version).toBe(5)
   })
 })
 

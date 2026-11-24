@@ -322,7 +322,7 @@ function makeSeedVerifiedRun(tools, ctx, root) {
   return async (
     runId,
     taskIds,
-    { request, integrityMode, auditStatus = "PASS", stampVictory = request !== undefined, victoryAudit, victorySkipReason, verification, allowUnsignedLegacy, requireHandoffs, handoffs = true, trustLevel, requireWitness, spec, beforePlan } = {},
+    { request, integrityMode, auditStatus = "PASS", stampVictory = request !== undefined, victoryAudit, victorySkipReason, verification, allowUnsignedLegacy, requireHandoffs, handoffs = true, trustLevel, requireWitness, spec, attestationPolicy, attestationKeyId, attestationIssuer, beforePlan } = {},
   ) => {
     // 0.11.0: an approval-bound plan hashes prompt_draft.md before mkdir, so a
     // fixture must put the exact draft (and its approval) on disk first.
@@ -349,6 +349,9 @@ function makeSeedVerifiedRun(tools, ctx, root) {
         ...(requireHandoffs !== undefined ? { requireHandoffs } : {}),
         ...(trustLevel !== undefined ? { trustLevel } : {}),
         ...(requireWitness !== undefined ? { requireWitness } : {}),
+        ...(attestationPolicy !== undefined ? { attestationPolicy } : {}),
+        ...(attestationKeyId !== undefined ? { attestationKeyId } : {}),
+        ...(attestationIssuer !== undefined ? { attestationIssuer } : {}),
         ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
         tasks: taskIds.map((id) => ({ id })),
       },
@@ -9069,7 +9072,7 @@ process.exit(0);
           spec: draftText,
         })
         const manifest = readJsonFile(runFile(testDir, runId, "run.manifest.json"))
-        assert.strictEqual(manifest.version, 4, "0.16.0 plans must write manifest version 4")
+        assert.strictEqual(manifest.version, 5, "0.18.0 plans must write manifest version 5")
         assert.strictEqual(manifest.approvalPolicy, "external-dir")
         assert.strictEqual(manifest.approvalKeyId, "approver_fixture")
         assert.strictEqual(manifest.approvalBinding, "prompt")
@@ -11911,7 +11914,7 @@ process.exit(0);
     })
     await tools.teamwork_plan.execute(planArgs(runId), { sessionID: FIXTURE_ROOT_SESSION })
     const manifest = JSON.parse(readFileSync(join(runDirOf(runId), "run.manifest.json"), "utf8"))
-    assert.strictEqual(manifest.version, 4, "a command plan must write manifest version 4")
+    assert.strictEqual(manifest.version, 5, "a command plan must write manifest version 5")
     assert.strictEqual(manifest.requiredProvenance, "command")
     const plan = JSON.parse(readFileSync(join(runDirOf(runId), "plan.dag.json"), "utf8"))
     assert.strictEqual(plan.requiredProvenance, "command", "the plan must record the sticky requirement")
@@ -12082,5 +12085,86 @@ process.exit(0);
     console.log(
       "✓ checks v2: signed rerun record, final rerunDigest, downgrade/rerun edits stale, command-mode refusals, REPORT_UNBOUND",
     )
+  }
+
+  // ==========================================
+  // Part 1c-quinquies: CI attestation policy (0.18.0)
+  // ==========================================
+  console.log("Testing CI attestation policy...")
+  {
+    const attestRoot = mkdtempSync(join(tmpdir(), "teamwork-attest-engine-"))
+    const tools = await makeToolsFor(attestRoot)
+    const seedRun = makeSeedVerifiedRun(tools, undefined, attestRoot)
+    const runFileOf = (id, name) => join(attestRoot, ".opencode", "teamwork", id, name)
+
+    const runId = "20261124-000042-attest-required"
+    await seedRun(runId, ["A1"], {
+      request: "Attest the fixture run in CI.",
+      victoryAudit: "skip",
+      stampVictory: false,
+      attestationPolicy: "required",
+      attestationKeyId: "attestation_fixture",
+      attestationIssuer: "https://ci.example.invalid/issuer",
+    })
+    const manifest = JSON.parse(readFileSync(runFileOf(runId, "run.manifest.json"), "utf8"))
+    assert.strictEqual(manifest.version, 5, "an attestation policy must write manifest v5")
+    assert.strictEqual(manifest.attestationPolicy, "required")
+    assert.strictEqual(manifest.attestationKeyId, "attestation_fixture")
+    assert.strictEqual(manifest.attestationIssuer, "https://ci.example.invalid/issuer")
+    const plan = JSON.parse(readFileSync(runFileOf(runId, "plan.dag.json"), "utf8"))
+    assert.strictEqual(plan.attestationPolicy, "required", "the plan records the policy")
+    const state = JSON.parse(readFileSync(runFileOf(runId, "state.json"), "utf8"))
+    assert.strictEqual(state.attestationPolicy, "required", "state records the policy")
+
+    const finalMissing = await tools.teamwork_final_verify.execute({ sessionId: runId })
+    assert.strictEqual(finalMissing.status, "FAIL", finalMissing.content)
+    assert(
+      finalMissing.reasons.some((reason) => reason.includes("AUTH_ATTESTATION_MISSING")),
+      `required + missing attestation must fail by name: ${JSON.stringify(finalMissing.reasons)}`,
+    )
+
+    const downgrade = await tools.teamwork_plan.execute(
+      { sessionId: runId, topology: "iterative-coding", attestationPolicy: "off", skipInterview: true, tasks: [{ id: "A1" }] },
+      { sessionID: FIXTURE_ROOT_SESSION },
+    )
+    assert.strictEqual(downgrade.refused, "AUTH_STALE", `a policy downgrade must be refused: ${downgrade.content}`)
+    assert(/attestationPolicy/.test(downgrade.content), downgrade.content)
+
+    const keyChange = await tools.teamwork_plan.execute(
+      {
+        sessionId: runId,
+        topology: "iterative-coding",
+        attestationPolicy: "required",
+        attestationKeyId: "attestation_other",
+        skipInterview: true,
+        tasks: [{ id: "A1" }],
+      },
+      { sessionID: FIXTURE_ROOT_SESSION },
+    )
+    assert.strictEqual(keyChange.refused, "AUTH_STALE", `a pinned key change must be refused: ${keyChange.content}`)
+    assert(/attestationKeyId/.test(keyChange.content), keyChange.content)
+
+    // A direct plan/state edit that downgrades the policy is caught by
+    // final_verify's signed-baseline drift check, not only at re-plan time.
+    const driftPlan = JSON.parse(readFileSync(runFileOf(runId, "plan.dag.json"), "utf8"))
+    driftPlan.attestationPolicy = "off"
+    writeFileSync(runFileOf(runId, "plan.dag.json"), JSON.stringify(driftPlan, null, 2) + "\n")
+    const driftState = JSON.parse(readFileSync(runFileOf(runId, "state.json"), "utf8"))
+    driftState.attestationPolicy = "off"
+    writeFileSync(runFileOf(runId, "state.json"), JSON.stringify(driftState, null, 2) + "\n")
+    const driftFinal = await tools.teamwork_final_verify.execute({ sessionId: runId })
+    assert.strictEqual(driftFinal.status, "FAIL", driftFinal.content)
+    assert(
+      driftFinal.reasons.some((reason) => reason.includes("AUTH_STALE") && reason.includes("attestationPolicy")),
+      `a plan/state policy downgrade must be stale at final: ${JSON.stringify(driftFinal.reasons)}`,
+    )
+
+    // `off` is the default and writes v5 without a policy requirement.
+    const offRun = "20261124-000043-attest-off"
+    await seedRun(offRun, ["A2"], { victoryAudit: "skip", stampVictory: false })
+    const offManifest = JSON.parse(readFileSync(runFileOf(offRun, "run.manifest.json"), "utf8"))
+    assert.strictEqual(offManifest.version, 5)
+    assert.strictEqual(offManifest.attestationPolicy, "off")
+    console.log("✓ attestationPolicy required fails closed without an artifact; downgrade and pinned-key change are AUTH_STALE; off is the default")
   }
 }

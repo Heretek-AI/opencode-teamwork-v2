@@ -28,6 +28,11 @@ import { createAuthContext } from "../plugins/opencode-teamwork/auth.ts"
 import { writeHandoff } from "../plugins/opencode-teamwork/handoff.ts"
 import { canonicalJson, contentSha256Hex, payloadDigest, sha256Hex } from "../plugins/opencode-teamwork/approval-format.mjs"
 import {
+  attestationKeyIdFromPublicKey,
+  loadAttestationPrivateKey,
+  signAttestation,
+} from "../plugins/opencode-teamwork/attestation.mjs"
+import {
   computePlanHash,
   computeRequirementsHash,
   renderVerify,
@@ -138,6 +143,10 @@ async function makeRun({
   requireHandoffs = "required",
   requireReportBinding = false,
   provenance = "declared",
+  attestationPolicy = "off",
+  attestationKeyId = null,
+  attestationIssuer = null,
+  manifestVersion = 5,
   tasks = [{ id: "R1", agent: "team/worker" }],
   git = undefined,
   unsigned = false,
@@ -180,6 +189,13 @@ async function makeRun({
     })),
     ...(requireReportBinding ? { requireReportBinding: true } : {}),
     ...(provenance === "command" ? { requiredProvenance: "command" } : {}),
+    ...(manifestVersion >= 5
+      ? {
+          attestationPolicy,
+          ...(attestationKeyId ? { attestationKeyId } : {}),
+          ...(attestationIssuer ? { attestationIssuer } : {}),
+        }
+      : {}),
     requirePinnedWrites: false,
   }
   writeJson(join(run, "plan.dag.json"), plan)
@@ -192,6 +208,13 @@ async function makeRun({
     victoryAudit,
     requireHandoffs,
     ...(provenance === "command" ? { requiredProvenance: "command" } : {}),
+    ...(manifestVersion >= 5
+      ? {
+          attestationPolicy,
+          ...(attestationKeyId ? { attestationKeyId } : {}),
+          ...(attestationIssuer ? { attestationIssuer } : {}),
+        }
+      : {}),
     tasks: Object.fromEntries(
       tasks.map((t) => [t.id, { status: "verified_pass", round: 1 }]),
     ),
@@ -222,7 +245,7 @@ async function makeRun({
     await ownSigner.auth.bindRunNonce(runId, nonce)
     await ownSigner.auth.bindRunKeyId(runId, ownSigner.keyId)
     const manifest = {
-      version: provenance === "command" ? 4 : 3,
+      version: manifestVersion,
       sessionId: runId,
       rootSessionId: "ses_fixture_root",
       integrityMode,
@@ -232,6 +255,9 @@ async function makeRun({
       requireHandoffs,
       handoffAuth: "signed",
       ...(provenance === "command" ? { requiredProvenance: "command" } : {}),
+      ...(manifestVersion >= 5
+        ? { attestationPolicy, attestationKeyId, attestationIssuer }
+        : {}),
       requestHash,
       requirementsHash,
       planHash: computePlanHash(plan),
@@ -558,6 +584,90 @@ function rerunEntryFromCheck(check, { timeoutMs = check.timeoutMs ?? 10000 } = {
     timeoutMs,
   }
 }
+
+// ---------------------------------------------------------------------------
+// CI attestation fixtures (0.18.0)
+// ---------------------------------------------------------------------------
+
+const ATTESTATION_ISSUER = "https://ci.example.invalid/issuer"
+
+function makeAttestationKeys(keyId = undefined) {
+  const pair = generateKeyPairSync("ed25519")
+  const publicKey = pair.publicKey.export({ format: "der", type: "spki" }).toString("base64url")
+  return {
+    pair,
+    keyId: keyId ?? attestationKeyIdFromPublicKey(publicKey),
+    publicKey,
+    privateKey: pair.privateKey,
+  }
+}
+
+/** A declared run with a command check and a report head, plus required policy. */
+async function attestationFixture(tag, { policy = "required", issuer = ATTESTATION_ISSUER } = {}) {
+  const ctx = await makeRun({
+    tag,
+    requireHandoffs: "skip",
+    victoryAudit: "skip",
+    attestationPolicy: policy,
+    attestationIssuer: issuer,
+  })
+  const headSha = "a".repeat(40)
+  const check = makeCommandCheck({
+    command: [process.execPath, "-e", "process.stdout.write('attested-ok\\n')"],
+    output: "attested-ok\n",
+  })
+  await buildComplete(ctx, {
+    reportOptions: { headSha, diffHash: "b".repeat(64), extraChecks: [check] },
+  })
+  return { ctx, headSha, check }
+}
+
+function attestationPayloadFor(ctx, overrides = {}) {
+  const manifest = readJson(join(ctx.run, "run.manifest.json"))
+  const report = readJson(join(ctx.run, "verify", "report-R1.json"))
+  const check = report.checks.find((entry) => Array.isArray(entry.command))
+  return {
+    v: 1,
+    provider: "github-actions",
+    workflow: "ci-attestation",
+    runId: ctx.runId,
+    runAttempt: 1,
+    repository: "example/repo",
+    commitSha: report.headSha,
+    baseSha: "c".repeat(40),
+    promptHash: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    planHash: manifest.planHash,
+    manifestDigest: payloadDigest(manifest),
+    commands: [
+      {
+        argv: check.command,
+        cwd: check.cwd,
+        exitCode: check.exitCode,
+        outputSha256: contentSha256Hex(check.output),
+        outputBytes: Buffer.byteLength(check.output, "utf8"),
+      },
+    ],
+    oidc: {
+      issuer: ATTESTATION_ISSUER,
+      subject: "repo:example/repo:ref:refs/heads/main",
+      audience: "opencode-teamwork",
+    },
+    issuedAt: new Date(Date.now() - 60_000).toISOString(),
+    expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    ...overrides,
+  }
+}
+
+function writeAttestation(ctx, payload, keys, options = {}) {
+  const artifact = signAttestation(payload, {
+    privateKey: keys.privateKey,
+    keyId: keys.keyId,
+    nonce: options.nonce ?? readJson(join(ctx.run, "run.manifest.json")).runNonce,
+  })
+  writeJson(join(ctx.run, "verify/ci/attestation.json"), artifact)
+  return artifact
+}
+
 
 /** Build a complete `command`-provenance run around one or more v2 checks. */
 async function buildCommandRun(ctx, {
@@ -1272,6 +1382,8 @@ async function main() {
       "runId",
       "runPath",
       "trust",
+      "attestation",
+      "attested",
       "verdict",
       "counts",
       "checks",
@@ -1286,6 +1398,7 @@ async function main() {
       const parsed = JSON.parse(cli.stdout)
       assert.deepStrictEqual(Object.keys(parsed), topKeys)
       assert.deepStrictEqual(Object.keys(parsed.trust), ["alg", "keyId", "source"])
+      assert.deepStrictEqual(Object.keys(parsed.attestation), ["status", "commitSha", "keyId", "issuer"])
       assert.deepStrictEqual(Object.keys(parsed.counts), ["pass", "warn", "fail", "skip", "unknown", "total"])
       for (const check of parsed.checks) {
         assert.deepStrictEqual(Object.keys(check), ["id", "level", "status", "detail", "artifacts"])
@@ -1481,7 +1594,7 @@ async function main() {
   // T27 — a legacy 0.15 report (manifest v3, checks v1) still parses as declared.
   // -------------------------------------------------------------------------
   {
-    const ctx = await makeRun({ tag: "t27", requireHandoffs: "skip", victoryAudit: "skip" })
+    const ctx = await makeRun({ tag: "t27", manifestVersion: 3, requireHandoffs: "skip", victoryAudit: "skip" })
     const built = await buildComplete(ctx, { withFinal: false })
     const report = readJson(join(ctx.run, "verify/report-R1.json"))
     assert.strictEqual(
@@ -1549,6 +1662,252 @@ async function main() {
     assert.strictEqual(failResult.verdict, "FAIL")
     assert(hasReason(failResult, "CHECK_EXIT_CONFLICT"), JSON.stringify(failResult.reasons))
     ok("T29 passed:true/exitCode:1 and passed:false/exitCode:0 -> CHECK_EXIT_CONFLICT")
+  }
+
+  // -------------------------------------------------------------------------
+  // T30 — a valid CI attestation is PASS, and the CLI reports attested:true.
+  // -------------------------------------------------------------------------
+  {
+    const keys = makeAttestationKeys()
+    const { ctx } = await attestationFixture("t30")
+    writeAttestation(ctx, attestationPayloadFor(ctx), keys)
+    const result = await verify(ctx, {
+      attestationPublicKey: keys.publicKey,
+      attestationIssuer: ATTESTATION_ISSUER,
+    })
+    assert.strictEqual(result.verdict, "PASS", JSON.stringify(result.reasons))
+    assert.strictEqual(result.attested, true)
+    assert.deepStrictEqual(result.attestation, {
+      status: "ATTESTED",
+      commitSha: "a".repeat(40),
+      keyId: keys.keyId,
+      issuer: ATTESTATION_ISSUER,
+    })
+    const cli = runCli([
+      "verify",
+      "--run-dir",
+      ctx.run,
+      ...signedArgs(ctx),
+      "--attestation-public-key",
+      keys.publicKey,
+      "--attestation-issuer",
+      ATTESTATION_ISSUER,
+      "--json",
+    ])
+    assert.strictEqual(cli.code, 0, cli.stderr)
+    const parsed = JSON.parse(cli.stdout)
+    assert.strictEqual(parsed.verdict, "PASS")
+    assert.strictEqual(parsed.attested, true)
+    assert.strictEqual(parsed.attestation.status, "ATTESTED")
+    ok("T30 required + valid fixture attestation -> PASS, attested:true (CLI and API)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T31 — required + missing is a named FAIL; without a key it is UNKNOWN.
+  // -------------------------------------------------------------------------
+  {
+    const keys = makeAttestationKeys()
+    const missing = await attestationFixture("t31a")
+    const missingResult = await verify(missing.ctx, { attestationPublicKey: keys.publicKey })
+    assert.strictEqual(missingResult.verdict, "FAIL", JSON.stringify(missingResult.reasons))
+    assert(hasReason(missingResult, "AUTH_ATTESTATION_MISSING"), JSON.stringify(missingResult.reasons))
+    assert.strictEqual(missingResult.attestation.status, "MISSING")
+
+    const noKey = await attestationFixture("t31b")
+    writeAttestation(noKey.ctx, attestationPayloadFor(noKey.ctx), keys)
+    const unknown = await verify(noKey.ctx)
+    assert.strictEqual(unknown.verdict, "UNKNOWN", JSON.stringify(unknown.reasons))
+    assert.strictEqual(verifyExitCode(unknown), 2)
+    assert.strictEqual(unknown.attestation.status, "UNKNOWN")
+    assert(!hasReason(unknown, "AUTH_ATTESTATION_STALE"))
+    ok("T31 required missing -> AUTH_ATTESTATION_MISSING; no public key -> UNKNOWN (exit 2)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T32 — stale plan hash, commit mismatch and command/output mismatch.
+  // -------------------------------------------------------------------------
+  {
+    const keys = makeAttestationKeys()
+    const stale = await attestationFixture("t32a")
+    writeAttestation(stale.ctx, attestationPayloadFor(stale.ctx, { planHash: "f".repeat(64) }), keys)
+    const staleResult = await verify(stale.ctx, { attestationPublicKey: keys.publicKey })
+    assert.strictEqual(staleResult.verdict, "FAIL")
+    assert(hasReason(staleResult, "AUTH_ATTESTATION_STALE"), JSON.stringify(staleResult.reasons))
+
+    const commit = await attestationFixture("t32b")
+    writeAttestation(commit.ctx, attestationPayloadFor(commit.ctx, { commitSha: "d".repeat(40) }), keys)
+    const commitResult = await verify(commit.ctx, { attestationPublicKey: keys.publicKey })
+    assert.strictEqual(commitResult.verdict, "FAIL")
+    assert(hasReason(commitResult, "AUTH_ATTESTATION_COMMIT_MISMATCH"), JSON.stringify(commitResult.reasons))
+
+    const output = await attestationFixture("t32c")
+    const payload = attestationPayloadFor(output.ctx)
+    payload.commands[0].outputSha256 = contentSha256Hex("different output\n")
+    payload.commands[0].outputBytes = Buffer.byteLength("different output\n")
+    writeAttestation(output.ctx, payload, keys)
+    const outputResult = await verify(output.ctx, { attestationPublicKey: keys.publicKey })
+    assert.strictEqual(outputResult.verdict, "FAIL")
+    assert(hasReason(outputResult, "AUTH_ATTESTATION_STALE"), JSON.stringify(outputResult.reasons))
+    ok("T32 stale plan / commit mismatch / command-output mismatch -> named codes")
+  }
+
+  // -------------------------------------------------------------------------
+  // T33 — replay from another run and a run-key signature are refused.
+  // -------------------------------------------------------------------------
+  {
+    const keys = makeAttestationKeys()
+    const replay = await attestationFixture("t33a")
+    const payload = attestationPayloadFor(replay.ctx, { runId: "20261124-000000-other" })
+    writeAttestation(replay.ctx, payload, keys, { nonce: randomBytes(16).toString("base64url") })
+    const replayResult = await verify(replay.ctx, { attestationPublicKey: keys.publicKey })
+    assert.strictEqual(replayResult.verdict, "FAIL")
+    assert(hasReason(replayResult, "AUTH_ATTESTATION_REPLAY"), JSON.stringify(replayResult.reasons))
+
+    const runKeyed = await attestationFixture("t33b")
+    // The fixture's run is HMAC; rebuild one with an Ed25519 run key so the
+    // same private key can sign the attestation.
+    const ed = await makeRun({
+      tag: "t33c",
+      alg: "ed25519",
+      requireHandoffs: "skip",
+      victoryAudit: "skip",
+      attestationPolicy: "required",
+      attestationIssuer: ATTESTATION_ISSUER,
+    })
+    const headSha = "a".repeat(40)
+    const check = makeCommandCheck({
+      command: [process.execPath, "-e", "process.stdout.write('run-key\\n')"],
+      output: "run-key\n",
+    })
+    await buildComplete(ed, {
+      reportOptions: { headSha, diffHash: "b".repeat(64), extraChecks: [check] },
+    })
+    const edPayload = attestationPayloadFor(ed)
+    const runPrivate = loadAttestationPrivateKey(ed.signer.env.OPENCODE_TEAMWORK_ED25519_PRIVATE_KEY)
+    assert(runPrivate, "the Ed25519 fixture run must expose its private key")
+    writeAttestation(ed, edPayload, { privateKey: runPrivate, keyId: ed.signer.keyId })
+    const runKeyResult = await verify(ed, { attestationPublicKey: ed.signer.publicKey })
+    assert.strictEqual(runKeyResult.verdict, "FAIL")
+    assert(hasReason(runKeyResult, "AUTH_ATTESTATION_UNTRUSTED"), JSON.stringify(runKeyResult.reasons))
+    ok("T33 foreign runId/nonce -> REPLAY; run-key signature -> UNTRUSTED")
+  }
+
+  // -------------------------------------------------------------------------
+  // T34 — policy downgrade is AUTH_STALE; off ignores; optional records.
+  // -------------------------------------------------------------------------
+  {
+    const keys = makeAttestationKeys()
+    const downgrade = await attestationFixture("t34a")
+    writeAttestation(downgrade.ctx, attestationPayloadFor(downgrade.ctx), keys)
+    for (const rel of ["plan.dag.json", "state.json"]) {
+      const value = readJson(join(downgrade.ctx.run, rel))
+      value.attestationPolicy = "off"
+      writeJson(join(downgrade.ctx.run, rel), value)
+    }
+    const downgraded = await verify(downgrade.ctx, { attestationPublicKey: keys.publicKey })
+    assert.strictEqual(downgraded.verdict, "FAIL")
+    assert(hasReason(downgraded, "AUTH_STALE"), JSON.stringify(downgraded.reasons))
+    assert(
+      downgraded.reasons.some((reason) => reason.includes("attestationPolicy")),
+      JSON.stringify(downgraded.reasons),
+    )
+
+    const off = await attestationFixture("t34b", { policy: "off" })
+    writeJson(join(off.ctx.run, "verify/ci/attestation.json"), { garbage: true })
+    const offResult = await verify(off.ctx)
+    assert.strictEqual(offResult.verdict, "PASS", JSON.stringify(offResult.reasons))
+    assert.strictEqual(offResult.attestation.status, "OFF")
+    assert.strictEqual(offResult.attested, false)
+
+    const optional = await attestationFixture("t34c", { policy: "optional" })
+    writeJson(join(optional.ctx.run, "verify/ci/attestation.json"), { garbage: true })
+    const optionalResult = await verify(optional.ctx, { attestationPublicKey: keys.publicKey })
+    assert.strictEqual(optionalResult.verdict, "PASS", JSON.stringify(optionalResult.reasons))
+    assert.strictEqual(optionalResult.attestation.status, "INVALID")
+    assert(optionalResult.counts.warn >= 1)
+    ok("T34 downgrade -> AUTH_STALE; off ignores; optional records INVALID without failing")
+  }
+
+  // -------------------------------------------------------------------------
+  // T35 — the producer CLI writes an artifact the verifier accepts.
+  // -------------------------------------------------------------------------
+  {
+    const keys = makeAttestationKeys()
+    const { ctx } = await attestationFixture("t35")
+    const manifestPath = join(ctx.run, "run.manifest.json")
+    const manifest = readJson(manifestPath)
+    const report = readJson(join(ctx.run, "verify/report-R1.json"))
+    const payload = attestationPayloadFor(ctx)
+    const keyFile = join(TEST_ROOT, "t35-attestation-key.pem")
+    writeFileSync(keyFile, keys.pair.privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 })
+    const commandsFile = join(TEST_ROOT, "t35-commands.json")
+    writeJson(commandsFile, payload.commands)
+    const outPath = join(ctx.run, "verify/ci/attestation.json")
+    const cli = execFileSync(
+      process.execPath,
+      [
+        resolve("scripts/attest-sign.mjs"),
+        "--run-id",
+        ctx.runId,
+        "--manifest-digest",
+        payloadDigest(manifest),
+        "--manifest",
+        manifestPath,
+        "--commit",
+        report.headSha,
+        "--base",
+        "",
+        "--commands",
+        `@${commandsFile}`,
+        "--key",
+        keyFile,
+        "--out",
+        outPath,
+        "--oidc-issuer",
+        ATTESTATION_ISSUER,
+        "--json",
+      ],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    )
+    const produced = JSON.parse(cli)
+    assert.strictEqual(produced.ok, true)
+    assert.strictEqual(produced.keyId, keys.keyId)
+    const artifact = readJson(outPath)
+    assert.strictEqual(artifact._auth.path, "verify/ci/attestation.json")
+    assert.strictEqual(artifact.planHash, manifest.planHash)
+    const verified = await verify(ctx, { attestationPublicKey: keys.publicKey, attestationIssuer: ATTESTATION_ISSUER })
+    assert.strictEqual(verified.verdict, "PASS", JSON.stringify(verified.reasons))
+    assert.strictEqual(verified.attested, true)
+
+    // The producer refuses a manifest digest that does not match the manifest.
+    let refused = 0
+    try {
+      execFileSync(
+        process.execPath,
+        [
+          resolve("scripts/attest-sign.mjs"),
+          "--run-id",
+          ctx.runId,
+          "--manifest-digest",
+          "0".repeat(64),
+          "--manifest",
+          manifestPath,
+          "--commit",
+          report.headSha,
+          "--commands",
+          `@${commandsFile}`,
+          "--key",
+          keyFile,
+          "--out",
+          outPath,
+        ],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+      )
+    } catch (err) {
+      refused = err.status ?? 1
+    }
+    assert.strictEqual(refused, 1)
+    ok("T35 attest-sign.mjs produces a verifiable artifact and refuses a mismatched manifest digest")
   }
 
   rmSync(TEST_ROOT, { recursive: true, force: true })
