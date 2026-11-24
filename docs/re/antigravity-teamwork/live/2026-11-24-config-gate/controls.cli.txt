@@ -1,0 +1,5 @@
+I1124 14:33:01.378682       1 session.go:201] Print mode: conversation=<conversation-C1>, sending message
+I1124 14:33:01.378687       1 printmode.go:939] Print mode: slash command expansion disabled
+I1124 14:33:01.378849       1 conversation_manager.go:1080] Forwarding user message to conversation <conversation-C1> (items=1, media=0)
+I1124 14:33:21.038595       1 session.go:201] Print mode: conversation=<conversation-C2>, sending message
+I1124 14:33:21.050360       1 conversation_manager.go:1080] Forwarding user message to conversation <conversation-C2> (items=1, media=0)
