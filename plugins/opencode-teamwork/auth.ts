@@ -50,12 +50,17 @@ import {
   verify as cryptoVerify,
 } from "node:crypto"
 import { spawn } from "node:child_process"
+import { lstatSync, realpathSync } from "node:fs"
+import { isAbsolute, join } from "node:path"
 import {
   artifactSignatureInput,
   canonicalJson,
+  contentSha256Hex,
   payloadDigest,
   approvalKeyIdFromPublicKey,
   sha256Hex,
+  signerApprovalSignatureInput,
+  witnessSignatureInput,
 } from "./approval-format.mjs"
 
 export { artifactSignatureInput, canonicalJson, payloadDigest, sha256Hex }
@@ -76,6 +81,18 @@ export const ENV_SIGNER_KEY_ID = "OPENCODE_TEAMWORK_SIGNER_KEY_ID"
 export const ENV_SIGNER_TIMEOUT_MS = "OPENCODE_TEAMWORK_SIGNER_TIMEOUT_MS"
 export const ENV_WITNESS = "OPENCODE_TEAMWORK_WITNESS"
 export const ENV_WITNESS_TIMEOUT_MS = "OPENCODE_TEAMWORK_WITNESS_TIMEOUT_MS"
+/**
+ * Verify-only witness key (0.14.0). When configured, final_verify requires a
+ * signed witness receipt; when unset, a receipt is recorded as `unverified`.
+ */
+export const ENV_WITNESS_PUBLIC_KEY = "OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY"
+export const ENV_WITNESS_KEY_ID = "OPENCODE_TEAMWORK_WITNESS_KEY_ID"
+/**
+ * Signer protocol v2 (0.14.0). When set, the command signer receives
+ * `{v:2, op:"sign-artifact", runId, approvalRef, …}`; when unset, the exact v1
+ * request is sent for byte-compatible back-compat.
+ */
+export const ENV_SIGNER_APPROVAL_DIR = "OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR"
 /**
  * Verify-only approval key (0.10.2). A human/CI approval must be signed by a
  * key distinct from the run's `runKeyId`; this public key is how the verifier
@@ -195,6 +212,7 @@ function failureFromError(err: unknown, fallback: AuthFailureCode = "AUTH_UNAVAI
 
 const SHA256_HEX = /^[0-9a-f]{64}$/
 const BASE64URL = /^[A-Za-z0-9_-]+$/
+const RUN_ID = /^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$/
 
 function decodeKey(key: unknown): Buffer | undefined {
   if (typeof key !== "string" || !BASE64URL.test(key)) return undefined
@@ -429,6 +447,28 @@ interface CommandSigner {
   publicKey: string
   keyId: string
   timeoutMs: number
+  /** Optional v2 approval directory; when set the request is v2. */
+  approvalDir?: string
+}
+
+let signerApprovalOwnerUidOverride: number | null = null
+
+/**
+ * Test-only seam. A signer approval directory must be owned by a principal
+ * other than the workload; a single-UID test process cannot create one.
+ * Production never calls this (the default is `process.geteuid()`).
+ */
+export function setSignerApprovalOwnerUidForTest(uid: number | null): void {
+  signerApprovalOwnerUidOverride = typeof uid === "number" && Number.isFinite(uid) ? Math.trunc(uid) : null
+}
+
+function expectedSignerApprovalOwnerUid(): number | undefined {
+  if (signerApprovalOwnerUidOverride !== null) return signerApprovalOwnerUidOverride
+  try {
+    return typeof process.geteuid === "function" ? process.geteuid() : undefined
+  } catch {
+    return undefined
+  }
 }
 
 function commandPath(value: string): string | undefined {
@@ -463,27 +503,107 @@ function resolveSigner(env: Record<string, string | undefined>): CommandSigner |
   }
   const configuredId = env[ENV_SIGNER_KEY_ID]?.trim()
   const keyId = configuredId || deriveKeyId("signer", publicKey)
-  return { command, publicKey, keyId, timeoutMs: timeoutFromEnv(env, ENV_SIGNER_TIMEOUT_MS) }
+  const approvalDir = resolveSignerApprovalDir(env)
+  return {
+    command,
+    publicKey,
+    keyId,
+    timeoutMs: timeoutFromEnv(env, ENV_SIGNER_TIMEOUT_MS),
+    ...(approvalDir ? { approvalDir } : {}),
+  }
+}
+
+/**
+ * Resolve the v2 signer approval directory. It is a policy input for the
+ * *signer*, not the plugin: the plugin only derives the reference. It must be
+ * absolute, a real directory, and owned by a principal other than this process.
+ * A configured-but-unusable directory fails closed before any spawn.
+ */
+function resolveSignerApprovalDir(env: Record<string, string | undefined>): string | undefined {
+  const raw = env[ENV_SIGNER_APPROVAL_DIR]?.trim()
+  if (!raw) return undefined
+  if (!isAbsolute(raw)) {
+    throw new AuthError({
+      code: "AUTH_SIGNER_UNAVAILABLE",
+      message: `${ENV_SIGNER_APPROVAL_DIR} must be an absolute path`,
+    })
+  }
+  let st
+  try {
+    st = lstatSync(raw)
+  } catch (err: any) {
+    throw new AuthError({
+      code: "AUTH_SIGNER_UNAVAILABLE",
+      message: `${ENV_SIGNER_APPROVAL_DIR} is not readable (${String(err?.code ?? err).slice(0, 40)})`,
+    })
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw new AuthError({
+      code: "AUTH_SIGNER_UNAVAILABLE",
+      message: `${ENV_SIGNER_APPROVAL_DIR} must be a real directory (not a symlink)`,
+    })
+  }
+  const expected = expectedSignerApprovalOwnerUid()
+  if (expected !== undefined && st.uid === expected) {
+    throw new AuthError({
+      code: "AUTH_SIGNER_UNAVAILABLE",
+      message: `${ENV_SIGNER_APPROVAL_DIR} is owned by this process (uid ${st.uid}); a signer approval must come from a different principal`,
+    })
+  }
+  try {
+    return realpathSync(raw)
+  } catch (err: any) {
+    throw new AuthError({
+      code: "AUTH_SIGNER_UNAVAILABLE",
+      message: `${ENV_SIGNER_APPROVAL_DIR} cannot be resolved (${String(err?.code ?? err).slice(0, 40)})`,
+    })
+  }
 }
 
 interface WitnessConfig {
   kind: "command" | "http"
   target: string
   timeoutMs: number
+  /** Verify-only SPKI Ed25519 key. Absent means receipts are `unverified`. */
+  publicKey?: string
+  keyId?: string
 }
 
 function resolveWitness(env: Record<string, string | undefined>): WitnessConfig | undefined {
   const raw = env[ENV_WITNESS]?.trim()
-  if (!raw) return undefined
-  const command = commandPath(raw)
-  if (command) return { kind: "command", target: command, timeoutMs: timeoutFromEnv(env, ENV_WITNESS_TIMEOUT_MS) }
-  if (raw.startsWith("http://") || raw.startsWith("https://")) {
-    return { kind: "http", target: raw, timeoutMs: timeoutFromEnv(env, ENV_WITNESS_TIMEOUT_MS) }
+  const configuredKey = env[ENV_WITNESS_PUBLIC_KEY]?.trim()
+  const configuredKeyId = env[ENV_WITNESS_KEY_ID]?.trim()
+  if (!raw) {
+    if (configuredKey || configuredKeyId) {
+      throw new AuthError({
+        code: "AUTH_WITNESS_UNAVAILABLE",
+        message: `${ENV_WITNESS_PUBLIC_KEY} is set but ${ENV_WITNESS} is not; no witness can produce a receipt`,
+      })
+    }
+    return undefined
   }
-  throw new AuthError({
-    code: "AUTH_WITNESS_UNAVAILABLE",
-    message: `${ENV_WITNESS} must be command:<absolute path> or http(s)://<url>`,
-  })
+  const command = commandPath(raw)
+  const base =
+    command
+      ? { kind: "command" as const, target: command, timeoutMs: timeoutFromEnv(env, ENV_WITNESS_TIMEOUT_MS) }
+      : raw.startsWith("http://") || raw.startsWith("https://")
+        ? { kind: "http" as const, target: raw, timeoutMs: timeoutFromEnv(env, ENV_WITNESS_TIMEOUT_MS) }
+        : undefined
+  if (!base) {
+    throw new AuthError({
+      code: "AUTH_WITNESS_UNAVAILABLE",
+      message: `${ENV_WITNESS} must be command:<absolute path> or http(s)://<url>`,
+    })
+  }
+  if (!configuredKey) return base
+  if (!ed25519PublicKeyObject(configuredKey)) {
+    throw new AuthError({
+      code: "AUTH_WITNESS_UNAVAILABLE",
+      message: `${ENV_WITNESS_PUBLIC_KEY} must be a base64url SPKI Ed25519 key`,
+    })
+  }
+  const keyId = configuredKeyId || deriveKeyId("witness", configuredKey)
+  return { ...base, publicKey: configuredKey, keyId }
 }
 
 function spawnJson(
@@ -602,6 +722,24 @@ export interface ArtifactCheck {
   failure?: AuthFailure
 }
 
+/**
+ * Result of checking a stored witness receipt against a configured witness key.
+ *   * `verified`   — a witness public key is configured and the receipt's
+ *                    signature covers this run, path, digest, nonce and time.
+ *   * `unverified` — no witness public key is configured; the receipt is a
+ *                    detection-only record (never upgraded to verified).
+ *   * `missing`    — no receipt was recorded (AUTH_WITNESS_UNAVAILABLE).
+ *   * `invalid`    — the record is present but is forged/foreign/stale
+ *                    (AUTH_INVALID).
+ *   * `unknown`    — storage is unavailable; cannot tell.
+ */
+export interface WitnessCheck {
+  status: "verified" | "unverified" | "missing" | "invalid" | "unknown"
+  failure?: AuthFailure
+  keyId?: string
+  at?: string
+}
+
 export interface SignOptions {
   /** Per-run nonce. Required for ed25519 run artifacts. */
   nonce?: string
@@ -609,6 +747,12 @@ export interface SignOptions {
   expectedKeyId?: string
   /** Expected per-run nonce (a signed run's `runNonce`). */
   requireNonce?: string
+  /**
+   * Run id for the signer protocol. Optional and additive: `signRunArtifact`
+   * supplies it; a bare `signArtifact` call without one keeps the v1 signer
+   * request (and a v2 request without a run id is refused).
+   */
+  runId?: string
 }
 
 export interface AuthContext {
@@ -648,6 +792,16 @@ export interface AuthContext {
   hasWitnessReceipt(runId: string, relPath: string): Promise<boolean>
   /** Read the recorded witness receipt, if any. */
   witnessReceipt(runId: string, relPath: string): Promise<string | undefined>
+  /**
+   * Check a stored witness receipt. When `OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY`
+   * is configured the signature must cover this run, path, digest and nonce;
+   * otherwise the record is reported `unverified` (detection-only).
+   */
+  verifyWitnessReceipt(
+    runId: string,
+    relPath: string,
+    expected?: { digest?: string; nonce?: string },
+  ): Promise<WitnessCheck>
 }
 
 export function createAuthContext(storage: StorageLike | undefined, env: Record<string, string | undefined> = {}): AuthContext {
@@ -761,6 +915,7 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
     payload: unknown,
     nonce: string | undefined,
     at: string,
+    runId: string | undefined,
   ): Promise<AuthEnvelope> => {
     if (!nonce) {
       throw new AuthError({
@@ -770,15 +925,44 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
     }
     const digest = payloadDigest(payload)
     const message = artifactSignatureInput(AUTH_ED25519, external.keyId, relPath, nonce, payload)
-    const request = {
-      v: 1,
-      alg: AUTH_ED25519,
-      keyId: external.keyId,
-      path: relPath,
-      digest,
-      nonce,
-      at,
-      message: Buffer.from(message, "utf8").toString("base64url"),
+    let request: Record<string, unknown>
+    if (external.approvalDir) {
+      // Signer protocol v2. The approval reference is derived only from
+      // trusted inputs: the configured directory, the run id, and the plain
+      // SHA-256 of the run-relative path. The plugin does NOT read or verify
+      // the approval; that decision belongs to the signer.
+      if (!runId || !RUN_ID.test(runId)) {
+        throw new AuthError({
+          code: "AUTH_SIGNER_UNAVAILABLE",
+          message: `${ENV_SIGNER_APPROVAL_DIR} is set but no valid run id is available for the v2 signer request`,
+        })
+      }
+      const approvalRef = join(external.approvalDir, runId, `${contentSha256Hex(relPath)}.json`)
+      request = {
+        v: 2,
+        op: "sign-artifact",
+        runId,
+        alg: AUTH_ED25519,
+        keyId: external.keyId,
+        path: relPath,
+        digest,
+        nonce,
+        at,
+        approvalRef,
+        message: Buffer.from(message, "utf8").toString("base64url"),
+      }
+    } else {
+      // Exact v1 request, byte-compatible with a pre-0.14 signer.
+      request = {
+        v: 1,
+        alg: AUTH_ED25519,
+        keyId: external.keyId,
+        path: relPath,
+        digest,
+        nonce,
+        at,
+        message: Buffer.from(message, "utf8").toString("base64url"),
+      }
     }
     const response = await spawnJson(external.command, request, external.timeoutMs, "AUTH_SIGNER_UNAVAILABLE")
     const sig = decodeBase64Url(response?.sig)
@@ -835,7 +1019,7 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
     const external = getSigner()
     if (external) {
       resolvedAlg = AUTH_ED25519
-      const envelope = await signerEnvelope(external, relPath, payload, opts.nonce, at)
+      const envelope = await signerEnvelope(external, relPath, payload, opts.nonce, at, opts.runId)
       return { ...(payload as Record<string, unknown>), _auth: envelope }
     }
     const res = await pullRing()
@@ -1088,29 +1272,59 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
   const appendWitness = async (runId: string, relPath: string, auth: AuthEnvelope): Promise<void> => {
     const config = getWitness()
     if (!config) return
+    const nonce = auth.nonce ?? ""
     const record = {
       runId,
       path: relPath,
       digest: auth.digest,
       keyId: auth.keyId,
-      nonce: auth.nonce ?? "",
+      nonce,
       at: auth.at,
     }
+    const request = { v: 2, ...record }
     const response =
       config.kind === "command"
-        ? await spawnJson(config.target, { v: 1, ...record }, config.timeoutMs, "AUTH_WITNESS_UNAVAILABLE")
-        : await httpWitness(config.target, { v: 1, ...record }, config.timeoutMs)
+        ? await spawnJson(config.target, request, config.timeoutMs, "AUTH_WITNESS_UNAVAILABLE")
+        : await httpWitness(config.target, request, config.timeoutMs)
     const receipt = response?.receipt
     if (typeof receipt !== "string" || receipt.trim() === "") {
       throw new AuthError({ code: "AUTH_WITNESS_UNAVAILABLE", message: "the witness did not return a receipt" })
+    }
+    let proven: { alg: "ed25519"; keyId: string; sig: string } | undefined
+    if (config.publicKey) {
+      const sig = decodeBase64Url(response?.sig)
+      if (
+        response?.alg !== AUTH_ED25519 ||
+        response?.keyId !== config.keyId ||
+        !sig ||
+        sig.length !== 64
+      ) {
+        throw new AuthError({
+          code: "AUTH_WITNESS_UNAVAILABLE",
+          message: "the witness returned a receipt without a valid {alg,keyId,sig} response",
+        })
+      }
+      const message = witnessSignatureInput(runId, relPath, auth.digest, nonce, auth.at)
+      const publicKey = ed25519PublicKeyObject(config.publicKey)
+      if (!publicKey || !cryptoVerify(null, Buffer.from(message, "utf8"), publicKey, sig)) {
+        throw new AuthError({
+          code: "AUTH_WITNESS_UNAVAILABLE",
+          message: "the witness receipt signature does not verify with the configured witness public key",
+        })
+      }
+      proven = { alg: AUTH_ED25519, keyId: config.keyId!, sig: sig.toString("base64url") }
     }
     if (!storageUsable) {
       throw new AuthError({ code: "AUTH_WITNESS_UNAVAILABLE", message: "ctx.storage is unavailable; cannot record the witness receipt" })
     }
     try {
       await storage.set(witnessKey(runId, relPath), {
-        v: 1,
+        // v2 shape: {receipt, alg, keyId, sig, at} when a witness key is
+        // configured; an unverified v1-style receipt otherwise.
+        v: 2,
         receipt: receipt.slice(0, 4096),
+        ...(proven ? { alg: proven.alg, keyId: proven.keyId, sig: proven.sig, at: auth.at } : { alg: "unverified", at: auth.at }),
+        verified: !!proven,
         record,
         recordedAt: new Date().toISOString(),
       })
@@ -1153,7 +1367,7 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
   ): Promise<any> => {
     const nonce = opts.nonce ?? (await runNonce(runId))
     const pinnedKeyId = await runKeyId(runId)
-    const signed = await signArtifact(relPath, payload, { ...opts, nonce })
+    const signed = await signArtifact(relPath, payload, { ...opts, nonce, runId })
     if (pinnedKeyId && signed._auth?.keyId !== pinnedKeyId) {
       throw new AuthError({
         code: "AUTH_INVALID",
@@ -1292,6 +1506,129 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
     }
   }
 
+  const verifyWitnessReceipt = async (
+    runId: string,
+    relPath: string,
+    expected: { digest?: string; nonce?: string } = {},
+  ): Promise<WitnessCheck> => {
+    if (!storageUsable) {
+      return {
+        status: "unknown",
+        failure: { code: "AUTH_UNAVAILABLE", message: "ctx.storage is unavailable; cannot read the witness receipt" },
+      }
+    }
+    let value: any
+    try {
+      value = await storage.get(witnessKey(runId, relPath))
+    } catch (err: any) {
+      return {
+        status: "unknown",
+        failure: {
+          code: "AUTH_UNAVAILABLE",
+          message: `could not read the witness receipt (${String(err?.message ?? err).slice(0, 120)})`,
+        },
+      }
+    }
+    if (value === undefined || value === null || typeof value !== "object" || Array.isArray(value)) {
+      return {
+        status: "missing",
+        failure: {
+          code: "AUTH_WITNESS_UNAVAILABLE",
+          message: `no witness receipt was recorded for ${relPath}`,
+        },
+      }
+    }
+    const config = (() => {
+      try {
+        return getWitness()
+      } catch (err: any) {
+        return { error: err } as any
+      }
+    })()
+    if ((config as any)?.error) {
+      const failure = (config as any).error?.failure as AuthFailure | undefined
+      return {
+        status: "invalid",
+        failure: failure ?? {
+          code: "AUTH_WITNESS_UNAVAILABLE",
+          message: String((config as any).error?.message ?? "witness configuration is invalid").slice(0, 200),
+        },
+      }
+    }
+    // No verify key: today's detection-only behavior. Never call this verified.
+    if (!config?.publicKey) {
+      return { status: "unverified", ...(typeof value.at === "string" ? { at: value.at } : {}) }
+    }
+    const record = value.record
+    if (!record || typeof record !== "object" || Array.isArray(record)) {
+      return {
+        status: "invalid",
+        failure: { code: "AUTH_INVALID", message: `the witness receipt for ${relPath} has no recorded request` },
+      }
+    }
+    if (record.runId !== runId || record.path !== relPath) {
+      return {
+        status: "invalid",
+        failure: {
+          code: "AUTH_INVALID",
+          message: `the witness receipt for ${relPath} was recorded for ${String(record.runId)}/${String(record.path)}; it is foreign`,
+        },
+      }
+    }
+    const digest = expected.digest ?? (typeof record.digest === "string" ? record.digest : undefined)
+    const nonce = expected.nonce ?? (typeof record.nonce === "string" ? record.nonce : undefined)
+    if (!digest || !SHA256_HEX.test(digest) || nonce === undefined) {
+      return {
+        status: "invalid",
+        failure: { code: "AUTH_INVALID", message: `the witness receipt for ${relPath} does not bind a digest and nonce` },
+      }
+    }
+    if (
+      (expected.digest !== undefined && record.digest !== expected.digest) ||
+      (expected.nonce !== undefined && record.nonce !== expected.nonce)
+    ) {
+      return {
+        status: "invalid",
+        failure: {
+          code: "AUTH_INVALID",
+          message: `the witness receipt for ${relPath} covers a different digest/nonce than the artifact`,
+        },
+      }
+    }
+    if (value.alg !== AUTH_ED25519 || value.keyId !== config.keyId) {
+      return {
+        status: "invalid",
+        failure: {
+          code: "AUTH_INVALID",
+          message: `the witness receipt for ${relPath} is not a ${AUTH_ED25519} receipt from witness key ${String(config.keyId)}`,
+        },
+      }
+    }
+    const sig = decodeBase64Url(value.sig)
+    if (!sig || sig.length !== 64) {
+      return {
+        status: "invalid",
+        failure: { code: "AUTH_INVALID", message: `the witness receipt for ${relPath} has no 64-byte signature` },
+      }
+    }
+    const at = typeof value.at === "string" ? value.at : undefined
+    if (!at) {
+      return {
+        status: "invalid",
+        failure: { code: "AUTH_INVALID", message: `the witness receipt for ${relPath} has no signed time` },
+      }
+    }
+    const publicKey = ed25519PublicKeyObject(config.publicKey)
+    const message = witnessSignatureInput(runId, relPath, digest, nonce, at)
+    if (!publicKey || !cryptoVerify(null, Buffer.from(message, "utf8"), publicKey, sig)) {
+      return {
+        status: "invalid",
+        failure: { code: "AUTH_INVALID", message: `the witness receipt signature for ${relPath} is invalid` },
+      }
+    }
+    return { status: "verified", keyId: config.keyId, at }
+  }
+
   return {
     configured: !!env[ENV_KEY] || !!env[ENV_ED25519_PRIVATE_KEY] || !!env[ENV_ED25519_PUBLIC_KEY] || !!env[ENV_SIGNER] || storageUsable,
     get signerConfigured() {
@@ -1315,5 +1652,6 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
     runKeyId,
     hasWitnessReceipt: async (runId, relPath) => (await witnessReceipt(runId, relPath)) !== undefined,
     witnessReceipt,
+    verifyWitnessReceipt,
   }
 }

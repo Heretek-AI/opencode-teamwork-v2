@@ -650,13 +650,31 @@ await checkAsync("detective SIGKILL between rename and post-check leaves an unco
     `setWriteAnomalyAuditPathForTest(process.env.AUDIT)`,
     `setFdTraversalModeForTest("detective")`,
     `writeFileAtomicWithin(process.env.RUN, "killed.json", "KILLED_BYTES", { afterRename: () => process.kill(process.pid, "SIGKILL") })`,
+    `console.log("WRITE_DONE")`,
   ].join("\n")
   const res = spawnSync(process.execPath, [...process.execArgv, "--input-type=module", "-e", code], {
     encoding: "utf8",
     timeout: 15000,
     env: { ...process.env, RUN: run, AUDIT: audit },
   })
-  assert.strictEqual(res.signal, "SIGKILL", `the child must die between rename and post-check: ${res.stderr || ""}`)
+  if (process.platform === "win32") {
+    // TerminateProcess does not report a POSIX signal: the child exits
+    // non-zero with signal null. The marker proves it never reached the
+    // post-check; a completed write is a hard failure, never a silent pass.
+    const completed = /WRITE_DONE/.test(res.stdout ?? "")
+    const exitedNonZero = typeof res.status === "number" && res.status !== 0
+    const terminated = res.signal !== null
+    assert(
+      !completed,
+      `the child must die between rename and post-check, not complete: status=${res.status} signal=${res.signal} ${res.stderr || ""}`,
+    )
+    assert(
+      exitedNonZero || terminated,
+      `the child must be terminated on win32 (status=${res.status}, signal=${res.signal}): ${res.stderr || ""}`,
+    )
+  } else {
+    assert.strictEqual(res.signal, "SIGKILL", `the child must die between rename and post-check: ${res.stderr || ""}`)
+  }
   setWriteAnomalyAuditPathForTest(audit)
   try {
     const pending = unacknowledgedWriteAnomalies(run)

@@ -113,9 +113,17 @@ rather than being treated as local.
   requirement at all, and the CLI's typed confirmation is not human-presence
   enforcement. The administrator-only deployment steps (separate signer UID,
   root-owned signer, socket service, audit rules, SELinux labels, verification)
-  are in [ADMIN-HARDENING.md](ADMIN-HARDENING.md); the v2 signer contract and
-  the plugin change it requires are in [SIGNER-PROTOCOL.md](SIGNER-PROTOCOL.md).
-  They are not in-process controls and are not enforced by the plugin.
+  are in [ADMIN-HARDENING.md](ADMIN-HARDENING.md); the v2 signer contract is in
+  [SIGNER-PROTOCOL.md](SIGNER-PROTOCOL.md). They are not in-process controls
+  and are not enforced by the plugin. **0.14.0 witness and signer v2:** a
+  witness receipt is `verified` only when `OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY`
+  is configured and the receipt signature covers the run, path, digest, nonce
+  and signed time; otherwise it is `unverified` and detection-only. A forged KV
+  receipt is `AUTH_INVALID`, not a pass. When
+  `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` is set the plugin sends a v2 request
+  with the derived `approvalRef`, but it does not read the approval: the
+  signer's policy remains outside the plugin, and the signer is not shipped in
+  this repository (see [ADR 0014](adr/0014-verifiable-witness-and-signer-v2.md)).
   Free-form inputs that are not control-plane verdicts (`state.json` task
   summaries, `pitfalls.md`, `prompt_draft.md`, spec text) remain untrusted and
   are sanitised before injection, not authenticated. **Handoff prose is in the

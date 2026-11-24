@@ -310,7 +310,17 @@ Ed25519, public-only verification allowed), or
 `OPENCODE_TEAMWORK_SIGNER_PUBLIC_KEY` (+ optional `_KEY_ID`, `_TIMEOUT_MS`) for
 an external Ed25519 signer. An optional witness is configured with
 `OPENCODE_TEAMWORK_WITNESS=command:<path>` or `http(s)://<url>` and receipts are
-stored at `auth/witness/<runId>/<relPath>`.
+stored at `auth/witness/<runId>/<relPath>`. The v2 witness request is
+`{v:2, runId, path, digest, keyId, nonce, at}`; when
+`OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY` is configured the response must be
+`{receipt, alg:"ed25519", keyId, sig}` over
+`teamwork-witness-v1\0runId\0path\0digest\0nonce\0at`, and the record stores
+`{v:2, receipt, alg, keyId, sig, at, verified:true, record, recordedAt}`.
+`final_verify` verifies it when `requireWitness` is set: a missing receipt is
+`AUTH_WITNESS_UNAVAILABLE`, a forged/foreign/different-digest record is
+`AUTH_INVALID`. Without a witness public key the receipt is stored with
+`alg:"unverified"`, `verified:false`, and final.json records
+`evidence.witness.status: "unverified"` (detection-only).
 
 `teamwork_plan` also records `trustLevel` (`local-hmac` default,
 `external-signer`, `human-approved`, `ci-attested`) and `requireWitness`.
@@ -420,6 +430,30 @@ nonce, approver, and `approvedAt` with the signed manifest.
 > `docs/adr/0005-artifact-authenticity.md`,
 > `docs/adr/0006-artifact-trust-isolation.md`,
 > `docs/adr/0008-signer-spi-and-trust-levels.md` and `SECURITY.md`.
+
+### Signer protocol v2 and the signer approval (ADR 0014)
+
+Without `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` the command signer receives the
+exact v1 request `{v:1, alg, keyId, path, digest, nonce, at, message}`. When
+the directory is set, the request is
+`{v:2, op:"sign-artifact", runId, alg, keyId, path, digest, nonce, at,
+approvalRef, message}` and `approvalRef` is
+`<DIR>/<runId>/<plain sha256(path)>.json` (`contentSha256Hex`, not the keyed
+artifact digest). `runId` is threaded through `signRunArtifact` →
+`signArtifact` (`SignOptions.runId`). The plugin validates the directory
+(absolute, real, not owned by this process), derives the reference from trusted
+inputs, and never reads the approval. A v1-only signer with the directory set,
+or a v2-only signer without it, fails `AUTH_SIGNER_UNAVAILABLE`; there is no HMAC
+fallback.
+
+The approval is produced by
+`opencode-teamwork approve signer --session <runId> --path <relPath> --digest
+<64hex>`, written mode `0600` at the same layout, with payload
+`{v:1, kind:"teamwork.signer-approval", runId, path, digest, nonce, approvedAt,
+expiresAt, approvedBy, approvalId, _auth}`. `nonce` is the run nonce from the
+signed manifest. The signature domain is
+`teamwork-signer-approval-v1\0runId\0path\0digest\0nonce\0expiresAt\0canonicalJson(payload without _auth)`.
+The plugin does not verify this artifact; the signer does.
 
 ### `spec.json` — one per dispatched worker (written by the sentinel)
 

@@ -1,10 +1,19 @@
 # Admin hardening runbook: a policy-enforcing signer
 
-**Status:** deployment documentation for the 0.13.0 artifact-trust boundary.
+**Status:** deployment documentation for the 0.14.0 artifact-trust boundary.
 This is a runbook for an administrator. **None of these steps was executed on
 the host that wrote this document.** The commands are templates; substitute
 your identities and paths, review every line, and test on a disposable host
 first.
+
+**The signer is not in this repository and is not shipped with the package.**
+The plugin can call `OPENCODE_TEAMWORK_SIGNER=command:<path>` and, with a signer
+approval directory, send a v2 request; the program at that path is yours. It
+must be built (the outline and test list are in
+[docs/SIGNER-PROTOCOL.md §8](SIGNER-PROTOCOL.md#8-reference-implementation-outline))
+and installed as root-owned code in Step 7 below. Do not describe a deployment
+as hardened because the plugin is configured; the signer's policy is the
+boundary.
 
 This runbook builds the deployment that the package cannot build in-process: a
 signer in a different UID, root-owned signer code, a policy that refuses
@@ -13,13 +22,15 @@ detection for the remaining paths. It does not make the plugin, the prompts or
 the model trustworthy. See [SECURITY.md](../SECURITY.md) for the boundary and
 [docs/SIGNER-PROTOCOL.md](SIGNER-PROTOCOL.md) for the signer contract.
 
-> **Version gate.** This runbook describes the **v2** policy signer. The 0.13.0
-> plugin sends `v: 1` and does not send `runId` or `approvalRef`. A v2-only
-> signer will refuse every 0.13.0 request, and every signed write will fail
-> `AUTH_SIGNER_UNAVAILABLE`. Deploy the plugin change in
-> [SIGNER-PROTOCOL.md §7](SIGNER-PROTOCOL.md#7-plugin-side-change-required-for-v2)
-> with this signer, or keep the previous key source. Do not point an unmodified
-> 0.13.0 plugin at a v2-only signer and call the result hardened.
+> **Version gate.** This runbook describes the **v2** policy signer. 0.14.0
+> sends `v: 2` with `runId` and `approvalRef` only when
+> `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` is set; without it the plugin sends
+> the exact v1 request for back-compat. A v2-only signer will refuse a v1
+> request, and the write fails `AUTH_SIGNER_UNAVAILABLE`; a v1-only signer with
+> the directory set refuses the v2 request the same way. There is no fallback
+> to the local HMAC key. Deploy the signer with the matching plugin, or keep
+> the previous key source. Do not point a v1-only signer at a configured v2
+> directory and call the result hardened.
 
 > **What "policy-enforcing" means here.** A bare command signer that signs any
 > well-formed `(path, digest)` is a signing oracle: a same-UID shell can ask it
@@ -596,13 +607,23 @@ chgrp "$APPROVAL_GROUP" "$PROMPT_APPROVAL"
 chmod 0640 "$PROMPT_APPROVAL"
 ```
 
-For a v2 signer approval, the signer (not the workload) must read the file. Put
-it in the separate subdirectory and give it the signer-approval group:
+For a v2 signer approval, the signer (not the workload) must read the file. The
+layout is **one file per `(runId, path)`**, derived by both the producer and the
+plugin from trusted inputs:
+
+```text
+$SIGNER_APPROVAL_DIR/<runId>/<sha256(run-relative path)>.json
+```
+
+The hash is a **plain SHA-256** of the UTF-8 path (`contentSha256Hex` in
+`plugins/opencode-teamwork/approval-format.mjs`), not the keyed artifact digest.
+Put the file in the separate subdirectory and give it the signer-approval group:
 
 ```sh
-# Example after producing one signer approval; run as the approver.
+# Example after producing one signer approval with `approve signer`; run as the approver.
 RUN_ID=r-01J8Z5K8V6Q9W2M4N7P3S6T8X0
-SIGNER_APPROVAL_FILE="$SIGNER_APPROVAL_DIR/$RUN_ID/approval.json"
+PATH_HASH=$(printf '%s' "verify/victory.json" | sha256sum | cut -d' ' -f1)
+SIGNER_APPROVAL_FILE="$SIGNER_APPROVAL_DIR/$RUN_ID/$PATH_HASH.json"
 chgrp "$SIGNER_APPROVAL_GROUP" "$SIGNER_APPROVAL_FILE"
 chmod 0640 "$SIGNER_APPROVAL_FILE"
 ```
@@ -911,13 +932,13 @@ compromised signer can sign anything its policy allows; the audit journal is not
 immutable. The service is an availability dependency: if it is down, signing
 fails closed and the run cannot complete.
 
-> **Version note.** The 0.13.0 plugin sends a `v:1` signer request without a
-> `runId` or `approvalRef`. The v2 signer in
-> [SIGNER-PROTOCOL.md](SIGNER-PROTOCOL.md) requires the plugin change described
-> there. Until that change ships, a v2-only signer will refuse every 0.13.0
-> request; pointing 0.13.0 at it makes every signed write fail
-> `AUTH_SIGNER_UNAVAILABLE`. The v2 protocol is a target contract, not a
-> description of 0.13.0 behavior.
+> **Version note.** 0.14.0 sends the `v:2` signer request with `runId` and
+> `approvalRef` when `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` is set; without it
+> the plugin sends the exact v1 request. The v2 signer in
+> [SIGNER-PROTOCOL.md](SIGNER-PROTOCOL.md) requires that directory and refuses
+> v1 with `E_VERSION`, which the plugin reports as
+> `AUTH_SIGNER_UNAVAILABLE`. A v1-only signer with the directory set refuses the
+> v2 request the same way. The plugin never falls back to a local HMAC key.
 
 ---
 

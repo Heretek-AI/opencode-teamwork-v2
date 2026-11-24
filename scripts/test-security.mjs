@@ -207,6 +207,86 @@ try {
     assert.strictEqual(insideRunCheck.status, "fail", insideRunCheck.message)
     assert(/inside the run directory/.test(insideRunCheck.message), insideRunCheck.message)
 
+    // Approver private material visible to this process is a failure: the key
+    // belongs to the approver's principal, not the workload's.
+    const inlineKey = collectSecurityReport(
+      allPassOptions({
+        env: {
+          OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY: "fixture-public-key",
+          OPENCODE_TEAMWORK_APPROVAL_PRIVATE_KEY: "fixture-private-key",
+        },
+      }),
+    )
+    const inlineCheck = inlineKey.checks.find((c) => c.name === "approval_key")
+    assert.strictEqual(inlineCheck.status, "fail", `an inline approver key must fail: ${inlineCheck.message}`)
+    assert(/visible to this process/.test(inlineCheck.message), inlineCheck.message)
+    assert(/different principal/.test(inlineCheck.message), inlineCheck.message)
+
+    const keyFile = join(testDir, "approver.pem")
+    writeFileSync(keyFile, "fixture-private-key\n", { mode: 0o600 })
+    const readableKey = collectSecurityReport(
+      allPassOptions({
+        env: {
+          OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY: "fixture-public-key",
+          OPENCODE_TEAMWORK_APPROVAL_KEY_FILE: keyFile,
+        },
+      }),
+    )
+    const readableCheck = readableKey.checks.find((c) => c.name === "approval_key")
+    assert.strictEqual(readableCheck.status, "fail", `a readable approver key file must fail: ${readableCheck.message}`)
+
+    // An approver key path this process cannot read is not visible: verify-only.
+    const unreadableKey = collectSecurityReport(
+      allPassOptions({
+        env: {
+          OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY: "fixture-public-key",
+          OPENCODE_TEAMWORK_APPROVAL_KEY_FILE: join(testDir, "absent-approver.pem"),
+        },
+      }),
+    )
+    const unreadableCheck = unreadableKey.checks.find((c) => c.name === "approval_key")
+    assert.strictEqual(unreadableCheck.status, "pass", unreadableCheck.message)
+    assert(/no approver private material is readable/.test(unreadableCheck.message), unreadableCheck.message)
+
+    // Signer approval directory: unset is a pass (v1), inside repo / caller
+    // owned is a failure.
+    const signerUnset = collectSecurityReport(allPassOptions())
+    const signerUnsetCheck = signerUnset.checks.find((c) => c.name === "signer_approval_dir")
+    assert.strictEqual(signerUnsetCheck.status, "pass", signerUnsetCheck.message)
+    assert(/is not configured/.test(signerUnsetCheck.message), signerUnsetCheck.message)
+
+    const signerInsideRepo = join(testDir, "repo", "signer-approvals")
+    mkdirSync(signerInsideRepo, { recursive: true })
+    const signerInsideReport = collectSecurityReport(
+      allPassOptions({
+        env: { OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR: signerInsideRepo },
+        euid: statSync(signerInsideRepo).uid + 1,
+        repoRoot: join(testDir, "repo"),
+      }),
+    )
+    const signerInsideCheck = signerInsideReport.checks.find((c) => c.name === "signer_approval_dir")
+    assert.strictEqual(signerInsideCheck.status, "fail", signerInsideCheck.message)
+    assert(/inside the repository/.test(signerInsideCheck.message), signerInsideCheck.message)
+
+    const signerOwned = join(testDir, "owned-signer-approvals")
+    mkdirSync(signerOwned, { recursive: true })
+    const signerOwnedReport = collectSecurityReport(
+      allPassOptions({
+        env: { OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR: signerOwned },
+        euid: statSync(signerOwned).uid,
+      }),
+    )
+    const signerOwnedCheck = signerOwnedReport.checks.find((c) => c.name === "signer_approval_dir")
+    assert.strictEqual(signerOwnedCheck.status, "fail", signerOwnedCheck.message)
+    assert(/owned or writable/.test(signerOwnedCheck.message), signerOwnedCheck.message)
+
+    const signerRelative = collectSecurityReport(
+      allPassOptions({ env: { OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR: "relative/signer-approvals" } }),
+    )
+    const signerRelativeCheck = signerRelative.checks.find((c) => c.name === "signer_approval_dir")
+    assert.strictEqual(signerRelativeCheck.status, "fail", signerRelativeCheck.message)
+    assert(/must be an absolute path/.test(signerRelativeCheck.message), signerRelativeCheck.message)
+
     const detectiveReport = collectSecurityReport(
       allPassOptions({
         env: { OPENCODE_TEAMWORK_WITNESS: "command:/usr/bin/fixture-witness" },

@@ -9,6 +9,8 @@ a sibling extension of ADR 0005, specified in
 [ADR 0007](docs/adr/0007-signed-handoff-provenance.md). Evidence binding and
 contradiction detection are specified in
 [ADR 0012](docs/adr/0012-evidence-binding-and-contradiction-detection.md).
+Verifiable witness receipts and signer protocol v2 are specified in
+[ADR 0014](docs/adr/0014-verifiable-witness-and-signer-v2.md).
 
 ## What is protected
 
@@ -89,9 +91,10 @@ reviewer read the artifact, or replace re-execution.
 `opencode-teamwork doctor --security` prints the relevant host facts (key
 source/algorithm, signer/witness config, `ptrace_scope`, root-equivalent group
 membership, DB mode including `-wal`/`-shm`, config/plugin writability, whether
-an approver key is configured, whether a configured signer could accept an
-`approvals/` path, the approval directory and its owner, write-containment
-mode, SELinux). A knowable problem is a
+an approver key is configured and whether its private material is visible to
+this UID, whether a configured signer could accept an `approvals/` path, the
+prompt-approval directory and its owner, the signer-approval directory and its
+owner, write-containment mode, SELinux). A knowable problem is a
 `fail`; an uninspectable fact is `unknown`, never "safe".
 `doctor --security --require-hardened` exits 2 when any check is `fail` or
 `unknown`; plain `doctor --security` is advisory (exit 0 with a warning
@@ -227,8 +230,12 @@ the default is used.
    `OPENCODE_TEAMWORK_WITNESS=command:<path>` or `http(s)://<url>` and set
    `requireWitness: true` on the plan. A witness receipt is appended on every
    signed write and checked by `final_verify` (`AUTH_WITNESS_UNAVAILABLE` when
-   required and missing). A local file witness is detection-only; it shares the
-   same UID.
+   required and missing). Configure `OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY` to
+   make the receipt a signature over `(runId, path, digest, nonce, at)`: a
+   forged KV receipt is then `AUTH_INVALID` instead of accepted. Without that
+   public key the receipt is recorded and labelled `unverified` in
+   `verify/final.json`; a local file/command witness is detection-only and
+   shares the same UID either way.
 
 The hardened profile is an administrator/deployment change (a system service,
 separate UID, SELinux labels, or a remote approver). The plugin cannot create
@@ -251,7 +258,10 @@ steps are deployment guidance, not something the plugin enforces.
 | `OPENCODE_TEAMWORK_SIGNER_KEY_ID` | Optional expected key id; defaults to a digest of the public key. |
 | `OPENCODE_TEAMWORK_SIGNER_TIMEOUT_MS` | Signer timeout (default 5000, max 60000). |
 | `OPENCODE_TEAMWORK_WITNESS` | `command:<absolute path>` or `http(s)://<url>`. |
+| `OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY` | SPKI Ed25519 witness key (base64url). When set, a receipt must carry a valid `sig` over `teamwork-witness-v1`. |
+| `OPENCODE_TEAMWORK_WITNESS_KEY_ID` | Optional witness key id; defaults to a digest of the public key. |
 | `OPENCODE_TEAMWORK_WITNESS_TIMEOUT_MS` | Witness timeout (default 5000, max 60000). |
+| `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` | Absolute signer-approval directory outside the run/repo, owned by a different UID. When set, the signer request is v2 with `runId` and `approvalRef`; when unset, the exact v1 request is sent. |
 | `OPENCODE_TEAMWORK_APPROVAL_DIR` | Absolute approval directory outside the run and repo, owned by a different UID. Required for `human-approved`/`ci-attested`. |
 | `OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY` | SPKI Ed25519 public key of the approver (verify-only). Pinned as `approvalKeyId` at plan time. |
 | `OPENCODE_TEAMWORK_APPROVAL_KEY_ID` | Optional approval key id; defaults to a digest of the approval public key. |
@@ -260,10 +270,17 @@ steps are deployment guidance, not something the plugin enforces.
 | `OPENCODE_TEAMWORK_APPROVAL_KEY_FILE` | Path to a PEM or base64url PKCS#8 approver key for `approve sign` (alternative to the env/`--key`). |
 
 The command signer receives `{v, alg, keyId, path, digest, nonce, at, message}`
-and must return `{alg: "ed25519", keyId, sig}`. The plugin verifies the returned
-signature with the configured public key before accepting it. A configured but
-unavailable, malformed, timing-out, or non-verifying signer fails closed with
-`AUTH_SIGNER_UNAVAILABLE`; it never falls back to the local HMAC key.
+when `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` is unset, or
+`{v: 2, op: "sign-artifact", runId, alg, keyId, path, digest, nonce, at,
+approvalRef, message}` when it is set, and must return
+`{alg: "ed25519", keyId, sig}`. The plugin verifies the returned signature with
+the configured public key before accepting it. A configured but unavailable,
+malformed, timing-out, or non-verifying signer fails closed with
+`AUTH_SIGNER_UNAVAILABLE`; it never falls back to the local HMAC key. A v1-only
+signer with the directory set, or a v2-only signer without it, fails the same
+way. The plugin derives `approvalRef` as
+`<DIR>/<runId>/<plain sha256(path)>.json` and does not read the approval; the
+signer's policy is outside the plugin.
 
 ## Residual risks
 
@@ -275,7 +292,10 @@ unavailable, malformed, timing-out, or non-verifying signer fails closed with
   location, is what makes it meaningful.
 - **Nonce and index storage.** The nonce, key-id pin, and digest index live in
   plugin storage. A same-UID writer can rewrite them; the witness is the
-  optional cross-check.
+  optional cross-check. A witness receipt is only `verified` when a witness
+  public key is configured and its signature covers the run, path, digest,
+  nonce and signed time. Without that key it is `unverified` (detection-only),
+  and a local witness shares the UID.
 - **Approval artifact.** `approvals/<runId>.json` is verified with the
   configured approval key. The plugin refuses to sign an `approvals/` path, and
   0.11.0 requires an Ed25519 approver key distinct from `runKeyId` and an
@@ -287,9 +307,12 @@ unavailable, malformed, timing-out, or non-verifying signer fails closed with
 - **Approval content is a name, not a proof.** `approvedBy` is a claimed label.
   A compromised or careless approver process can sign any draft, and a
   same-UID key holder (including a single-UID sandbox) cannot satisfy the
-  distinct-principal requirement at all. There is no human-presence enforcement:
-  the CLI asks for a typed digest prefix and the word `approve`, but a script
-  holding the key can reproduce both.
+  distinct-principal requirement at all. `doctor --security` now fails
+  `approval_key` when the approver private key (inline or a readable key file)
+  is visible to the workload UID, but a single-UID host cannot fix that by
+  configuration. There is no human-presence enforcement: the CLI asks for a
+  typed digest prefix and the word `approve`, but a script holding the key can
+  reproduce both.
 - **Display spoofing.** The CLI hashes the bytes on disk and prints the digest.
   It cannot prove that the approver's review surface showed those same bytes; a
   redirect, a different checkout, or a renderer that hides text is outside the

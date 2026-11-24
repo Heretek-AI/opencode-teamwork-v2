@@ -61,6 +61,9 @@ Commands:
                approve sign --request <file|-> --draft <path> [--key <path>]
                             [--ttl 24h] [--approver uid:<name>|oidc:...|ci:...]
                approve verify --session <runId> [--json]
+             Produce a signer approval for signer protocol v2:
+               approve signer --session <runId> --path <relPath> --digest <64hex>
+                              [--key <path>] [--ttl 1h] [--approver ...] [--out <dir>]
   help       Show this help
 
 Options:
