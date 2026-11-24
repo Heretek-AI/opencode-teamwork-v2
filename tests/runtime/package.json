@@ -1,0 +1,16 @@
+{
+  "name": "@heretek-ai/opencode-teamwork-v2-runtime-tests",
+  "private": true,
+  "type": "module",
+  "description": "L1 harness: the real plugin inside the real OpenCode 2.4.1 runtime, no model.",
+  "scripts": {
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@opencode/ai": "2.4.1",
+    "@opencode/core": "2.4.1",
+    "@opencode/plugin": "2.4.1",
+    "@opencode/sdk": "2.4.1",
+    "effect": "4.1.0"
+  }
+}
