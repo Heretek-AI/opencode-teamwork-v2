@@ -50,6 +50,8 @@ import {
   verify as cryptoVerify,
 } from "node:crypto"
 import { spawn } from "node:child_process"
+import { lstatSync, realpathSync } from "node:fs"
+import { isAbsolute, join } from "node:path"
 import {
   artifactSignatureInput,
   canonicalJson,
@@ -210,6 +212,7 @@ function failureFromError(err: unknown, fallback: AuthFailureCode = "AUTH_UNAVAI
 
 const SHA256_HEX = /^[0-9a-f]{64}$/
 const BASE64URL = /^[A-Za-z0-9_-]+$/
+const RUN_ID = /^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$/
 
 function decodeKey(key: unknown): Buffer | undefined {
   if (typeof key !== "string" || !BASE64URL.test(key)) return undefined
@@ -444,6 +447,28 @@ interface CommandSigner {
   publicKey: string
   keyId: string
   timeoutMs: number
+  /** Optional v2 approval directory; when set the request is v2. */
+  approvalDir?: string
+}
+
+let signerApprovalOwnerUidOverride: number | null = null
+
+/**
+ * Test-only seam. A signer approval directory must be owned by a principal
+ * other than the workload; a single-UID test process cannot create one.
+ * Production never calls this (the default is `process.geteuid()`).
+ */
+export function setSignerApprovalOwnerUidForTest(uid: number | null): void {
+  signerApprovalOwnerUidOverride = typeof uid === "number" && Number.isFinite(uid) ? Math.trunc(uid) : null
+}
+
+function expectedSignerApprovalOwnerUid(): number | undefined {
+  if (signerApprovalOwnerUidOverride !== null) return signerApprovalOwnerUidOverride
+  try {
+    return typeof process.geteuid === "function" ? process.geteuid() : undefined
+  } catch {
+    return undefined
+  }
 }
 
 function commandPath(value: string): string | undefined {
@@ -478,7 +503,61 @@ function resolveSigner(env: Record<string, string | undefined>): CommandSigner |
   }
   const configuredId = env[ENV_SIGNER_KEY_ID]?.trim()
   const keyId = configuredId || deriveKeyId("signer", publicKey)
-  return { command, publicKey, keyId, timeoutMs: timeoutFromEnv(env, ENV_SIGNER_TIMEOUT_MS) }
+  const approvalDir = resolveSignerApprovalDir(env)
+  return {
+    command,
+    publicKey,
+    keyId,
+    timeoutMs: timeoutFromEnv(env, ENV_SIGNER_TIMEOUT_MS),
+    ...(approvalDir ? { approvalDir } : {}),
+  }
+}
+
+/**
+ * Resolve the v2 signer approval directory. It is a policy input for the
+ * *signer*, not the plugin: the plugin only derives the reference. It must be
+ * absolute, a real directory, and owned by a principal other than this process.
+ * A configured-but-unusable directory fails closed before any spawn.
+ */
+function resolveSignerApprovalDir(env: Record<string, string | undefined>): string | undefined {
+  const raw = env[ENV_SIGNER_APPROVAL_DIR]?.trim()
+  if (!raw) return undefined
+  if (!isAbsolute(raw)) {
+    throw new AuthError({
+      code: "AUTH_SIGNER_UNAVAILABLE",
+      message: `${ENV_SIGNER_APPROVAL_DIR} must be an absolute path`,
+    })
+  }
+  let st
+  try {
+    st = lstatSync(raw)
+  } catch (err: any) {
+    throw new AuthError({
+      code: "AUTH_SIGNER_UNAVAILABLE",
+      message: `${ENV_SIGNER_APPROVAL_DIR} is not readable (${String(err?.code ?? err).slice(0, 40)})`,
+    })
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw new AuthError({
+      code: "AUTH_SIGNER_UNAVAILABLE",
+      message: `${ENV_SIGNER_APPROVAL_DIR} must be a real directory (not a symlink)`,
+    })
+  }
+  const expected = expectedSignerApprovalOwnerUid()
+  if (expected !== undefined && st.uid === expected) {
+    throw new AuthError({
+      code: "AUTH_SIGNER_UNAVAILABLE",
+      message: `${ENV_SIGNER_APPROVAL_DIR} is owned by this process (uid ${st.uid}); a signer approval must come from a different principal`,
+    })
+  }
+  try {
+    return realpathSync(raw)
+  } catch (err: any) {
+    throw new AuthError({
+      code: "AUTH_SIGNER_UNAVAILABLE",
+      message: `${ENV_SIGNER_APPROVAL_DIR} cannot be resolved (${String(err?.code ?? err).slice(0, 40)})`,
+    })
+  }
 }
 
 interface WitnessConfig {
@@ -836,6 +915,7 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
     payload: unknown,
     nonce: string | undefined,
     at: string,
+    runId: string | undefined,
   ): Promise<AuthEnvelope> => {
     if (!nonce) {
       throw new AuthError({
@@ -845,15 +925,44 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
     }
     const digest = payloadDigest(payload)
     const message = artifactSignatureInput(AUTH_ED25519, external.keyId, relPath, nonce, payload)
-    const request = {
-      v: 1,
-      alg: AUTH_ED25519,
-      keyId: external.keyId,
-      path: relPath,
-      digest,
-      nonce,
-      at,
-      message: Buffer.from(message, "utf8").toString("base64url"),
+    let request: Record<string, unknown>
+    if (external.approvalDir) {
+      // Signer protocol v2. The approval reference is derived only from
+      // trusted inputs: the configured directory, the run id, and the plain
+      // SHA-256 of the run-relative path. The plugin does NOT read or verify
+      // the approval; that decision belongs to the signer.
+      if (!runId || !RUN_ID.test(runId)) {
+        throw new AuthError({
+          code: "AUTH_SIGNER_UNAVAILABLE",
+          message: `${ENV_SIGNER_APPROVAL_DIR} is set but no valid run id is available for the v2 signer request`,
+        })
+      }
+      const approvalRef = join(external.approvalDir, runId, `${contentSha256Hex(relPath)}.json`)
+      request = {
+        v: 2,
+        op: "sign-artifact",
+        runId,
+        alg: AUTH_ED25519,
+        keyId: external.keyId,
+        path: relPath,
+        digest,
+        nonce,
+        at,
+        approvalRef,
+        message: Buffer.from(message, "utf8").toString("base64url"),
+      }
+    } else {
+      // Exact v1 request, byte-compatible with a pre-0.14 signer.
+      request = {
+        v: 1,
+        alg: AUTH_ED25519,
+        keyId: external.keyId,
+        path: relPath,
+        digest,
+        nonce,
+        at,
+        message: Buffer.from(message, "utf8").toString("base64url"),
+      }
     }
     const response = await spawnJson(external.command, request, external.timeoutMs, "AUTH_SIGNER_UNAVAILABLE")
     const sig = decodeBase64Url(response?.sig)
@@ -910,7 +1019,7 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
     const external = getSigner()
     if (external) {
       resolvedAlg = AUTH_ED25519
-      const envelope = await signerEnvelope(external, relPath, payload, opts.nonce, at)
+      const envelope = await signerEnvelope(external, relPath, payload, opts.nonce, at, opts.runId)
       return { ...(payload as Record<string, unknown>), _auth: envelope }
     }
     const res = await pullRing()
@@ -1258,7 +1367,7 @@ export function createAuthContext(storage: StorageLike | undefined, env: Record<
   ): Promise<any> => {
     const nonce = opts.nonce ?? (await runNonce(runId))
     const pinnedKeyId = await runKeyId(runId)
-    const signed = await signArtifact(relPath, payload, { ...opts, nonce })
+    const signed = await signArtifact(relPath, payload, { ...opts, nonce, runId })
     if (pinnedKeyId && signed._auth?.keyId !== pinnedKeyId) {
       throw new AuthError({
         code: "AUTH_INVALID",

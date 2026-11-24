@@ -1,11 +1,12 @@
 # Signer protocol v2: from signing oracle to policy enforcement
 
-**Status:** target contract for a policy-enforcing command signer. **The 0.13.0
-plugin sends `v: 1` and does not send `runId` or `approvalRef`.** This document
-specifies the v2 contract and the plugin change required to use it. A
-v2-only signer is incompatible with an unmodified 0.13.0 plugin: it will refuse
-every request, and every signed write will fail closed with
-`AUTH_SIGNER_UNAVAILABLE`. Do not deploy the two halves separately.
+**Status:** 0.14.0 implements the plugin half. The plugin sends `v: 2` with
+`runId` and `approvalRef` when `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` is set,
+and the exact v1 request when it is unset. This document specifies the contract
+the signer must implement. The signer itself is **not in this repository** and
+must be built (§8). A v2-only signer with an unmodified/0.13 client, or a v1-only
+signer with the directory set, fails closed with `AUTH_SIGNER_UNAVAILABLE`; there
+is no HMAC fallback. Do not deploy the two halves separately.
 
 The runbook that installs the service, key directory and approvals is
 [docs/ADMIN-HARDENING.md](ADMIN-HARDENING.md). The artifact envelope and digest
@@ -175,13 +176,23 @@ same artifact as the prompt approval used by `human-approved`/`ci-attested`
 
 - `approvalRef` is absolute and must resolve under the signer's configured
   approval directory (for example `/var/lib/teamwork-approvals/signer/`).
+- The layout is **one file per `(runId, path)`**:
+  `<APPROVAL_DIR>/<runId>/<sha256(path)>.json`, where `sha256(path)` is the plain
+  (unkeyed) SHA-256 of the UTF-8 run-relative path, hex-encoded. The plugin
+  derives it with `contentSha256Hex` in
+  `plugins/opencode-teamwork/approval-format.mjs`; the producer
+  (`opencode-teamwork approve signer`) writes the same path. This is deliberately
+  **not** the keyed artifact digest (`payloadDigest`/`sha256Hex`).
 - The directory and file must be owned by the configured approver UID (or, at
   minimum, not by the workload UID). The runbook uses a dedicated
   `teamwork-approver`.
 - The file is a regular file, not a symlink, at most 64 KiB, mode `0640` with a
-  group the signer can read. The workload must not be in that group.
-- The filename is not a policy input. The signed payload binds the policy
-  fields; a copied file with the same fields is the same authorization.
+  group the signer can read. The workload must not be in that group or be able
+  to write the directory.
+- The filename is not a policy input: the signed payload binds the policy
+  fields, and the signer must recompute the expected reference rather than trust
+  a caller-chosen path. A copied file with the same fields is the same
+  authorization for the same `(runId, path, digest, nonce)`.
 
 ### 4.2 Payload
 
@@ -379,8 +390,8 @@ Failure (stdout; exit non-zero; no `sig`):
 
 ### 6.1 Plugin-side fail-closed mapping
 
-The 0.13.0 plugin's `spawnJson` verifies the response shape and signature. Any
-of the following is `AUTH_SIGNER_UNAVAILABLE` and the write fails; there is no
+The plugin's `spawnJson` verifies the response shape and signature. Any of the
+following is `AUTH_SIGNER_UNAVAILABLE` and the write fails; there is no
 fallback to the local HMAC key:
 
 - a non-zero exit, a timeout, a malformed/partial response, or stderr noise;
@@ -398,27 +409,28 @@ different request is a new policy decision.
 
 ---
 
-## 7. Plugin-side change required for v2
+## 7. Plugin side (implemented in 0.14.0)
 
-This is a specification, not a patch. The change is small but it is a code
-change, not a configuration toggle:
+0.14.0 makes exactly this change; the list remains the contract a replacement
+plugin must satisfy:
 
 1. **Send `v: 2` and `op: "sign-artifact"`** from the command-signer adapter
-   (currently `signerEnvelope` in `plugins/opencode-teamwork/auth.ts` builds
-   `v: 1`).
-2. **Carry `runId`** through `signArtifact` and `signerEnvelope`. `signRunArtifact`
-   already has it; `signArtifact` (used for non-run artifacts) does not. A v2
-   signer must refuse an artifact with no run id.
+   (`signerEnvelope` in `plugins/opencode-teamwork/auth.ts`) when
+   `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` is set.
+2. **Carry `runId`** through `signRunArtifact` → `signArtifact` (the optional
+   `runId` on `SignOptions`). A v2 signer must refuse an artifact with no run id.
 3. **Derive `approvalRef` from trusted state**, not from an agent tool argument:
-   `approvalRef = <OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR>/<runId>/<sha256(path)>.json`.
-   Validate the run id and path with the same allowlist the engine uses. Do not
-   accept a caller-supplied `approvalRef`; the agent must not choose which
-   approval to present.
+   `approvalRef = <OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR>/<runId>/<contentSha256Hex(path)>.json`.
+   The run id is validated against `^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$`; the path
+   hash is the plain SHA-256 from `approval-format.mjs`. Do not accept a
+   caller-supplied `approvalRef`; the agent must not choose which approval to
+   present.
 4. **Configure the approval directory** with
-   `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` (proposed; not present in 0.13.0).
-   It is absolute, outside the run and repository, and owned by another
-   principal. When it is unset, keep v1 for compatibility; when it is set, send
-   v2 and let the signer refuse.
+   `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` (present in 0.14.0). It must be
+   absolute, an existing real directory, and owned by a principal other than
+   the workload; a configured-but-unusable directory fails
+   `AUTH_SIGNER_UNAVAILABLE` before any spawn. When it is unset, the plugin
+   keeps the exact v1 request for compatibility.
 5. **Do not verify the approval in the plugin.** The plugin cannot know whether
    the approver is a human or whether the signer applied its policy. It verifies
    the returned signature only. Duplicating the approval check in the plugin
@@ -427,10 +439,14 @@ change, not a configuration toggle:
    signer must never fall back to the local key. The existing
    `AUTH_SIGNER_UNAVAILABLE` behavior is correct.
 
-**Compatibility warning.** A v2-only signer + an unmodified 0.13.0 plugin is a
-broken deployment: every signed write is refused. Ship the plugin change and
-the signer together, or keep the v1 signer and document that it is an oracle
-unless it independently enforces a policy. Do not call a v1 signer "hardened."
+**Compatibility matrix.**
+
+| Plugin | Signer | Result |
+| --- | --- | --- |
+| dir set (v2) | v2 | v2 request; the signer decides. |
+| dir unset (v1) | v1 | exact v1 request; the signer is only as good as its own policy. |
+| dir set (v2) | v1-only | the signer refuses; `AUTH_SIGNER_UNAVAILABLE`, no fallback. |
+| dir unset (v1) | v2-only | the signer refuses `E_VERSION`; `AUTH_SIGNER_UNAVAILABLE`, no fallback. |
 
 **What the plugin still cannot do.** It can verify a signature; it cannot verify
 a policy. A same-UID writer can edit the plugin to skip the signer entirely, or
@@ -604,6 +620,8 @@ The policy is what makes the signer non-oracle.
 - **Availability.** A stopped signer fails every signed write closed. That is
   the intended behavior, but it is an availability dependency; plan a restart
   policy and monitor the socket.
-- **Version compatibility.** This v2 contract requires the plugin change in §7.
-  A v2 signer must refuse v1; an unmodified 0.13.0 plugin cannot use it. Do not
-  describe a v1 deployment as policy-enforcing.
+- **Version compatibility.** This v2 contract requires
+  `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` and a plugin that sends v2 (0.14.0 or
+  a replacement). A v2 signer must refuse v1; a v1-only signer refuses v2. Both
+  mismatch directions fail closed (`AUTH_SIGNER_UNAVAILABLE`). Do not describe a
+  v1-only deployment as policy-enforcing.

@@ -7,9 +7,10 @@
 //
 // Run with plain Node (no test framework): an uncaught assertion exits non-zero.
 
-import { createAuthContext, sha256Hex } from "../plugins/opencode-teamwork/auth.ts"
+import { createAuthContext, setSignerApprovalOwnerUidForTest, sha256Hex } from "../plugins/opencode-teamwork/auth.ts"
+import { contentSha256Hex } from "../plugins/opencode-teamwork/approval-format.mjs"
 import { generateKeyPairSync } from "node:crypto"
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { createServer } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -67,6 +68,38 @@ const key = createPrivateKey({ key: Buffer.from(${JSON.stringify(privateKey)}, "
 process.stdout.write(JSON.stringify({ alg: "ed25519", keyId: request.keyId, sig: sign(null, message, key).toString("base64url") }))
 `,
   )
+}
+
+/**
+ * A protocol-version-specific signer stub. It appends every accepted request to
+ * a log so the test can assert the exact shape, and refuses the wrong version.
+ */
+function versionedSignerScript(privateKey, logFile, accept) {
+  return writeScript(
+    `signer-v${accept}.mjs`,
+    `#!/usr/bin/env node
+import { appendFileSync, readFileSync } from "node:fs"
+import { createPrivateKey, sign } from "node:crypto"
+const request = JSON.parse(readFileSync(0, "utf8"))
+appendFileSync(${JSON.stringify(logFile)}, JSON.stringify(request) + "\\n")
+if (request.v !== ${accept}) {
+  process.stderr.write("unsupported protocol version " + request.v)
+  process.exit(3)
+}
+const message = Buffer.from(request.message, "base64url")
+const key = createPrivateKey({ key: Buffer.from(${JSON.stringify(privateKey)}, "base64url"), format: "der", type: "pkcs8" })
+process.stdout.write(JSON.stringify({ alg: "ed25519", keyId: request.keyId, sig: sign(null, message, key).toString("base64url") }))
+`,
+  )
+}
+
+function readRequestLog(file) {
+  if (!existsSync(file)) return []
+  return readFileSync(file, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
 }
 
 function witnessScript(mode) {
@@ -320,6 +353,136 @@ try {
     )
 
     console.log("✓ command signer happy path verifies publicly; malformed, bad-sig, timeout, missing, and relative paths fail closed")
+    }
+  }
+
+  // ==========================================================================
+  // 3b. Signer protocol v2: runId + approvalRef, fail closed on mismatches
+  // ==========================================================================
+  {
+    console.log("Testing the signer protocol v2...")
+    if (process.platform === "win32") {
+      console.log("SKIP: a command signer needs a shebang-executable script; this runner cannot execute one. Recorded.")
+    } else {
+    const keys = generatedEd25519()
+    const keyId = signerKeyId(keys.publicKey)
+    const approvalDir = join(testDir, "signer-approvals")
+    mkdirSync(approvalDir, { recursive: true })
+    const log = join(testDir, "signer-v2-requests.jsonl")
+    const v2Signer = versionedSignerScript(keys.privateKey, log, 2)
+    const v1Signer = versionedSignerScript(keys.privateKey, join(testDir, "signer-v1-requests.jsonl"), 1)
+    const euid = typeof process.geteuid === "function" ? process.geteuid() : 0
+    // The fixture directory is owned by this test UID; the seam declares that
+    // UID to be "the workload" so a real different-owner check still runs.
+    setSignerApprovalOwnerUidForTest(Math.min(euid + 1, 2_000_000_000))
+    try {
+      const v2Env = {
+        OPENCODE_TEAMWORK_SIGNER: `command:${v2Signer}`,
+        OPENCODE_TEAMWORK_SIGNER_PUBLIC_KEY: keys.publicKey,
+        OPENCODE_TEAMWORK_SIGNER_TIMEOUT_MS: "2000",
+        OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR: approvalDir,
+      }
+      const auth = context(v2Env).auth
+      await auth.bindRunNonce("run-v2", NONCE_A)
+      const signed = await auth.signRunArtifact("run-v2", "verify/victory.json", { verdict: "PASS" })
+      assert.strictEqual(signed._auth.alg, "ed25519")
+      const requests = readRequestLog(log)
+      assert.strictEqual(requests.length, 1, JSON.stringify(requests))
+      const request = requests[0]
+      assert.strictEqual(request.v, 2)
+      assert.strictEqual(request.op, "sign-artifact")
+      assert.strictEqual(request.runId, "run-v2")
+      assert.strictEqual(request.alg, "ed25519")
+      assert.strictEqual(request.keyId, keyId)
+      assert.strictEqual(request.path, "verify/victory.json")
+      assert.strictEqual(request.nonce, NONCE_A)
+      assert.strictEqual(
+        request.approvalRef,
+        join(approvalDir, "run-v2", `${contentSha256Hex("verify/victory.json")}.json`),
+        "approvalRef must be <DIR>/<runId>/<plain sha256(path)>.json",
+      )
+      assert(!existsSync(join(approvalDir, "run-v2")), "the plugin never creates the run approval directory")
+
+      // With the directory unset, the exact v1 request is sent.
+      const v1Log = join(testDir, "signer-v1-unset-requests.jsonl")
+      const v1Only = versionedSignerScript(keys.privateKey, v1Log, 1)
+      const v1Auth = context({
+        OPENCODE_TEAMWORK_SIGNER: `command:${v1Only}`,
+        OPENCODE_TEAMWORK_SIGNER_PUBLIC_KEY: keys.publicKey,
+        OPENCODE_TEAMWORK_SIGNER_TIMEOUT_MS: "2000",
+      }).auth
+      await v1Auth.bindRunNonce("run-v1", NONCE_A)
+      await v1Auth.signRunArtifact("run-v1", "verify/final.json", { status: "PASS" })
+      const v1Request = readRequestLog(v1Log)[0]
+      assert.strictEqual(v1Request.v, 1)
+      assert(!("op" in v1Request), "v1 has no op")
+      assert(!("runId" in v1Request), "v1 has no runId")
+      assert(!("approvalRef" in v1Request), "v1 has no approvalRef")
+      assert.deepStrictEqual(
+        Object.keys(v1Request).sort(),
+        ["alg", "at", "digest", "keyId", "message", "nonce", "path", "v"],
+        "the v1 request stays byte-compatible",
+      )
+
+      // A v1-only signer with the directory set fails closed, named, and no
+      // partial run directory is left behind.
+      const v1WithDirLog = join(testDir, "signer-v1-with-dir.jsonl")
+      const v1WithDir = versionedSignerScript(keys.privateKey, v1WithDirLog, 1)
+      const v1DirAuth = context({
+        OPENCODE_TEAMWORK_SIGNER: `command:${v1WithDir}`,
+        OPENCODE_TEAMWORK_SIGNER_PUBLIC_KEY: keys.publicKey,
+        OPENCODE_TEAMWORK_SIGNER_TIMEOUT_MS: "2000",
+        OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR: approvalDir,
+      }).auth
+      await v1DirAuth.bindRunNonce("run-v1-dir", NONCE_A)
+      let v1DirCode
+      try {
+        await v1DirAuth.signRunArtifact("run-v1-dir", "verify/final.json", { status: "PASS" })
+      } catch (err) {
+        v1DirCode = err?.failure?.code
+      }
+      assert.strictEqual(v1DirCode, "AUTH_SIGNER_UNAVAILABLE", "a v1-only signer with the dir set must fail closed")
+      assert(
+        !existsSync(join(approvalDir, "run-v1-dir")),
+        "a refused v2 request must not leave a partial run approval directory",
+      )
+
+      // A v2-only signer against the unmodified client (no dir) fails closed.
+      const v2NoDirAuth = context({
+        OPENCODE_TEAMWORK_SIGNER: `command:${v2Signer}`,
+        OPENCODE_TEAMWORK_SIGNER_PUBLIC_KEY: keys.publicKey,
+        OPENCODE_TEAMWORK_SIGNER_TIMEOUT_MS: "2000",
+      }).auth
+      await v2NoDirAuth.bindRunNonce("run-v2-nodir", NONCE_A)
+      let v2NoDirCode
+      try {
+        await v2NoDirAuth.signRunArtifact("run-v2-nodir", "verify/final.json", { status: "PASS" })
+      } catch (err) {
+        v2NoDirCode = err?.failure?.code
+      }
+      assert.strictEqual(v2NoDirCode, "AUTH_SIGNER_UNAVAILABLE", "a v2-only signer must fail closed for a v1 request")
+
+      // A relative or same-owner directory is refused before any spawn.
+      for (const [label, env] of [
+        ["relative", { ...v2Env, OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR: "relative/approvals" }],
+        ["same-owner", { ...v2Env, OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR: approvalDir }],
+      ]) {
+        if (label === "same-owner") setSignerApprovalOwnerUidForTest(euid)
+        const bad = context(env).auth
+        await bad.bindRunNonce(`run-bad-${label}`, NONCE_A)
+        let code
+        try {
+          await bad.signRunArtifact(`run-bad-${label}`, "verify/final.json", { status: "PASS" })
+        } catch (err) {
+          code = err?.failure?.code
+        }
+        assert.strictEqual(code, "AUTH_SIGNER_UNAVAILABLE", `a ${label} approval directory must fail closed`)
+        if (label === "same-owner") setSignerApprovalOwnerUidForTest(Math.min(euid + 1, 2_000_000_000))
+      }
+    } finally {
+      setSignerApprovalOwnerUidForTest(null)
+    }
+    console.log("✓ v2 sends runId/approvalRef with the documented layout; v1 stays exact; v1/v2 mismatches fail AUTH_SIGNER_UNAVAILABLE")
     }
   }
 
