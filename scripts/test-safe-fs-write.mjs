@@ -40,6 +40,7 @@ import { spawn, spawnSync } from "node:child_process"
 import assert from "node:assert"
 import {
   appendLineWithin,
+  assertPinnedWritePolicy,
   assertSingleSegment,
   createDirWithin,
   fdContainmentMode,
@@ -54,7 +55,9 @@ import {
   setRequirePinnedWritesForTest,
   setRunRequirePinnedWrites,
   setWindowsLexicalModeForTest,
+  setWriteAnomalyAuditPathForTest,
   supportsPinnedWrites,
+  unacknowledgedWriteAnomalies,
   unlinkWithin,
   writeFileAtomicAt,
   writeFileAtomicWithin,
@@ -69,12 +72,14 @@ import {
   withPinnedCrossProcessLock,
 } from "../plugins/opencode-teamwork/locks.ts"
 import { nextEventSeqFromFd } from "../plugins/opencode-teamwork/tools.ts"
-import { assertRunRootIdentity } from "../plugins/opencode-teamwork/tournament.ts"
+import { assertRunRootIdentity, writeSafeRunJson } from "../plugins/opencode-teamwork/tournament.ts"
 
 const MARKER = "OUTSIDE_WRITE_SENTINEL_DO_NOT_LEAK"
 const SECRET = "OUTSIDE_SECRET_SENTINEL"
 
 const testDir = mkdtempSync(join(tmpdir(), "teamwork-safe-fs-write-"))
+// Keep the durable anomaly audit hermetic: never write to the real config dir.
+setWriteAnomalyAuditPathForTest(join(testDir, "write-anomalies.jsonl"))
 const PINNED = supportsPinnedWrites()
 const safeFsUrl = new URL("../plugins/opencode-teamwork/safe-fs.mjs", import.meta.url).href
 const toolsUrl = new URL("../plugins/opencode-teamwork/tools.ts", import.meta.url).href
@@ -554,6 +559,174 @@ await checkAsync("detective fallback: a post-rename swap is refused and audited"
     assert(/write_anomaly/.test(events), "the anomaly must be recorded as an audit event")
   } finally {
     setFdTraversalModeForTest(null)
+  }
+})
+
+// ------------------------------------- 12b. detective temp/rename evidence
+
+check("detective temp/rename failure: evidence is recorded, never a bare ENOENT/EISDIR", () => {
+  const { run } = makeFixture()
+  setFdTraversalModeForTest("detective")
+  try {
+    const before = recentWriteAnomalies().length
+    mkdirSync(join(run, "verify"), { recursive: true })
+    assert.throws(
+      () =>
+        writeFileAtomicWithin(run, "verify/leak.json", "LEAKED_BYTES", {
+          afterTemp: ({ dest }) => {
+            // The destination is replaced by a directory after the temp write,
+            // so the rename fails while the temp bytes already exist.
+            mkdirSync(dest)
+          },
+        }),
+      (err) => err?.reason === "postcheck" && /could not be written atomically/.test(String(err.message)),
+      "a rename failure after the temp write must refuse with reason postcheck",
+    )
+    const anomalies = recentWriteAnomalies().slice(before)
+    const temp = anomalies.find((a) => a.kind === "detective-temp")
+    assert(temp, `a detective-temp anomaly must be recorded: ${JSON.stringify(anomalies)}`)
+    assert.strictEqual(temp.phase, "rename")
+    assert.strictEqual(temp.bytesWritten, "LEAKED_BYTES".length)
+    assert(/^[0-9a-f]{64}$/.test(temp.intendedSha256), "the intended sha256 must be recorded")
+    assert(typeof temp.tempPath === "string" && temp.tempPath.includes("leak.json."))
+    assert.strictEqual(existsSync(join(run, "verify", "leak.json.tmp")), false, "no bare temp name may remain")
+  } finally {
+    setFdTraversalModeForTest(null)
+  }
+})
+
+check("detective post-check: a same-inode overwrite is refused by re-hashing the bytes", () => {
+  const { run } = makeFixture()
+  setFdTraversalModeForTest("detective")
+  try {
+    assert.throws(
+      () =>
+        writeFileAtomicWithin(run, "verify/same-inode.json", "ORIGINAL", {
+          afterRename: ({ destPath }) => {
+            // Truncate/write keeps the inode; only the bytes change.
+            writeFileSync(destPath, "TAMPERED")
+          },
+        }),
+      (err) => err?.reason === "identity" && /byte-identity/.test(String(err.message)),
+      "a byte mismatch on the same inode must be an identity refusal",
+    )
+  } finally {
+    setFdTraversalModeForTest(null)
+  }
+})
+
+check("detective afterRename swap: exactly one anomaly and the destination is never deleted", () => {
+  const { run, outside } = makeFixture()
+  setFdTraversalModeForTest("detective")
+  try {
+    const before = recentWriteAnomalies().length
+    const dest = join(run, "verify", "swapped.json")
+    assert.throws(
+      () =>
+        writeFileAtomicWithin(run, "verify/swapped.json", "PAYLOAD", {
+          afterRename: ({ destPath }) => {
+            renameSync(destPath, join(outside, "stolen.json"))
+            writeFileSync(destPath, "REPLACEMENT")
+          },
+        }),
+      (err) => /identity|post-write|refused/i.test(String(err.message)),
+    )
+    const anomalies = recentWriteAnomalies().slice(before).filter((a) => a.kind.startsWith("detective"))
+    // The intent record is not a refusal; only the post-check refusal counts.
+    const refusals = anomalies.filter((a) => a.kind !== "detective_mode")
+    assert.strictEqual(refusals.length, 1, `exactly one anomaly must be recorded: ${JSON.stringify(refusals)}`)
+    assert.strictEqual(existsSync(dest), true, "the destination must not be unlinked after a containment refusal")
+    assert.strictEqual(readFileSync(dest, "utf8"), "REPLACEMENT")
+  } finally {
+    setFdTraversalModeForTest(null)
+  }
+})
+
+await checkAsync("detective SIGKILL between rename and post-check leaves an uncommitted intent", async () => {
+  const { run } = makeFixture()
+  const audit = join(testDir, "sigkill-anomalies.jsonl")
+  const code = [
+    `import { writeFileAtomicWithin, setFdTraversalModeForTest, setWriteAnomalyAuditPathForTest } from ${JSON.stringify(safeFsUrl)}`,
+    `setWriteAnomalyAuditPathForTest(process.env.AUDIT)`,
+    `setFdTraversalModeForTest("detective")`,
+    `writeFileAtomicWithin(process.env.RUN, "killed.json", "KILLED_BYTES", { afterRename: () => process.kill(process.pid, "SIGKILL") })`,
+  ].join("\n")
+  const res = spawnSync(process.execPath, [...process.execArgv, "--input-type=module", "-e", code], {
+    encoding: "utf8",
+    timeout: 15000,
+    env: { ...process.env, RUN: run, AUDIT: audit },
+  })
+  assert.strictEqual(res.signal, "SIGKILL", `the child must die between rename and post-check: ${res.stderr || ""}`)
+  setWriteAnomalyAuditPathForTest(audit)
+  try {
+    const pending = unacknowledgedWriteAnomalies(run)
+    assert(
+      pending.some((a) => a.kind === "detective-temp"),
+      `the uncommitted intent must surface as detective-temp: ${JSON.stringify(pending)}`,
+    )
+  } finally {
+    setWriteAnomalyAuditPathForTest(join(testDir, "write-anomalies.jsonl"))
+  }
+})
+
+// ------------------------------------- 12c. unlocked-writer policy (ADR 0013)
+
+await checkAsync("policy: a fresh process refuses an unlocked tournament write from the plan flag", async () => {
+  const { run } = makeFixture()
+  writeFileSync(join(run, "plan.dag.json"), JSON.stringify({ requirePinnedWrites: true }, null, 2))
+  const code = [
+    `import { writeSafeRunJson } from ${JSON.stringify(new URL("../plugins/opencode-teamwork/tournament.ts", import.meta.url).href)}`,
+    `import { setFdTraversalModeForTest } from ${JSON.stringify(safeFsUrl)}`,
+    `import { join } from "node:path"`,
+    `setFdTraversalModeForTest("detective")`,
+    `try { writeSafeRunJson(process.env.RUN, join(process.env.RUN, "tournament", "candidates", "x.json"), { ok: true }); console.log("WROTE") }`,
+    `catch (err) { console.log("REFUSED:" + (err.reason || "") + ":" + String(err.message)) }`,
+  ].join("\n")
+  const res = spawnSync(process.execPath, [...process.execArgv, "--input-type=module", "-e", code], {
+    encoding: "utf8",
+    timeout: 30000,
+    env: { ...process.env, RUN: run },
+  })
+  assert.strictEqual(res.status, 0, `child failed: ${res.stderr}`)
+  assert(/REFUSED:containment-mode:/.test(res.stdout), `the write must be refused by name: ${res.stdout}`)
+  assert(res.stdout.includes(basename(run)), "the refusal must name the run id")
+  assert.strictEqual(existsSync(join(run, "tournament", "candidates", "x.json")), false)
+})
+
+check("policy: a case-varied run path resolves to the same assertion", () => {
+  const { run } = makeFixture()
+  setRunRequirePinnedWrites(run, true)
+  setFdTraversalModeForTest("detective")
+  try {
+    const variant = run.replace(/[a-z]/g, (c) => c.toUpperCase())
+    if (variant === run || !existsSync(variant)) {
+      console.log("RECORD: case-varied run path is not resolvable on this case-sensitive volume")
+      return
+    }
+    assert.throws(
+      () => assertPinnedWritePolicy(variant),
+      (err) => err?.reason === "containment-mode",
+      "a case-varied spelling of the same run must inherit the policy",
+    )
+  } finally {
+    setFdTraversalModeForTest(null)
+    setRunRequirePinnedWrites(run, false)
+  }
+})
+
+await checkAsync("policy: the lock-layer refusal carries reason containment-mode and the run id", async () => {
+  const { run } = makeFixture()
+  setRunRequirePinnedWrites(run, true)
+  setFdTraversalModeForTest("detective")
+  try {
+    await assert.rejects(
+      withPinnedCrossProcessLock(run, "state.json", () => "never"),
+      (err) => err?.reason === "containment-mode" && String(err.message).includes(basename(run)),
+      "the lock refusal must be the shared containment-mode error",
+    )
+  } finally {
+    setFdTraversalModeForTest(null)
+    setRunRequirePinnedWrites(run, false)
   }
 })
 

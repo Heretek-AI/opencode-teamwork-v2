@@ -24,6 +24,7 @@
 import { createHash } from "node:crypto"
 import { basename, join } from "node:path"
 import {
+  MAX_VERIFIER_REPORT_BYTES,
   clean,
   cleanBlock,
   readBoundedRunFile,
@@ -54,7 +55,6 @@ export const WAVE_VERDICTS: Record<WaveKind, string> = {
 
 const STRICT_TASK_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 const MAX_PLAN_BYTES = 8 * 1024 * 1024
-const MAX_REPORT_BYTES = 1024 * 1024
 const MAX_WAVE_BYTES = 256 * 1024
 const NOTES_MAX = 1000
 const EVIDENCE_MAX = 2000
@@ -138,9 +138,18 @@ function resolveWaveCites(
   run: string,
   raw: unknown,
 ): { ok: true; cites: WaveCite[] } | { ok: false; error: string } {
+  // Absent cites is a legacy verdict shape. Present-but-empty is not: a strict
+  // verdict that cites nothing is unbound, so it is refused and can never be
+  // mistaken for a verdict that reviewed evidence.
   if (raw === undefined || raw === null) return { ok: true, cites: [] }
   if (!Array.isArray(raw)) {
     return { ok: false, error: "refused: cites must be an array of verify/<name> paths; nothing was written" }
+  }
+  if (raw.length === 0) {
+    return {
+      ok: false,
+      error: "refused: cites is present but empty; a strict verdict must cite at least one verify/ artifact it reviewed; nothing was written",
+    }
   }
   if (raw.length > MAX_WAVE_CITES) {
     return {
@@ -242,7 +251,7 @@ export async function recordVerificationWave(
     }
   }
   const reportPath = `verify/report-${taskId}.json`
-  const reportRes = readBoundedRunFile(run, join(run, reportPath), MAX_REPORT_BYTES)
+  const reportRes = readBoundedRunFile(run, join(run, reportPath), MAX_VERIFIER_REPORT_BYTES)
   if (reportRes.status === "absent") {
     return {
       ok: false,
@@ -265,6 +274,10 @@ export async function recordVerificationWave(
     }
   }
   const reportHash = sha256Hex(reportRes.text)
+  // D1: absent `cites` keeps the legacy shape (no field); a present array must
+  // contain at least one cite. Writing `cites: []` for an absent input would
+  // turn every legacy verdict into an unbound one on the next read.
+  const citesProvided = input.cites !== undefined && input.cites !== null
   const resolvedCites = resolveWaveCites(run, input.cites)
   if (!resolvedCites.ok) return resolvedCites
 
@@ -299,7 +312,7 @@ export async function recordVerificationWave(
     agent: expectedAgent,
     agentSessionId: input.agentSessionId,
     reportHash,
-    cites: resolvedCites.cites,
+    ...(citesProvided ? { cites: resolvedCites.cites } : {}),
     notes: typeof input.notes === "string" ? cleanBlock(input.notes, NOTES_MAX).trim() : "",
     evidence: typeof input.evidence === "string" ? cleanBlock(input.evidence, EVIDENCE_MAX).trim() : "",
     generatedAt: new Date().toISOString(),
@@ -419,6 +432,9 @@ function readWaveEvidence(
     )
   } else if (!Array.isArray(value.cites)) {
     reasons.push(`${label}: cites must be an array`)
+  } else if (value.cites.length === 0) {
+    // D1: an empty `cites` array is unbound, not "bound with no evidence".
+    reasons.push(`${label}: cites is empty; the verdict is unbound (cite at least one verify/ artifact)`)
   } else {
     for (const entry of value.cites) {
       const rel = entry && typeof entry === "object" ? entry.path : undefined
@@ -520,7 +536,7 @@ export function evaluateStrictGate(
   const missing: Array<{ taskId: string; kind: WaveKind }> = []
   const evidence: StrictTaskEvidence[] = []
   for (const task of tasks) {
-    const reportRes = readBoundedRunFile(run, join(run, `verify/report-${task.id}.json`), MAX_REPORT_BYTES)
+    const reportRes = readBoundedRunFile(run, join(run, `verify/report-${task.id}.json`), MAX_VERIFIER_REPORT_BYTES)
     let reportStatus: StrictTaskEvidence["reportStatus"] = "MISSING"
     let currentReportHash: string | null = null
     if (reportRes.status === "ok") {

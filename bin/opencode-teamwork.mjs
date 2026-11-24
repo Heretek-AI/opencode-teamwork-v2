@@ -69,6 +69,9 @@ Options:
       --model <id>=<m>   Override one agent (repeatable), id may omit the "team/" prefix
       --session <id>     Target a specific session ID (for inspect, prune or export)
       --json             Print doctor or timeline output as raw JSON
+      --force            With prune: remove a worktree even when a live/expired/
+                         needs-inspection/cross-host claim still blocks it
+      --reason <text>    Recorded reason for a forced prune
       --security         Add the artifact-trust security posture section
       --require-hardened With --security: exit 2 if any check is fail/unknown
       --html             Export as HTML (default for export)
@@ -125,6 +128,12 @@ function parseArgs(argv) {
         break
       case "--no-color":
         options.noColor = true
+        break
+      case "--force":
+        options.force = true
+        break
+      case "--reason":
+        options.reason = rest.shift() ?? ""
         break
       case "--security":
         options.security = true
@@ -471,7 +480,20 @@ function pruneCommand(options) {
   const res = pruneTeamworkWorktrees(process.cwd(), {
     all: Boolean(options.all),
     sessionId: options.session,
+    force: options.force === true,
+    ...(options.reason ? { reason: options.reason } : {}),
   })
+  if (res.refused.length) {
+    for (const entry of res.refused) {
+      console.error(`refused: ${entry.sessionId} still has ${entry.reason}; use --force only after confirming the claim is gone`)
+    }
+    process.exitCode = 1
+  }
+  if (res.forced.length) {
+    for (const entry of res.forced) {
+      console.error(`WARNING: --force pruned ${entry.sessionId} despite ${entry.reason}`)
+    }
+  }
   if (!res.count) {
     console.log("No worktrees were pruned.")
   } else {
@@ -481,6 +503,20 @@ function pruneCommand(options) {
 
 const DOCTOR_INDICATORS = { pass: "[✓]", warn: "[!]", fail: "[✗]" }
 
+/** Read the plan's pinned-write flag for doctor (bounded, no symlink follow). */
+function runPlanRequirePinnedWrites(runDir) {
+  if (!runDir) return undefined
+  try {
+    const file = join(runDir, "plan.dag.json")
+    const st = lstatSync(file)
+    if (!st.isFile() || st.size > 64 * 1024) return undefined
+    const parsed = JSON.parse(readFileSync(file, "utf8"))
+    return parsed?.requirePinnedWrites === true
+  } catch {
+    return undefined
+  }
+}
+
 function doctorCommand(options) {
   const configDir = resolveConfigDir(options.configDir)
   const report = runDoctor({ configDir, cwd: process.cwd() })
@@ -489,9 +525,16 @@ function doctorCommand(options) {
     typeof options.session === "string" && /^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$/.test(options.session)
       ? join(process.cwd(), ".opencode", "teamwork", options.session)
       : undefined
+  const planRequirePinnedWrites = runPlanRequirePinnedWrites(runDir)
   const security =
     options.security || options.json
-      ? collectSecurityReport({ env: process.env, configDir, repoRoot: process.cwd(), ...(runDir ? { runDir } : {}) })
+      ? collectSecurityReport({
+          env: process.env,
+          configDir,
+          repoRoot: process.cwd(),
+          ...(runDir ? { runDir } : {}),
+          ...(planRequirePinnedWrites !== undefined ? { planRequirePinnedWrites } : {}),
+        })
       : undefined
 
   if (options.json) {

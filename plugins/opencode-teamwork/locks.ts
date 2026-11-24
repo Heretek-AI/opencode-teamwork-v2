@@ -45,13 +45,12 @@ import { hostname } from "node:os"
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { randomBytes, randomInt } from "node:crypto"
 import {
-  REQUIRE_PINNED_WRITES_ENV,
   assertSingleSegment,
+  containmentModeRefusal,
   fdTraversalMode,
   pinParent,
   recordWriteAnomaly,
-  runRequiresPinnedWrites,
-  setRunRequirePinnedWrites,
+  resolveRunPolicy,
 } from "./safe-fs.mjs"
 
 const PROC_SELF_FD = "/proc/self/fd"
@@ -592,47 +591,22 @@ function pathWithinOrEqual(root: string, target: string): boolean {
  * is recorded, and a failed containment check fails closed. Linux without a
  * usable `/proc/self/fd` still fails closed; it never silently falls back.
  */
-const hydratedPinnedRuns = new Set<string>()
-
-/**
- * Rehydrate a plan's `requirePinnedWrites` after a process restart. The plan is
- * untrusted input, but only the boolean `true` is honoured and it can only make
- * the writer stricter; a malformed/absent plan leaves the default (off).
- */
-function hydratePinnedWritePolicy(run: string): void {
-  let key: string
-  try {
-    key = resolve(String(run))
-  } catch {
-    return
-  }
-  if (hydratedPinnedRuns.has(key)) return
-  hydratedPinnedRuns.add(key)
-  try {
-    const file = join(key, "plan.dag.json")
-    const stat = lstatSync(file)
-    if (!stat.isFile() || stat.size > 64 * 1024) return
-    const parsed = JSON.parse(readFileSync(file, "utf8"))
-    if (parsed?.requirePinnedWrites === true) setRunRequirePinnedWrites(key, true)
-  } catch {
-    // Absent/invalid plan: the run keeps the default policy.
-  }
-}
-
 export async function withPinnedCrossProcessLock<T>(
   run: string,
   relTargetPath: string,
   fn: () => Promise<T> | T,
   options: CrossProcessLockOptions = {},
 ): Promise<T> {
-  hydratePinnedWritePolicy(run)
   const mode = fdTraversalMode()
+  // The resolver rehydrates `plan.dag.json` itself (realpath + (dev, ino) keyed,
+  // bounded by mtime/size), so a fresh process that reaches an unlocked writer
+  // is covered before any lock artifact is created.
+  if (resolveRunPolicy(run).required && mode !== "pinned") {
+    // One refusal for the writer and the lock layer: same reason, same text
+    // (including the run id).
+    throw containmentModeRefusal(run, mode)
+  }
   if (mode === "detective") {
-    if (runRequiresPinnedWrites(run)) {
-      throw new Error(
-        `refused: this run requires pinned write containment (${REQUIRE_PINNED_WRITES_ENV}/requirePinnedWrites), but this host's write containment mode is "detective"; nothing was written`,
-      )
-    }
     let runReal: string
     try {
       const st = lstatSync(run)

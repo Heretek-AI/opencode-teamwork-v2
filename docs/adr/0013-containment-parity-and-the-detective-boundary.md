@@ -182,3 +182,58 @@ explicit `SKIP`/`RECORD` line; nothing fails silently.
   visible.
 - **Claim detective checks as prevention.** False. Rejected; the four windows
   are documented verbatim above and the doctor calls the mode what it is.
+
+## 7. Amendment — 0.13.1 (audit closure)
+
+The post-0.13.0 audit found that several detective paths could report less than
+they knew, and that the fail-closed policy could fail open when the same run was
+named differently. 0.13.1 closes those defects without adding a capability.
+
+### 7.1 Detective anomalies are evidence, and they are never silent
+
+- The `afterRename` destination is never unlinked on a failure path (`unlink`
+  remains guarded by `!renamed`). A containment refusal must not remove a path
+  after the fact.
+- A temp create, write or rename failure records `detective-temp` with
+  `{phase, tempPath, destRealAfter, bytesWritten, intendedSha256}` and refuses
+  with reason `postcheck`; a bare `ENOENT` is no longer the only evidence.
+- The pre-create containment refusal records `detective-containment`; when the
+  per-segment walk stopped at a missing component that later resolves outside
+  the run, it records `detective-precreate` (the walk cannot see a later
+  symlink).
+- The post-check re-hashes the destination bytes, bounded by the byte count that
+  was written. `(dev, ino)` equality is a hint, not a byte guarantee: a
+  same-inode overwrite is an `identity` refusal.
+- A detective atomic write persists a pre-rename **write intent** and a
+  post-check **commit**. A SIGKILL between them leaves an uncommitted intent,
+  which readers surface as `detective-temp`.
+- Anomalies are appended to `<config-dir>/teamwork/write-anomalies.jsonl` and
+  policy/lock anomalies also go to stderr. They are never appended to
+  `events.jsonl`, which the policy itself refuses. `teamwork_status` and
+  `doctor --security` list unacknowledged anomalies; an unacknowledged anomaly
+  makes the run `needs-inspection` and `final_verify` refuses to consume it.
+  Acknowledgement is an explicit operator record in the same audit, not a
+  repair.
+
+### 7.2 The policy resolves one run, not one spelling
+
+`resolveRunPolicy(run)` is the single entry point for the writer, the lock
+layer, the plan tool, `tournament.ts` and `doctor`. It keys on the lexical path,
+the realpath and `(dev, ino)` (lexical fallback when the run does not exist yet),
+and hydrates `plan.dag.json` itself (bounded 64 KiB, cached by mtime/size, only
+`true` honoured). A case-insensitive volume (APFS/NTFS) or a symlinked ancestor
+therefore cannot fail open, and an unlocked writer in a fresh process is covered
+without taking the lock first. The lock-layer refusal is the writer's
+`containment-mode` error, with the run id in the message. The per-run set is
+bounded, cleared by `setRunRequirePinnedWrites(run, false)`, and `doctor` reports
+both the env assertion and `planRequirePinnedWrites`.
+
+### 7.3 No rollback is still the boundary
+
+The additions above increase what is *recorded*; they do not add prevention on
+macOS/Windows. A detected transient swap may already have written bytes outside
+the run, and nothing is rolled back. The audit file is durable evidence for an
+operator, not a restoration mechanism. The single-host/shared-filesystem
+contract is unchanged and now stated explicitly: guarantees hold only among
+processes on one host with a coherent filesystem, multi-host is best-effort
+duplicate suppression (never exactly-once), and a missing host is cross-host.

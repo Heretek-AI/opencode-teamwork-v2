@@ -18,6 +18,7 @@
 
 import { basename, join } from "node:path"
 import {
+  MAX_VERIFIER_REPORT_BYTES,
   clean,
   cleanBlock,
   isSafeTaskId,
@@ -43,7 +44,6 @@ export const VICTORY_SKIP_REASON_MAX = 500
 const MAX_REQUIREMENTS_BYTES = 256 * 1024
 const MAX_VICTORY_BYTES = 512 * 1024
 const MAX_REQUEST_BYTES = 1024 * 1024
-const MAX_REPORT_BYTES = 1024 * 1024
 const MAX_PLAN_BYTES = 8 * 1024 * 1024
 const MAX_STATE_BYTES = 8 * 1024 * 1024
 const MAX_AUDIT_BYTES = 1024 * 1024
@@ -354,7 +354,7 @@ export function evidenceDigestsFromDisk(run: string): VictoryEvidenceDigests {
   // Null-prototype map: a task id such as `constructor` is an ordinary key.
   const reports: Record<string, string> = Object.create(null)
   for (const id of evidenceTaskIds(run)) {
-    const digest = runFileDigest(run, `verify/report-${id}.json`, MAX_REPORT_BYTES)
+    const digest = runFileDigest(run, `verify/report-${id}.json`, MAX_VERIFIER_REPORT_BYTES)
     if (digest !== null) reports[id] = digest
   }
   // A `final.json` is bound only when it is a PASS verdict the audit could have
