@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  # L1: the real plugin inside the real OpenCode 2.4.1 runtime, with no model
+  # L1/L2: the real plugin inside the real OpenCode 2.4.1 runtime, with no model
   # call and no network at test time. Dependencies are pinned in
   # tests/runtime/package.json; the root package stays dependency-free.
   runtime-l1:
@@ -25,7 +25,7 @@ jobs:
         working-directory: tests/runtime
         run: bun install --frozen-lockfile
 
-      - name: L1 runtime suite
+      - name: L1/L2 runtime suite
         working-directory: tests/runtime
         run: bun test
 
