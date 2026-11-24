@@ -10,10 +10,10 @@
 import { createAuthContext, setSignerApprovalOwnerUidForTest, sha256Hex } from "../plugins/opencode-teamwork/auth.ts"
 import { contentSha256Hex } from "../plugins/opencode-teamwork/approval-format.mjs"
 import { generateKeyPairSync } from "node:crypto"
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { createServer } from "node:http"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { basename, dirname, join } from "node:path"
 import assert from "node:assert"
 
 const testDir = mkdtempSync(join(tmpdir(), "teamwork-auth-test-"))
@@ -396,11 +396,21 @@ try {
       assert.strictEqual(request.keyId, keyId)
       assert.strictEqual(request.path, "verify/victory.json")
       assert.strictEqual(request.nonce, NONCE_A)
+      const expectedPathHash = `${contentSha256Hex("verify/victory.json")}.json`
+      // macOS resolves /var -> /private/var in the plugin, so compare through
+      // the real directory; the filename still has to be the plain path hash.
+      const expectedRef = join(realpathSync(approvalDir), "run-v2", expectedPathHash)
       assert.strictEqual(
         request.approvalRef,
-        join(approvalDir, "run-v2", `${contentSha256Hex("verify/victory.json")}.json`),
+        expectedRef,
         "approvalRef must be <DIR>/<runId>/<plain sha256(path)>.json",
       )
+      assert.strictEqual(
+        basename(request.approvalRef),
+        expectedPathHash,
+        "approvalRef must use the plain sha256(path), not the keyed artifact digest",
+      )
+      assert.strictEqual(basename(dirname(request.approvalRef)), "run-v2", "approvalRef must include the run id segment")
       assert(!existsSync(join(approvalDir, "run-v2")), "the plugin never creates the run approval directory")
 
       // With the directory unset, the exact v1 request is sent.
