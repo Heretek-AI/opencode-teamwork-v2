@@ -1,4 +1,4 @@
-# L1/L2 runtime harness
+# L1/L2/L3 runtime harness
 
 The real plugin registered in the real **OpenCode 2.4.1** runtime, exercised
 through the host's own tool executor, with **no model and no network**. This
@@ -7,7 +7,10 @@ is excluded from the published tarball by omission.
 
 L1 covers loading, the catalog, commands, schema rejection, permission hooks,
 storage and result shape. L2 drives the engine tools themselves — plan,
-claims, evidence, approvals — through real sessions and real host storage.
+claims, evidence, approvals — through real sessions and real host storage. L3
+drives whole workflows: real git worktrees, retries, strict waves, victory
+refusal/resume, failure limits, a two-process claim race, and the offline
+verifier CLI.
 
 ## Run
 
@@ -101,6 +104,12 @@ Two host details the harness relies on:
 | C10–C14 | Claims: `next` fences, `STALE_FENCE`, a second Sentinel gets no claim and `CLAIM_OWNED_BY_OTHER`, descendant updates, `verified_pass` evidence rules, and `recover inspect`/`adopt` with a single-use token, no new commit, and token replay refusal. |
 | D15–D19 | Evidence: five-section handoffs and signed index entries, report→worker-handoff binding and `REPORT_HANDOFF_STALE`, victory-audit `evidenceDigests` and post-mutation `AUTH_STALE`, cited/empty/absent strict-wave evidence (`STALE`, unbound, `legacy_unbound_wave`), and `INCONSISTENT_VICTORY_TASK` without auto-repair. |
 | F20–F24 | Approvals: `approve sign` + `human-approved` plan with the full prompt binding recorded, one-byte draft edit (`AUTH_APPROVAL_STALE`), replay (`AUTH_APPROVAL_REPLAY`), HMAC approval (`AUTH_APPROVAL_NOT_HUMAN`), and `approvedBy` identity rules. |
+| I1 | Standard happy path: two tasks claimed by the Sentinel, a real worktree each, verifier FAIL on round 1, worker round 2, PASS, security audit, victory audit, stamped `verify/final.json` PASS, `next` → `ALL_PASSED`, no `GATE_STATUS.md`, no duplicate effects. |
+| I2 | Strict path: per-task falsifier `PASS` + security-auditor `CLEAN` waves with cites; `next` stays `NEEDS_STRICT_WAVE` while either is missing; a missing wave fails `final_verify`; the strict PASS writes every `GATE_STATUS.md` row. |
+| I3 | `VICTORY REJECTED` with an unmet requirement blocks the dedicated gate; repeated `next` reads change nothing; only a fresh trusted audit resumes the run, and `final_verify` stamps PASS only after `CONFIRMED`. |
+| I4 | Failure limits: `maxRounds` exhaustion coerces the task to `blocked`, the run records `PRESENT_PARTIAL`, `next` reports `DEADLOCK`, and nothing outside the run is written. The budget-exhaustion half is skipped as a recorded defect (`FINDINGS.md` §4). |
+| I5 | Two OS processes race `next` on one run with a file-backed session DB: each task is claimed by exactly one process, `state.json` parses, and `events.jsonl` keeps one unique, contiguous, monotonic `seq` space. |
+| I6 | Offline verifier on produced runs: Ed25519 `--public-key @file` PASS, one-byte flip FAIL, a `chmod -R a-w` copy verifies PASS and is byte-identical afterwards, HMAC `--hmac-key` PASS, and `requiredProvenance: "command"` is UNKNOWN (exit 2) without `--rerun` and PASS (exit 0) with `--rerun` on a clean checkout. |
 
 ## L2 execution model
 
@@ -136,18 +145,49 @@ control-plane tree check before it can contend for a claim, and
 `teamwork_wave_record` refuses `cites: []` at write time while the gate treats a
 pre-existing empty array as unbound.
 
+**L3 found one genuine limitation and three observations**, all recorded in
+`FINDINGS.md`: the run budget is advisory outside the massive-proof tournament
+(I4b is skipped), bare `next` claims append no event (I5 also records each
+claimed `worker_active`), `BLOCKED_BY_VICTORY_AUDIT` needs a pre-existing stamped
+PASS (I3 seeds one through the same signing auth context), and a `request`
+derives a requirements baseline, which makes the victory and handoff gates
+required by default (L3 scenarios set `requireHandoffs: "skip"` explicitly where
+that gate is not the subject).
+
+## L3 execution model
+
+Each L3 spec gets its own temp project, git repo, worktrees directory, config
+directory and both an in-memory DB and (for I5) a file-backed `opencode.db`
+under that project. Sessions are the host's real sessions: a root
+`team/sentinel`, and children created with `parentID` for `team/worker`,
+`team/verifier`, `team/falsifier`, `team/security-auditor` and
+`team/victory-auditor`.
+
+- **Worktrees.** `teamwork_worktree { action: "setup", role: "worker" }` creates
+  `<TEAMWORK_WORKTREES_DIR>/<runId>/<taskId>` on branch
+  `teamwork/<runId>-<taskId>`; the worker commits there with real `git commit`,
+  and the verifier report binds `headSha`/`diffHash` to that branch.
+- **Two processes.** I5 closes the parent host, then spawns two
+  `harness/race-child.ts` processes. Each opens its own embedded host on the
+  same file-backed session DB and calls `next` once as one of two Sentinel
+  sessions. Only the assertions are serialised in the parent; the processes run
+  concurrently.
+- **Verifier CLI.** I6 runs `node bin/opencode-teamwork.mjs verify` on runs
+  produced through the runtime. Ed25519 runs set the `OPENCODE_TEAMWORK_ED25519_*`
+  env keys for the fixture's lifetime; HMAC runs use the preload key. The
+  read-only assertion copies the run, `chmod -R a-w`, verifies, and compares the
+  full tree hash before and after.
+- **Signing fixtures.** I3 needs a stamped final PASS that predates a rejection.
+  `signFixtureArtifact` uses the plugin's own `createAuthContext` with the
+  teamwork plugin's captured `ctx.storage` and the manifest nonce, so the
+  fixture carries the same HMAC envelope and digest-index entry the tools write.
+
 ## Deliberately not covered
 
-- **L3** (real git worktrees beyond the single clean-worktree adopt fixture),
-  and **L4** (live provider) — this harness never sends a model request.
+- **L4** (live provider) — this harness never sends a model request.
 - TUI rendering, prompt judgment, cost/provider truth, same-UID forgery, NFS
   lock semantics, and transient filesystem swaps. These are residuals in
   `docs/OPENCODE-COMPATIBILITY.md` §7 and are not made provable here.
-- The literal spec sentence "a second root Sentinel gets no claim": an
-  unrelated root session cannot call a run-bound tool at all (the control plane
-  requires the run root or a descendant, fail closed). L2 exercises the
-  reachable contention case — two Sentinel sessions under the run root — and
-  also asserts the unrelated-root refusal.
 - The published tarball's installability (T4): `npm pack --dry-run` in CI checks
   the file list, but nothing here installs the packed tarball.
 - Channel/dev builds and `@opencode/*@latest` drift (T3).
