@@ -27,7 +27,7 @@ type CommandSpec = {
   template: string
 }
 
-const COMMANDS: CommandSpec[] = [
+export const COMMANDS: CommandSpec[] = [
   {
     name: "teamwork",
     description:

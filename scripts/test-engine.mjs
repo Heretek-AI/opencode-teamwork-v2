@@ -1,6 +1,6 @@
 import { registerTeamworkTools, registerTeamworkHooks, describeRun, touch, nextEventSeq, setApprovalOwnerUidForTest } from "../plugins/opencode-teamwork/tools.ts"
 import { registerTool } from "./tool-registry.mjs"
-import { warnMissingAgents } from "../plugins/opencode-teamwork/index.ts"
+import { checkOpencodeVersion, warnMissingAgents } from "../plugins/opencode-teamwork/index.ts"
 import { createAuthContext, canonicalJson, payloadDigest, sha256Hex } from "../plugins/opencode-teamwork/auth.ts"
 import {
   analyzeLeanDeclarations,
@@ -8151,6 +8151,15 @@ process.exit(0);
       const vendored = registerPlugin({ configDir: vendoredCfg, cwd: vendoredProject })
       assert.strictEqual(vendored.status, "vendored", "a project-scoped vendored entry must win over npm registration")
       assert(!existsSync(join(vendoredCfg, "opencode.json")), "init must not add the npm name beside a vendored copy")
+
+      // Version contract: the verified pair is 2.4; anything else warns.
+      assert(checkOpencodeVersion("2.4.1").ok, "2.4.1 must match the verified pair")
+      assert(checkOpencodeVersion("v2.4.0").ok, "a leading v must be accepted")
+      assert(!checkOpencodeVersion("2.3.9").ok, "2.3 must warn")
+      assert(!checkOpencodeVersion("2.5.0").ok, "an unverified minor must warn")
+      assert(!checkOpencodeVersion("3.0.0").ok, "3.0 must warn")
+      assert(!checkOpencodeVersion(undefined).ok, "a missing version must warn")
+      assert(String(checkOpencodeVersion("2.5.0").warning).includes("2.4.x"), "the warning must name the verified pair")
 
       // reference file: overwrite refuses a symlinked dest, keep-if-present is honoured
       const refDir = join(root, "ref-config")

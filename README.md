@@ -89,6 +89,7 @@ exposed ids:
 | `teamwork_report` | trusted writer for a signed `verify/report-<taskId>.json`: caller must be `team/verifier`, descend from the run root, and name an existing task; a `PASS` needs a summary or check |
 | `teamwork_security_audit` | mandatory pre-merge security gate (`verify/security-audit.json`; signed on a signed run) |
 | `teamwork_victory_audit` | record the independent `team/victory-auditor` acceptance verdict, bound to the current `ORIGINAL_REQUEST.md` and `requirements.json` hashes (`verify/victory.json`); caller must descend from the run root |
+| `teamwork_evidence` | write one bounded evidence artifact under `verify/evidence/<name>` (64 KiB, 32 files) through the pinned run writer; returns `{path, sha256, bytes}` so `teamwork_wave_record` can cite it. Bytes, not a verdict |
 | `teamwork_wave_record` | strict mode only: record one `team/falsifier` challenge (`PASS`) or `team/security-auditor` audit (`CLEAN`) per task (`verify/challenge-<task>.json` / `verify/audit-<task>.json`); trusted caller identity + session tree, sha256-bound to the verifier report (same-report write-once, changed-report replace) |
 | `teamwork_final_verify` | compute the final verdict from the task reports + security audit + victory audit (plus the strict wave when enabled, and `lemma/` artifacts when in LEMMA mode), verify the signed baseline, stamp it, write signed `verify/final.json` |
 | `teamwork_lemma_probe` | read-only probe for `lean`, `lake`, and the LEAP CLI (`leap`; legacy `leap-tools` accepted) on `PATH` |
