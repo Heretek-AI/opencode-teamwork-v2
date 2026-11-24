@@ -116,6 +116,13 @@ function authFor(root) {
 function fixtureSessionGet({ sessionID }) {
   if (sessionID === FIXTURE_ROOT_SESSION) return { agent: "team/sentinel" }
   if (sessionID === "ses_root_ok") return { agent: "team/sentinel" }
+  // Ancestry-shape fixtures: a fork has no parentID, its fork source is the
+  // ancestry edge; an orphan has neither; a no-agent session cannot identify.
+  if (sessionID === "ses_authz_fork") {
+    return { agent: "team/security-auditor", parentID: null, fork: { sessionID: FIXTURE_ROOT_SESSION } }
+  }
+  if (sessionID === "ses_authz_orphan") return { agent: "team/security-auditor", parentID: null }
+  if (sessionID === "ses_authz_noagent") return { parentID: FIXTURE_ROOT_SESSION }
   const agent = FIXTURE_AGENT_SESSIONS[sessionID]
   if (agent) return { agent, parentID: FIXTURE_ROOT_SESSION }
   return undefined
@@ -9241,6 +9248,25 @@ process.exit(0);
     const crafterPlan = await call("plan", { sessionId: "20261123-000030-authz-crafter", topology: "iterative-coding", skipInterview: true, tasks: [{ id: "C1" }] }, "ses_fixture_crafter")
     assert(crafterPlan.content.startsWith("Planned"), `team/crafter must plan: ${crafterPlan.content}`)
 
+    // Caller identity: the tool call's context.agent wins over Session.Info.agent.
+    const ctxPlanRun = "20261123-000030-authz-context-plan"
+    const ctxPlan = await az.teamwork_plan.execute(
+      { sessionId: ctxPlanRun, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "X1" }] },
+      // The session lookup still claims team/worker; only context.agent may plan.
+      { sessionID: worker, agent: "team/crafter" },
+    )
+    assert(ctxPlan.content.startsWith("Planned"), `context.agent must authorize the plan: ${ctxPlan.content}`)
+    const ctxManifest = JSON.parse(
+      readFileSync(join(authzRoot, ".opencode", "teamwork", ctxPlanRun, "run.manifest.json"), "utf8"),
+    )
+    assert.strictEqual(ctxManifest.planAgent, "team/crafter", "the manifest must record the plan-time context.agent")
+    const staleSessionPlan = await az.teamwork_plan.execute(
+      { sessionId: "20261123-000030-authz-context-denied", topology: "iterative-coding", skipInterview: true, tasks: [{ id: "X2" }] },
+      // The session says sentinel, but the call itself says worker: context wins.
+      { sessionID: sentinel, agent: "team/worker" },
+    )
+    assert(authRefused(staleSessionPlan), `a denied context.agent must not be rescued by a stale session: ${staleSessionPlan.content}`)
+
     // next/preflight/budget: sentinel/orchestrator only.
     res = await call("next", { sessionId: runId }, worker)
     assert(authRefused(res), `team/worker must not call next: ${res.content}`)
@@ -9364,8 +9390,29 @@ process.exit(0);
     res = await call("tournament", { action: "cancel", sessionId: tRun, reason: "done" }, sentinel)
     assert(!authRefused(res), `the sentinel must cancel: ${res.content}`)
 
+    // A fork (parentID null + fork.sessionID) is a descendant edge, not an
+    // orphan; a session with neither ancestry nor an agent still fails closed.
+    res = await az.teamwork_security_audit.execute(
+      { sessionId: runId, status: "PASS", findings: [] },
+      { sessionID: "ses_authz_fork", agent: "team/security-auditor" },
+    )
+    assert(!authRefused(res), `a forked auditor must resolve its ancestry: ${res.content}`)
+    res = await az.teamwork_security_audit.execute(
+      { sessionId: runId, status: "PASS", findings: [] },
+      { sessionID: "ses_authz_orphan", agent: "team/security-auditor" },
+    )
+    assert(authRefused(res) && /has no parent/.test(res.content), `an orphan must be refused by name: ${res.content}`)
+    res = await az.teamwork_next.execute(
+      { sessionId: runId },
+      { sessionID: "ses_authz_noagent", agent: undefined },
+    )
+    assert(
+      authRefused(res) && /needs a trusted session identity/.test(res.content),
+      `both identities absent must use the named refusal: ${res.content}`,
+    )
+
     assert(!existsSync(join(authzRoot, ".opencode", "teamwork", "20261123-000030-authz-denied")), "a refused plan must write nothing")
-    console.log("✓ control tools enforce the trusted role map; task_update/security_audit/final_verify, worktree, document, LEMMA, and tournament lanes verified")
+    console.log("✓ control tools enforce the trusted role map; context.agent, fork ancestry, and named identity refusal verified; task_update/security_audit/final_verify, worktree, document, LEMMA, and tournament lanes verified")
     rmSync(authzRoot, { recursive: true, force: true })
   }
 

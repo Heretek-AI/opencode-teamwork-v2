@@ -606,16 +606,29 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 
 /**
  * Best-effort actor lookup for the calling session. Fail-open: never throws and
- * never blocks longer than 2s. Order: the client's session.get agent, then the
- * agent recorded for that session in snapshots.json (same source as
- * bySession[*].agent). Returns the actor with its provenance (`session` for both
- * sources), or undefined when neither is available.
+ * never blocks longer than 2s.
+ *
+ * Order:
+ *   1. `context.agent` — OpenCode sets it from the tool call itself
+ *      (packages/schema/src/tool.ts Context.agent), so it is the current value
+ *      even after `switchAgent`.
+ *   2. `ctx.session.get(sessionID).agent` — `Session.Info.agent` is optional
+ *      and may be stale, but is better than nothing.
+ *   3. The agent recorded for that session in snapshots.json.
+ *
+ * `source` records which surface answered; "context" is the call's own agent,
+ * "session" is a session/snapshot lookup. Undefined only when every source is
+ * absent, which lets the authorization layer fail closed with its named
+ * refusal.
  */
 async function deriveCallerAgent(
   ctx: any,
   run: string,
   sessionID: string | undefined,
-): Promise<{ agent: string; source: "session" } | undefined> {
+  context?: any,
+): Promise<{ agent: string; source: "context" | "session" } | undefined> {
+  const fromCall = typeof context?.agent === "string" ? clean(context.agent, 64).trim() : ""
+  if (fromCall) return { agent: fromCall, source: "context" }
   if (!sessionID) return undefined
   try {
     if (typeof ctx?.session?.get === "function") {
@@ -3536,8 +3549,8 @@ async function appendEvent(
     to: string
     round?: number
     agent?: string | null
-    /** Provenance of `agent`: explicit input, session lookup, or plan declaration. */
-    agentSource?: "explicit" | "session" | "plan"
+    /** Provenance of `agent`: explicit input, the call context, a session lookup, or plan declaration. */
+    agentSource?: "explicit" | "context" | "session" | "plan"
     branch?: string | null
     worktree?: string | null
     phase?: string | null
@@ -3568,7 +3581,10 @@ async function appendEvent(
       const agent = opt(ev.agent, 64)
       const note = opt(ev.note, 200)
       const source =
-        agent && (ev.agentSource === "explicit" || ev.agentSource === "session" || ev.agentSource === "plan")
+        agent && (ev.agentSource === "explicit" ||
+        ev.agentSource === "context" ||
+        ev.agentSource === "session" ||
+        ev.agentSource === "plan")
           ? ev.agentSource
           : null
       const buildLine = (fd: number) =>
@@ -3955,6 +3971,12 @@ type RunManifest = {
   version: RunManifestVersion
   sessionId: string
   rootSessionId: string
+  /**
+   * Plan-time caller agent. `context.agent` is the current tool-call identity
+   * (preferred); `Session.Info.agent` is only a fallback. Absent on legacy
+   * manifests and when no identity could be resolved.
+   */
+  planAgent?: string | null
   integrityMode: IntegrityMode
   verification: VerificationMode
   victoryAudit: VictoryAuditMode
@@ -5293,9 +5315,9 @@ async function authorizeToolAction(
   action: string | undefined,
   context: any,
   opts: { skipSessionTree?: boolean } = {},
-): Promise<{ ok: true; caller: { agent: string; source: "session" } | undefined; sessionID: string | undefined } | { ok: false; content: string }> {
+): Promise<{ ok: true; caller: { agent: string; source: "context" | "session" } | undefined; sessionID: string | undefined } | { ok: false; content: string }> {
   const sessionID = typeof context?.sessionID === "string" ? context.sessionID : undefined
-  const caller = sessionID ? await deriveCallerAgent(ctx, run ?? "", sessionID) : undefined
+  const caller = sessionID ? await deriveCallerAgent(ctx, run ?? "", sessionID, context) : undefined
   let rootSessionId: string | undefined
   if (run && existsSync(run)) {
     const plan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
@@ -6222,6 +6244,10 @@ async function createPlanRun(
   // hand edit cannot silently drop the gate.
   const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
   const rootSessionId = callSession ?? sessionId
+  // Provenance: who planned the run. The first plan wins on a re-plan, so a
+  // later caller cannot rewrite the recorded plan-time identity.
+  const planCaller = await deriveCallerAgent(ctx, run, callSession, context)
+  const planAgent = existingManifest?.planAgent ?? planCaller?.agent ?? null
   const tasks = (input.tasks || []).map((t: any) => ({
     id: clean(t.id, 64),
     dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.map((d: any) => clean(d, 64)) : [],
@@ -6262,6 +6288,7 @@ async function createPlanRun(
   const planObject = {
     sessionId,
     rootSessionId,
+    ...(planAgent ? { planAgent } : {}),
     topology,
     integrityMode,
     verification: verificationMode,
@@ -6476,6 +6503,7 @@ async function createPlanRun(
         version: manifestVersion,
         sessionId,
         rootSessionId,
+        ...(planAgent ? { planAgent } : {}),
         integrityMode,
         verification: verificationMode,
         victoryAudit: victoryAuditMode,
@@ -8275,7 +8303,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 : { content: mRes.error }
             }
           const manifest = mRes.manifest
-          const caller = await deriveCallerAgent(ctx, run, callSession)
+          const caller = await deriveCallerAgent(ctx, run, callSession, context)
 
           if (action === "cancel") {
             if (manifest.phase === "COMPLETED" || manifest.phase === "FAILED") {
@@ -8296,7 +8324,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 to: "CANCELLED",
                 round: manifest.iteration,
                 agent: caller?.agent ?? null,
-                agentSource: caller?.agent ? "session" : undefined,
+                agentSource: caller?.source,
                 phase: "PRESENT_PARTIAL",
                 note: partial.manifest.cancelled?.reason ?? "Cancelled explicitly",
               })
@@ -8335,7 +8363,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 to: "CANCELLED",
                 round: manifest.iteration,
                 agent: caller?.agent ?? null,
-                agentSource: caller?.agent ? "session" : undefined,
+                agentSource: caller?.source,
                 phase: "PRESENT_PARTIAL",
                 note: "Aborted via AbortSignal",
               })
@@ -8383,7 +8411,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                   to: "BUDGET_HALTED",
                   round: manifest.iteration,
                   agent: caller?.agent ?? null,
-                  agentSource: caller?.agent ? "session" : undefined,
+                  agentSource: caller?.source,
                   phase: "PRESENT_PARTIAL",
                   note: reason,
                 })
@@ -8701,7 +8729,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 }
               }
               const manifest = mRes.manifest
-              const caller = await deriveCallerAgent(ctx, run, callSession)
+              const caller = await deriveCallerAgent(ctx, run, callSession, context)
 
               if (TOURNAMENT_ACTIVE_PHASES.has(manifest.phase) && context?.signal?.aborted) {
                 const partial = finalizeTournamentPartial(run, manifest, {
@@ -8719,7 +8747,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                     to: "CANCELLED",
                     round: manifest.iteration,
                     agent: caller?.agent ?? null,
-                    agentSource: caller?.agent ? "session" : undefined,
+                    agentSource: caller?.source,
                     phase: "PRESENT_PARTIAL",
                     note: "Aborted via AbortSignal",
                   })
@@ -8769,7 +8797,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                         to: "BUDGET_HALTED",
                         round: manifest.iteration,
                         agent: caller?.agent ?? null,
-                        agentSource: caller?.agent ? "session" : undefined,
+                        agentSource: caller?.source,
                         phase: "PRESENT_PARTIAL",
                         note: reason,
                       })
@@ -9454,7 +9482,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
           if (!signedRun && !wasAlreadyMerge) {
             const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
-            const caller = await deriveCallerAgent(ctx, run, callSession)
+            const caller = await deriveCallerAgent(ctx, run, callSession, context)
             await appendEvent(run, {
               event: "legacy_unsigned_bypass",
               sessionId: basename(run),
@@ -9462,7 +9490,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               to: "ALL_PASSED",
               round: 0,
               agent: caller?.agent ?? null,
-              agentSource: caller?.agent ? "session" : undefined,
+              agentSource: caller?.source,
               phase: state.phase ?? null,
               note: "allowUnsignedLegacy: true completed an unsigned legacy run; artifact _auth envelopes were not verified",
             })
@@ -9471,7 +9499,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (!stamped) {
             // Explicit legacy escape hatch: accept, but record who did it and why.
             const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
-            const caller = await deriveCallerAgent(ctx, run, callSession)
+            const caller = await deriveCallerAgent(ctx, run, callSession, context)
             await appendEvent(run, {
               event: "final_verification_bypass",
               sessionId: basename(run),
@@ -9479,7 +9507,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               to: "ALL_PASSED",
               round: 0,
               agent: caller?.agent ?? null,
-              agentSource: caller?.agent ? "session" : undefined,
+              agentSource: caller?.source,
               phase: state.phase ?? null,
               note: "unstamped verify/final.json accepted via allowUnstamped; verdict was not produced by teamwork_final_verify",
             })
@@ -9685,10 +9713,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const plan = readJson<any>(run, planFile, undefined)
         const def = Array.isArray(plan?.tasks) ? plan.tasks.find((t: any) => t.id === taskId) : undefined
         const explicitAgent = typeof input.agent === "string" ? clean(input.agent, 64).trim() : ""
-        const caller = explicitAgent ? undefined : await deriveCallerAgent(ctx, run, callSession)
+        const caller = explicitAgent ? undefined : await deriveCallerAgent(ctx, run, callSession, context)
         const planAgent = def?.agent ? clean(def.agent, 64) : undefined
         const recordedAgent = explicitAgent || caller?.agent || planAgent || null
-        const agentSource = explicitAgent ? "explicit" : caller?.agent ? "session" : planAgent ? "plan" : undefined
+        const agentSource = explicitAgent ? "explicit" : (caller?.source ?? (planAgent ? "plan" : undefined))
         const sentinelCaller = isSentinelAgent(authz.caller?.agent)
         const reasonText = typeof input.reason === "string" ? clean(input.reason, 200).trim() : ""
 
@@ -10633,7 +10661,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           to: rawAction.toUpperCase(),
           round: Number(task.round) || 0,
           agent: authz.caller?.agent ?? null,
-          agentSource: authz.caller?.agent ? "session" : undefined,
+          agentSource: authz.caller?.source,
           note: outcome.note,
         })
         await refreshBriefingSafe(run)
@@ -11607,7 +11635,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
 
         return await withPinnedCrossProcessLock(run, runRel(run, finalFile), async () => {
-          const caller = await deriveCallerAgent(ctx, run, callSession)
+          const caller = await deriveCallerAgent(ctx, run, callSession, context)
           const state = readJson<any>(run, join(run, "state.json"), undefined)
           if (!state || typeof state.tasks !== "object") {
             return { content: `Error: No state.json found for run ${basename(run)}.` }
@@ -11657,7 +11685,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               to: "final_verify",
               round: 0,
               agent: caller?.agent ?? null,
-              agentSource: caller?.agent ? "session" : undefined,
+              agentSource: caller?.source,
               phase: state.phase ?? null,
               note: "allowUnsignedLegacy: true accepted an unsigned legacy run; artifact _auth envelopes are not verified",
             })
@@ -12104,7 +12132,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               await withPinnedCrossProcessLock(run, runRel(run, mFile), async () => {
                 const mRes = readTournamentManifest(run)
                 if (mRes.status === "ok" && TOURNAMENT_ACTIVE_PHASES.has(mRes.manifest.phase) && context?.signal?.aborted) {
-                  const callerAbort = await deriveCallerAgent(ctx, run, callSession)
+                  const callerAbort = await deriveCallerAgent(ctx, run, callSession, context)
                   const partial = finalizeTournamentPartial(run, mRes.manifest, {
                     trigger: "signal",
                     reason: "Aborted via AbortSignal",
@@ -12120,7 +12148,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                       to: "CANCELLED",
                       round: mRes.manifest.iteration,
                       agent: callerAbort?.agent ?? null,
-                      agentSource: callerAbort?.agent ? "session" : undefined,
+                      agentSource: callerAbort?.source,
                       phase: "PRESENT_PARTIAL",
                       note: "Aborted via AbortSignal",
                     })
@@ -12453,7 +12481,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             to: status,
             round: 0,
             agent: caller?.agent ?? null,
-            agentSource: caller?.agent ? "session" : undefined,
+            agentSource: caller?.source,
             phase: state.phase ?? null,
           })
           await refreshBriefingSafe(run)
@@ -13044,7 +13072,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
           if (action === "review_pre" || action === "review_final") {
-            const caller = await deriveCallerAgent(ctx, run, callSession)
+            const caller = await deriveCallerAgent(ctx, run, callSession, context)
             const explicitReviewer = input?.reviewer ? clean(input.reviewer, 64).trim() : ""
             if (explicitReviewer && explicitReviewer !== "team/formalization-reviewer") {
               return { content: `refused: formalization review must be performed by team/formalization-reviewer (got "${explicitReviewer}").` }
