@@ -26,7 +26,14 @@
 import { registerTeamworkTools, setApprovalOwnerUidForTest } from "../plugins/opencode-teamwork/tools.ts"
 import { createAuthContext, canonicalJson } from "../plugins/opencode-teamwork/auth.ts"
 import { payloadDigest, contentSha256Hex } from "../plugins/opencode-teamwork/approval-format.mjs"
-import { signApprovalArtifact, verifyApprovalArtifact } from "../lib/approve.mjs"
+import {
+  buildSignerApprovalPayload,
+  signApprovalArtifact,
+  signSignerApproval,
+  signerApprovalFileFor,
+  verifyApprovalArtifact,
+  writeSignerApprovalAtomically,
+} from "../lib/approve.mjs"
 import {
   chmodSync,
   existsSync,
@@ -37,7 +44,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs"
-import { createHmac, generateKeyPairSync, randomBytes } from "node:crypto"
+import { createHmac, createPublicKey, generateKeyPairSync, randomBytes, verify as cryptoVerify } from "node:crypto"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -289,6 +296,101 @@ function writeRequestFile(payload) {
   const file = join(testDir, `request-${++caseSeq}.json`)
   writeFileSync(file, JSON.stringify(payload, null, 2), { mode: 0o600 })
   return file
+}
+
+/**
+ * A v2 signer stub: it enforces the documented request layout, derives the
+ * approval reference itself, verifies the approval over the
+ * `teamwork-signer-approval-v1` domain, checks the binding/expiry, refuses a
+ * reused approvalId, and only then signs `request.message`.
+ */
+function writeV2SignerStub({ signerPrivateKey, signerKeyId, approverPublicKey, approverKeyId, approvalDir, ledgerFile }) {
+  const file = join(testDir, `v2-signer-${++caseSeq}.mjs`)
+  writeFileSync(
+    file,
+    `#!/usr/bin/env node
+import { readFileSync, writeFileSync } from "node:fs"
+import { createHash, createPrivateKey, createPublicKey, sign, verify } from "node:crypto"
+const request = JSON.parse(readFileSync(0, "utf8"))
+const die = (code, message) => { process.stdout.write(JSON.stringify({ ok: false, code, message })); process.exit(1) }
+const canon = (v) => {
+  if (v === null) return "null"
+  if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]"
+  if (typeof v === "object") return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + canon(v[k])).join(",") + "}"
+  return JSON.stringify(v)
+}
+const sha256 = (value) => createHash("sha256").update(value).digest("hex")
+if (request.v !== 2) die("E_VERSION", "v must be 2")
+if (request.op !== "sign-artifact") die("E_OP", "op")
+if (request.alg !== "ed25519") die("E_ALG", "alg")
+if (request.keyId !== ${JSON.stringify(signerKeyId)}) die("E_KEYID", "key id")
+if (!/^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$/.test(request.runId)) die("E_REQUEST", "run id")
+if (typeof request.path !== "string" || request.path.startsWith("/") || request.path.split("/").some((s) => !s || s === "." || s === "..")) die("E_PATH", "path")
+if (!/^[0-9a-f]{64}$/.test(request.digest)) die("E_DIGEST", "digest shape")
+if (typeof request.nonce !== "string" || Buffer.from(request.nonce, "base64url").length < 16) die("E_NONCE", "nonce")
+const approvalRef = ${JSON.stringify(approvalDir)} + "/" + request.runId + "/" + sha256(request.path) + ".json"
+if (request.approvalRef !== approvalRef) die("E_APPROVAL_REF", "approval ref layout")
+let approval
+try { approval = JSON.parse(readFileSync(approvalRef, "utf8")) } catch { die("E_APPROVAL_OPEN", "approval unreadable") }
+if (approval.v !== 1 || approval.kind !== "teamwork.signer-approval") die("E_APPROVAL_BINDING", "kind/version")
+if (!approval._auth || approval._auth.alg !== "ed25519" || approval._auth.keyId !== ${JSON.stringify(approverKeyId)}) die("E_APPROVAL_SIG", "key")
+const unsigned = { ...approval }
+delete unsigned._auth
+const input = "teamwork-signer-approval-v1\\0" + unsigned.runId + "\\0" + unsigned.path + "\\0" + unsigned.digest + "\\0" + unsigned.nonce + "\\0" + unsigned.expiresAt + "\\0" + canon(unsigned)
+const approverKey = createPublicKey({ key: Buffer.from(${JSON.stringify(approverPublicKey)}, "base64url"), format: "der", type: "spki" })
+if (!verify(null, Buffer.from(input, "utf8"), approverKey, Buffer.from(String(approval._auth.sig), "base64url"))) die("E_APPROVAL_SIG", "signature")
+if (approval.runId !== request.runId || approval.path !== request.path || approval.digest !== request.digest || approval.nonce !== request.nonce) die("E_APPROVAL_BINDING", "binding")
+const expires = Date.parse(approval.expiresAt)
+const approved = Date.parse(approval.approvedAt)
+if (!Number.isFinite(expires) || !Number.isFinite(approved)) die("E_APPROVAL_EXPIRED", "time")
+if (Date.now() > expires) die("E_APPROVAL_EXPIRED", "expired")
+if (approved > Date.now() + 300000) die("E_APPROVAL_EXPIRED", "not yet valid")
+if (expires - approved > 7 * 24 * 3600 * 1000) die("E_APPROVAL_EXPIRED", "lifetime")
+let ledger = {}
+try { ledger = JSON.parse(readFileSync(${JSON.stringify(ledgerFile)}, "utf8")) } catch {}
+if (ledger[approval.approvalId]) die("E_APPROVAL_REPLAY", "approval id already used")
+ledger[approval.approvalId] = sha256(request.runId + "\\0" + request.path + "\\0" + request.digest + "\\0" + request.nonce)
+writeFileSync(${JSON.stringify(ledgerFile)}, JSON.stringify(ledger), { mode: 0o600 })
+const message = Buffer.from(request.message, "base64url")
+const key = createPrivateKey({ key: Buffer.from(${JSON.stringify(signerPrivateKey)}, "base64url"), format: "der", type: "pkcs8" })
+process.stdout.write(JSON.stringify({ alg: "ed25519", keyId: request.keyId, sig: sign(null, message, key).toString("base64url") }))
+`,
+    { mode: 0o755 },
+  )
+  return { file, approvalDir }
+}
+
+function v2RequestFor({ runId, path, digest, nonce, approvalDir, signerKeyId }) {
+  const message = Buffer.from(
+    `teamwork-artifact-v1\u0000ed25519\u0000${signerKeyId}\u0000${path}\u0000${nonce}\u0000{"kind":"teamwork.test","verdict":"PASS"}`,
+    "utf8",
+  ).toString("base64url")
+  return {
+    v: 2,
+    op: "sign-artifact",
+    runId,
+    alg: "ed25519",
+    keyId: signerKeyId,
+    path,
+    digest,
+    nonce,
+    at: new Date().toISOString(),
+    approvalRef: join(approvalDir, runId, `${contentSha256Hex(path)}.json`),
+    message,
+  }
+}
+
+function runV2Signer(stubFile, request) {
+  const res = spawnSync(process.execPath, [stubFile], {
+    input: JSON.stringify(request),
+    encoding: "utf8",
+    timeout: 30_000,
+  })
+  let body
+  try {
+    body = JSON.parse(String(res.stdout ?? "").trim())
+  } catch {}
+  return { status: res.status, body, stdout: res.stdout, stderr: res.stderr }
 }
 
 function approvalFixture(label, { trustLevel = "human-approved", draftText, overrides = {} } = {}) {
@@ -945,6 +1047,191 @@ try {
     }
 
     console.log("✓ legacy: v1 unbound + v2 readable; local-hmac/allowUnsignedLegacy unchanged; ci-attested bound")
+  }
+
+  // ==========================================================================
+  // 6. Signer approval producer (`approve signer`) and the v2 signer stub
+  // ==========================================================================
+  {
+    console.log("Testing the signer approval producer...")
+    const { root } = makeRoot("signer-approval")
+    const outDir = mkdtempSync(join(tmpdir(), "teamwork-signer-approvals-"))
+    roots.push(outDir)
+    const keys = makeKeys()
+    const keyFile = writeKeyFile(keys.pair)
+    const runId = `signer-${++caseSeq}`
+    const relPath = "verify/victory.json"
+    const digest = "ab".repeat(32)
+    const emptyEnv = { OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR: "" }
+    const runDir = join(root, ".opencode", "teamwork", runId)
+    mkdirSync(runDir, { recursive: true })
+    const runNonce = randomBytes(32).toString("base64url")
+    writeFileSync(join(runDir, "run.manifest.json"), JSON.stringify({ version: 3, runNonce }, null, 2))
+
+    const produced = runCli(
+      [
+        "approve",
+        "signer",
+        "--session",
+        runId,
+        "--path",
+        relPath,
+        "--digest",
+        digest,
+        "--key",
+        keyFile,
+        "--approver",
+        "uid:signer-approver",
+        "--ttl",
+        "1h",
+        "--out",
+        outDir,
+      ],
+      emptyEnv,
+      root,
+    )
+    assert.strictEqual(produced.status, 0, `${produced.stdout}${produced.stderr}`)
+    const approvalFile = signerApprovalFileFor(outDir, runId, relPath)
+    assert(existsSync(approvalFile), `the signer approval must be at ${approvalFile}`)
+    const artifact = JSON.parse(readFileSync(approvalFile, "utf8"))
+    assert.strictEqual(artifact.kind, "teamwork.signer-approval")
+    assert.strictEqual(artifact.v, 1)
+    assert.strictEqual(artifact.runId, runId)
+    assert.strictEqual(artifact.path, relPath)
+    assert.strictEqual(artifact.digest, digest)
+    assert.strictEqual(artifact.approvedBy, "uid:signer-approver")
+    assert(Buffer.from(artifact.nonce, "base64url").length >= 16, "nonce must be >=128 bits")
+    assert(Buffer.from(artifact.approvalId, "base64url").length >= 16, "approvalId must be >=128 bits")
+    assert(Number.isFinite(Date.parse(artifact.expiresAt)), "expiresAt must be an ISO timestamp")
+    assert.strictEqual(artifact._auth.alg, "ed25519")
+    for (const promptField of [
+      "binding",
+      "trustLevel",
+      "promptDraftSha256",
+      "promptDraftBytes",
+      "openGaps",
+      "approvalNonce",
+      "planHash",
+    ]) {
+      assert(!(promptField in artifact), `a signer approval must not reuse the prompt field ${promptField}`)
+    }
+    if (process.platform !== "win32") {
+      assert.strictEqual(statSync(approvalFile).mode & 0o777, 0o600, "the signer approval must be 0600")
+    }
+
+    // A v2 signer stub accepts the produced approval and signs the request.
+    const approverKeyId = artifact._auth.keyId
+    const signerKeys = makeKeys()
+    const signerKeyId = "signer_stub"
+    const ledgerFile = join(testDir, `signer-ledger-${++caseSeq}.json`)
+    const stub = writeV2SignerStub({
+      signerPrivateKey: signerKeys.privateKey,
+      signerKeyId,
+      approverPublicKey: keys.publicKey,
+      approverKeyId,
+      approvalDir: outDir,
+      ledgerFile,
+    }).file
+    const nonce = runNonce
+    const request = v2RequestFor({ runId, path: relPath, digest, nonce, approvalDir: outDir, signerKeyId })
+    const accepted = runV2Signer(stub, request)
+    assert.strictEqual(accepted.status, 0, `${accepted.stdout}${accepted.stderr}`)
+    assert.strictEqual(accepted.body.alg, "ed25519")
+    assert.strictEqual(accepted.body.keyId, signerKeyId)
+    const signerPublic = createPublicKey({
+      key: Buffer.from(signerKeys.publicKey, "base64url"),
+      format: "der",
+      type: "spki",
+    })
+    assert(
+      cryptoVerify(
+        null,
+        Buffer.from(request.message, "base64url"),
+        signerPublic,
+        Buffer.from(accepted.body.sig, "base64url"),
+      ),
+      "the stub signature must verify over the request message",
+    )
+
+    // Wrong digest: the approval file exists at the same (run, path) but the
+    // binding check refuses it.
+    const wrongDigest = runV2Signer(stub, { ...request, digest: "cd".repeat(32) })
+    assert.notStrictEqual(wrongDigest.status, 0, "a wrong digest must be refused")
+    assert.strictEqual(wrongDigest.body.code, "E_APPROVAL_BINDING", JSON.stringify(wrongDigest.body))
+
+    // Wrong path/runId derive a different approvalRef, which does not exist.
+    const wrongPath = runV2Signer(
+      stub,
+      v2RequestFor({ runId, path: "verify/final.json", digest, nonce, approvalDir: outDir, signerKeyId }),
+    )
+    assert.notStrictEqual(wrongPath.status, 0, "a wrong path must be refused")
+    assert.strictEqual(wrongPath.body.code, "E_APPROVAL_OPEN", JSON.stringify(wrongPath.body))
+    const wrongRun = runV2Signer(
+      stub,
+      v2RequestFor({ runId: "another-run", path: relPath, digest, nonce, approvalDir: outDir, signerKeyId }),
+    )
+    assert.notStrictEqual(wrongRun.status, 0, "a wrong run id must be refused")
+    assert.strictEqual(wrongRun.body.code, "E_APPROVAL_OPEN", JSON.stringify(wrongRun.body))
+
+    // Expired approval: built for a window that has already ended.
+    const expiredPath = "verify/expired.json"
+    const expiredPayload = buildSignerApprovalPayload({
+      runId,
+      path: expiredPath,
+      digest,
+      nonce: runNonce,
+      approver: "uid:signer-approver",
+      ttlMs: 60 * 60 * 1000,
+      now: Date.now() - 2 * 60 * 60 * 1000,
+    })
+    const expiredArtifact = signSignerApproval(expiredPayload, {
+      privateKey: keys.pair.privateKey,
+      keyId: approverKeyId,
+    })
+    const expiredWritten = writeSignerApprovalAtomically(outDir, runId, expiredPath, expiredArtifact)
+    assert(expiredWritten.ok, JSON.stringify(expiredWritten))
+    const expired = runV2Signer(stub, v2RequestFor({ runId, path: expiredPath, digest, nonce, approvalDir: outDir, signerKeyId }))
+    assert.notStrictEqual(expired.status, 0, "an expired approval must be refused")
+    assert.strictEqual(expired.body.code, "E_APPROVAL_EXPIRED", JSON.stringify(expired.body))
+
+    // Replay: the same approvalId cannot be used a second time by the stub.
+    const replay = runV2Signer(stub, request)
+    assert.notStrictEqual(replay.status, 0, "a replayed approvalId must be refused")
+    assert.strictEqual(replay.body.code, "E_APPROVAL_REPLAY", JSON.stringify(replay.body))
+
+    // The CLI refuses an output inside the run directory.
+    const inRun = runCli(
+      [
+        "approve",
+        "signer",
+        "--session",
+        runId,
+        "--path",
+        relPath,
+        "--digest",
+        digest,
+        "--key",
+        keyFile,
+        "--out",
+        runDir,
+      ],
+      emptyEnv,
+      root,
+    )
+    assert.strictEqual(inRun.status, 1, `${inRun.stdout}${inRun.stderr}`)
+    assert(/inside the run directory/.test(inRun.stderr), inRun.stderr)
+    assert(!existsSync(signerApprovalFileFor(runDir, runId, relPath)), "no approval may be written into the run")
+
+    // Without --out or the env there is no destination: refuse before signing.
+    const noDir = runCli(
+      ["approve", "signer", "--session", runId, "--path", relPath, "--digest", digest, "--key", keyFile],
+      emptyEnv,
+      root,
+    )
+    assert.strictEqual(noDir.status, 1, `${noDir.stdout}${noDir.stderr}`)
+    assert(/OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR is not set/.test(noDir.stderr), noDir.stderr)
+
+    console.log("✓ producer writes the documented file; the v2 stub accepts it; wrong digest/path/runId/expiry/replay fail; in-run output refused")
   }
 
   console.log("All authenticated prompt-approval tests passed")
