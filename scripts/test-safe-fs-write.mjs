@@ -26,6 +26,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -34,7 +35,7 @@ import {
   linkSync,
 } from "node:fs"
 import { tmpdir, hostname } from "node:os"
-import { dirname, join } from "node:path"
+import { basename, dirname, join } from "node:path"
 import { spawn, spawnSync } from "node:child_process"
 import assert from "node:assert"
 import {
@@ -46,9 +47,12 @@ import {
   openPinnedRoot,
   pinParent,
   recentWriteAnomalies,
+  setDarwinRootFdCheckForTest,
   setFdContainmentModeForTest,
   setFdTraversalModeForTest,
   setIdentityUnavailableForTest,
+  setRequirePinnedWritesForTest,
+  setRunRequirePinnedWrites,
   setWindowsLexicalModeForTest,
   supportsPinnedWrites,
   unlinkWithin,
@@ -65,6 +69,7 @@ import {
   withPinnedCrossProcessLock,
 } from "../plugins/opencode-teamwork/locks.ts"
 import { nextEventSeqFromFd } from "../plugins/opencode-teamwork/tools.ts"
+import { assertRunRootIdentity } from "../plugins/opencode-teamwork/tournament.ts"
 
 const MARKER = "OUTSIDE_WRITE_SENTINEL_DO_NOT_LEAK"
 const SECRET = "OUTSIDE_SECRET_SENTINEL"
@@ -167,7 +172,7 @@ check("1,000 atomic writes leak no file descriptors", () => {
 
 check("static intermediate symlink: pinned write refuses, outside gains nothing", () => {
   const { run, outside } = makeFixture()
-  symlinkSync(outside, join(run, "verify"))
+  if (!makeTestLink(outside, join(run, "verify"), "dir")) return
   assert.throws(
     () => writeFileAtomicWithin(run, "verify/report.json", "NOPE"),
     (err) => /refused/.test(String(err.message)),
@@ -177,7 +182,7 @@ check("static intermediate symlink: pinned write refuses, outside gains nothing"
 
 check("negative control: the old path-based mkdir+write DOES escape through the symlink", () => {
   const { run, outside } = makeFixture()
-  symlinkSync(outside, join(run, "verify"))
+  if (!makeTestLink(outside, join(run, "verify"), "dir")) return
   const target = join(run, "verify", "report.json")
   const res = spawnSync(
     process.execPath,
@@ -201,7 +206,7 @@ check("nested pin: a swap of run/verify after the pin cannot redirect the write"
   try {
     // Swap the name after the descriptor is pinned.
     renameSync(join(run, "verify"), join(run, "verify.real"))
-    symlinkSync(outside, join(run, "verify"))
+    if (!makeTestLink(outside, join(run, "verify"), "dir")) return
     writeFileAtomicAt(pin.dirFd, "report.json", "PINNED_BYTES")
     assert.strictEqual(readFileSync(join(run, "verify.real", "report.json"), "utf8"), "PINNED_BYTES")
     assert.strictEqual(existsSync(join(outside, "report.json")), false)
@@ -461,7 +466,7 @@ check("pre-planted temp-name symlink/hard link: victim unchanged, target written
   writeFileSync(victim, "ORIGINAL")
   const target = join(run, "manifest.json")
   // The legacy predictable temp names (the pinned writer also uses O_EXCL).
-  symlinkSync(victim, `${target}.tmp`)
+  if (!makeTestLink(victim, `${target}.tmp`, "file")) return
   linkSync(victim, join(run, "lock.json.tmp"))
   writeFileAtomicWithin(run, "manifest.json", "SAFE")
   assert.strictEqual(readFileSync(victim, "utf8"), "ORIGINAL", "a planted temp link must not overwrite the victim")
@@ -470,7 +475,7 @@ check("pre-planted temp-name symlink/hard link: victim unchanged, target written
   // A symlink at the destination is replaced as a directory entry, never followed.
   const destVictim = join(run, "dest-victim.txt")
   writeFileSync(destVictim, "DEST_ORIGINAL")
-  symlinkSync(destVictim, join(run, "verdict.json"))
+  if (!makeTestLink(destVictim, join(run, "verdict.json"), "file")) return
   writeFileAtomicWithin(run, "verdict.json", "SAFE2")
   assert.strictEqual(readFileSync(destVictim, "utf8"), "DEST_ORIGINAL")
   assert.strictEqual(readFileSync(join(run, "verdict.json"), "utf8"), "SAFE2")
@@ -480,12 +485,16 @@ check("pre-planted temp-name symlink/hard link: victim unchanged, target written
 
 check("static symlink refusal runs on every platform (recorded)", () => {
   const { run, outside } = makeFixture()
-  symlinkSync(outside, join(run, "verify"))
+  if (!makeTestLink(outside, join(run, "verify"), "dir")) return
   assert.throws(() => writeFileAtomicWithin(run, "verify/x.json", "NO"), /refused/)
   assert.strictEqual(existsSync(join(outside, "x.json")), false)
 })
 
 check("FIFO at the append target is refused without hanging (child timeout)", () => {
+  if (process.platform === "win32") {
+    console.log("SKIP: named pipes (mkfifo) are unavailable on this runner; FIFO append refusal recorded")
+    return
+  }
   const { run } = makeFixture()
   const fifo = join(run, "events.fifo")
   const mk = spawnSync("mkfifo", [fifo], { encoding: "utf8" })
@@ -515,13 +524,13 @@ check("FIFO at the append target is refused without hanging (child timeout)", ()
 // ----------------------------------------- 12. detective fallback post-check
 
 await checkAsync("detective fallback: a post-rename swap is refused and audited", async () => {
-  if (!PINNED) {
-    console.log(`SKIP: pinned writes unavailable (mode=${fdTraversalMode()}) — deterministic detective hook not run`)
-    return
-  }
+  // This case runs on every platform: on Linux it injects detective mode, and
+  // on macOS/Windows detective is the real mode already.
   const { run, outside } = makeFixture()
-  assert.strictEqual(fdTraversalMode(), "pinned")
-  setFdTraversalModeForTest("detective")
+  if (PINNED) {
+    assert.strictEqual(fdTraversalMode(), "pinned")
+    setFdTraversalModeForTest("detective")
+  }
   try {
     const before = recentWriteAnomalies().length
     assert.throws(
@@ -600,7 +609,7 @@ check("detective append: a static final-component symlink is refused and the vic
   const { run, outside } = makeFixture()
   const victim = join(outside, "bashrc")
   writeFileSync(victim, "ORIGINAL\n")
-  symlinkSync(victim, join(run, "pitfalls.md"))
+  if (!makeTestLink(victim, join(run, "pitfalls.md"), "file")) return
   setFdTraversalModeForTest("detective")
   try {
     assert.throws(
@@ -628,7 +637,10 @@ check("detective append: a post-write identity mismatch is refused and audited",
         }),
       (err) => /identity|refused/i.test(String(err.message)),
     )
-    assert.strictEqual(readFileSync(join(outside, "stolen-append.jsonl"), "utf8"), JSON.stringify({ ok: 1 }) + "\n")
+    // The per-run detective_mode diagnostic is itself an audit event in
+    // events.jsonl, so compare the last non-anomaly line.
+    const eventLog = readFileSync(join(outside, "stolen-append.jsonl"), "utf8").trim().split("\n")
+    assert.strictEqual(eventLog[eventLog.length - 1], JSON.stringify({ ok: 1 }), "the append line must be the last line")
     const anomalies = recentWriteAnomalies().slice(before)
     assert(anomalies.some((a) => a.kind === "detective-append"), "the identity mismatch must record a detective-append anomaly")
   } finally {
@@ -643,7 +655,8 @@ check("detective append: the fd-containment override exercises the non-Linux bra
   try {
     assert.strictEqual(fdContainmentMode(), "unsupported")
     appendLineWithin(run, "events.jsonl", () => JSON.stringify({ branch: "unsupported" }) + "\n")
-    assert.strictEqual(readFileSync(join(run, "events.jsonl"), "utf8").trim(), JSON.stringify({ branch: "unsupported" }))
+    const lines = readFileSync(join(run, "events.jsonl"), "utf8").trim().split("\n")
+    assert.strictEqual(lines[lines.length - 1], JSON.stringify({ branch: "unsupported" }))
   } finally {
     setFdContainmentModeForTest(null)
     setFdTraversalModeForTest(null)
@@ -652,6 +665,7 @@ check("detective append: the fd-containment override exercises the non-Linux bra
 
 check("detective createDir: a post-create swap outside the run is refused and audited", () => {
   const { run, outside } = makeFixture()
+  if (!makeTestLink(outside, join(run, "sub.swap"), "dir")) return
   setFdTraversalModeForTest("detective")
   try {
     const before = recentWriteAnomalies().length
@@ -660,7 +674,7 @@ check("detective createDir: a post-create swap outside the run is refused and au
         createDirWithin(run, "sub", {
           afterCreate: () => {
             renameSync(join(run, "sub"), join(run, "sub.real"))
-            symlinkSync(outside, join(run, "sub"))
+            renameSync(join(run, "sub.swap"), join(run, "sub"))
           },
         }),
       (err) => /post-create|containment|refused/i.test(String(err.message)),
@@ -675,6 +689,7 @@ check("detective unlink: a post-unlink parent swap is refused, and a delete neve
   const { run, outside } = makeFixture()
   mkdirSync(join(run, "sub"), { recursive: true })
   writeFileSync(join(run, "sub", "gone.txt"), "bye\n")
+  if (!makeTestLink(outside, join(run, "sub.swap"), "dir")) return
   setFdTraversalModeForTest("detective")
   try {
     const before = recentWriteAnomalies().length
@@ -683,17 +698,282 @@ check("detective unlink: a post-unlink parent swap is refused, and a delete neve
         unlinkWithin(run, "sub/gone.txt", {
           afterUnlink: () => {
             renameSync(join(run, "sub"), join(run, "sub.real"))
-            symlinkSync(outside, join(run, "sub"))
+            renameSync(join(run, "sub.swap"), join(run, "sub"))
           },
         }),
-      (err) => /post-unlink|containment|refused/i.test(String(err.message)),
+      (err) => /post-unlink|containment|identity|refused/i.test(String(err.message)),
     )
-    assert(recentWriteAnomalies().slice(before).some((a) => a.kind === "detective-unlink"))
+    assert(
+      recentWriteAnomalies()
+        .slice(before)
+        .some((a) => a.kind === "detective-unlink" || a.kind === "detective-identity-changed"),
+      "the post-unlink swap must record an anomaly",
+    )
     assert.strictEqual(unlinkWithin(run, "never-created/gone.txt"), false, "a missing file is a no-op delete")
     assert.strictEqual(existsSync(join(run, "never-created")), false, "a delete must not create parent directories")
   } finally {
     setFdTraversalModeForTest(null)
   }
+})
+
+// ------------------------------------- 13b. ancestor identity pin (ADR 0013)
+
+function withDetectiveMode(fn) {
+  if (PINNED) setFdTraversalModeForTest("detective")
+  try {
+    return fn()
+  } finally {
+    if (PINNED) setFdTraversalModeForTest(null)
+  }
+}
+
+function makeTestLink(target, path, kind = "file") {
+  try {
+    symlinkSync(target, path, process.platform === "win32" ? (kind === "dir" ? "junction" : "file") : kind)
+    return true
+  } catch (err) {
+    console.log(`SKIP: symlink fixture unsupported on this runner (${err?.code || err?.message}); recorded`)
+    return false
+  }
+}
+
+check("detective identity pin: an ancestor swap after the pin refuses with identity-changed", () => {
+  const { run, outside } = makeFixture()
+  mkdirSync(join(run, "sub"), { recursive: true })
+  if (!makeTestLink(outside, join(run, "sub.swap"), "dir")) return
+  withDetectiveMode(() => {
+    const before = recentWriteAnomalies().length
+    assert.throws(
+      () =>
+        writeFileAtomicWithin(run, "sub/report.json", "NOPE", {
+          afterTarget: () => {
+            renameSync(join(run, "sub"), join(run, "sub.real"))
+            renameSync(join(run, "sub.swap"), join(run, "sub"))
+          },
+        }),
+      (err) => err.reason === "identity-changed" && /pre-create|identity/i.test(String(err.message)),
+    )
+    assert.strictEqual(existsSync(join(outside, "report.json")), false, "the swapped ancestor must receive nothing")
+    assert(
+      recentWriteAnomalies()
+        .slice(before)
+        .some((a) => a.kind === "detective-identity-changed"),
+      "the ancestor mismatch must be audited",
+    )
+  })
+})
+
+check("detective identity pin: a symlinked ancestor above the run still pins the real subdirectory", () => {
+  // macOS /var -> /private/var and Windows 8.3 short names make the lexical run
+  // path differ from its realpath. The ancestor chain must be re-rooted at the
+  // real path, or a swapped subdirectory would not be detected.
+  const base = mkdtempSync(join(testDir, "symroot-"))
+  const real = join(base, "real")
+  const outside = join(base, "outside")
+  mkdirSync(real, { recursive: true })
+  mkdirSync(outside, { recursive: true })
+  if (!makeTestLink(real, join(base, "link"), "dir")) return
+  const run = join(base, "link", "run")
+  mkdirSync(join(run, "sub"), { recursive: true })
+  if (!makeTestLink(outside, join(run, "sub.swap"), "dir")) return
+  withDetectiveMode(() => {
+    assert.throws(
+      () =>
+        writeFileAtomicWithin(run, "sub/report.json", "NOPE", {
+          afterTarget: () => {
+            renameSync(join(run, "sub"), join(run, "sub.real"))
+            renameSync(join(run, "sub.swap"), join(run, "sub"))
+          },
+        }),
+      (err) => err.reason === "identity-changed",
+    )
+    assert.strictEqual(existsSync(join(outside, "report.json")), false)
+  })
+})
+
+check("detective identity pin: an ancestor swapped after the temp create refuses before the rename", () => {
+  const { run, outside } = makeFixture()
+  mkdirSync(join(run, "sub"), { recursive: true })
+  if (!makeTestLink(outside, join(run, "sub.swap"), "dir")) return
+  withDetectiveMode(() => {
+    assert.throws(
+      () =>
+        writeFileAtomicWithin(run, "sub/report.json", "NOPE", {
+          afterTemp: () => {
+            renameSync(join(run, "sub"), join(run, "sub.real"))
+            renameSync(join(run, "sub.swap"), join(run, "sub"))
+          },
+        }),
+      (err) => err.reason === "identity-changed" && /pre-rename/i.test(String(err.message)),
+    )
+    assert.strictEqual(existsSync(join(outside, "report.json")), false)
+  })
+})
+
+check("detective identity pin: a legitimately renamed run root refuses (fail closed)", () => {
+  const { root, run, outside } = makeFixture()
+  withDetectiveMode(() => {
+    assert.throws(
+      () =>
+        writeFileAtomicWithin(run, "verify/report.json", "NOPE", {
+          afterRename: () => renameSync(run, join(root, "run.moved")),
+        }),
+      (err) => err.reason === "identity-changed",
+    )
+    assert.strictEqual(existsSync(join(outside, "report.json")), false)
+  })
+})
+
+check("detective identity pin: appending through a renamed run root refuses in the post-check", () => {
+  if (process.platform === "win32") {
+    console.log(
+      "SKIP: win32 does not permit renaming a directory while an open append descriptor is inside it; the post-append identity mismatch case covers the check",
+    )
+    return
+  }
+  const { root, run } = makeFixture()
+  withDetectiveMode(() => {
+    assert.throws(
+      () =>
+        appendLineWithin(run, "events.jsonl", () => JSON.stringify({ ok: 1 }) + "\n", {
+          afterAppend: () => renameSync(run, join(root, "run.moved")),
+        }),
+      (err) => err.reason === "identity-changed" && /post-append/i.test(String(err.message)),
+    )
+  })
+})
+
+check("detective identity pin: the darwin run-root fd check is consulted when enabled", () => {
+  const { root, run } = makeFixture()
+  setDarwinRootFdCheckForTest(true)
+  try {
+    withDetectiveMode(() => {
+      writeFileAtomicWithin(run, "fd-ok.txt", "OK")
+      assert.strictEqual(readFileSync(join(run, "fd-ok.txt"), "utf8"), "OK")
+      assert.throws(
+        () =>
+          writeFileAtomicWithin(run, "fd-bad.txt", "NOPE", {
+            afterTarget: () => renameSync(run, join(root, "run.moved")),
+          }),
+        (err) => err.reason === "identity-changed",
+      )
+    })
+  } finally {
+    setDarwinRootFdCheckForTest(false)
+  }
+})
+
+check("containment-mode policy: REQUIRE_PINNED_WRITES=1 refuses control-plane writes in detective mode", () => {
+  const { run } = makeFixture()
+  const envKey = "OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES"
+  const previous = process.env[envKey]
+  process.env[envKey] = "1"
+  try {
+    withDetectiveMode(() => {
+      for (const rel of ["run.manifest.json", "state.json", "costs.json", "verify/final.json"]) {
+        assert.throws(
+          () => writeFileAtomicWithin(run, rel, "{}\n"),
+          (err) => err.reason === "containment-mode" && /detective/.test(String(err.message)),
+          `${rel} must be refused by the policy`,
+        )
+        assert.strictEqual(existsSync(join(run, rel)), false, `${rel} must not be written`)
+      }
+      assert.throws(
+        () => createDirWithin(run, "newdir"),
+        (err) => err.reason === "containment-mode",
+      )
+      assert.throws(
+        () => appendLineWithin(run, "events.jsonl", () => "{}\n"),
+        (err) => err.reason === "containment-mode",
+      )
+    })
+  } finally {
+    if (previous === undefined) delete process.env[envKey]
+    else process.env[envKey] = previous
+  }
+})
+
+check("containment-mode policy: default off keeps detective writes working", () => {
+  const { run } = makeFixture()
+  withDetectiveMode(() => {
+    writeFileAtomicWithin(run, "a.txt", "A")
+    writeFileAtomicWithin(run, "verify/b.json", "{}")
+    assert.strictEqual(readFileSync(join(run, "a.txt"), "utf8"), "A")
+  })
+})
+
+check("containment-mode policy: a per-run plan assertion refuses only that run", () => {
+  const first = makeFixture()
+  const second = makeFixture()
+  setRunRequirePinnedWrites(first.run, true)
+  try {
+    withDetectiveMode(() => {
+      assert.throws(
+        () => writeFileAtomicWithin(first.run, "state.json", "{}"),
+        (err) => err.reason === "containment-mode",
+      )
+      writeFileAtomicWithin(second.run, "state.json", "{}")
+      assert.strictEqual(readFileSync(join(second.run, "state.json"), "utf8"), "{}")
+    })
+  } finally {
+    setRunRequirePinnedWrites(first.run, false)
+  }
+})
+
+check("containment-mode policy: pinned mode satisfies the assertion", () => {
+  if (!PINNED) {
+    console.log("SKIP: pinned mode is unavailable on this host — policy success path not asserted")
+    return
+  }
+  const { run } = makeFixture()
+  const envKey = "OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES"
+  const previous = process.env[envKey]
+  process.env[envKey] = "1"
+  try {
+    writeFileAtomicWithin(run, "state.json", "{}\n")
+    assert.strictEqual(readFileSync(join(run, "state.json"), "utf8"), "{}\n")
+  } finally {
+    if (previous === undefined) delete process.env[envKey]
+    else process.env[envKey] = previous
+  }
+})
+
+check("containment-mode diagnostic: detective_mode is recorded once per run, not per write", () => {
+  const { run } = makeFixture()
+  withDetectiveMode(() => {
+    const before = recentWriteAnomalies().length
+    writeFileAtomicWithin(run, "one.txt", "1")
+    writeFileAtomicWithin(run, "two.txt", "2")
+    writeFileAtomicWithin(run, "three.txt", "3")
+    const modes = recentWriteAnomalies()
+      .slice(before)
+      .filter((a) => a.kind === "detective_mode" && a.run === run)
+    assert.strictEqual(modes.length, 1, `expected exactly one detective_mode diagnostic, got ${modes.length}`)
+    assert.strictEqual(modes[0].mode, "detective")
+  })
+})
+
+check("run-root identity: a signed manifest pins the root and a renamed/replaced root fails closed", () => {
+  const { root, run } = makeFixture()
+  const st = lstatSync(run)
+  writeFileSync(
+    join(run, "run.manifest.json"),
+    JSON.stringify({ version: 3, runRootIdentity: { dev: st.dev, ino: st.ino } }) + "\n",
+  )
+  assert.doesNotThrow(() => assertRunRootIdentity(run), "the matching root must pass")
+  renameSync(run, join(root, "run.moved"))
+  mkdirSync(run)
+  assert.throws(
+    () => assertRunRootIdentity(run),
+    (err) => err.reason === "identity-changed" && /run\.manifest|identity/i.test(String(err.message)),
+    "a replaced root must refuse the control-plane write",
+  )
+})
+
+check("run-root identity: a legacy manifest without the field is a no-op", () => {
+  const { run } = makeFixture()
+  writeFileSync(join(run, "run.manifest.json"), JSON.stringify({ version: 3 }) + "\n")
+  assert.doesNotThrow(() => assertRunRootIdentity(run))
 })
 
 check("identity: a filesystem reporting dev/ino 0 is refused by name", () => {
@@ -727,6 +1007,106 @@ check("Windows lexical policy: trailing dot/space, reserved devices, colon, and 
     assert.doesNotThrow(() => assertSingleSegment("CON"), "Linux behaviour must be unchanged")
   }
 })
+
+// ------------------------------------------- 13c. platform-native parity cases
+
+function writeThroughRunCaseVariant(label) {
+  const { root, run } = makeFixture()
+  const variant = join(root, basename(run).toUpperCase())
+  let caseInsensitive = false
+  try {
+    // Compare case-insensitively: some platforms canonicalise the on-disk case
+    // in realpath, others echo the caller's spelling.
+    caseInsensitive =
+      existsSync(variant) && realpathSync(variant).toLowerCase() === realpathSync(run).toLowerCase()
+  } catch {}
+  if (!caseInsensitive) {
+    console.log(`SKIP: ${label} — this runner's filesystem is case-sensitive; recorded`)
+    return
+  }
+  writeFileAtomicWithin(variant, "case-variant.txt", "CASE\n")
+  assert.strictEqual(readFileSync(join(run, "case-variant.txt"), "utf8"), "CASE\n")
+}
+
+if (process.platform === "darwin") {
+  check("darwin: a case-insensitive run spelling still writes through the real run", () => {
+    writeThroughRunCaseVariant("case-insensitive run spelling")
+  })
+
+  check("darwin: /tmp (symlink to /private/tmp) as the fixture root writes through the realpath", () => {
+    let tmpSymlinked = false
+    try {
+      tmpSymlinked = lstatSync("/tmp").isSymbolicLink()
+    } catch {}
+    console.log(
+      tmpSymlinked
+        ? "RECORD: /tmp is a symlink to /private/tmp; exercising the symlinked-root realpath"
+        : "RECORD: /tmp is not a symlink on this runner; the fixture still exercises a temp root",
+    )
+    const base = mkdtempSync(join("/tmp", "teamwork-safe-fs-tmp-"))
+    const run = join(base, "run")
+    mkdirSync(run, { recursive: true })
+    try {
+      writeFileAtomicWithin(run, "verify/report.json", "TMP\n")
+      assert.strictEqual(readFileSync(join(run, "verify", "report.json"), "utf8"), "TMP\n")
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  check("darwin: append through a final symlink is refused and the victim is untouched", () => {
+    const { run, outside } = makeFixture()
+    const victim = join(outside, "victim.md")
+    writeFileSync(victim, "ORIGINAL\n")
+    if (!makeTestLink(victim, join(run, "pitfalls.md"), "file")) return
+    assert.throws(() => appendLineWithin(run, "pitfalls.md", () => "{}\n"), /refused|symlink/i)
+    assert.strictEqual(readFileSync(victim, "utf8"), "ORIGINAL\n")
+  })
+
+  check("darwin: the run root reports non-zero dev/ino", () => {
+    const { run } = makeFixture()
+    const runStat = lstatSync(run)
+    assert.notStrictEqual(runStat.dev, 0, "run root dev must be reported")
+    assert.notStrictEqual(runStat.ino, 0, "run root ino must be reported")
+    writeFileAtomicWithin(run, "identity.json", "{}\n")
+    const fileStat = lstatSync(join(run, "identity.json"))
+    assert.notStrictEqual(fileStat.dev, 0)
+    assert.notStrictEqual(fileStat.ino, 0)
+  })
+} else if (process.platform === "win32") {
+  check("win32: a junction to an outside directory is refused by the writer", () => {
+    const { run, outside } = makeFixture()
+    if (!makeTestLink(outside, join(run, "verify"), "dir")) return
+    assert.throws(() => writeFileAtomicWithin(run, "verify/x.json", "NO"), /refused/)
+    assert.strictEqual(existsSync(join(outside, "x.json")), false)
+  })
+
+  check("win32: '.. ', CON, and ADS segments are refused by the lexical policy", () => {
+    const { run } = makeFixture()
+    for (const bad of [".. ", "CON", "LPT1.txt", "file.txt:stream", "trailing."]) {
+      assert.throws(() => assertSingleSegment(bad), /invalid single path segment|refused/i, `"${bad}" must be refused`)
+    }
+    assert.throws(() => writeFileAtomicWithin(run, "CON", "NO"), /invalid single path segment|refused/i)
+    assert.strictEqual(existsSync(join(run, "CON")), false)
+  })
+
+  check("win32: a case-varied run path still writes", () => {
+    writeThroughRunCaseVariant("case-varied run path")
+  })
+
+  check("win32: the run root reports non-zero dev/ino", () => {
+    const { run } = makeFixture()
+    const runStat = lstatSync(run)
+    assert.notStrictEqual(runStat.dev, 0, "run root dev must be reported")
+    assert.notStrictEqual(runStat.ino, 0, "run root ino must be reported")
+    writeFileAtomicWithin(run, "identity.json", "{}\n")
+    const fileStat = lstatSync(join(run, "identity.json"))
+    assert.notStrictEqual(fileStat.dev, 0)
+    assert.notStrictEqual(fileStat.ino, 0)
+  })
+} else {
+  console.log("SKIP: platform-native darwin/win32 containment cases are not applicable on linux (recorded)")
+}
 
 // ------------------------------------------------- 14. release / mkdir races
 

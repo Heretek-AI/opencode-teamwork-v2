@@ -397,7 +397,83 @@ export function readBoundedRunJson<T = any>(
   }
 }
 
+const RUN_MANIFEST_FILE = "run.manifest.json"
+const MAX_SIGNED_MANIFEST_BYTES = 64 * 1024
+const manifestRootIdentityCache = new Map<
+  string,
+  { mtimeMs: number; size: number; identity: { dev: number; ino: number } | null }
+>()
+// Once a run is observed to have a signed root identity, a later missing
+// manifest at the old path is a fail-closed condition (the run root was renamed
+// or removed under us), not "a new run".
+const knownRootIdentities = new Map<string, { dev: number; ino: number }>()
+
+function refuseRunRootIdentity(run: string): never {
+  const err: any = new Error(
+    `refused: [identity-changed] the run root "${basename(run)}" no longer matches the (dev, ino) recorded in the signed run.manifest.json; the control-plane write is not trusted`,
+  )
+  err.reason = "identity-changed"
+  err.code = "EREFUSED"
+  throw err
+}
+
+/**
+ * ADR 0013: a signed manifest records the run-root `(dev, ino)` at plan time.
+ * Re-check it before a control-plane write. A renamed/replaced root fails
+ * closed; a legacy/unsigned manifest (no field) is a no-op. The read is bounded
+ * and cached by the manifest's mtime/size, so a re-plan re-reads naturally.
+ */
+export function assertRunRootIdentity(run: string): void {
+  const key = resolve(run)
+  const manifestPath = join(key, RUN_MANIFEST_FILE)
+  let manifestStat
+  try {
+    manifestStat = lstatSync(manifestPath)
+  } catch {
+    if (knownRootIdentities.has(key)) refuseRunRootIdentity(key)
+    return
+  }
+  if (manifestStat.isSymbolicLink() || !manifestStat.isFile()) {
+    if (knownRootIdentities.has(key)) refuseRunRootIdentity(key)
+    return
+  }
+  let identity: { dev: number; ino: number } | null = null
+  const cached = manifestRootIdentityCache.get(key)
+  if (cached && cached.mtimeMs === manifestStat.mtimeMs && cached.size === manifestStat.size) {
+    identity = cached.identity
+  } else {
+    const res = readBoundedRunJson<any>(key, manifestPath, MAX_SIGNED_MANIFEST_BYTES)
+    const raw = res.status === "ok" ? res.value?.runRootIdentity : undefined
+    if (
+      raw &&
+      Number.isFinite(raw.dev) &&
+      Number.isFinite(raw.ino) &&
+      raw.dev !== 0 &&
+      raw.ino !== 0
+    ) {
+      identity = { dev: raw.dev, ino: raw.ino }
+    }
+    manifestRootIdentityCache.set(key, {
+      mtimeMs: manifestStat.mtimeMs,
+      size: manifestStat.size,
+      identity,
+    })
+  }
+  if (identity) knownRootIdentities.set(key, identity)
+  if (!identity) return
+  let rootStat
+  try {
+    rootStat = lstatSync(key)
+  } catch {
+    refuseRunRootIdentity(key)
+  }
+  if (rootStat.isSymbolicLink() || rootStat.dev !== identity.dev || rootStat.ino !== identity.ino) {
+    refuseRunRootIdentity(key)
+  }
+}
+
 export function writeSafeRunFile(run: string, targetPath: string, content: string): void {
+  assertRunRootIdentity(run)
   // Keep the path-level policy and its exact error text: `ensureSafeRunSubpath`
   // refuses symlinks/escapes before any syscall and is the documented contract
   // for this writer.

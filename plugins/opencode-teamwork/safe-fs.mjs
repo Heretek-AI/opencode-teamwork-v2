@@ -317,6 +317,123 @@ export function setFdTraversalModeForTest(mode) {
     mode === "pinned" || mode === "detective" || mode === "fail-closed" ? mode : null
 }
 
+// ---------------------------------------------------------------------------
+// Fail-closed policy (ADR 0013)
+// ---------------------------------------------------------------------------
+//
+// `OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES=1` (or a plan's
+// `requirePinnedWrites: true`) asserts that this run only accepts *pinned*
+// control-plane writes. On a host whose traversal mode is `detective` (macOS /
+// Windows) or `fail-closed` the writer refuses by name (`containment-mode`)
+// instead of silently accepting a detective write. Default off: platforms keep
+// the documented detective behaviour unless the operator asks for the policy.
+
+export const REQUIRE_PINNED_WRITES_ENV = "OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES"
+
+const pinnedRequiredRuns = new Set()
+let requirePinnedWritesOverride = null
+
+function envFlagEnabled(raw) {
+  const value = String(raw ?? "").trim().toLowerCase()
+  return value === "1" || value === "true" || value === "yes" || value === "on"
+}
+
+/** True when the env policy is asserted (test override wins when set). */
+export function requirePinnedWritesEnabled(env = process.env) {
+  if (requirePinnedWritesOverride !== null) return requirePinnedWritesOverride
+  return envFlagEnabled(env?.[REQUIRE_PINNED_WRITES_ENV])
+}
+
+/** Test seam: force the env policy on/off (or null to clear). */
+export function setRequirePinnedWritesForTest(enabled) {
+  requirePinnedWritesOverride = typeof enabled === "boolean" ? enabled : null
+}
+
+/** Register a plan's `requirePinnedWrites` for one run in this process. */
+export function setRunRequirePinnedWrites(run, enabled) {
+  let key
+  try {
+    key = resolve(String(run))
+  } catch {
+    return
+  }
+  if (enabled === true) pinnedRequiredRuns.add(key)
+  else pinnedRequiredRuns.delete(key)
+}
+
+/** True when this run's writes must be pinned. */
+export function runRequiresPinnedWrites(run) {
+  if (requirePinnedWritesEnabled()) return true
+  let key
+  try {
+    key = resolve(String(run))
+  } catch {
+    return false
+  }
+  return pinnedRequiredRuns.has(key)
+}
+
+/**
+ * Refuse a run write when the pinned-write policy is asserted and the host's
+ * traversal mode is not `pinned`. `options.requirePinnedWrites: true` can
+ * assert the policy for one call; `false` clears a per-run plan flag but never
+ * an env assertion.
+ */
+export function assertPinnedWritePolicy(run, options = {}) {
+  const envOn = requirePinnedWritesEnabled()
+  let runOn = false
+  if (!envOn && options.requirePinnedWrites !== true) {
+    let key
+    try {
+      key = resolve(String(run))
+    } catch {
+      key = null
+    }
+    runOn = key !== null && options.requirePinnedWrites !== false && pinnedRequiredRuns.has(key)
+  }
+  if (!envOn && !runOn && options.requirePinnedWrites !== true) return
+  const mode = currentTraversalMode()
+  if (mode === "pinned") return
+  recordWriteAnomaly({
+    kind: "containment-mode",
+    run: typeof run === "string" ? run : null,
+    mode,
+    detail: `${REQUIRE_PINNED_WRITES_ENV}/requirePinnedWrites is asserted, but write containment is "${mode}"`,
+  })
+  throw refusalError(
+    "containment-mode",
+    `refused: this run requires pinned write containment (${REQUIRE_PINNED_WRITES_ENV}/requirePinnedWrites), but this host's write containment mode is "${mode}"; nothing was written`,
+  )
+}
+
+// One `detective_mode` diagnostic per run, never per write. It is diagnostic
+// only: the write itself is still governed by the detective checks below.
+const MAX_MODE_DIAGNOSTIC_RUNS = 512
+const modeDiagnosticRuns = new Set()
+
+export function noteTraversalModeForRun(run) {
+  const mode = currentTraversalMode()
+  if (mode === "pinned") return
+  let key
+  try {
+    key = resolve(String(run))
+  } catch {
+    return
+  }
+  if (modeDiagnosticRuns.has(key)) return
+  if (modeDiagnosticRuns.size >= MAX_MODE_DIAGNOSTIC_RUNS) {
+    const oldest = modeDiagnosticRuns.values().next().value
+    if (oldest !== undefined) modeDiagnosticRuns.delete(oldest)
+  }
+  modeDiagnosticRuns.add(key)
+  recordWriteAnomaly({
+    kind: "detective_mode",
+    run: key,
+    mode,
+    detail: `write containment on this host is "${mode}"; post-write identity checks are detective, not preventive`,
+  })
+}
+
 /** Recent write anomalies (bounded ring, oldest first). */
 export function recentWriteAnomalies(limit = MAX_WRITE_ANOMALIES) {
   const n = Math.max(0, Math.min(MAX_WRITE_ANOMALIES, Math.trunc(limit) || MAX_WRITE_ANOMALIES))
@@ -840,6 +957,8 @@ function pinOrThrow(run, relPath, create, mode) {
 
 /** Atomic write of `content` to `run/relPath` with pinned-fd containment. */
 export function writeFileAtomicWithin(run, relPath, content, options = {}) {
+  assertPinnedWritePolicy(run, options)
+  noteTraversalModeForRun(run)
   const mode = options.mode ?? currentTraversalMode()
   if (mode === "detective") return writeFileAtomicDetective(run, relPath, content, options)
   const pin = pinOrThrow(run, relPath, options.createDirs !== false, mode)
@@ -855,6 +974,8 @@ export function writeFileAtomicWithin(run, relPath, content, options = {}) {
 
 /** Write `run/relPath` once. `EEXIST` is propagated to the caller. */
 export function writeOnceWithin(run, relPath, content, options = {}) {
+  assertPinnedWritePolicy(run, options)
+  noteTraversalModeForRun(run)
   const mode = options.mode ?? currentTraversalMode()
   if (mode === "detective") return writeOnceDetective(run, relPath, content, options)
   const pin = pinOrThrow(run, relPath, options.createDirs !== false, mode)
@@ -870,6 +991,8 @@ export function writeOnceWithin(run, relPath, content, options = {}) {
 
 /** Create `run/relPath` only if absent; `EEXIST` is a no-op. */
 export function touchWithin(run, relPath, content, options = {}) {
+  assertPinnedWritePolicy(run, options)
+  noteTraversalModeForRun(run)
   const mode = options.mode ?? currentTraversalMode()
   if (mode === "detective") return touchDetective(run, relPath, content, options)
   const pin = pinOrThrow(run, relPath, options.createDirs !== false, mode)
@@ -889,6 +1012,8 @@ export function touchWithin(run, relPath, content, options = {}) {
  * sequence number computed from it is read from the same inode.
  */
 export function appendLineWithin(run, relPath, buildLineFromFd, options = {}) {
+  assertPinnedWritePolicy(run, options)
+  noteTraversalModeForRun(run)
   const mode = options.mode ?? currentTraversalMode()
   if (mode === "detective") return appendLineDetective(run, relPath, buildLineFromFd, options)
   const pin = pinOrThrow(run, relPath, true, mode)
@@ -904,6 +1029,8 @@ export function appendLineWithin(run, relPath, buildLineFromFd, options = {}) {
 
 /** Remove `run/relPath` through a pinned parent (best-effort ENOENT). */
 export function unlinkWithin(run, relPath, options = {}) {
+  assertPinnedWritePolicy(run, options)
+  noteTraversalModeForRun(run)
   const mode = options.mode ?? currentTraversalMode()
   if (mode === "detective") {
     // A delete never creates parent directories as a side effect. A missing
@@ -915,6 +1042,7 @@ export function unlinkWithin(run, relPath, options = {}) {
       if (err?.reason === "absent") return false
       throw err
     }
+    verifyAncestorIdentities(target, "pre-unlink")
     try {
       unlinkSync(target.dest)
     } catch (err) {
@@ -922,6 +1050,7 @@ export function unlinkWithin(run, relPath, options = {}) {
       throw err
     }
     if (typeof options.afterUnlink === "function") options.afterUnlink({ dest: target.dest })
+    verifyAncestorIdentities(target, "post-unlink")
     try {
       const parentReal = realpathSync(dirname(target.dest))
       if (parentReal !== target.runReal && !isPathWithin(target.runReal, parentReal)) {
@@ -962,6 +1091,8 @@ export function unlinkWithin(run, relPath, options = {}) {
  * the next one is created relative to that pinned descriptor.
  */
 export function createDirWithin(run, relPath, options = {}) {
+  assertPinnedWritePolicy(run, options)
+  noteTraversalModeForRun(run)
   const mode = options.mode ?? currentTraversalMode()
   if (mode === "fail-closed") {
     throw refusalError(
@@ -971,8 +1102,11 @@ export function createDirWithin(run, relPath, options = {}) {
   }
   if (mode === "detective") {
     const target = detectiveTarget(run, relPath)
+    if (typeof options.afterTarget === "function") options.afterTarget({ dest: target.dest, run: target.run })
+    verifyAncestorIdentities(target, "pre-create-dir")
     mkdirSync(target.dest, { recursive: true })
     if (typeof options.afterCreate === "function") options.afterCreate({ dest: target.dest })
+    verifyAncestorIdentities(target, "post-create-dir")
     try {
       const createdReal = realpathSync(target.dest)
       if (createdReal !== target.runReal && !isPathWithin(target.runReal, createdReal)) {
@@ -1030,6 +1164,187 @@ export function createDirWithin(run, relPath, options = {}) {
 // is detective only: a transient intermediate swap that is reverted before the
 // post-write checks can be missed. On Linux without procfs writes fail closed
 // instead; this code is never selected there by default.
+//
+// ADR 0013 (detective parity): before any mutation the writer records the
+// (dev, ino) of the run root and every existing component between it and the
+// destination, re-stats each of them immediately before the create/rename/
+// unlink, and again in the post-check. A mismatch is a named `identity-changed`
+// refusal (fail closed). That detects a renamed or replaced run root and an
+// ancestor swapped for a different directory. It still cannot prevent a
+// transient swap that is reverted before the check, so this remains detective.
+
+// The pin is bounded; the run root is always kept and the closest components
+// win when a deep path would exceed the cap.
+const MAX_DETECTIVE_ANCESTOR_PINS = 32
+let darwinRootFdCheckOverride = null
+
+/** Test seam: run the darwin run-root fd identity check on any host. */
+export function setDarwinRootFdCheckForTest(enabled) {
+  darwinRootFdCheckOverride = enabled === true ? true : enabled === false ? false : null
+}
+
+function identityPair(stat, label) {
+  if (!stat || stat.dev === 0 || stat.ino === 0) {
+    recordWriteAnomaly({
+      kind: "identity-unavailable",
+      detail: `${label} reports dev=0 or ino=0; identity containment cannot be verified`,
+    })
+    throw refusalError(
+      "identity-unavailable",
+      `refused: ${label} has no stable (dev, ino) identity; the write cannot be verified`,
+    )
+  }
+  return { dev: stat.dev, ino: stat.ino }
+}
+
+/**
+ * Record the identity of the run root and every existing ancestor component of
+ * the destination. Refuses a symlink component (never follows one while
+ * pinning) and an unreadable component; both are `identity-changed` so the
+ * caller sees one named refusal for "the tree moved".
+ */
+function pinAncestorIdentities(runRoot, runReal, dest, run) {
+  const chain = [runReal]
+  // Derive the relative components from the lexical root (which contains
+  // `dest`) and re-root them at the real run path. Comparing runReal to dest
+  // directly is wrong when an ancestor above the run is a symlink or an 8.3
+  // short name: macOS `/var` -> `/private/var`, Windows `RUNNER~1`, and any
+  // symlinked temp root all make the lexical and real trees differ.
+  let relDir
+  try {
+    relDir = relative(runRoot, dirname(dest))
+  } catch {
+    relDir = null
+  }
+  if (relDir && relDir !== "." && relDir !== ".." && !relDir.startsWith(`..${sep}`) && !isAbsolute(relDir)) {
+    let cur = runReal
+    for (const segment of relDir.split(sep).filter((part) => part !== "")) {
+      cur = resolve(cur, segment)
+      chain.push(cur)
+    }
+  }
+  let kept = chain
+  if (kept.length > MAX_DETECTIVE_ANCESTOR_PINS) {
+    kept = [chain[0], ...chain.slice(chain.length - (MAX_DETECTIVE_ANCESTOR_PINS - 1))]
+  }
+  const pins = []
+  for (const path of kept) {
+    let stat
+    try {
+      stat = lstatSync(path)
+    } catch (err) {
+      recordWriteAnomaly({
+        kind: "detective-identity-changed",
+        run: run ?? null,
+        name: basename(path),
+        detail: `pin: "${basename(path)}" cannot be re-stated (${err?.code || "unreadable"})`,
+      })
+      throw refusalError(
+        "identity-changed",
+        `refused: the run tree moved while pinning "${sanitize(basename(path))}"; nothing was written`,
+      )
+    }
+    if (stat.isSymbolicLink()) {
+      recordWriteAnomaly({
+        kind: "detective-identity-changed",
+        run: run ?? null,
+        name: basename(path),
+        detail: `pin: "${basename(path)}" is a symlink; an ancestor identity cannot be pinned through it`,
+      })
+      throw refusalError(
+        "identity-changed",
+        `refused: "${sanitize(basename(path))}" is a symlink; refusing to pin an ancestor through it`,
+      )
+    }
+    if (!stat.isDirectory()) {
+      recordWriteAnomaly({
+        kind: "detective-identity-changed",
+        run: run ?? null,
+        name: basename(path),
+        detail: `pin: "${basename(path)}" is not a directory`,
+      })
+      throw refusalError("identity-changed", `refused: "${sanitize(basename(path))}" is not a directory`)
+    }
+    pins.push({ path, ...identityPair(stat, `ancestor "${basename(path)}"`) })
+  }
+  return pins
+}
+
+function identityRefusal(target, phase, label, detail) {
+  recordWriteAnomaly({
+    kind: "detective-identity-changed",
+    run: target.run ?? null,
+    name: target.name,
+    detail: `${phase}: ${detail}`,
+  })
+  throw refusalError(
+    "identity-changed",
+    `refused: "${sanitize(target.name)}" — ${sanitize(label)} changed identity (${phase}); the write is not trusted`,
+  )
+}
+
+/**
+ * Compare the pinned run-root/ancestor identities before a mutation and after
+ * it. On darwin the run root is additionally opened as a directory, fstat'ed
+ * and compared with the pinned path identity (identity confidence, not
+ * prevention); the descriptor is always closed in `finally`.
+ */
+function verifyAncestorIdentities(target, phase) {
+  for (const pin of target.ancestors) {
+    let stat
+    try {
+      stat = lstatSync(pin.path)
+    } catch (err) {
+      identityRefusal(target, phase, basename(pin.path), `cannot be re-stated (${err?.code || "unreadable"})`)
+    }
+    if (stat.isSymbolicLink()) {
+      identityRefusal(target, phase, basename(pin.path), "is now a symlink")
+    }
+    if (stat.dev !== pin.dev || stat.ino !== pin.ino) {
+      identityRefusal(
+        target,
+        phase,
+        basename(pin.path),
+        `(dev, ino) is now ${stat.dev}:${stat.ino}, pinned ${pin.dev}:${pin.ino}`,
+      )
+    }
+  }
+  if (process.platform === "darwin" || darwinRootFdCheckOverride === true) {
+    const rootPin = target.ancestors.find((pin) => pin.path === target.runReal)
+    if (rootPin) {
+      let fd = null
+      try {
+        fd = openSync(
+          target.runReal,
+          fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY || 0) | (fsConstants.O_NOFOLLOW || 0),
+        )
+        const opened = fstatSync(fd)
+        if (opened.dev !== rootPin.dev || opened.ino !== rootPin.ino) {
+          identityRefusal(
+            target,
+            phase,
+            "run root descriptor",
+            `fd (dev, ino) is ${opened.dev}:${opened.ino}, pinned ${rootPin.dev}:${rootPin.ino}`,
+          )
+        }
+      } catch (err) {
+        if (err?.code === "EREFUSED") throw err
+        identityRefusal(
+          target,
+          phase,
+          "run root descriptor",
+          `cannot be opened for identity confirmation (${err?.code || "unreadable"})`,
+        )
+      } finally {
+        if (fd !== null) {
+          try {
+            closeSync(fd)
+          } catch {}
+        }
+      }
+    }
+  }
+}
 
 function detectiveTarget(run, relPath, options = {}) {
   const runRoot = resolve(run)
@@ -1086,11 +1401,13 @@ function detectiveTarget(run, relPath, options = {}) {
   if (dirReal !== runReal && !isPathWithin(runReal, dirReal)) {
     throw refusalError("containment", "refused: target parent is outside the run realpath")
   }
-  return { dest, dirReal, runReal, run, name: segments[segments.length - 1], segments }
+  const ancestors = pinAncestorIdentities(runRoot, runReal, dest, run)
+  return { dest, dirReal, runReal, run, name: segments[segments.length - 1], segments, ancestors }
 }
 
 function detectivePostCheck(target, recorded) {
   try {
+    verifyAncestorIdentities(target, "post-write")
     const dirReal = realpathSync(dirname(target.dest))
     if (dirReal !== target.runReal && !isPathWithin(target.runReal, dirReal)) {
       recordWriteAnomaly({
@@ -1130,6 +1447,10 @@ function writeFileAtomicDetective(run, relPath, content, options) {
   let fd = null
   let recorded = null
   try {
+    if (typeof options.afterTarget === "function") {
+      options.afterTarget({ dest: target.dest, tempPath: temp, run: target.run })
+    }
+    verifyAncestorIdentities(target, "pre-create")
     fd = openSync(temp, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600)
     writeAllSync(fd, data)
     const st = fstatSync(fd)
@@ -1138,6 +1459,10 @@ function writeFileAtomicDetective(run, relPath, content, options) {
     if (options.durable !== false) fsyncSync(fd)
     closeSync(fd)
     fd = null
+    if (typeof options.afterTemp === "function") {
+      options.afterTemp({ dest: target.dest, tempPath: temp, run: target.run })
+    }
+    verifyAncestorIdentities(target, "pre-rename")
     renameSync(temp, target.dest)
     if (typeof options.afterRename === "function") {
       options.afterRename({ dirFd: null, tempName: temp, destName: target.name, destPath: target.dest })
@@ -1164,6 +1489,10 @@ function writeOnceDetective(run, relPath, content, options) {
   let fd = null
   let recorded = null
   try {
+    if (typeof options.afterTarget === "function") {
+      options.afterTarget({ dest: target.dest, run: target.run })
+    }
+    verifyAncestorIdentities(target, "pre-create")
     fd = openSync(target.dest, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600)
     writeAllSync(fd, data)
     const st = fstatSync(fd)
@@ -1200,6 +1529,10 @@ function appendLineDetective(run, relPath, buildLineFromFd, options) {
   let fd = null
   let recorded = null
   try {
+    if (typeof options.afterTarget === "function") {
+      options.afterTarget({ dest: target.dest, run: target.run })
+    }
+    verifyAncestorIdentities(target, "pre-append")
     if (nofollow === 0) {
       // Windows has no O_NOFOLLOW: refuse a symlink at the final component
       // immediately before the open. This check is not atomic, but it closes
@@ -1261,6 +1594,7 @@ function appendLineDetective(run, relPath, buildLineFromFd, options) {
     writeAllSync(fd, Buffer.from(line, "utf8"))
     if (options.durable !== false) fsyncSync(fd)
     if (typeof options.afterAppend === "function") options.afterAppend({ fd, dest: target.dest })
+    verifyAncestorIdentities(target, "post-append")
     // Post-write identity against the descriptor that was actually opened.
     let after
     try {

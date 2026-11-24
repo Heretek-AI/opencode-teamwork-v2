@@ -211,6 +211,11 @@ try {
   // 3. Command signer: happy path and every fail-closed branch
   // ==========================================================================
   {
+    if (process.platform === "win32") {
+      console.log(
+        "SKIP: the command signer protocol needs a shebang-executable script; this runner cannot execute one. Recorded; Linux/macOS cover the protocol.",
+      )
+    } else {
     console.log("Testing the command signer protocol...")
     const keys = generatedEd25519()
     const keyId = signerKeyId(keys.publicKey)
@@ -286,6 +291,7 @@ try {
     )
 
     console.log("✓ command signer happy path verifies publicly; malformed, bad-sig, timeout, missing, and relative paths fail closed")
+    }
   }
 
   // ==========================================================================
@@ -294,6 +300,9 @@ try {
   {
     console.log("Testing the witness adapter...")
     const keys = generatedEd25519()
+    if (process.platform === "win32") {
+      console.log("SKIP: a command witness needs a shebang-executable script; this runner cannot execute one. Recorded.")
+    } else {
     const witnessPath = witnessScript("ok")
     const witnessAuth = context({
       OPENCODE_TEAMWORK_ED25519_PRIVATE_KEY: keys.privateKey,
@@ -317,6 +326,7 @@ try {
       missingCode = err?.failure?.code
     }
     assert.strictEqual(missingCode, "AUTH_WITNESS_UNAVAILABLE", "a witness without a receipt must fail closed")
+    }
 
     // HTTP witness: a tiny loopback server returns a receipt.
     const server = createServer((req, res) => {

@@ -97,6 +97,30 @@ mode, SELinux). A knowable problem is a
 `unknown`; plain `doctor --security` is advisory (exit 0 with a warning
 summary). The doctor does not turn a warning into protection.
 
+### Write containment is preventive on Linux, detective elsewhere
+
+Run-artifact writers are **preventive** only on Linux with a usable
+`/proc/self/fd`: the destination parent is pinned once and every create, mkdir,
+rename, write, lstat and unlink is relative to that descriptor (ADR 0010).
+**Linux without procfs fails closed**; nothing is written. **macOS and Windows
+are detective**: there is no pure-JS dir-relative write without a native addon,
+so the writer keeps the path-based atomic write and checks. 0.13.0 records the
+run root and every existing ancestor `(dev, ino)` at target time, re-stats them
+before the create/rename/unlink and in the post-check, refuses a mismatch as
+`identity-changed`, and records the run-root identity in the signed
+`run.manifest.json` for a re-check before control-plane writes. A detected swap
+is a report about an event that already happened, not a prevented one: bytes may
+already be outside the run and are not rolled back, and a transient swap that is
+reverted before the check can be missed. A legitimately renamed run root fails
+closed.
+
+`OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES=1` (or a plan's
+`requirePinnedWrites: true`) makes the policy explicit: on a host whose mode is
+not `pinned`, **control-plane writes are refused** with a named
+`containment-mode` refusal. It is off by default. `doctor --security` reports
+the mode and the env setting; an asserted policy on a non-pinned host is a
+failure, so `--require-hardened` exits 2.
+
 ## Trust levels
 
 `teamwork_plan` accepts `trustLevel` (default `local-hmac`). The level is

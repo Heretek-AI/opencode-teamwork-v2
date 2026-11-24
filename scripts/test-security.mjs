@@ -219,6 +219,54 @@ try {
   }
 
   // ==========================================================================
+  // 3b. Containment mode, the pinned-write policy, and the hardened profile
+  // ==========================================================================
+  {
+    console.log("Testing containment mode and REQUIRE_PINNED_WRITES visibility...")
+    const pinned = collectSecurityReport(allPassOptions({ env: { OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: "fixture-public-key" } }))
+    const pinnedCheck = pinned.checks.find((c) => c.name === "containment")
+    assert.strictEqual(pinnedCheck.status, "pass", pinnedCheck.message)
+    assert(/fdTraversalMode=pinned/.test(pinnedCheck.message), pinnedCheck.message)
+    assert(/OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES=0/.test(pinnedCheck.message), pinnedCheck.message)
+
+    // Detective by default: advisory only, so the hardened profile is untouched.
+    const detectiveDefault = collectSecurityReport(
+      allPassOptions({ containmentMode: "detective", env: { OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: "fixture-public-key" } }),
+    )
+    const defaultCheck = detectiveDefault.checks.find((c) => c.name === "containment")
+    assert.strictEqual(defaultCheck.status, "warn", defaultCheck.message)
+    assert(/fdTraversalMode=detective/.test(defaultCheck.message), defaultCheck.message)
+    assert(/OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES=0/.test(defaultCheck.message), defaultCheck.message)
+    assert.strictEqual(hardenedExitCode(detectiveDefault), 0, "a mere detective warning must not hard-fail")
+
+    // The policy is asserted but the host cannot satisfy it: fail, exit 2.
+    const asserted = collectSecurityReport(
+      allPassOptions({
+        containmentMode: "detective",
+        env: { OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES: "1", OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: "fixture-public-key" },
+      }),
+    )
+    const assertedCheck = asserted.checks.find((c) => c.name === "containment")
+    assert.strictEqual(assertedCheck.status, "fail", assertedCheck.message)
+    assert(/fdTraversalMode=detective/.test(assertedCheck.message), assertedCheck.message)
+    assert(/OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES=1/.test(assertedCheck.message), assertedCheck.message)
+    assert(/requirePinnedWrites is asserted/.test(assertedCheck.message), assertedCheck.message)
+    assert.strictEqual(hardenedExitCode(asserted), 2, "an asserted policy on a detective host must fail --require-hardened")
+
+    // Pinned + the policy is satisfied.
+    const satisfied = collectSecurityReport(
+      allPassOptions({
+        containmentMode: "pinned",
+        env: { OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES: "1", OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: "fixture-public-key" },
+      }),
+    )
+    assert.strictEqual(satisfied.checks.find((c) => c.name === "containment").status, "pass")
+    assert.strictEqual(hardenedExitCode(satisfied), 0)
+
+    console.log("✓ doctor reports the containment mode and env setting; an asserted policy on a detective host fails hardened")
+  }
+
+  // ==========================================================================
   // 4. Claim lint: forbidden phrase fails, a negated boundary note passes
   // ==========================================================================
   {
