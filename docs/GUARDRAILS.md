@@ -105,7 +105,11 @@ remove the sharpest edges.
   draft, that the displayed text matched the bytes hashed, or that the approval
   body is accurate. A single-UID host cannot satisfy the different-owner
   requirement at all, and the CLI's typed confirmation is not human-presence
-  enforcement.
+  enforcement. The administrator-only deployment steps (separate signer UID,
+  root-owned signer, socket service, audit rules, SELinux labels, verification)
+  are in [ADMIN-HARDENING.md](ADMIN-HARDENING.md); the v2 signer contract and
+  the plugin change it requires are in [SIGNER-PROTOCOL.md](SIGNER-PROTOCOL.md).
+  They are not in-process controls and are not enforced by the plugin.
   Free-form inputs that are not control-plane verdicts (`state.json` task
   summaries, `pitfalls.md`, `prompt_draft.md`, spec text) remain untrusted and
   are sanitised before injection, not authenticated. **Handoff prose is in the
