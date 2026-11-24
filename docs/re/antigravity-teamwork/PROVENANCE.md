@@ -3,7 +3,7 @@
 ## What This Corpus Is [OBSERVED]
 
 - This corpus is reverse-engineering notes plus recovered material about a third-party proprietary product (the Google Antigravity Linux CLI, focused on the `/teamwork` command). [OBSERVED]
-- The core is static analysis of the archive and extracted binary. Two later evidence classes are labelled separately: shipped builtin source read directly (`09`) and runtime observation of the installed CLI (`07`, `11`, `12`, `13`, `14`, `15`, `16`). The runtime runs are **not** all on one binary: `07`/`12`/`13` ran 1.5.14; `15`/`16` ran 1.5.15; `14` ran a version that is `UNKNOWN` because it predates the earliest surviving server log. See *version axes* below. [OBSERVED]
+- The core is static analysis of the archive and extracted binary. Two later evidence classes are labelled separately: shipped builtin source read directly (`09`) and runtime observation of the installed CLI (`07`, `11`, `12`, `13`, `14`, `15`, `16`, `17`). The runtime runs are **not** all on one binary: `07`/`12`/`13` ran 1.5.14; `15`/`16` ran 1.5.15; `17` is a **zero-turn probe on 1.5.16** (slash-command expansion only, no model call); `14` ran a version that is `UNKNOWN` because it predates the earliest surviving server log. See *version axes* below. [OBSERVED]
 
 ## Source Identity [OBSERVED]
 
@@ -24,7 +24,7 @@ Three binaries are in play, and this corpus keeps all three apart. They form **t
 
 ### Version axes [OBSERVED / INFERRED]
 
-- **1.5.16 is the live axis.** It is the installed binary from 2026-11-24 14:02:08 −05:00 onward and is the only build a new live capture can run. **No live `/teamwork` run on 1.5.16 exists in this corpus**; the version is adopted as the live axis for identity and reproduction, not as new evidence about behaviour. [OBSERVED — `sha256sum`, `stat`; absence of a run is a corpus fact]
+- **1.5.16 is the live axis.** It is the installed binary from 2026-11-24 14:02:08 −05:00 onward and is the only build a new live capture can run. **No live `/teamwork` workflow run on 1.5.16 exists in this corpus**; `17` records a **zero-turn config-gate probe** that binds the hash, size and version line to one observed process and observes the slash-command expansion, but takes no model turn, starts no route and writes no state tree. The version is therefore adopted as the live axis for identity and reproduction, not as new evidence about workflow behaviour. [OBSERVED — `sha256sum`, `stat`, run log line; absence of a workflow run is a corpus fact]
 - **1.5.15 is a historical axis.** The 2026-11-23 runs `15` (LEMMA gate) and `16` (interview gate) executed 1.5.15. [OBSERVED — server log line 3 of each run's log, plus the `agy --version` recorded then]
 - **1.5.14 is the static axis.** Every decimal file offset in `00`–`06`, `09` and `prompts/sentinel-routing.md` is a 1.5.14 offset. On 1.5.15 the sentinel prompt started at 113,300,479 (+58,770); on 1.5.16 it starts at 113,868,721 (+627,012 against 1.5.14, +568,242 against 1.5.15). The builtin tree `.checksum` changed at each step. [OBSERVED — byte comparison; `diff -rq` for the builtin tree where both trees were present]
 - **What does not change.** The sentinel prompt slice is **byte-identical** across all three binaries — 36,482 bytes, SHA-256 `3e8c347eb2db6059ef9f010873062c41bc7d95fd640746674b4caddd0fabf4c1` — so prompt-level behaviour observed on any of the three versions is comparable. [OBSERVED — sliced 1.5.14 and 1.5.16 in this pass; the 1.5.15 slice was compared in the earlier pass and the digest matches the recorded one]
@@ -55,7 +55,7 @@ Artifact facts in this section are [OBSERVED]; the licensing paragraph below is 
 
 ## Method Disclosure [OBSERVED]
 
-- Static extraction [OBSERVED]: `readelf`, `strings`, `grep -aob`, `xxd`, `go1.27.4-X:nodwarf5`, `objdump`, `radare2`, and Ghidra were used for the artifact. Runtime evidence (`07`, `11`, `12`, `13`, `14`, `15`, `16`) was produced by executing the installed CLI in print mode (`14` is an exception: it reads a completed prior run's state tree and transcripts, and its CLI version is `UNKNOWN`); shipped-source evidence (`09`) was read from the materialised builtin tree (`assets/builtin/`, captured at 1.5.14). The evidence class is stated per claim. [OBSERVED]
+- Static extraction [OBSERVED]: `readelf`, `strings`, `grep -aob`, `xxd`, `go1.27.4-X:nodwarf5`, `objdump`, `radare2`, and Ghidra were used for the artifact. Runtime evidence (`07`, `11`, `12`, `13`, `14`, `15`, `16`, `17`) was produced by executing the installed CLI in print mode (`14` is an exception: it reads a completed prior run's state tree and transcripts, and its CLI version is `UNKNOWN`; `17` is a probe that is killed on the expansion line, before any model call); shipped-source evidence (`09`) was read from the materialised builtin tree (`assets/builtin/`, captured at 1.5.14). The evidence class is stated per claim. [OBSERVED]
 - What `strings` can prove [OBSERVED]: it can prove that a byte sequence is present in the binary at a given file offset.
 - What `strings` cannot prove [INFERRED]: merged string literals mean recovered prompt boundaries can be imprecise — adjacent literals may be concatenated or truncated, so the exact original source text cannot be reconstructed from the dump alone.
 - Every recovered prompt must therefore carry a fidelity note stating how precisely its boundaries are known. [POLICY — project policy statement]
@@ -87,7 +87,7 @@ strings -a -n 5 antigravity > strings.txt
 tail -c +113241709 antigravity | head -c 36482 | sha256sum   # 3e8c347e…f0fabf4c1
 grep -aob '### Route Summary' antigravity                     # 113265667 (0-based)
 
-# live axis (1.5.16, installed; no live run yet)
+# live axis (1.5.16, installed; no workflow run — only the zero-turn probe in 17)
 agy --version                                              # 1.5.16 (not re-run in the corrections pass)
 sha256sum /home/john/.local/bin/agy                        # 05245f43…430934e785
 stat -c '%s %y' /home/john/.local/bin/agy                  # 275067592, mtime 2026-11-24 14:02:08

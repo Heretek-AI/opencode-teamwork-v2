@@ -1,0 +1,3 @@
+I1124 14:32:33.002798       1 printmode.go:209] Print mode: starting (promptLength=51, model="", conversationID="")
+I1124 14:32:44.646487       1 session.go:201] Print mode: conversation=<conversation-T>, sending message
+I1124 14:32:44.654409       1 printmode.go:962] Print mode: expanded slash command "teamwork" (system)
