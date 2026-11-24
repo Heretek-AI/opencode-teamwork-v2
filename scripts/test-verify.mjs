@@ -26,7 +26,7 @@ import { execFileSync } from "node:child_process"
 
 import { createAuthContext } from "../plugins/opencode-teamwork/auth.ts"
 import { writeHandoff } from "../plugins/opencode-teamwork/handoff.ts"
-import { canonicalJson, payloadDigest, sha256Hex } from "../plugins/opencode-teamwork/approval-format.mjs"
+import { canonicalJson, contentSha256Hex, payloadDigest, sha256Hex } from "../plugins/opencode-teamwork/approval-format.mjs"
 import {
   computePlanHash,
   computeRequirementsHash,
@@ -137,6 +137,7 @@ async function makeRun({
   victoryAudit = "required",
   requireHandoffs = "required",
   requireReportBinding = false,
+  provenance = "declared",
   tasks = [{ id: "R1", agent: "team/worker" }],
   git = undefined,
   unsigned = false,
@@ -178,6 +179,7 @@ async function makeRun({
       dependsOn: [],
     })),
     ...(requireReportBinding ? { requireReportBinding: true } : {}),
+    ...(provenance === "command" ? { requiredProvenance: "command" } : {}),
     requirePinnedWrites: false,
   }
   writeJson(join(run, "plan.dag.json"), plan)
@@ -189,6 +191,7 @@ async function makeRun({
     verification,
     victoryAudit,
     requireHandoffs,
+    ...(provenance === "command" ? { requiredProvenance: "command" } : {}),
     tasks: Object.fromEntries(
       tasks.map((t) => [t.id, { status: "verified_pass", round: 1 }]),
     ),
@@ -219,7 +222,7 @@ async function makeRun({
     await ownSigner.auth.bindRunNonce(runId, nonce)
     await ownSigner.auth.bindRunKeyId(runId, ownSigner.keyId)
     const manifest = {
-      version: 3,
+      version: provenance === "command" ? 4 : 3,
       sessionId: runId,
       rootSessionId: "ses_fixture_root",
       integrityMode,
@@ -228,6 +231,7 @@ async function makeRun({
       ...(victoryAudit === "skip" ? { victorySkipReason: "fixture skip" } : {}),
       requireHandoffs,
       handoffAuth: "signed",
+      ...(provenance === "command" ? { requiredProvenance: "command" } : {}),
       requestHash,
       requirementsHash,
       planHash: computePlanHash(plan),
@@ -417,6 +421,7 @@ function finalPayload(ctx, {
   tasks,
   victory = "CONFIRMED",
   handoffs = "PASS",
+  rerunDigest = undefined,
 } = {}) {
   return {
     status,
@@ -432,6 +437,7 @@ function finalPayload(ctx, {
       allTasksVerifiedPass: status === "PASS",
       reportDigests,
       auditDigest,
+      ...(rerunDigest !== undefined ? { rerunDigest } : {}),
       victory: { mode: ctx.victoryAudit, status: "CONFIRMED" },
       handoffs: { mode: ctx.requireHandoffs, status: "PASS", required: [], entries: [], reasons: [] },
     },
@@ -506,6 +512,135 @@ async function buildComplete(ctx, {
     await signWrite(ctx, "verify/final.json", final)
   }
   return { reports, auditDigest, withVictory }
+}
+
+/**
+ * A checks[] v2 programmatic entry. The engine computes every provenance field;
+ * the fixture computes the same values so the verifier can recompute them.
+ */
+function makeCommandCheck({
+  name = "command-check",
+  command,
+  output,
+  cwd = ".",
+  exitCode = 0,
+  durationMs = 1,
+  outputTruncated = false,
+  timeoutMs = 10000,
+} = {}) {
+  const cwdNorm = cwd === "." ? "." : cwd
+  return {
+    name,
+    type: "programmatic",
+    passed: exitCode === 0,
+    exitCode,
+    output,
+    ...(output !== "" ? { outputSha256: sha256Hex(output) } : {}),
+    command,
+    cwd: cwdNorm,
+    commandSha256: contentSha256Hex(canonicalJson({ argv: command, cwd: cwdNorm })),
+    outputBytes: Buffer.byteLength(output, "utf8"),
+    outputTruncated,
+    durationMs,
+    timeoutMs,
+  }
+}
+
+/** The signed rerun projection for one check. */
+function rerunEntryFromCheck(check, { timeoutMs = check.timeoutMs ?? 10000 } = {}) {
+  return {
+    name: check.name,
+    argv: check.command,
+    cwd: check.cwd,
+    expectedExit: check.exitCode,
+    outputSha256: contentSha256Hex(check.output),
+    outputBytes: Buffer.byteLength(check.output, "utf8"),
+    timeoutMs,
+  }
+}
+
+/** Build a complete `command`-provenance run around one or more v2 checks. */
+async function buildCommandRun(ctx, {
+  checks,
+  headSha,
+  rerunChecks,
+  withFinal = true,
+  withRerun = true,
+} = {}) {
+  const report = {
+    taskId: "R1",
+    status: "PASS",
+    verifierAgent: "team/verifier",
+    verifierSessionId: "ses_fixture_verifier",
+    timestamp: "2026-11-24T12:01:00.000Z",
+    summary: "Fixture command verification passed.",
+    checks,
+    fatalFindings: [],
+    feedbackForWorker: "",
+    evidence: "fixture command evidence",
+    requirementsHash: ctx.requirementsHash,
+    round: 1,
+    fence: 1,
+    branch: `teamwork/${ctx.runId}-R1`,
+    ...(headSha ? { headSha } : {}),
+    bound: Boolean(headSha),
+  }
+  await signWrite(ctx, "verify/report-R1.json", report)
+  const reportDigest = keyedDigestFile(join(ctx.run, "verify/report-R1.json"))
+  const audit = auditPayload(ctx, { R1: reportDigest })
+  await signWrite(ctx, "verify/security-audit.json", audit)
+  const auditDigest = keyedDigestFile(join(ctx.run, "verify/security-audit.json"))
+  let rerunDigest
+  if (withRerun) {
+    await signWrite(ctx, "verify/rerun.json", {
+      version: 1,
+      sessionId: ctx.runId,
+      tasks: { R1: { checks: rerunChecks ?? checks.map((check) => rerunEntryFromCheck(check)) } },
+      generatedAt: "2026-11-24T12:04:00.000Z",
+    })
+    rerunDigest = keyedDigestFile(join(ctx.run, "verify/rerun.json"))
+  }
+  if (withFinal) {
+    const final = finalPayload(ctx, {
+      reportDigests: { R1: reportDigest },
+      auditDigest,
+      tasks: [{ id: "R1", status: "verified_pass", report: "verify/report-R1.json", reportStatus: "PASS" }],
+      victory: "SKIPPED (explicit): fixture skip",
+      handoffs: "SKIPPED (explicit)",
+      ...(rerunDigest !== undefined ? { rerunDigest } : {}),
+    })
+    await signWrite(ctx, "verify/final.json", final)
+  }
+  return { reportDigest, auditDigest, rerunDigest }
+}
+
+async function commandFixture(tag, overrides = {}) {
+  const repo = mkdtempSync(join(TEST_ROOT, `${tag}-repo-`))
+  const sha = initGitRepo(repo)
+  const ctx = await makeRun({ tag, provenance: "command", requireHandoffs: "skip", victoryAudit: "skip" })
+  const command = overrides.command ?? [process.execPath, "-e", "process.stdout.write('ok\\n')"]
+  const check = makeCommandCheck({ ...overrides, command, output: overrides.output ?? "ok\n" })
+  const headSha = overrides.headSha === null ? undefined : overrides.headSha ?? sha
+  const built = await buildCommandRun(ctx, {
+    checks: overrides.checks ?? [check],
+    headSha,
+    ...(overrides.rerunChecks ? { rerunChecks: overrides.rerunChecks } : {}),
+  })
+  return { repo, sha, ctx, check, ...built }
+}
+
+/** Unkeyed hash of a directory's working tree, used to prove --rerun is read-only. */
+function hashTree(root, prefix = "") {
+  const out = []
+  for (const dirent of readdirSync(join(root, prefix), { withFileTypes: true })) {
+    if (prefix === "" && dirent.name === ".git") continue
+    const rel = prefix ? `${prefix}/${dirent.name}` : dirent.name
+    const abs = join(root, rel)
+    if (dirent.isSymbolicLink()) out.push([rel, "symlink"])
+    else if (dirent.isDirectory()) out.push(...hashTree(root, rel))
+    else if (dirent.isFile()) out.push([rel, plainDigestFile(abs)])
+  }
+  return contentSha256Hex(canonicalJson(out.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))))
 }
 
 async function verify(ctx, extra = {}) {
@@ -1175,6 +1310,245 @@ async function main() {
     assert(text.includes("opencode-teamwork verify"))
     assert(text.includes("Verdict:"))
     ok("T19 --json shape is stable across 3 fixtures (and the human table is rendered from it)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T20 — checks[] v2: a command claim is not PASS until it is re-executed.
+  // -------------------------------------------------------------------------
+  {
+    const { repo, ctx } = await commandFixture("t20")
+    const before = hashTree(repo)
+    const claimed = await verify(ctx)
+    assert.strictEqual(claimed.verdict, "UNKNOWN", JSON.stringify(claimed.reasons))
+    assert.strictEqual(verifyExitCode(claimed), 2)
+    assert(hasReason(claimed, "PROVENANCE_CLAIMED"), JSON.stringify(claimed.reasons))
+    assert(
+      claimed.checks.some((c) => c.id === "provenance:declared") === false,
+      "command provenance must not be reported as declared",
+    )
+
+    const rerun = await verify(ctx, { rerun: true, repo })
+    assert.strictEqual(rerun.verdict, "PASS", JSON.stringify(rerun.reasons))
+    assert.strictEqual(verifyExitCode(rerun), 0)
+    assert.strictEqual(rerun.counts.fail, 0)
+    assert(rerun.checks.some((c) => c.id === "provenance:required" && c.status === "pass"))
+    assert.strictEqual(hashTree(repo), before, "the source checkout must be byte-identical after --rerun")
+    assert.strictEqual(rerun.rerun.worktrees.length, 1)
+    for (const worktree of rerun.rerun.worktrees) {
+      assert(!existsSync(worktree), `a disposable worktree must be removed: ${worktree}`)
+    }
+    const cli = runCli(["verify", "--run-dir", ctx.run, ...signedArgs(ctx), "--rerun", "--repo", repo, "--json"])
+    assert.strictEqual(cli.code, 0, cli.stderr)
+    assert.strictEqual(JSON.parse(cli.stdout).verdict, "PASS")
+    ok("T20 command provenance is claimed without --rerun (exit 2), PASS after re-execution, worktree removed")
+  }
+
+  // -------------------------------------------------------------------------
+  // T21 — each re-execution failure shape.
+  // -------------------------------------------------------------------------
+  {
+    const changed = await commandFixture("t21a", {
+      command: [process.execPath, "-e", "process.stdout.write('actual\\n')"],
+      output: "expected\n",
+    })
+    const changedResult = await verify(changed.ctx, { rerun: true, repo: changed.repo })
+    assert.strictEqual(changedResult.verdict, "FAIL")
+    assert(hasReason(changedResult, "output-digest-mismatch"), JSON.stringify(changedResult.reasons))
+
+    const failed = await commandFixture("t21b", {
+      command: [process.execPath, "-e", "process.exit(1)"],
+      output: "",
+    })
+    const failedResult = await verify(failed.ctx, { rerun: true, repo: failed.repo })
+    assert.strictEqual(failedResult.verdict, "FAIL")
+    assert.strictEqual(verifyExitCode(failedResult), 1)
+    assert(hasReason(failedResult, "command-failed"), JSON.stringify(failedResult.reasons))
+
+    const missing = await commandFixture("t21c", {
+      command: ["definitely-not-a-real-binary-0x16"],
+      output: "",
+    })
+    const missingResult = await verify(missing.ctx, { rerun: true, repo: missing.repo })
+    assert.strictEqual(missingResult.verdict, "UNKNOWN")
+    assert.strictEqual(verifyExitCode(missingResult), 2)
+    assert(hasReason(missingResult, "command-unavailable"), JSON.stringify(missingResult.reasons))
+
+    const timed = await commandFixture("t21d", {
+      command: [process.execPath, "-e", "setTimeout(() => {}, 5000)"],
+      output: "",
+      timeoutMs: 200,
+    })
+    const timedResult = await verify(timed.ctx, { rerun: true, repo: timed.repo })
+    assert.strictEqual(timedResult.verdict, "FAIL")
+    assert.strictEqual(verifyExitCode(timedResult), 1)
+    assert(hasReason(timedResult, "command-timeout"), JSON.stringify(timedResult.reasons))
+    ok("T21 output-digest-mismatch / command-failed / command-unavailable (exit 2) / command-timeout")
+  }
+
+  // -------------------------------------------------------------------------
+  // T22 — shell lines and escaping cwd are refused, not executed.
+  // -------------------------------------------------------------------------
+  {
+    const shell = await commandFixture("t22a", {
+      command: ["sh", "-c", "exit 0"],
+      output: "",
+    })
+    const shellResult = await verify(shell.ctx, { rerun: true, repo: shell.repo })
+    assert.strictEqual(shellResult.verdict, "FAIL")
+    assert(
+      hasReason(shellResult, "command-refused") || shellResult.reasons.some((r) => /shell interpreter/.test(r)),
+      JSON.stringify(shellResult.reasons),
+    )
+
+    const escaped = await commandFixture("t22b", { cwd: "../outside", output: "ok\n" })
+    const escapedResult = await verify(escaped.ctx, { rerun: true, repo: escaped.repo })
+    assert.strictEqual(escapedResult.verdict, "FAIL")
+    assert(
+      hasReason(escapedResult, "command-refused") || escapedResult.reasons.some((r) => /cwd/.test(r)),
+      JSON.stringify(escapedResult.reasons),
+    )
+    ok("T22 sh -c and a cwd outside the worktree are refused")
+  }
+
+  // -------------------------------------------------------------------------
+  // T23 — --keep-worktree leaves the worktree; the default removes it.
+  // -------------------------------------------------------------------------
+  {
+    const { repo, ctx } = await commandFixture("t23")
+    const kept = await verify(ctx, { rerun: true, repo, keepWorktree: true })
+    assert.strictEqual(kept.verdict, "PASS", JSON.stringify(kept.reasons))
+    assert.strictEqual(kept.rerun.worktrees.length, 1)
+    const keptPath = kept.rerun.worktrees[0]
+    assert(existsSync(keptPath), "--keep-worktree must leave the disposable worktree")
+    assert(kept.checks.some((c) => c.id === "rerun:worktrees" && c.status === "skip"))
+    rmSync(keptPath, { recursive: true, force: true })
+    try {
+      execFileSync("git", ["-C", repo, "worktree", "prune"], { stdio: "ignore" })
+    } catch {}
+    ok("T23 --keep-worktree leaves the worktree and reports its path")
+  }
+
+  // -------------------------------------------------------------------------
+  // T24 — an edited verify/rerun.json is AUTH_STALE, even when re-signed.
+  // -------------------------------------------------------------------------
+  {
+    const { ctx } = await commandFixture("t24")
+    const rel = "verify/rerun.json"
+    const rerun = readJson(join(ctx.run, rel))
+    rerun.tasks.R1.checks[0].argv = [process.execPath, "-e", "process.stdout.write('tampered\\n')"]
+    const signed = await ctx.signer.auth.signRunArtifact(ctx.runId, rel, rerun)
+    writeJson(join(ctx.run, rel), signed)
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "FAIL")
+    assert(hasReason(result, "AUTH_STALE"), JSON.stringify(result.reasons))
+    assert(
+      result.reasons.some((r) => r.includes("rerun") || r.includes("R1")),
+      JSON.stringify(result.reasons),
+    )
+    ok("T24 edited rerun.json -> AUTH_STALE at verify (report/rerun digest relation)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T25 — manifest v4 requiredProvenance cannot be downgraded.
+  // -------------------------------------------------------------------------
+  {
+    const { ctx } = await commandFixture("t25")
+    const plan = readJson(join(ctx.run, "plan.dag.json"))
+    delete plan.requiredProvenance
+    writeJson(join(ctx.run, "plan.dag.json"), plan)
+    const state = readJson(join(ctx.run, "state.json"))
+    delete state.requiredProvenance
+    writeJson(join(ctx.run, "state.json"), state)
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "FAIL")
+    assert(hasReason(result, "AUTH_STALE"), JSON.stringify(result.reasons))
+    assert(result.reasons.some((r) => r.includes("requiredProvenance")), JSON.stringify(result.reasons))
+    ok("T25 plan downgrade of requiredProvenance -> AUTH_STALE")
+  }
+
+  // -------------------------------------------------------------------------
+  // T26 — a command check with no headSha is REPORT_UNBOUND.
+  // -------------------------------------------------------------------------
+  {
+    const { ctx } = await commandFixture("t26", { headSha: null })
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "FAIL")
+    assert(hasReason(result, "REPORT_UNBOUND"), JSON.stringify(result.reasons))
+    ok("T26 command claim without headSha -> REPORT_UNBOUND")
+  }
+
+  // -------------------------------------------------------------------------
+  // T27 — a legacy 0.15 report (manifest v3, checks v1) still parses as declared.
+  // -------------------------------------------------------------------------
+  {
+    const ctx = await makeRun({ tag: "t27", requireHandoffs: "skip", victoryAudit: "skip" })
+    const built = await buildComplete(ctx, { withFinal: false })
+    const report = readJson(join(ctx.run, "verify/report-R1.json"))
+    assert.strictEqual(
+      Object.prototype.hasOwnProperty.call(report.checks[0], "command"),
+      false,
+      "legacy fixture must not carry v2 command fields",
+    )
+    await signWrite(
+      ctx,
+      "verify/final.json",
+      finalPayload(ctx, {
+        reportDigests: { ...built.reports },
+        auditDigest: built.auditDigest,
+        tasks: [{ id: "R1", status: "verified_pass", report: "verify/report-R1.json", reportStatus: "PASS" }],
+        victory: "SKIPPED (explicit): fixture skip",
+        handoffs: "SKIPPED (explicit)",
+      }),
+    )
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "PASS", JSON.stringify(result.reasons))
+    assert(result.checks.some((c) => c.id === "provenance:declared" && c.status === "skip"))
+    assert.strictEqual(result.checks.some((c) => c.id === "manifest:requiredProvenance"), true)
+    ok("T27 legacy v3 manifest + checks v1 -> PASS as declared")
+  }
+
+  // -------------------------------------------------------------------------
+  // T28 — T17 under command + --rerun: the forged observation is re-executed.
+  // -------------------------------------------------------------------------
+  {
+    const { repo, ctx } = await commandFixture("t28", {
+      command: [process.execPath, "-e", "process.exit(1)"],
+      output: "Ran 999 tests in 0.01s: all passed.\n",
+    })
+    const result = await verify(ctx, { rerun: true, repo })
+    assert.strictEqual(result.verdict, "FAIL", JSON.stringify(result.reasons))
+    assert(hasReason(result, "command-failed"), JSON.stringify(result.reasons))
+    ok("T28 T17 negative control under command + --rerun -> command-failed")
+  }
+
+  // -------------------------------------------------------------------------
+  // T29 — passed/exitCode conflicts are refused by name in checks[] v2.
+  // -------------------------------------------------------------------------
+  {
+    const liePass = await commandFixture("t29a", { output: "" })
+    const report = readJson(join(liePass.ctx.run, "verify/report-R1.json"))
+    report.checks[0].passed = true
+    report.checks[0].exitCode = 1
+    writeJson(
+      join(liePass.ctx.run, "verify/report-R1.json"),
+      await liePass.ctx.signer.auth.signRunArtifact(liePass.ctx.runId, "verify/report-R1.json", report),
+    )
+    const passResult = await verify(liePass.ctx)
+    assert.strictEqual(passResult.verdict, "FAIL")
+    assert(hasReason(passResult, "CHECK_EXIT_CONFLICT"), JSON.stringify(passResult.reasons))
+
+    const lieFail = await commandFixture("t29b", { output: "" })
+    const report2 = readJson(join(lieFail.ctx.run, "verify/report-R1.json"))
+    report2.checks[0].passed = false
+    report2.checks[0].exitCode = 0
+    writeJson(
+      join(lieFail.ctx.run, "verify/report-R1.json"),
+      await lieFail.ctx.signer.auth.signRunArtifact(lieFail.ctx.runId, "verify/report-R1.json", report2),
+    )
+    const failResult = await verify(lieFail.ctx)
+    assert.strictEqual(failResult.verdict, "FAIL")
+    assert(hasReason(failResult, "CHECK_EXIT_CONFLICT"), JSON.stringify(failResult.reasons))
+    ok("T29 passed:true/exitCode:1 and passed:false/exitCode:0 -> CHECK_EXIT_CONFLICT")
   }
 
   rmSync(TEST_ROOT, { recursive: true, force: true })

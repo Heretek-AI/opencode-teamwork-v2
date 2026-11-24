@@ -4,6 +4,56 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-11-24
+
+Re-executable verification. A verifier `PASS` can now record argv-only command
+evidence, and the offline verifier can re-execute it at the commit the report
+observed. Additive for existing runs: a version 1–3 manifest is read as
+`requiredProvenance: "declared"`, which keeps the 0.15 semantics.
+
+### Added
+
+- **`requiredProvenance: "declared" | "command"` (ADR 0016).** New plans write a
+  version-4 manifest. `command` makes a `PASS` report carry at least one
+  programmatic check with `command`/`cwd`/`exitCode`/`outputBytes`/
+  `outputTruncated`/`commandSha256`/`durationMs`, and requires a `headSha`.
+  Sticky: a re-plan may upgrade `declared → command`, never downgrade it
+  (`AUTH_STALE`).
+- **checks[] v2.** `command` is argv only (≤32 args; `sh -c`/`bash -c` refused),
+  `cwd` is worktree-relative, `commandSha256 = contentSha256Hex(canonicalJson({argv,
+  cwd}))`, `passed === (exitCode === 0)`. The existing `output`/`outputSha256`
+  keys are unchanged; a command's `output` is preserved exactly (not trimmed)
+  so its digest is reproducible.
+- **`verify/rerun.json`.** A signed per-task projection of the command checks
+  (`version`, `sessionId`, `tasks.<id>.checks[{name,argv,cwd,expectedExit,
+  outputSha256,outputBytes,timeoutMs}]`, `generatedAt`). `teamwork_report`
+  merges and re-signs it; `final_verify` re-checks the envelope and projection
+  and stamps `evidence.rerunDigest` in `verify/final.json`.
+- **`opencode-teamwork verify --rerun --repo <clean-checkout> [--timeout <s>]
+  [--keep-worktree]`.** Creates a detached worktree at `report.headSha`, runs
+  each argv with `spawnSync` (no shell, minimal env, `cwd` inside the worktree),
+  enforces `timeoutMs`, and compares exit code plus stdout+stderr digest.
+  Failures: `output-digest-mismatch`, `command-failed`, `command-timeout`,
+  `command-refused` (exit 1), `command-unavailable` (exit 2),
+  `source-tree-modified`. The worktree is removed unless `--keep-worktree`.
+- **Claimed provenance.** Under `command`, `verify` without `--rerun` reports
+  `provenance: claimed` and returns `UNKNOWN` (exit 2), never `PASS`. Under
+  `declared`, 0.15 behaviour is unchanged with a `provenance: declared` note.
+
+### Changed
+
+- New signed plans write `run.manifest.json` version 4. Existing version 3
+  manifests stay valid and are read as `declared`.
+- `teamwork_report` refuses a programmatic check without a command under
+  `command` (and a `PASS` with no re-executable check) with
+  `CHECK_COMMAND_MISSING`; `verified_pass` and `final_verify` refuse a report
+  without `headSha` with `REPORT_UNBOUND`.
+- Tests: T20–T29 in `scripts/test-verify.mjs` cover re-execution, every failure
+  shape, shell/cwd refusal, worktree lifecycle, stale `rerun.json`, downgrade,
+  legacy 0.15 parsing, the T17 negative control under `--rerun`, and
+  passed/exitCode conflicts. `scripts/test-engine.mjs` covers the writer,
+  `final_verify`, sticky provenance and `REPORT_UNBOUND`.
+
 ## [0.15.0] - 2026-11-24
 
 Offline verification. A run can now be checked from a read-only copy and a

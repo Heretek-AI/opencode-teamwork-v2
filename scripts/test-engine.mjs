@@ -8912,7 +8912,7 @@ process.exit(0);
           spec: draftText,
         })
         const manifest = readJsonFile(runFile(testDir, runId, "run.manifest.json"))
-        assert.strictEqual(manifest.version, 3, "0.11.0 plans must write manifest version 3")
+        assert.strictEqual(manifest.version, 4, "0.16.0 plans must write manifest version 4")
         assert.strictEqual(manifest.approvalPolicy, "external-dir")
         assert.strictEqual(manifest.approvalKeyId, "approver_fixture")
         assert.strictEqual(manifest.approvalBinding, "prompt")
@@ -11586,5 +11586,208 @@ process.exit(0);
       rmSync(pruneRoot, { recursive: true, force: true })
       rmSync(worktreeBase, { recursive: true, force: true })
     }
+  }
+
+  // ==========================================
+  // 0.16.0: re-executable verification (engine)
+  // ==========================================
+  {
+    console.log("Testing re-executable verification (engine)...")
+    const rerunRoot = mkdtempSync(join(tmpdir(), "teamwork-rerun-engine-"))
+    const git = (...args) =>
+      execFileSync(GIT_BIN, args, { cwd: rerunRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()
+    git("init", "-q")
+    git("config", "user.email", "rerun@example.test")
+    git("config", "user.name", "Rerun Fixture")
+    writeFileSync(join(rerunRoot, "README.md"), "rerun fixture\n")
+    git("add", "README.md")
+    git("commit", "-q", "-m", "base")
+    const headSha = git("rev-parse", "HEAD")
+    const tools = await makeToolsFor(rerunRoot)
+    const runId = "20261124-000040-rerun-command"
+    const runDirOf = (id) => join(rerunRoot, ".opencode", "teamwork", id)
+    const planArgs = (id) => ({
+      sessionId: id,
+      topology: "iterative-coding",
+      skipInterview: true,
+      victoryAudit: "skip",
+      victorySkipReason: "fixture: re-execution test does not run the victory audit",
+      requireHandoffs: "skip",
+      requiredProvenance: "command",
+      tasks: [{ id: "R1" }],
+    })
+    await tools.plan.execute(planArgs(runId), { sessionID: FIXTURE_ROOT_SESSION })
+    const manifest = JSON.parse(readFileSync(join(runDirOf(runId), "run.manifest.json"), "utf8"))
+    assert.strictEqual(manifest.version, 4, "a command plan must write manifest version 4")
+    assert.strictEqual(manifest.requiredProvenance, "command")
+    const plan = JSON.parse(readFileSync(join(runDirOf(runId), "plan.dag.json"), "utf8"))
+    assert.strictEqual(plan.requiredProvenance, "command", "the plan must record the sticky requirement")
+    git("branch", `teamwork/${runId}-R1`, headSha)
+
+    const command = [process.execPath, "-e", "process.stdout.write('ok\\n')"]
+    for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+      await tools.task_update.execute({ sessionId: runId, taskId: "R1", status })
+    }
+    const accepted = await tools.report.execute(
+      {
+        sessionId: runId,
+        taskId: "R1",
+        status: "PASS",
+        summary: "command evidence",
+        checks: [
+          {
+            name: "node-fixture",
+            type: "programmatic",
+            passed: true,
+            exitCode: 0,
+            output: "ok\n",
+            command,
+            cwd: ".",
+            durationMs: 5,
+          },
+        ],
+      },
+      { sessionID: "ses_fixture_verifier" },
+    )
+    assert(!accepted.content.startsWith("refused:"), `a command PASS must be recorded: ${accepted.content}`)
+    const reportFile = join(runDirOf(runId), "verify/report-R1.json")
+    const reportText = readFileSync(reportFile, "utf8")
+    const report = JSON.parse(reportText)
+    assert.strictEqual(report.headSha, headSha, "the engine must bind the observed branch head")
+    assert.deepStrictEqual(report.checks[0].command, command)
+    assert.strictEqual(report.checks[0].cwd, ".")
+    assert.strictEqual(
+      report.checks[0].commandSha256,
+      contentSha256Hex(canonicalJson({ argv: command, cwd: "." })),
+      "commandSha256 must be the unkeyed digest of {argv,cwd}",
+    )
+    assert.strictEqual(report.checks[0].outputBytes, 3)
+    assert.strictEqual(report.checks[0].outputTruncated, false)
+    assert.strictEqual(report.checks[0].durationMs, 5)
+    const rerunFile = join(runDirOf(runId), "verify/rerun.json")
+    const rerunText = readFileSync(rerunFile, "utf8")
+    const rerun = JSON.parse(rerunText)
+    assert(rerun._auth, "verify/rerun.json must be signed on a signed run")
+    assert.strictEqual(rerun.version, 1)
+    assert.strictEqual(rerun.sessionId, runId)
+    assert.deepStrictEqual(rerun.tasks.R1.checks[0].argv, command)
+    assert.strictEqual(rerun.tasks.R1.checks[0].expectedExit, 0)
+    assert.strictEqual(rerun.tasks.R1.checks[0].outputBytes, 3)
+
+    // checks[] v2 refusals at record time.
+    const noCommand = await tools.report.execute(
+      {
+        sessionId: runId,
+        taskId: "R1",
+        status: "PASS",
+        summary: "no command under command provenance",
+        checks: [{ name: "rubric", type: "programmatic", passed: true, exitCode: 0 }],
+      },
+      { sessionID: "ses_fixture_verifier" },
+    )
+    assert.strictEqual(noCommand.status, "CHECK_COMMAND_MISSING", noCommand.content)
+    const exitLie = await tools.report.execute(
+      {
+        sessionId: runId,
+        taskId: "R1",
+        status: "PASS",
+        summary: "exit conflict",
+        checks: [{ name: "lie", type: "programmatic", passed: true, exitCode: 1, command, output: "" }],
+      },
+      { sessionID: "ses_fixture_verifier" },
+    )
+    assert.strictEqual(exitLie.status, "CHECK_EXIT_CONFLICT", exitLie.content)
+    const zeroLie = await tools.report.execute(
+      {
+        sessionId: runId,
+        taskId: "R1",
+        status: "FAIL",
+        checks: [{ name: "lie", type: "programmatic", passed: false, exitCode: 0, command, output: "" }],
+      },
+      { sessionID: "ses_fixture_verifier" },
+    )
+    assert.strictEqual(zeroLie.status, "CHECK_EXIT_CONFLICT", zeroLie.content)
+    // The refused calls must not have replaced the accepted report.
+    assert.strictEqual(readFileSync(reportFile, "utf8"), reportText)
+
+    await tools.task_update.execute({
+      sessionId: runId,
+      taskId: "R1",
+      status: "verified_pass",
+      verification: { status: "PASS" },
+    })
+    await tools.security_audit.execute({ sessionId: runId, status: "PASS", findings: [] })
+    const final = await tools.final_verify.execute({ sessionId: runId })
+    assert.strictEqual(final.status, "PASS", `a command run with a signed rerun record must complete: ${final.content}`)
+    const finalJson = JSON.parse(readFileSync(join(runDirOf(runId), "verify/final.json"), "utf8"))
+    assert(/^[0-9a-f]{64}$/.test(finalJson.evidence.rerunDigest || ""), "final evidence must stamp rerunDigest")
+
+    // A re-plan cannot downgrade the requirement.
+    const downgrade = await tools.plan.execute(
+      { ...planArgs(runId), requiredProvenance: "declared" },
+      { sessionID: FIXTURE_ROOT_SESSION },
+    )
+    assert.strictEqual(downgrade.refused, "AUTH_STALE", downgrade.content)
+    assert(/requiredProvenance/.test(downgrade.content), downgrade.content)
+
+    // Editing (and re-signing) verify/rerun.json is AUTH_STALE at final.
+    const tampered = JSON.parse(rerunText)
+    tampered.tasks.R1.checks[0].argv = [process.execPath, "-e", "process.stdout.write('tampered\\n')"]
+    writeFileSync(
+      rerunFile,
+      JSON.stringify(await authFor(rerunRoot).signRunArtifact(runId, "verify/rerun.json", tampered), null, 2) + "\n",
+    )
+    const tamperedFinal = await tools.final_verify.execute({ sessionId: runId })
+    assert.strictEqual(tamperedFinal.status, "FAIL", tamperedFinal.content)
+    assert(
+      tamperedFinal.reasons.some((r) => /AUTH_STALE/.test(r) && /rerun/.test(r)),
+      `editing rerun.json must be named: ${JSON.stringify(tamperedFinal.reasons)}`,
+    )
+    writeFileSync(rerunFile, rerunText)
+
+    // A hand-written programmatic PASS without a command is refused at final.
+    await writeSignedFixture(rerunRoot, runId, "verify/report-R1.json", {
+      taskId: "R1",
+      status: "PASS",
+      summary: "hand-written rubric only",
+      headSha,
+      checks: [{ name: "rubric", type: "programmatic", passed: true, exitCode: 0 }],
+    })
+    const finalNoCommand = await tools.final_verify.execute({ sessionId: runId })
+    assert.strictEqual(finalNoCommand.status, "FAIL", finalNoCommand.content)
+    assert(
+      finalNoCommand.reasons.some((r) => /CHECK_COMMAND_MISSING/.test(r)),
+      `a missing command must be named at final: ${JSON.stringify(finalNoCommand.reasons)}`,
+    )
+    writeFileSync(reportFile, reportText)
+
+    // A command claim with no headSha cannot be consumed under `command`.
+    const noHeadRun = "20261124-000041-rerun-unbound"
+    await tools.plan.execute(planArgs(noHeadRun), { sessionID: FIXTURE_ROOT_SESSION })
+    for (const status of ["worker_active", "worker_done", "verifier_active"]) {
+      await tools.task_update.execute({ sessionId: noHeadRun, taskId: "R1", status })
+    }
+    const noHeadReport = await tools.report.execute(
+      {
+        sessionId: noHeadRun,
+        taskId: "R1",
+        status: "PASS",
+        summary: "command without a commit",
+        checks: [{ name: "node-fixture", type: "programmatic", passed: true, exitCode: 0, output: "ok\n", command, cwd: ".", durationMs: 1 }],
+      },
+      { sessionID: "ses_fixture_verifier" },
+    )
+    assert(!noHeadReport.content.startsWith("refused:"), noHeadReport.content)
+    assert.strictEqual(JSON.parse(readFileSync(join(runDirOf(noHeadRun), "verify/report-R1.json"), "utf8")).headSha, undefined)
+    const noHeadPass = await tools.task_update.execute({
+      sessionId: noHeadRun,
+      taskId: "R1",
+      status: "verified_pass",
+      verification: { status: "PASS" },
+    })
+    assert.strictEqual(noHeadPass.status, "REPORT_UNBOUND", noHeadPass.content)
+    console.log(
+      "✓ checks v2: signed rerun record, final rerunDigest, downgrade/rerun edits stale, command-mode refusals, REPORT_UNBOUND",
+    )
   }
 }
