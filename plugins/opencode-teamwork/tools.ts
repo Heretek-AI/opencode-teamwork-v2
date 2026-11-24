@@ -2490,19 +2490,227 @@ function validateVerifierReportBinding(
   return { ok: true, ...(warnings.size ? { warning: Array.from(warnings).join(",") } : {}) }
 }
 
+const CHECK_MAX_ARGS = 32
+const CHECK_MAX_ARG_BYTES = 4096
+const CHECK_DEFAULT_TIMEOUT_MS = 120000
+const CHECK_MAX_TIMEOUT_MS = 600000
+const SHELL_NAMES = new Set([
+  "sh",
+  "bash",
+  "zsh",
+  "dash",
+  "ksh",
+  "mksh",
+  "pdksh",
+  "fish",
+  "csh",
+  "tcsh",
+  "busybox",
+  "ash",
+  "powershell",
+  "pwsh",
+  "cmd",
+  "cmd.exe",
+  "sh.exe",
+  "bash.exe",
+])
+
+/** Refuse an argv that names a shell and asks it to evaluate a string. */
+function checkShellRefusal(argv: string[]): string | undefined {
+  for (let i = 0; i < argv.length; i += 1) {
+    const name = basename(String(argv[i])).toLowerCase()
+    if (!SHELL_NAMES.has(name)) continue
+    for (let j = i + 1; j < argv.length; j += 1) {
+      const arg = String(argv[j]).toLowerCase()
+      if (arg === "-c" || arg === "/c" || arg === "-command" || arg.startsWith("-command:")) {
+        return `uses a shell interpreter (${name} ${String(argv[j])})`
+      }
+    }
+  }
+  return undefined
+}
+
+function normalizeCheckCwd(raw: unknown): { cwd?: string; error?: string } {
+  if (raw === undefined || raw === null || raw === "") return { cwd: "." }
+  if (typeof raw !== "string") return { error: "cwd must be a string" }
+  if (raw.includes("\0")) return { error: "cwd contains a NUL byte" }
+  if (isAbsolute(raw) || /^[A-Za-z]:[\\/]/.test(raw)) return { error: "cwd must be relative to the worktree" }
+  if (raw.startsWith("~")) return { error: "cwd must not start with ~" }
+  const segments = raw.split("/")
+  if (segments.includes("..")) return { error: "cwd must not escape the worktree with .." }
+  const cwd = segments.filter((segment) => segment !== "" && segment !== ".").join("/")
+  return { cwd: cwd === "" ? "." : cwd }
+}
+
+/** Normalise and validate argv-only command evidence for checks[] v2. */
+function normalizeCheckCommand(raw: unknown): { argv?: string[]; error?: string } {
+  if (!Array.isArray(raw)) return { error: "command must be an array of argv strings" }
+  if (raw.length === 0) return { error: "command must not be empty" }
+  if (raw.length > CHECK_MAX_ARGS) return { error: `command has ${raw.length} args (cap ${CHECK_MAX_ARGS})` }
+  const argv: string[] = []
+  for (const arg of raw) {
+    if (typeof arg !== "string" || arg === "") return { error: "command must contain only non-empty strings" }
+    if (arg.includes("\0")) return { error: "command must not contain a NUL byte" }
+    if (Buffer.byteLength(arg, "utf8") > CHECK_MAX_ARG_BYTES) {
+      return { error: `command arg exceeds ${CHECK_MAX_ARG_BYTES} bytes` }
+    }
+    argv.push(arg)
+  }
+  const shell = checkShellRefusal(argv)
+  if (shell) return { error: `command ${shell}; record argv, not a shell line` }
+  return { argv }
+}
+
+/** The run-relative command digest: unkeyed over canonical {argv,cwd}. */
+function checkCommandDigest(argv: string[], cwd: string): string {
+  return contentSha256Hex(canonicalJson({ argv, cwd }))
+}
+
+/**
+ * Validate and normalise one checks[] v2 entry. The engine computes the
+ * provenance fields (commandSha256, outputBytes, outputSha256); a caller can
+ * only supply the observation (command, cwd, exitCode, output, durationMs).
+ */
+function normalizeReportCheck(
+  c: any,
+  provenance: ProvenanceMode,
+): { check?: any; problems: string[] } {
+  const problems: string[] = []
+  const name = clean(c?.name, 200) || `#${"?"}`
+  const type = clean(c?.type, 64) || "check"
+  const rawOutput = typeof c?.output === "string" ? c.output : ""
+  const hasCommandInput = c?.command !== undefined
+  // A command claim's digest must cover exactly the bytes the verifier
+  // captured: sanitising or trimming would make every re-execution mismatch.
+  // Non-command prose keeps the existing display sanitisation.
+  const output = hasCommandInput
+    ? rawOutput.length > 2000
+      ? rawOutput.slice(0, 2000)
+      : rawOutput
+    : rawOutput
+      ? cleanBlock(rawOutput, 2000).trim()
+      : ""
+  const outputTruncated = c?.outputTruncated === true || rawOutput.length > 2000
+  const exitCode = Number.isInteger(c?.exitCode) ? Number(c.exitCode) : undefined
+  const durationMs = c?.durationMs === undefined ? undefined : Number(c.durationMs)
+  const timeoutMs = c?.timeoutMs === undefined ? CHECK_DEFAULT_TIMEOUT_MS : Number(c.timeoutMs)
+  const check: any = {
+    name,
+    type,
+    passed: c?.passed === true,
+    ...(output ? { output, outputSha256: sha256Hex(output) } : {}),
+    ...(typeof c?.error === "string" && cleanBlock(c.error, 2000).trim()
+      ? { error: cleanBlock(c.error, 2000).trim() }
+      : {}),
+    ...(exitCode !== undefined ? { exitCode } : {}),
+  }
+
+  if (c?.command !== undefined) {
+    const argvCheck = normalizeCheckCommand(c.command)
+    const cwdCheck = normalizeCheckCwd(c.cwd)
+    if (argvCheck.error) problems.push(`check ${name} ${argvCheck.error}`)
+    if (cwdCheck.error) problems.push(`check ${name} ${cwdCheck.error}`)
+    if (exitCode === undefined) problems.push(`check ${name} with a command must record an integer exitCode`)
+    if (durationMs !== undefined && (!Number.isInteger(durationMs) || durationMs < 0)) {
+      problems.push(`check ${name} durationMs must be a non-negative integer`)
+    }
+    if (durationMs === undefined) problems.push(`check ${name} with a command must record durationMs`)
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > CHECK_MAX_TIMEOUT_MS) {
+      problems.push(`check ${name} timeoutMs must be an integer in 1..${CHECK_MAX_TIMEOUT_MS}`)
+    }
+    if (argvCheck.argv && cwdCheck.cwd !== undefined) {
+      check.command = argvCheck.argv
+      check.cwd = cwdCheck.cwd
+      check.commandSha256 = checkCommandDigest(argvCheck.argv, cwdCheck.cwd)
+    } else {
+      if (argvCheck.argv) check.command = argvCheck.argv
+      if (cwdCheck.cwd !== undefined) check.cwd = cwdCheck.cwd
+    }
+    check.outputBytes = Buffer.byteLength(output, "utf8")
+    check.outputTruncated = outputTruncated
+    if (durationMs !== undefined) check.durationMs = durationMs
+    if (Number.isInteger(timeoutMs)) check.timeoutMs = timeoutMs
+  } else {
+    if (c?.cwd !== undefined || c?.commandSha256 !== undefined) {
+      problems.push(`check ${name} records cwd/commandSha256 without a command`)
+    }
+    if (provenance === "command" && type === "programmatic") {
+      problems.push(`CHECK_COMMAND_MISSING: programmatic check ${name} has no command under requiredProvenance "command"`)
+    }
+  }
+  if (exitCode !== undefined && check.passed === true && exitCode !== 0) {
+    problems.push(`CHECK_EXIT_CONFLICT: check ${name} passed=true but exitCode=${exitCode}`)
+  } else if (exitCode !== undefined && check.passed !== true && exitCode === 0) {
+    problems.push(`CHECK_EXIT_CONFLICT: check ${name} passed=false but exitCode=0`)
+  }
+  return { check, problems }
+}
+
+/** The signed rerun record for one check; only a full, untruncated capture. */
+function rerunEntryForCheck(check: any): any | undefined {
+  if (!check || !Array.isArray(check.command) || check.command.length === 0) return undefined
+  if (check.outputTruncated !== false) return undefined
+  return {
+    name: check.name,
+    argv: check.command,
+    cwd: check.cwd,
+    expectedExit: Number(check.exitCode),
+    outputSha256: contentSha256Hex(check.output ?? ""),
+    outputBytes: Buffer.byteLength(check.output ?? "", "utf8"),
+    timeoutMs: Number(check.timeoutMs) || CHECK_DEFAULT_TIMEOUT_MS,
+  }
+}
+
+/** The command checks a report claims, in report order (what rerun.json must mirror). */
+function reportCommandProjection(report: any): any[] {
+  return (Array.isArray(report?.checks) ? report.checks : [])
+    .filter(
+      (check: any) =>
+        check &&
+        typeof check === "object" &&
+        Array.isArray(check.command) &&
+        check.command.length > 0 &&
+        check.outputTruncated === false,
+    )
+    .map((check: any) => ({
+      name: check.name,
+      argv: check.command,
+      cwd: normalizeCheckCwd(check.cwd).cwd ?? ".",
+      expectedExit: Number(check.exitCode),
+      outputBytes: Number(check.outputBytes),
+    }))
+}
+
+/** Compare a rerun.json task's checks to the report projection, in order. */
+function rerunMatchesReport(report: any, recorded: any): boolean {
+  if (!Array.isArray(recorded)) return false
+  const expected = reportCommandProjection(report)
+  if (recorded.length !== expected.length) return false
+  for (let i = 0; i < expected.length; i += 1) {
+    const a = expected[i]
+    const b = recorded[i]
+    if (!b || typeof b !== "object") return false
+    if (b.name !== a.name || b.expectedExit !== a.expectedExit || b.outputBytes !== a.outputBytes) return false
+    if (normalizeCheckCwd(b.cwd).cwd !== a.cwd) return false
+    if (canonicalJson(b.argv) !== canonicalJson(a.argv)) return false
+  }
+  return true
+}
+
 /**
  * Re-check a verifier report's PASS evidence from its content. `teamwork_report`
  * writes these invariants, but final_verify must not trust a hand-forged file
  * that was signed through some other path: every check passed, no fatal
  * findings, some evidence, and each output hash matches the output bytes.
  */
-function verifierReportIntegrityProblems(report: any): string[] {
+function verifierReportIntegrityProblems(report: any, provenance: ProvenanceMode = "declared"): string[] {
   const problems: string[] = []
   if (!report || typeof report !== "object") return ["report is not an object"]
   const checks = Array.isArray(report.checks) ? report.checks : []
   if (report.checks !== undefined && !Array.isArray(report.checks)) {
     problems.push("checks is not an array")
   }
+  let rerunnable = 0
   checks.forEach((check: any, index: number) => {
     const name = typeof check?.name === "string" && check.name ? check.name : `#${index + 1}`
     if (!check || typeof check !== "object" || check.passed !== true) {
@@ -2528,7 +2736,63 @@ function verifierReportIntegrityProblems(report: any): string[] {
         problems.push(`CHECK_EXIT_CONFLICT: check ${name} passed=false but exitCode=0`)
       }
     }
+    // checks[] v2: a command is argv only and must be self-describing. The
+    // digest is recomputed, never trusted.
+    if (check?.command !== undefined) {
+      const argvProblem = normalizeCheckCommand(check.command)
+      const cwdCheck = normalizeCheckCwd(check.cwd)
+      if (!Array.isArray(check.command)) problems.push(`check ${name} command must be an array of argv strings`)
+      else if (check.command.length > CHECK_MAX_ARGS) problems.push(`check ${name} command has more than ${CHECK_MAX_ARGS} args`)
+      if (argvProblem.error) problems.push(`check ${name} ${argvProblem.error}`)
+      if (cwdCheck.error) problems.push(`check ${name} ${cwdCheck.error}`)
+      if (!Number.isInteger(Number(check.exitCode))) problems.push(`check ${name} with a command must record an integer exitCode`)
+      if (!Number.isInteger(Number(check.outputBytes)) || Number(check.outputBytes) < 0) {
+        problems.push(`check ${name} must record a non-negative integer outputBytes`)
+      }
+      if (typeof check.outputTruncated !== "boolean") problems.push(`check ${name} must record a boolean outputTruncated`)
+      if (!Number.isInteger(Number(check.durationMs)) || Number(check.durationMs) < 0) {
+        problems.push(`check ${name} must record a non-negative integer durationMs`)
+      }
+      if (!cwdCheck.error && Array.isArray(check.command)) {
+        let expected: string | undefined
+        try {
+          expected = checkCommandDigest(check.command, cwdCheck.cwd ?? ".")
+        } catch {
+          expected = undefined
+        }
+        if (!/^[0-9a-f]{64}$/.test(String(check.commandSha256 ?? ""))) {
+          problems.push(`check ${name} commandSha256 is missing or invalid`)
+        } else if (expected && check.commandSha256 !== expected) {
+          problems.push(`check ${name} commandSha256 does not match {argv,cwd}`)
+        }
+      }
+      if (check.outputTruncated === false && Number.isInteger(Number(check.outputBytes)) && output !== "") {
+        if (Number(check.outputBytes) !== Buffer.byteLength(output, "utf8")) {
+          problems.push(`check ${name} outputBytes does not match its untruncated output`)
+        }
+      }
+      if (
+        check.type === "programmatic" &&
+        Array.isArray(check.command) &&
+        check.command.length > 0 &&
+        check.outputTruncated === false
+      ) {
+        rerunnable += 1
+      }
+    } else {
+      if (check?.cwd !== undefined || check?.commandSha256 !== undefined) {
+        problems.push(`check ${name} records cwd/commandSha256 without a command`)
+      }
+      if (provenance === "command" && check?.type === "programmatic") {
+        problems.push(`CHECK_COMMAND_MISSING: programmatic check ${name} has no command under requiredProvenance "command"`)
+      }
+    }
   })
+  if (provenance === "command" && rerunnable === 0) {
+    problems.push(
+      'CHECK_COMMAND_MISSING: requiredProvenance "command" needs at least one programmatic check with a re-executable command',
+    )
+  }
   if (Array.isArray(report.fatalFindings) && report.fatalFindings.length > 0) {
     problems.push("fatalFindings is non-empty")
   }
@@ -3575,10 +3839,27 @@ const RUN_MANIFEST = "run.manifest.json"
  * approval digest/nonce/approver so a re-plan or a later edit is `AUTH_STALE`.
  * Version 2 stays readable and keeps its manifestDigest-bound approval
  * semantics.
+ *
+ * 0.16.0 bumps to version 4: the manifest records `requiredProvenance`
+ * (`declared` | `command`). Versions 1–3 keep their meaning (declared).
  */
-const RUN_MANIFEST_VERSION = 3
-const SUPPORTED_RUN_MANIFEST_VERSIONS = [1, 2, 3] as const
+const RUN_MANIFEST_VERSION = 4
+const SUPPORTED_RUN_MANIFEST_VERSIONS = [1, 2, 3, 4] as const
 type RunManifestVersion = (typeof SUPPORTED_RUN_MANIFEST_VERSIONS)[number]
+/** First manifest version that can require re-executable command evidence. */
+const COMMAND_PROVENANCE_MIN_VERSION = 4
+const PROVENANCE_MODES = ["declared", "command"] as const
+type ProvenanceMode = (typeof PROVENANCE_MODES)[number]
+
+function normalizeProvenance(value: unknown): ProvenanceMode | undefined {
+  return value === "declared" || value === "command" ? value : undefined
+}
+
+/** Manifest authority for re-execution: version < 4 is always `declared`. */
+function manifestProvenance(manifest: RunManifest | undefined): ProvenanceMode {
+  if (!manifest || Number(manifest.version) < COMMAND_PROVENANCE_MIN_VERSION) return "declared"
+  return manifest.requiredProvenance === "command" ? "command" : "declared"
+}
 /** First manifest version that requires the external approval directory. */
 const APPROVAL_EXTERNAL_MIN_VERSION = 2
 /** First manifest version that binds the approval to `prompt_draft.md`. */
@@ -3627,6 +3908,12 @@ type RunManifest = {
   approvedBy?: string | null
   /** Version 3+: ISO timestamp from the approval artifact. */
   approvedAt?: string | null
+  /**
+   * Version 4+: whether a PASS must carry re-executable command evidence.
+   * Absent = `declared` (the 0.15 meaning). A re-plan may upgrade to `command`
+   * but never downgrade it.
+   */
+  requiredProvenance?: ProvenanceMode
   /**
    * ADR 0013: the run root `(dev, ino)` at plan time. Additive and optional;
    * a later control-plane write refuses when the root no longer matches.
@@ -3765,6 +4052,9 @@ function manifestDriftReason(drift: string): string {
   if (drift.startsWith("requireHandoffs")) {
     return `[AUTH_STALE] handoff gate downgrade/change refused (${drift})`
   }
+  if (drift.startsWith("requiredProvenance")) {
+    return `[AUTH_STALE] re-execution requirement downgrade/change refused (${drift})`
+  }
   if (drift.startsWith("trustLevel")) {
     return `[AUTH_STALE] artifact trust level downgrade/change refused (${drift})`
   }
@@ -3865,6 +4155,16 @@ function manifestDrift(
   if (baselineHandoffAuth === "signed" && currentHandoffAuth === "legacy") {
     drift.push(`handoffAuth downgraded: manifest=signed current=legacy`)
   }
+  // 0.16.0: re-execution is sticky. declared→command is an upgrade (allowed at
+  // re-plan); command→declared is a downgrade.
+  const baselineProvenance = manifestProvenance(manifest)
+  const currentProvenance =
+    manifest.version >= COMMAND_PROVENANCE_MIN_VERSION && current.requiredProvenance === "command"
+      ? "command"
+      : "declared"
+  if (baselineProvenance === "command" && currentProvenance !== "command") {
+    drift.push(`requiredProvenance downgraded: manifest=command current=${currentProvenance}`)
+  }
   for (const key of ["requestHash", "requirementsHash", "planHash", "lemmaPolicyHash"] as const) {
     const a = manifest[key]
     const b = current[key]
@@ -3939,6 +4239,7 @@ function currentManifestDrift(manifest: RunManifest, plan: any, state: any, run:
     approvalPolicy: approvalPolicyFor(currentTrust, manifest.version),
     approvalKeyId: currentApprovalKey,
     handoffAuth: plan?.allowUnsignedLegacy === true || state?.allowUnsignedLegacy === true ? "legacy" : "signed",
+    requiredProvenance: manifestProvenance(manifest),
     requestHash: originalRequestHash(run),
     requirementsHash: currentRequirementsHash(run),
     planHash: planHashOf(plan),
@@ -5017,6 +5318,26 @@ async function createPlanRun(
     }
   }
   const requireReportBinding = persistedRequireReportBinding || input.requireReportBinding === true
+  // 0.16.0: require re-executable command evidence. Chosen at plan time and
+  // sticky: a re-plan may upgrade declared→command, never downgrade it.
+  if (input.requiredProvenance !== undefined && normalizeProvenance(input.requiredProvenance) === undefined) {
+    return {
+      ok: false,
+      content: `refused: requiredProvenance must be "declared" or "command" (got "${clean(input.requiredProvenance, 32)}"); nothing was written.`,
+    }
+  }
+  const persistedProvenance =
+    normalizeProvenance(persistedPlan?.requiredProvenance) ?? manifestProvenance(existingManifest)
+  if (persistedProvenance === "command" && input.requiredProvenance === "declared") {
+    return {
+      ok: false,
+      content:
+        'refused: [AUTH_STALE] requiredProvenance is already persisted as "command" for this run and cannot be downgraded by a re-plan; omit it to keep the requirement or start a new session. Nothing was written.',
+      refused: "AUTH_STALE",
+    }
+  }
+  const requiredProvenance: ProvenanceMode =
+    persistedProvenance === "command" || input.requiredProvenance === "command" ? "command" : "declared"
   const rawRoute = typeof input.route === "string" ? clean(input.route, 32).trim().toLowerCase() : ""
   const isLemma = input.lemmaMode === true || rawRoute === "lemma"
   if (input.lemmaMode === true && rawRoute && rawRoute !== "lemma") {
@@ -5375,7 +5696,19 @@ async function createPlanRun(
   // Human/CI approval prerequisites are checked before any mkdir/state write,
   // so a refused plan leaves no run directory. A version 1 manifest is a
   // pre-0.10.2 run and keeps its in-run legacy approval path.
-  const manifestVersion = existingManifest?.version ?? RUN_MANIFEST_VERSION
+  const manifestVersionBase = existingManifest?.version ?? RUN_MANIFEST_VERSION
+  if (requiredProvenance === "command" && manifestVersionBase < COMMAND_PROVENANCE_MIN_VERSION && manifestVersionBase < 3) {
+    return {
+      ok: false,
+      content:
+        'refused: requiredProvenance "command" needs a 0.11+ (version 3) run; this legacy manifest cannot be upgraded safely. Start a new session. Nothing was written.',
+      refused: "AUTH_STALE",
+    }
+  }
+  const manifestVersion =
+    requiredProvenance === "command" && manifestVersionBase < COMMAND_PROVENANCE_MIN_VERSION
+      ? COMMAND_PROVENANCE_MIN_VERSION
+      : manifestVersionBase
   const approvalPrereq = checkApprovalPrerequisites(root, run, trustLevel, manifestVersion, process.env)
   if (!approvalPrereq.ok) {
     return {
@@ -5568,6 +5901,9 @@ async function createPlanRun(
     const baselineWitness = existingManifest.requireWitness === true
     if (baselineWitness !== requireWitness) {
       modeDrift.push(`requireWitness (${baselineWitness} -> ${requireWitness})`)
+    }
+    if (manifestProvenance(existingManifest) === "command" && requiredProvenance !== "command") {
+      modeDrift.push(`requiredProvenance (command -> ${requiredProvenance})`)
     }
     if (modeDrift.length > 0) {
       return {
@@ -5854,6 +6190,7 @@ async function createPlanRun(
     requireHandoffsSource,
     ...(requirePinnedWrites ? { requirePinnedWrites: true } : {}),
     ...(requireReportBinding ? { requireReportBinding: true } : {}),
+    ...(requiredProvenance === "command" ? { requiredProvenance: "command" as const } : {}),
     claimProtocol: CLAIM_PROTOCOL,
     claimLeaseMs,
     host: planHost,
@@ -5901,6 +6238,7 @@ async function createPlanRun(
         requireHandoffs: requireHandoffsMode,
         ...(requirePinnedWrites ? { requirePinnedWrites: true } : {}),
         ...(requireReportBinding ? { requireReportBinding: true } : {}),
+        ...(requiredProvenance === "command" ? { requiredProvenance: "command" as const } : {}),
         claimProtocol: CLAIM_PROTOCOL,
         claimLeaseMs,
         host: planHost,
@@ -5931,6 +6269,7 @@ async function createPlanRun(
             state.requireHandoffs !== requireHandoffsMode ||
             (requirePinnedWrites && state.requirePinnedWrites !== true) ||
             (requireReportBinding && state.requireReportBinding !== true) ||
+            (requiredProvenance === "command" && state.requiredProvenance !== "command") ||
             state.rootSessionId !== rootSessionId ||
             (allowUnsignedLegacy && state.allowUnsignedLegacy !== true) ||
             (state.claimProtocol >= CLAIM_PROTOCOL &&
@@ -5947,6 +6286,7 @@ async function createPlanRun(
           state.requireHandoffs = requireHandoffsMode
           if (requirePinnedWrites) state.requirePinnedWrites = true
           if (requireReportBinding) state.requireReportBinding = true
+          if (requiredProvenance === "command") state.requiredProvenance = "command"
           state.rootSessionId = rootSessionId
           if (allowUnsignedLegacy) state.allowUnsignedLegacy = true
           if (state.claimProtocol >= CLAIM_PROTOCOL) {
@@ -5992,6 +6332,7 @@ async function createPlanRun(
           ? existingManifest?.approvalKeyId ?? null
           : approvalPrereq.approvalKeyId,
       handoffAuth: allowUnsignedLegacy ? "legacy" : "signed",
+      requiredProvenance,
       requestHash: baselineRequestHash,
       requirementsHash: baselineRequirementsHash,
       planHash: baselinePlanHash,
@@ -6065,6 +6406,7 @@ async function createPlanRun(
         requireHandoffs: requireHandoffsMode,
         ...(runNonce ? { runNonce } : {}),
         handoffAuth: allowUnsignedLegacy ? "legacy" : "signed",
+        ...(manifestVersion >= COMMAND_PROVENANCE_MIN_VERSION ? { requiredProvenance } : {}),
         requestHash: baselineRequestHash,
         requirementsHash: baselineRequirementsHash,
         planHash: baselinePlanHash,
@@ -6292,6 +6634,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             type: "boolean",
             description:
               "Default false (compatibility). When true, a PASS verifier report must carry headSha and diffHash computed by the engine; teamwork_report and final_verify refuse an unbound PASS with REPORT_UNBOUND. Sticky: a re-plan cannot disable it.",
+          },
+          requiredProvenance: {
+            type: "string",
+            description:
+              "declared | command. Default declared (compatibility). command records a manifest-v4 requirement that every PASS verifier report carries at least one programmatic check with argv/cwd/exitCode/output digest, and writes a signed verify/rerun.json that `opencode-teamwork verify --rerun --repo <clean-checkout>` can re-execute. A re-plan may upgrade declared→command but never downgrade it.",
           },
           requireSameHost: {
             type: "boolean",
@@ -9548,6 +9895,28 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 }
               }
             }
+            // 0.16.0: under `command` a verified_pass consumes only a report
+            // with a re-executable programmatic check and a commit to run it on.
+            if (report?.status === "PASS") {
+              const reportProvenance = manifestProvenance(
+                evidenceManifest.ok && evidenceManifest.signed ? evidenceManifest.manifest : undefined,
+              )
+              if (reportProvenance === "command") {
+                const problems = verifierReportIntegrityProblems(report, "command")
+                if (problems.length > 0) {
+                  return {
+                    status: "REPORT_INVALID",
+                    content: `REPORT_INVALID: refusing verified_pass for task "${taskId}" — ${problems.join("; ")}. Re-record the report through teamwork_report.`,
+                  }
+                }
+                if (typeof report.headSha !== "string" || report.headSha.trim() === "") {
+                  return {
+                    status: "REPORT_UNBOUND",
+                    content: `REPORT_UNBOUND: refusing verified_pass for task "${taskId}" — requiredProvenance is "command" but the report records no headSha to re-execute against.`,
+                  }
+                }
+              }
+            }
             inlineEvidenceUsed = inlinePass
             if (protocol >= CLAIM_PROTOCOL && report?.status === "PASS") {
               // Cheap movement check under the lock: the expensive base/head
@@ -10701,7 +11070,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
     editor.add({
       name: "report",
       description:
-        "Trusted writer for verify/report-<taskId>.json. Only a session whose trusted agent is team/verifier, descending from the run root, may call it. The task must exist in plan.dag.json and a PASS report must carry evidence (a summary or checks, every check passed, no fatal findings). The report is signed for a signed run (run.manifest.json) and indexed in ctx.storage; final_verify re-checks the signature and the PASS evidence. A wrong agent, a missing task, or an inconsistent PASS is refused.",
+        "Trusted writer for verify/report-<taskId>.json. Only a session whose trusted agent is team/verifier, descending from the run root, may call it. The task must exist in plan.dag.json and a PASS report must carry evidence (a summary or checks, every check passed, no fatal findings). A check may record argv-only command evidence (command/cwd/exitCode/output/durationMs); the engine computes commandSha256/outputBytes and writes a signed verify/rerun.json projection that `opencode-teamwork verify --rerun` can re-execute at the report's headSha. The report is signed for a signed run (run.manifest.json) and indexed in ctx.storage; final_verify re-checks the signature and the PASS evidence. A wrong agent, a missing task, an inconsistent PASS, a shell command line, or (under requiredProvenance \"command\") a programmatic check without a command is refused.",
       input: {
         type: "object",
         properties: {
@@ -10721,6 +11090,18 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 output: { type: "string", description: "Optional captured output (max 2000 chars); stored and hashed as outputSha256." },
                 error: { type: "string", description: "Optional captured error output (max 2000 chars)." },
                 exitCode: { type: "number", description: "Optional process/check exit code (integer)." },
+                command: {
+                  type: "array",
+                  items: { type: "string" },
+                  description:
+                    "Optional argv-only command (max 32 args). Never a shell line; `sh -c`/`bash -c` is refused. Under requiredProvenance \"command\" a programmatic check must record one.",
+                },
+                cwd: { type: "string", description: "Optional relative directory inside the re-execution worktree (default \".\"). Absolute paths and .. are refused." },
+                durationMs: { type: "number", description: "Observed command duration in milliseconds (integer, engine-bounded). Required when command is supplied." },
+                timeoutMs: { type: "number", description: "Optional per-command timeout in milliseconds (1..600000, default 120000); recorded only in verify/rerun.json." },
+                outputTruncated: { type: "boolean", description: "Set when `output` is a truncated capture; a truncated check stays audit evidence but is never recorded as re-executable." },
+                outputBytes: { type: "number", description: "Engine-computed. Ignored on input." },
+                commandSha256: { type: "string", description: "Engine-computed over {argv,cwd}. Ignored on input." },
                 outputSha256: { type: "string", description: "Engine-computed. Ignored on input; final_verify recomputes it from output." },
               },
               required: ["name", "passed"],
@@ -10791,20 +11172,23 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (!planIds.includes(taskId)) {
           return { content: `refused: task "${clean(taskId, 64)}" is not in plan.dag.json; nothing was written` }
         }
+        const manifestCheck = await readRunManifest(run, auth)
+        if (!manifestCheck.ok) {
+          return { content: `refused: ${authFailureText(manifestCheck.failure)}; nothing was written` }
+        }
+        const provenance = manifestProvenance(
+          manifestCheck.signed ? manifestCheck.manifest : undefined,
+        )
+        const checkProblems: string[] = []
         const checks = Array.isArray(input?.checks)
-          ? input.checks.slice(0, 100).map((c: any) => {
-              const output = typeof c?.output === "string" ? cleanBlock(c.output, 2000).trim() : ""
-              const error = typeof c?.error === "string" ? cleanBlock(c.error, 2000).trim() : ""
-              const exitCode = Number.isInteger(c?.exitCode) ? Number(c.exitCode) : undefined
-              return {
-                name: clean(c?.name, 200),
-                type: clean(c?.type, 64) || "check",
-                passed: c?.passed === true,
-                ...(output ? { output, outputSha256: sha256Hex(output) } : {}),
-                ...(error ? { error } : {}),
-                ...(exitCode !== undefined ? { exitCode } : {}),
-              }
-            })
+          ? input.checks
+              .slice(0, 100)
+              .map((c: any) => {
+                const normalized = normalizeReportCheck(c, provenance)
+                checkProblems.push(...normalized.problems)
+                return normalized.check
+              })
+              .filter(Boolean)
           : []
         const summary = typeof input?.summary === "string" ? cleanBlock(input.summary, 2000).trim() : ""
         const fatalFindings = Array.isArray(input?.fatalFindings)
@@ -10824,28 +11208,73 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             content: "refused: a PASS report requires every checks[].passed to be true; nothing was written",
           }
         }
-        // D4: ignore an exitCode that contradicts `passed` instead of recording
-        // a self-contradictory check. Named refusal, no artifact.
-        const exitConflicts = checks.filter(
-          (c: any) =>
-            c.exitCode !== undefined &&
-            (!Number.isInteger(c.exitCode) || (c.passed === true ? c.exitCode !== 0 : c.exitCode === 0)),
-        )
-        if (exitConflicts.length > 0) {
+        // D4 + checks[] v2: a self-contradictory exitCode, an argv that is not
+        // re-executable, or a programmatic claim without a command is refused
+        // by name instead of being recorded.
+        if (checkProblems.length > 0) {
+          const exitConflict = checkProblems.some((p) => p.startsWith("CHECK_EXIT_CONFLICT"))
+          const commandMissing = checkProblems.some((p) => p.startsWith("CHECK_COMMAND_MISSING"))
           return {
-            status: "CHECK_EXIT_CONFLICT",
-            content: `refused: CHECK_EXIT_CONFLICT: ${exitConflicts
-              .map((c: any) => `check ${clean(c.name, 64)} passed=${c.passed} exitCode=${clean(c.exitCode, 16)}`)
-              .join("; ")}; a check's exitCode must agree with passed; nothing was written`,
+            status: exitConflict ? "CHECK_EXIT_CONFLICT" : commandMissing ? "CHECK_COMMAND_MISSING" : "CHECK_INVALID",
+            content: `refused: ${checkProblems.join("; ")}; nothing was written`,
+          }
+        }
+        if (status === "PASS" && provenance === "command") {
+          const rerunnable = checks.some(
+            (c: any) => c.type === "programmatic" && Array.isArray(c.command) && c.command.length > 0 && c.outputTruncated === false,
+          )
+          if (!rerunnable) {
+            return {
+              status: "CHECK_COMMAND_MISSING",
+              content:
+                'refused: CHECK_COMMAND_MISSING: requiredProvenance is "command", so a PASS needs at least one programmatic check with an untruncated argv/output observation; nothing was written',
+            }
           }
         }
         if (status === "PASS" && summary === "" && checks.length === 0) {
           return { content: "refused: a PASS report needs evidence — provide a non-empty summary or at least one check; nothing was written" }
         }
-        const manifestCheck = await readRunManifest(run, auth)
-        if (!manifestCheck.ok) {
-          return { content: `refused: ${authFailureText(manifestCheck.failure)}; nothing was written` }
+        // verify/rerun.json is the signed, re-executable projection of the
+        // command checks. It is merged per task and re-signed; the existing
+        // file's envelope is verified first so a re-report cannot launder a
+        // tampered re-execution record.
+        const runIdForRerun = basename(run)
+        const rerunFile = join(run, "verify", "rerun.json")
+        const rerunTasks: Record<string, any> = Object.create(null)
+        if (existsSync(rerunFile)) {
+          const existingRerun = readJson<any>(run, rerunFile, undefined)
+          if (!existingRerun || typeof existingRerun !== "object" || !existingRerun.tasks || typeof existingRerun.tasks !== "object") {
+            return { status: "RERUN_INVALID", content: "refused: [RERUN_INVALID] verify/rerun.json is malformed; repair it before recording a report. Nothing was written." }
+          }
+          if (manifestCheck.signed) {
+            const rerunCheck = auth
+              ? await auth.verifyRunArtifact(runIdForRerun, "verify/rerun.json", existingRerun)
+              : { status: "unknown" as const, failure: { code: "AUTH_UNAVAILABLE" as const, message: "no authenticity context" } }
+            if (rerunCheck.status !== "signed") {
+              const failure =
+                rerunCheck.status === "unsigned"
+                  ? { code: "AUTH_MISSING", message: "verify/rerun.json has no _auth envelope" }
+                  : rerunCheck.failure ?? { code: "AUTH_INVALID", message: "verify/rerun.json failed verification" }
+              return { content: `refused: ${authFailureText(failure)}; verify/rerun.json must verify before it can be extended. Nothing was written.` }
+            }
+          }
+          for (const [id, value] of Object.entries(existingRerun.tasks)) {
+            if (id !== taskId) rerunTasks[id] = value
+          }
         }
+        const rerunEntries = checks
+          .map((check: any) => rerunEntryForCheck(check))
+          .filter((entry: any) => entry !== undefined)
+        if (rerunEntries.length > 0) rerunTasks[taskId] = { checks: rerunEntries }
+        const rerunPayload: any =
+          Object.keys(rerunTasks).length > 0
+            ? {
+                version: 1,
+                sessionId: runIdForRerun,
+                tasks: rerunTasks,
+                generatedAt: new Date().toISOString(),
+              }
+            : undefined
         const state = readJson<any>(run, join(run, "state.json"), undefined)
         const taskState = state?.tasks && typeof state.tasks === "object" ? state.tasks[taskId] ?? {} : {}
         const protocol = claimProtocolOf(state)
@@ -10978,10 +11407,30 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
         }
+        let rerunToWrite: any
+        if (rerunPayload && manifestCheck.signed) {
+          try {
+            rerunToWrite = await auth!.signRunArtifact(basename(run), "verify/rerun.json", rerunPayload)
+          } catch (err: any) {
+            const failure = err?.failure as AuthFailure | undefined
+            return {
+              content: `refused: could not sign verify/rerun.json (${failure ? failure.code : "signing failed"}); nothing was written`,
+              refused: failure?.code ?? "AUTH_UNAVAILABLE",
+            }
+          }
+        } else if (rerunPayload) {
+          rerunToWrite = rerunPayload
+        }
         try {
           writeJsonSafe(run, join(run, relativePath), toWrite)
         } catch (err: any) {
           return { content: `refused: could not write ${relativePath} (${clean(err?.message, 140)}); nothing was written` }
+        }
+        try {
+          if (rerunToWrite) writeJsonSafe(run, rerunFile, rerunToWrite)
+          else if (existsSync(rerunFile)) rmSync(rerunFile, { force: true })
+        } catch (err: any) {
+          return { content: `refused: could not write verify/rerun.json (${clean(err?.message, 140)}); the report is not consumable` }
         }
         await appendEvent(run, {
           event: "verifier_report",
@@ -10994,10 +11443,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           phase: state?.phase ?? null,
         })
         return {
-          content: `VERIFIER REPORT WRITTEN: ${taskId} ${status}${manifestCheck.signed ? " (signed)" : " (unsigned legacy)"}.\nArtifact: ${join(run, relativePath)}`,
+          content: `VERIFIER REPORT WRITTEN: ${taskId} ${status}${manifestCheck.signed ? " (signed)" : " (unsigned legacy)"}.${rerunToWrite ? "\nRe-execution record: verify/rerun.json" : ""}\nArtifact: ${join(run, relativePath)}`,
           report: toWrite,
           artifact: join(run, relativePath),
           signed: manifestCheck.signed,
+          ...(rerunToWrite ? { rerunArtifact: join(run, "verify", "rerun.json") } : {}),
         }
       },
     })
@@ -11112,6 +11562,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const trustLevel: TrustLevel = signedRun
             ? normalizeTrustLevel(manifestCheck.manifest.trustLevel) ?? DEFAULT_TRUST_LEVEL
             : DEFAULT_TRUST_LEVEL
+          // 0.16.0: the signed manifest decides whether a claim must be
+          // re-executable. A version < 4 manifest keeps the 0.15 `declared`
+          // meaning. final_verify never executes a command; `verify --rerun`
+          // does. It does enforce the record shape and the rerun artifact.
+          const provenance: ProvenanceMode = signedRun ? manifestProvenance(manifestCheck.manifest) : "declared"
           const observedAlgs: Array<string | undefined> = []
           // SEC-1: null-prototype map; ids are read as data, never used as paths
           // unless they pass isSafeTaskId.
@@ -11156,10 +11611,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 report?.status === "PASS" ? "PASS" : report?.status === "FAIL" ? "FAIL" : "MISSING",
             })
             if (reportRel && report?.status === "PASS") {
-              const problems = verifierReportIntegrityProblems(report)
+              const problems = verifierReportIntegrityProblems(report, provenance)
               if (problems.length > 0) {
                 contentIntegrityReasons.push(
                   `task ${id}: report ${reportRel} is not a valid PASS (${problems.join("; ")})`,
+                )
+              }
+              // A command claim without a commit has no worktree to re-run in.
+              if (provenance === "command" && (typeof report.headSha !== "string" || report.headSha.trim() === "")) {
+                contentIntegrityReasons.push(
+                  `[REPORT_UNBOUND] task ${id}: requiredProvenance is "command" but report ${reportRel} records no headSha`,
                 )
               }
             }
@@ -11223,6 +11684,27 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               }
             }
           }
+          // A command claim with no commit cannot be re-executed against any
+          // tree. This is the same named refusal whether or not the plan also
+          // asserted requireReportBinding.
+          if (provenance === "command") {
+            const unbound = tasks.filter((t) => {
+              if (t.reportStatus !== "PASS") return false
+              const value = reportValues[t.id]
+              return !value || typeof value.headSha !== "string" || value.headSha.trim() === ""
+            })
+            if (unbound.length > 0) {
+              return {
+                status: "REPORT_UNBOUND",
+                content: `FINAL VERIFICATION REFUSED: requiredProvenance is "command" but PASS report(s) for ${unbound
+                  .map((t) => t.id)
+                  .join(", ")} record no headSha; a command claim must name the commit it was observed on. Nothing was written.`,
+                reasons: unbound.map(
+                  (t) => `[REPORT_UNBOUND] task ${t.id}: requiredProvenance "command" needs a report.headSha`,
+                ),
+              }
+            }
+          }
           const audit = readJson<any>(run, join(run, "verify", "security-audit.json"), undefined)
           const securityAudit = {
             path: "verify/security-audit.json",
@@ -11251,6 +11733,66 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             } else {
               observedAlgs.push(check.auth?.alg)
             }
+          }
+          // 0.16.0: verify/rerun.json is the signed re-execution projection of
+          // the report's command checks. final_verify does not execute it (the
+          // offline verifier's --rerun does); it refuses a missing record under
+          // `command`, a bad envelope, or a record that no longer mirrors the
+          // reports. Its digest is stamped into final evidence.
+          const rerunRaw = readBoundedRunFile(run, join(run, "verify", "rerun.json"), MAX_RUN_FILE_BYTES)
+          let rerunValue: any
+          let rerunDigest: string | null = null
+          if (rerunRaw.status === "ok") {
+            rerunDigest = sha256Hex(rerunRaw.text)
+            try {
+              rerunValue = JSON.parse(rerunRaw.text)
+            } catch {
+              rerunValue = undefined
+              contentIntegrityReasons.push("[RERUN_INVALID] verify/rerun.json is malformed")
+            }
+          }
+          if (rerunValue) {
+            if (requireSigned) {
+              const check = auth
+                ? await auth.verifyRunArtifact(basename(run), "verify/rerun.json", rerunValue)
+                : {
+                    status: "unknown" as const,
+                    failure: { code: "AUTH_UNAVAILABLE" as const, message: "no authenticity context is wired for this run" },
+                  }
+              if (check.status === "unsigned") {
+                authReasons.push("[AUTH_MISSING] verify/rerun.json has no _auth envelope (a signed run requires one)")
+              } else if (check.status !== "signed") {
+                const failure = check.failure ?? { code: "AUTH_INVALID" as const, message: "verify/rerun.json failed verification" }
+                authReasons.push(`[${failure.code}] ${failure.message}`)
+              }
+            }
+            if (rerunValue.version !== 1 || rerunValue.sessionId !== basename(run)) {
+              contentIntegrityReasons.push("[RERUN_INVALID] verify/rerun.json has an unsupported version or sessionId")
+            } else if (!rerunValue.tasks || typeof rerunValue.tasks !== "object" || Array.isArray(rerunValue.tasks)) {
+              contentIntegrityReasons.push("[RERUN_INVALID] verify/rerun.json has no tasks object")
+            } else {
+              for (const [id, report] of Object.entries(reportValues)) {
+                if (!isSafeTaskId(id)) continue
+                const projection = reportCommandProjection(report)
+                if (projection.length === 0) continue
+                if (!rerunMatchesReport(report, rerunValue.tasks[id]?.checks)) {
+                  contentIntegrityReasons.push(
+                    `[AUTH_STALE] verify/rerun.json no longer mirrors the command checks in verify/report-${id}.json`,
+                  )
+                }
+              }
+              for (const id of Object.keys(rerunValue.tasks)) {
+                if (!isSafeTaskId(id) || reportCommandProjection(reportValues[id]).length === 0) {
+                  contentIntegrityReasons.push(
+                    `[AUTH_STALE] verify/rerun.json records commands for ${clean(id, 64)}, which no report claims`,
+                  )
+                }
+              }
+            }
+          } else if (provenance === "command") {
+            contentIntegrityReasons.push(
+              '[RERUN_MISSING] requiredProvenance is "command" but verify/rerun.json is missing',
+            )
           }
           const allTasksVerifiedPass = tasks.length > 0 && tasks.every((t) => t.status === "verified_pass")
 
@@ -11707,6 +12249,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               allTasksVerifiedPass,
               reportDigests,
               auditDigest,
+              rerunDigest,
               victory: victoryGate.skipped
                 ? { mode: "skip", status: victoryGate.status, reason: victoryGate.reason ?? null, reasons: [] }
                 : victoryGate.ok
