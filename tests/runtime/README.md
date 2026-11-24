@@ -107,7 +107,7 @@ Two host details the harness relies on:
 | I1 | Standard happy path: two tasks claimed by the Sentinel, a real worktree each, verifier FAIL on round 1, worker round 2, PASS, security audit, victory audit, stamped `verify/final.json` PASS, `next` → `ALL_PASSED`, no `GATE_STATUS.md`, no duplicate effects. |
 | I2 | Strict path: per-task falsifier `PASS` + security-auditor `CLEAN` waves with cites; `next` stays `NEEDS_STRICT_WAVE` while either is missing; a missing wave fails `final_verify`; the strict PASS writes every `GATE_STATUS.md` row. |
 | I3 | `VICTORY REJECTED` with an unmet requirement blocks the dedicated gate; repeated `next` reads change nothing; only a fresh trusted audit resumes the run, and `final_verify` stamps PASS only after `CONFIRMED`. |
-| I4 | Failure limits: `maxRounds` exhaustion coerces the task to `blocked`, the run records `PRESENT_PARTIAL`, `next` reports `DEADLOCK`, and nothing outside the run is written. The budget-exhaustion half is skipped as a recorded defect (`FINDINGS.md` §4). |
+| I4 | Failure limits: `maxRounds` exhaustion coerces the task to `blocked`, the run records `PRESENT_PARTIAL`, `next` reports `DEADLOCK`, and nothing outside the run is written. The budget half asserts the documented advisory behaviour: at 1000% of `budgetUsd`, `teamwork_cost` returns `shouldHalt`/`thresholdPct`, but `next` still dispatches and `task_update` still starts a round; `budgetUsd: 0` is unlimited. |
 | I5 | Two OS processes race `next` on one run with a file-backed session DB: each task is claimed by exactly one process, `state.json` parses, and `events.jsonl` keeps one unique, contiguous, monotonic `seq` space. |
 | I6 | Offline verifier on produced runs: Ed25519 `--public-key @file` PASS, one-byte flip FAIL, a `chmod -R a-w` copy verifies PASS and is byte-identical afterwards, HMAC `--hmac-key` PASS, and `requiredProvenance: "command"` is UNKNOWN (exit 2) without `--rerun` and PASS (exit 0) with `--rerun` on a clean checkout. |
 
@@ -147,7 +147,8 @@ pre-existing empty array as unbound.
 
 **L3 found one genuine limitation and three observations**, all recorded in
 `FINDINGS.md`: the run budget is advisory outside the massive-proof tournament
-(I4b is skipped), bare `next` claims append no event (I5 also records each
+(0.17.2 documents the limitation, makes the 80% threshold explicit, and unskips
+I4b to assert it), bare `next` claims append no event (I5 also records each
 claimed `worker_active`), `BLOCKED_BY_VICTORY_AUDIT` needs a pre-existing stamped
 PASS (I3 seeds one through the same signing auth context), and a `request`
 derives a requirements baseline, which makes the victory and handoff gates

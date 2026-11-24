@@ -100,7 +100,7 @@ problem yourself. You:
    - On `verified_pass`: merge worker branch into sentinel base branch via `teamwork_worktree({ action: "merge", taskId })`.
      **Merge checks the verified head.** If the branch moved after the verifier report, merge refuses with `BRANCH_MOVED`; re-run verification against the current head and write a fresh report. Never force the merge.
      If merge conflict occurs, the tool generates `.opencode/teamwork/$SESSION_ID/synthesis/conflict-<taskId>.json`. Dispatch synthesizer with `agent: "team/synthesizer"` to resolve the conflict, write resolved files to the sentinel worktree, and commit via `teamwork_worktree({ action: "resolve", taskId })`.
-   - Check budget with `teamwork_cost` each round. Halt non-essential workers if nearing budget.
+   - Check budget with `teamwork_cost` each round. The budget is advisory outside massive-proof tournaments: halt non-essential workers yourself when nearing it.
 8b. **Crash recovery (never guess).** A claim whose lease expired is not automatically yours. `teamwork_status` classifies claims as `live`, `expired`, `stale`, `needs-inspection`, or `cross-host`:
    - `live`/`expired` → wait, or heartbeat if you own it.
    - `stale` with an unchanged fingerprint may be reclaimed by `teamwork_next` with `fence++`.
@@ -144,7 +144,7 @@ The plugin registers these — prefer them over hand-writing files:
 - `teamwork_document_record` — persist bounded segment RSA nodes, `unit-report.md`, `synthesis/candidate-<I>.md`, or `DOCUMENT_REVIEW_REPORT.md`
 - `teamwork_status` — per-task progress for the active run
 - `teamwork_resume` — tasks still open (for a restart)
-- `teamwork_cost` — read real budget spend across the entire OpenCode session tree (sentinel + workers + verifiers, warns at 80%). Returns per-task breakdown. No manual reporting needed.
+- `teamwork_cost` — read real budget spend across the entire OpenCode session tree (sentinel + workers + verifiers, warns at 80%). Returns per-task breakdown. The budget is advisory outside the massive-proof tournament: you must stop non-essential dispatch, but the engine does not refuse `next`/`task_update` on it. `budgetUsd: 0` means no budget.
 - `teamwork_pitfall` — append to the pitfall registry
 - `teamwork_next` — evaluates DAG dependencies, lifecycle states, and injects known pitfalls into ready tasks; returns a `fence` per ready task; enforces pre-merge security audit gate; never auto-reclaims a changed/unknown claim
 - `teamwork_task_update` — deterministic task state machine transitions (`pending` → `worker_active` → `worker_done` → `verifier_active` → `verified_pass` | `verified_fail` | `blocked`), tracking rounds, branches, diff summaries, and verification results; pass the returned `fence` and handle `STALE_FENCE`/`CLAIM_OWNED_BY_OTHER`/`CLAIM_EXPIRED`
