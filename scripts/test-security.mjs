@@ -248,6 +248,41 @@ try {
     assert.strictEqual(unreadableCheck.status, "pass", unreadableCheck.message)
     assert(/no approver private material is readable/.test(unreadableCheck.message), unreadableCheck.message)
 
+    // CI attestation key: verify-only is a pass, visible private material is a
+    // failure, and `required` with no key is a warning.
+    const { generateKeyPairSync } = await import("node:crypto")
+    const attestationPair = generateKeyPairSync("ed25519")
+    const attestationPublic = attestationPair.publicKey.export({ format: "der", type: "spki" }).toString("base64url")
+    const attestationOk = collectSecurityReport(
+      allPassOptions({ env: { OPENCODE_TEAMWORK_ATTESTATION_PUBLIC_KEY: attestationPublic } }),
+    )
+    const attestationOkCheck = attestationOk.checks.find((c) => c.name === "attestation_key")
+    assert.strictEqual(attestationOkCheck.status, "pass", attestationOkCheck.message)
+    assert(/verify-only Ed25519 CI attestation key/.test(attestationOkCheck.message), attestationOkCheck.message)
+
+    const attestationPrivate = collectSecurityReport(
+      allPassOptions({
+        env: {
+          OPENCODE_TEAMWORK_ATTESTATION_PUBLIC_KEY: attestationPublic,
+          OPENCODE_TEAMWORK_ATTESTATION_PRIVATE_KEY: "fixture-private-key",
+        },
+      }),
+    )
+    const attestationPrivateCheck = attestationPrivate.checks.find((c) => c.name === "attestation_key")
+    assert.strictEqual(attestationPrivateCheck.status, "fail", attestationPrivateCheck.message)
+    assert(/CI signer key must live only in the CI principal/.test(attestationPrivateCheck.message))
+
+    const requiredRun = join(testDir, "attestation-required-run")
+    mkdirSync(requiredRun, { recursive: true })
+    writeFileSync(
+      join(requiredRun, "run.manifest.json"),
+      JSON.stringify({ version: 5, attestationPolicy: "required" }),
+    )
+    const attestationMissing = collectSecurityReport(allPassOptions({ runDir: requiredRun }))
+    const attestationMissingCheck = attestationMissing.checks.find((c) => c.name === "attestation_key")
+    assert.strictEqual(attestationMissingCheck.status, "warn", attestationMissingCheck.message)
+    assert(/attestationPolicy "required"/.test(attestationMissingCheck.message), attestationMissingCheck.message)
+
     // Signer approval directory: unset is a pass (v1), inside repo / caller
     // owned is a failure.
     const signerUnset = collectSecurityReport(allPassOptions())

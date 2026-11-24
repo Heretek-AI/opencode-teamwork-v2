@@ -32,6 +32,12 @@ const DIGEST_DOMAIN_KEY = Buffer.from([
 export const SIGNATURE_DOMAIN = "teamwork-artifact-v1"
 export const WITNESS_DOMAIN = "teamwork-witness-v1"
 export const SIGNER_APPROVAL_DOMAIN = "teamwork-signer-approval-v1"
+/**
+ * CI attestation (0.18.0). A distinct domain keeps an attestation signature
+ * from being replayable as a run artifact, a witness receipt, or an approval.
+ * The envelope is the same v1 `_auth` shape; only the signed bytes differ.
+ */
+export const ATTESTATION_DOMAIN = "teamwork-ci-attestation-v1"
 export const AUTH_ED25519 = "ed25519"
 export const AUTH_HMAC = "hmac-sha256"
 
@@ -137,6 +143,16 @@ export function approvalKeyIdFromPublicKey(publicKey, configured) {
  */
 export function witnessSignatureInput(runId, path, digest, nonce, at) {
   return `${WITNESS_DOMAIN}\0${runId}\0${path}\0${digest}\0${nonce}\0${at}`
+}
+
+/**
+ * CI attestation signature input. Same construction as the artifact envelope
+ * (canonical payload without `_auth`, key id, path, nonce) under a dedicated
+ * domain label, so a CI key's signature is not interchangeable with any other
+ * Teamwork protocol signature.
+ */
+export function attestationSignatureInput(alg, keyId, path, nonce, payload) {
+  return `${ATTESTATION_DOMAIN}\0${alg}\0${keyId}\0${path}\0${nonce}\0${canonicalJson(withoutAuth(payload))}`
 }
 
 /**

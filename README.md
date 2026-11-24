@@ -418,6 +418,10 @@ opencode-teamwork verify --session <id> --public-key ... --require-index snapsho
 # 0.16.0: re-execute recorded command evidence at the report's commit
 opencode-teamwork verify --run-dir /path/to/run --public-key ... \
   --rerun --repo /path/to/clean-checkout [--timeout 300] [--keep-worktree]
+
+# 0.18.0: verify a CI attestation signed by a key the run does not hold
+opencode-teamwork verify --run-dir /path/to/run --public-key ... \
+  --attestation-public-key @ci-attestation.pub [--attestation-issuer <issuer>]
 ```
 
 Under a plan that recorded `requiredProvenance: "command"`, a PASS report must
@@ -433,6 +437,17 @@ is exit 2 `command-unavailable`, a timeout is `command-timeout`, and a shell lin
 or escaping `cwd` is `command-refused`. The source checkout is hashed before and
 after; the worktree is removed unless `--keep-worktree`. `declared` runs keep the
 0.15 behaviour.
+
+Since 0.18.0 a plan can set `attestationPolicy: "optional" | "required"`. A CI
+job runs `.github/workflows/attest.yml` (or `scripts/attest-sign.mjs`) under a
+separate Ed25519 key and writes `verify/ci/attestation.json`, binding the run
+nonce, plan hash, prompt hash, report commit and every command's argv/exit/output
+digest. `final_verify` refuses a `required` run without a valid attestation
+(`AUTH_ATTESTATION_MISSING/STALE/UNTRUSTED/COMMIT_MISMATCH/REPLAY`), and `verify`
+reports `attestation.status` plus `attested: true` with
+`--attestation-public-key`; without that key a present attestation is `UNKNOWN`
+(exit 2), never `PASS`. The attestation key must differ from `runKeyId`. See
+[ADR 0018](docs/adr/0018-ci-attestation.md).
 
 The signed `run.manifest.json` is the anchor: its `runNonce`, `runKeyId` and
 algorithm are covered by the envelope, and every other artifact is pinned to
@@ -453,10 +468,13 @@ recompute every byte digest, citation, branch binding and cross-artifact
 relation; it still cannot prove an observation, a consistently authored false
 report passes every check, and a whole-run rollback to an earlier signed set is
 undetectable without a snapshot or witness. Re-execution narrows this: a false
-PASS under `command` must survive `--rerun`. It does not prove the command is
-meaningful or that a test was not edited in the same commit; see
+PASS under `command` must survive `--rerun`. A CI attestation narrows it again:
+the declared commands ran at the recorded commit under a separate identity. It
+does not prove the suite is meaningful or that a test was not edited in the same
+commit, and a CI principal reachable by the agent's UID is not a boundary. See
 [ADR 0015](docs/adr/0015-offline-verification.md),
-[ADR 0016](docs/adr/0016-re-executable-verification.md) and
+[ADR 0016](docs/adr/0016-re-executable-verification.md),
+[ADR 0018](docs/adr/0018-ci-attestation.md) and
 [`docs/ARTIFACTS.md`](docs/ARTIFACTS.md#offline-verification-opencode-teamwork-verify).
 
 ## Model assignment

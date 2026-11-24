@@ -99,6 +99,9 @@ Options:
       --witness-public-key <k>  Optional Ed25519 witness key for a receipt
       --witness-key-id <id>     Expected witness key id
       --witness-receipt <path>  Witness receipt JSON to verify
+      --attestation-public-key <k>  Ed25519 CI attestation key (base64url SPKI or @file)
+      --attestation-key-id <id>     Expected CI attestation key id
+      --attestation-issuer <issuer> Expected CI OIDC issuer
       --force            With prune: remove a worktree even when a live/expired/
                          needs-inspection/cross-host claim still blocks it
       --reason <text>    Recorded reason for a forced prune
@@ -118,7 +121,7 @@ Options:
 `
 
 function parseArgs(argv) {
-  const options = { command: undefined, yes: false, all: undefined, assignments: {}, register: true, dryRun: false, refresh: false, configDir: undefined, session: undefined, json: false, noColor: false, help: false, markdown: false, output: undefined, security: false, requireHardened: false, runDir: undefined, publicKey: undefined, keyId: undefined, hmacKey: undefined, hmacKeyId: undefined, repo: undefined, requireIndex: undefined, requireGit: false, allowUnsigned: false, failOnWarning: false, witnessPublicKey: undefined, witnessKeyId: undefined, witnessReceipt: undefined }
+  const options = { command: undefined, yes: false, all: undefined, assignments: {}, register: true, dryRun: false, refresh: false, configDir: undefined, session: undefined, json: false, noColor: false, help: false, markdown: false, output: undefined, security: false, requireHardened: false, runDir: undefined, publicKey: undefined, keyId: undefined, hmacKey: undefined, hmacKeyId: undefined, repo: undefined, requireIndex: undefined, requireGit: false, allowUnsigned: false, failOnWarning: false, witnessPublicKey: undefined, witnessKeyId: undefined, witnessReceipt: undefined, attestationPublicKey: undefined, attestationKeyId: undefined, attestationIssuer: undefined }
   const rest = [...argv]
   options.command = rest.shift()
   while (rest.length) {
@@ -222,6 +225,15 @@ function parseArgs(argv) {
         break
       case "--witness-receipt":
         options.witnessReceipt = rest.shift() ?? ""
+        break
+      case "--attestation-public-key":
+        options.attestationPublicKey = rest.shift() ?? ""
+        break
+      case "--attestation-key-id":
+        options.attestationKeyId = rest.shift() ?? ""
+        break
+      case "--attestation-issuer":
+        options.attestationIssuer = rest.shift() ?? ""
         break
       case "--html":
         options.markdown = false
@@ -619,6 +631,9 @@ async function verifyCommand(options) {
       witnessPublicKey: options.witnessPublicKey || undefined,
       witnessKeyId: options.witnessKeyId || undefined,
       witnessReceipt: options.witnessReceipt || undefined,
+      attestationPublicKey: options.attestationPublicKey || undefined,
+      attestationKeyId: options.attestationKeyId || undefined,
+      attestationIssuer: options.attestationIssuer || undefined,
     })
     if (options.json) {
       // JSON.stringify escapes C0 only; escape DEL and C1 (incl. 0x9b CSI) too

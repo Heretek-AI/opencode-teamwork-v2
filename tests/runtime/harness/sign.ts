@@ -99,7 +99,7 @@ export function assertSignedManifest(
 ): RunManifest {
   const manifest = readManifest(project, runId)
   if (!manifest) throw new Error(`run.manifest.json is missing for ${runId}`)
-  const version = expected.version ?? 4
+  const version = expected.version ?? 5
   if (manifest.version !== version) throw new Error(`manifest.version is ${manifest.version}, expected ${version}`)
   if (manifest.integrityMode === undefined) throw new Error("manifest.integrityMode is missing")
   if (typeof manifest.runKeyId !== "string" || manifest.runKeyId === "") throw new Error("manifest.runKeyId is missing")

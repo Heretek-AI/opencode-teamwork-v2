@@ -4,6 +4,62 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-11-24
+
+CI attestation, signed by a principal distinct from the run key. A plan can now
+require a signed statement from outside the agent's process: the run nonce,
+plan hash, prompt hash, report commit and every command's output digest bound
+to an Ed25519 key the run does not hold.
+
+### Added
+
+- **`verify/ci/attestation.json`** is an `_auth`-signed artifact over
+  `{v, provider, workflow, runId, runAttempt, repository, commitSha, baseSha,
+  promptHash, planHash, manifestDigest, commands[], oidc, issuedAt, expiresAt}`.
+  Signing uses the existing envelope under a dedicated
+  `teamwork-ci-attestation-v1` domain, with `nonce` equal to the signed
+  manifest's `runNonce`.
+- **Manifest v5** records `attestationPolicy` (`off` | `optional` | `required`,
+  default `off`), `attestationKeyId` and `attestationIssuer`. Versions 1–4 read
+  as `off`. A re-plan may upgrade `off → optional → required`, never downgrade,
+  and cannot change a pinned key id or issuer (`AUTH_STALE`).
+- **Enforcement.** `final_verify` fails a `required` run with
+  `AUTH_ATTESTATION_MISSING`, `AUTH_ATTESTATION_STALE`,
+  `AUTH_ATTESTATION_UNTRUSTED`, `AUTH_ATTESTATION_COMMIT_MISMATCH` or
+  `AUTH_ATTESTATION_REPLAY`. A run-key signature is `UNTRUSTED`; a foreign
+  run id/nonce is `REPLAY`; a command/output that no report check records is
+  `STALE`; `commitSha` must equal every report head. `optional` records the
+  status, `off` ignores the artifact. `final.json.evidence.attestation` records
+  `{policy, status, code?, commitSha, keyId, issuer}`.
+- **`verify`** gains `--attestation-public-key <b64url|@file>`,
+  `--attestation-key-id` and `--attestation-issuer`; `--json` now includes
+  `attestation: {status, commitSha, keyId, issuer}` and `attested: boolean`.
+  Without a key a present attestation is `UNKNOWN` (exit 2), never `PASS`.
+- **`scripts/attest-sign.mjs`** is the dev/CI producer (no runtime dependency,
+  atomic 0600 write). **`.github/workflows/attest.yml`** is a
+  `workflow_dispatch` template gated on the protected default branch, with
+  literal test commands and an environment secret; its comments document why a
+  dispatch cannot attest arbitrary code.
+- **`doctor --security`** reports `attestation_key` (pass for a verify-only
+  key, fail for visible private material, warn when `required` has no key).
+- **ADR 0018**, `docs/ARTIFACTS.md` schema/policy/codes, `SECURITY.md` residual,
+  and L2/L3 coverage plus unit tests for every code, the policy matrix and the
+  downgrade refusal.
+
+### Changed
+
+- New plans write manifest version 5. Existing v1–v4 runs keep their meaning and
+  `attestationPolicy: "off"`.
+
+### Security
+
+- Establishes: the declared commands ran at the recorded commit, at the recorded
+  output digests, under a separate signing identity that bound the signed plan
+  and run nonce. Does not establish: the suite is meaningful, a test was not
+  edited in the same commit, CI was not compromised, or that the CI key is
+  unreachable by the agent's UID. A CI principal reachable by that UID is not a
+  boundary.
+
 ## [0.17.2] - 2026-11-24
 
 Budget-enforcement honesty. The L3 runtime suite reported that `teamwork_cost`
