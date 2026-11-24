@@ -2185,6 +2185,78 @@ asserted and the mode is not pinned, the check is a failure and
 - `TOURNAMENT_REPORT.md` (+ `interrupted.md` + `state.json` `phase: "PRESENT_PARTIAL"` + `tournament_cancelled` event on `AbortSignal`, explicit `cancel`, or `shouldHalt` / budget exhaustion).
 - `teamwork_final_verify` stamps `evidence.tournament` into `verify/final.json` and refuses `PASS` unless `manifest.phase === "COMPLETED"` with a `team/referee` `ACCEPT` verdict.
 
+## Offline verification (`opencode-teamwork verify`)
+
+`opencode-teamwork verify` recomputes a run's named relations from the bytes in
+one run directory plus a public key. It never writes into the run, never reads
+`ctx.storage`, and never executes a reported check. See
+[ADR 0015](adr/0015-offline-verification.md).
+
+```sh
+opencode-teamwork verify --session <id> --public-key <base64url|@file> [--key-id <id>] [--json]
+opencode-teamwork verify --run-dir <path> --public-key ...
+opencode-teamwork verify --session <id> --hmac-key <base64url> --hmac-key-id <id>
+```
+
+The manifest is the trust anchor. Its `_auth` is verified first; `runNonce`,
+`runKeyId` and the algorithm are read from the signed payload (not from
+storage), then every artifact is pinned to those values. A copied envelope
+fails on path, nonce, key id or digest.
+
+### What the verifier recomputes
+
+| Artifact | Recomputed relation |
+| --- | --- |
+| `run.manifest.json` | `_auth`; `requestHash`, `requirementsHash`, `planHash`, `lemmaPolicyHash`, `specHash`/`specBytes` against the artifacts on disk; plan/state mode drift |
+| `verify/report-<task>.json` | `_auth`; task id and PASS schema; each check's `outputSha256`; `passed` vs `exitCode` (`CHECK_EXIT_CONFLICT`); `workerHandoff` path+sha256 vs the current body and `handoffs/index.json` |
+| `verify/security-audit.json` | `_auth`; one `ruleChecks` entry for every rule forbidden by the integrity mode parsed from `ORIGINAL_REQUEST.md`; `reviewedDigests.reports`/`final` vs current bytes; violations on a PASS |
+| `verify/challenge-<task>.json`, `verify/audit-<task>.json` | `_auth`; `kind`/`verdict`/`agent`/`sessionId`; `reportHash` (unkeyed sha256) vs the current report; every `cites[].sha256` and `bytes`; `cites: []` is unbound (fail), absent is `legacy_unbound_wave` (warn) |
+| `verify/victory.json` | `_auth`; `evidenceDigests.reports` vs every current report (including "appeared after" and "never reviewed"); `securityAudit` and a pre-existing PASS `final`; `requestHash`/`requirementsHash`; requirement coverage |
+| `handoffs/index.json` + `<entry>.md` | each entry's `_auth` (payload rebuilt from the entry), body sha256/bytes, canonical `# HANDOFF — <taskId> — <agent>` header, and every citation |
+| `verify/final.json` | `_auth`; `evidence.reportDigests` (a `null` for a PASS is a failure), `evidence.auditDigest`, `requirementsHash`; its PASS claim against task/report/audit/victory/handoff evidence |
+| Cross-artifact | `INCONSISTENT_VICTORY_TASK`, `INCONSISTENT_REPORT_BRANCH`, `INCONSISTENT_AUDIT_HIGH`, `INCONSISTENT_WAVE_REPORT` |
+| Optional | `--repo` branch head/diff vs `headSha`/`diffHash`; `--require-index` snapshot vs every run file |
+
+Wave `cites` and `reportHash` use **unkeyed** SHA-256 (matching `strict.ts`);
+`evidenceDigests`, `reviewedDigests`, handoff hashes and final digests use the
+keyed domain-separated digest from `approval-format.mjs`. The two are never
+mixed.
+
+### Exit codes and JSON
+
+`0` verified (`PASS`), `1` fail (`FAIL`), `2` unverifiable (`UNKNOWN`), `3`
+usage. `--fail-on-warning` promotes a warning to exit 1. `--json` prints the
+stable object described in ADR 0015; the human table is rendered from it.
+`--allow-unsigned` analyses an unsigned legacy run but the verdict stays
+`UNKNOWN`: a missing signature is exactly what the verifier cannot supply.
+
+### Index snapshot (`--require-index`)
+
+A per-artifact check cannot see a whole-run rollback to an earlier validly
+signed set. A snapshot maps each run-relative file to its unkeyed SHA-256:
+
+```json
+{
+  "version": 1,
+  "runId": "20261124-120000-abcd",
+  "generatedAt": "2026-11-24T12:06:00.000Z",
+  "files": { "run.manifest.json": "<sha256>", "verify/report-R1.json": "<sha256>" }
+}
+```
+
+Every snapshot file must still match, and every current run file must be in the
+snapshot. A difference is `INDEX_ROLLBACK` (exit 1). `--require-index` without a
+path is `UNKNOWN` (exit 2). The snapshot is caller-supplied, not signed by this
+tool.
+
+### What it cannot prove
+
+A verifier holding only the public key and a read-only copy can recompute every
+byte digest, citation, branch binding and cross-artifact relation; it still
+cannot prove an observation, a consistently authored false report passes every
+check, and a whole-run rollback to an earlier signed set is undetectable without
+a snapshot or witness.
+
 ## Export report (`report.html` / `report.md`)
 
 `opencode-teamwork export` writes a human-readable report of one run. It is a

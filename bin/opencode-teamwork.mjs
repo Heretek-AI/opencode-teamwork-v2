@@ -79,7 +79,7 @@ Options:
   -y, --yes              Accept current/default models without prompting
       --all <model>      Use one model for every agent (e.g. anthropic/claude-sonnet-4-5)
       --model <id>=<m>   Override one agent (repeatable), id may omit the "team/" prefix
-      --session <id>     Target a specific session ID (for inspect, prune or export)
+      --session <id>     Target a specific session ID (for inspect, prune, export or verify)
       --json             Print doctor, timeline or verify output as raw JSON
       --run-dir <path>   Verify this run directory directly (instead of --session)
       --public-key <k>   Ed25519 verify key: base64url SPKI or @file

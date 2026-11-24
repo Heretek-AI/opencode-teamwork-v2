@@ -4,6 +4,49 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-11-24
+
+Offline verification. A run can now be checked from a read-only copy and a
+public key, without the plugin, the key ring or `ctx.storage`. Additive: no
+artifact schema changed and no engine tool reads the verifier.
+
+### Added
+
+- **`opencode-teamwork verify` (ADR 0015).** `--session <id>` or `--run-dir
+  <path>`, `--public-key <base64url|@file>` (or `--hmac-key <b64url>` +
+  `--hmac-key-id`), optional `--repo`/`--require-git`, `--require-index
+  <snapshot>`, `--allow-unsigned`, `--fail-on-warning` and `--json`. Exit codes:
+  `0` verified, `1` fail, `2` unverifiable, `3` usage. The signed manifest's
+  `runNonce`/`runKeyId`/algorithm pin every artifact's `_auth` path, digest,
+  nonce, key id and algorithm; no digest index is required.
+- **Relation recomputation.** Victory `evidenceDigests` (including reports that
+  appeared after the audit and reports never reviewed), audit `ruleChecks`
+  coverage against the mode parsed from `ORIGINAL_REQUEST.md` plus
+  `reviewedDigests`, report→worker-handoff bindings, wave `cites` (`sha256` and
+  bytes), handoff index entry auth/body-hash/bytes/header/cites, final
+  `reportDigests`/`auditDigest`/`requirementsHash`, the manifest baseline hashes,
+  and the four `INCONSISTENT_*` contradictions.
+- **Honest failure shapes.** A `cites: []` wave is unbound (fail); absent cites
+  is `legacy_unbound_wave` (warn); a `null` report digest for a PASS fails; a
+  `passed`/`exitCode` conflict fails; a legacy victory without `evidenceDigests`
+  is `AUTH_STALE`; an unsigned legacy run is `UNKNOWN`, never `PASS`.
+- **Optional rollback check.** `--require-index <snapshot>` compares every
+  run-relative file to an unkeyed SHA-256 snapshot and reports `INDEX_ROLLBACK`.
+  `--require-index` without a path is `UNKNOWN`.
+- **Read-only guarantee tests.** `scripts/test-verify.mjs` (T01–T19) builds
+  fixtures through the real signer and handoff writer, covers every named
+  failure, and runs one fixture under `chmod -R a-w` to assert unchanged sizes,
+  mtimes and file set. T17 is the negative control: a consistently signed,
+  invented observation still verifies (documented residual).
+
+### Documentation
+
+- Add [ADR 0015](docs/adr/0015-offline-verification.md), a README section, a
+  `docs/ARTIFACTS.md` "what the verifier recomputes" table, and the exact
+  residual in `SECURITY.md`.
+- Add `lib/verify.mjs` and `scripts/test-verify.mjs` to the packaging guard's
+  required list. `npm test` now runs `test:verify`.
+
 ## [0.14.0] - 2026-11-24
 
 Verifiable witness receipts, honest approval-key diagnostics, and the
