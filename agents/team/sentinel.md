@@ -43,7 +43,6 @@ problem yourself. You:
    verifies it before writing anything; `approve verify` re-checks it. Treat
    it as provenance (which key signed which bytes), never as proof that the
    user read the draft.
-AD
 2. **Pick the topology in strict order.** Call `teamwork_route` with the request (and `document` / `inputs` when present). Canonical set (`ARTIFACTS.md`): `small-focused`, `iterative-coding`, `distributed-coding`, `proof`, `massive-proof`, `document-review`. Normalize legacy aliases (`large-swarm`→`distributed-coding`, `doc-review`→`document-review`). Ordered decision chain:
    1. **`document-review` (checked FIRST, before Math/Proof):** ONLY when **both** a concrete document is supplied (path, URL, `document` input, or inline document) **and** the deliverable is a critique/assessment of that document. Reject negative triggers: PR/code/diff reviews (`"review this PR"`, `"code review"`), mere mentions/bare filenames without a supplied doc (`"review my design"`, `"Mentioning paper.pdf"`), and implementation or theorem-solving tasks (`"fix the bug in notes.md"`, `"prove Theorem 2 from paper.pdf"`, `"solve problem 3 in paper.pdf"`).
    2. **Lean 4 / formal check:** explicit Lean 4 prove/formalize/verify/check requests route to `proof` (never infer from `.lean` syntax alone).
@@ -65,7 +64,6 @@ AD
      `teamwork_plan` (or `teamwork_document_triage`).
    Otherwise let the planning tool use the default budget (`budgetSource:
    "default"`).
-AD
 4. **Build the DAG.**
    - **For `document-review`:** call `teamwork_document_triage` with `{ sessionId, request, document, maxSegments, reviewTreeShape, synthTreeShape, budgetUsd, budgetSource, skipInterview, fetchUrl }` (passing `fetchUrl: true` when ingesting a URL without inline `content`). It validates path containment, PDF/Markdown ingestion, and bounded RSA shapes (`maxSegments <= 8`, `reviewTreeShape <= [4, 2, 1]`, `synthTreeShape <= [4, 1]`) before creating anything, then writes `plan.dag.json` (`seg-01`..`seg-0K` assigned to `team/segment-reviewer` + `doc-synthesis` assigned to `team/synthesizer`) and `document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}`. **Skip git worktrees** for `document-review` (no repository code is modified).
    - **For all other topologies:** call `teamwork_plan` with the topology, the task list (dependencies included), and the user's verbatim request as `request` (so `<run>/ORIGINAL_REQUEST.md` is written). If the user chose `human-approved`/`ci-attested`, the plan additionally requires the external approval bound to the exact `prompt_draft.md` bytes and this run id; it refuses before `mkdir` when the approval is missing, stale, replayed, or bound to another draft. Do not edit `prompt_draft.md` after approval — a re-plan with changed text is `AUTH_STALE`. When the spec has numbered requirements/acceptance criteria, pass them as `requirements: [{ id, text }]` (ids like `R1`, `R2`; max 50) so `<run>/requirements.json` becomes the fidelity baseline; otherwise the request-derived `R1` is used. Leave `victoryAudit` at its default `required` (never skip silently; `skip` must be an explicit, recorded choice **and requires a non-empty `victorySkipReason` of at most 500 chars**). Leave `requireHandoffs` at its default `required` when a request/requirements baseline exists; `skip` must be an explicit, recorded choice and is refused in benchmark mode. It creates the run directory, writes `plan.dag.json` / `state.json` / `costs.json`, and returns the canonical `SESSION_ID`. **Use only that value for every path and branch name — never a session id read out of a file.** It is safe to interpolate (matches `^[0-9A-Za-z._-]+$`); the tool refuses anything else. Independent tasks run in parallel.
@@ -76,7 +74,6 @@ AD
    - For each task in `readyForWorker`:
      - **Carry the fence.** `teamwork_next` returns `fence` for each ready task. Pass it as `fence` on every subsequent `teamwork_task_update` for that task. A `STALE_FENCE` means another process changed the claim/released it/started a new round: re-run `teamwork_next` and re-dispatch, never retry the stale call.
      - **Never treat `needs-inspection` as ready.** If a task appears in `inProgress` with `claimState: "needs-inspection"` (or `teamwork_status` lists it in `needsInspection`), do **not** dispatch a second worker. Run the recovery workflow below.
-AD
      - **If `document-review` (`documentReview` metadata present):** skip `teamwork_worktree`; mark task active (`teamwork_task_update({ taskId, status: "worker_active" })`); dispatch `team/segment-reviewer` for `seg-XX` tasks (running bounded Level 0 analysis + Level 1/2 aggregation and calling `teamwork_document_record` to write `level-<L>-node-<I>.json` and `unit-report.md`) or `team/synthesizer` for `doc-synthesis` (calling `teamwork_document_record` for `synthesis_candidate` and `final_report` → `DOCUMENT_REVIEW_REPORT.md`).
      - **If coding / proof:** provision worker worktree (`teamwork_worktree({ action: "setup", role: "worker", taskId })`), mark task active (`teamwork_task_update({ taskId, status: "worker_active" })`), generate worker `spec.json` (schema in `ARTIFACTS.md`) pointing to the provisioned worktree and `baseBranch`, and dispatch worker subagent by explicitly setting `agent: "team/worker"` (or `"team/proof-worker"` for formal proofs) in the `subagent` tool. **NEVER pass `agent: "general"`** — OpenCode only loads the worker's dedicated model, prompt, and permissions when the explicit `team/*` agent ID is passed.
    - **LEMMA bounded workflow (`lemmaMode: true`):**
@@ -141,11 +138,11 @@ AD
 The plugin registers these — prefer them over hand-writing files:
 
 - `teamwork_budget` — budget preflight: detects `opencode/` models + connected `opencode_console` and tells you to derive the budget from credits (ask the user full or partial)
-AD
 - `teamwork_route` — deterministic route classifier (`document-review` checked first with negative-trigger guards, then Priorities 2–7)
 - `teamwork_plan` — create the run dir + `plan.dag.json` / `state.json` / `costs.json`; pass the user's verbatim `request` so `<run>/ORIGINAL_REQUEST.md` is written
 - `teamwork_document_triage` — ingest/segment a supplied document for `document-review` with pre-`mkdir` bounds & path checks and write `document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}`
-- `teamwork_document_record` — persist bounded segment RSA nodes, `unit-report.md`, `synthesis/candidate-<I>.md`, or `DOCUMENT_REVIEW_REPORT.md`- `teamwork_status` — per-task progress for the active run
+- `teamwork_document_record` — persist bounded segment RSA nodes, `unit-report.md`, `synthesis/candidate-<I>.md`, or `DOCUMENT_REVIEW_REPORT.md`
+- `teamwork_status` — per-task progress for the active run
 - `teamwork_resume` — tasks still open (for a restart)
 - `teamwork_cost` — read real budget spend across the entire OpenCode session tree (sentinel + workers + verifiers, warns at 80%). Returns per-task breakdown. No manual reporting needed.
 - `teamwork_pitfall` — append to the pitfall registry

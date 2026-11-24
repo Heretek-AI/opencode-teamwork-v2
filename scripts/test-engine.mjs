@@ -1,5 +1,6 @@
 import { registerTeamworkTools, registerTeamworkHooks, describeRun, touch, nextEventSeq, setApprovalOwnerUidForTest } from "../plugins/opencode-teamwork/tools.ts"
 import { registerTool } from "./tool-registry.mjs"
+import { warnMissingAgents } from "../plugins/opencode-teamwork/index.ts"
 import { createAuthContext, canonicalJson, payloadDigest, sha256Hex } from "../plugins/opencode-teamwork/auth.ts"
 import {
   analyzeLeanDeclarations,
@@ -35,6 +36,7 @@ import {
   writeModelMap,
   installAgents,
   ensureAgents,
+  verifyAgents,
   registerPlugin,
   writeReferenceFile,
   DEFAULT_MODELS,
@@ -8073,6 +8075,29 @@ process.exit(0);
       assert(!ensureSym.includes("sentinel.md"), "ensureAgents must skip a symlinked target")
       assert.strictEqual(readFileSync(ensureOutside, "utf8"), "OUTSIDE ENSURE\n", "ensureAgents must not write through a symlink")
 
+      // verifyAgents + the setup warning are read-only: a missing file is
+      // reported (and warned about) but never recreated by plugin load.
+      assert.deepStrictEqual(verifyAgents({ configDir: ensureDir }).missing, [], "a complete install must verify clean")
+      rmSync(join(ensureDir, "agents", "team", "worker.md"))
+      const missingCheck = verifyAgents({ configDir: ensureDir })
+      assert.deepStrictEqual(missingCheck.missing, ["worker.md"], "verifyAgents must name every missing file")
+      const warnings = []
+      const originalWarn = console.warn
+      console.warn = (...args) => warnings.push(args.join(" "))
+      try {
+        await warnMissingAgents(ensureDir)
+      } finally {
+        console.warn = originalWarn
+      }
+      assert(
+        warnings.some((line) => line.includes("worker.md") && line.includes("missing")),
+        `setup verification must warn by file name: ${JSON.stringify(warnings)}`,
+      )
+      assert(
+        !existsSync(join(ensureDir, "agents", "team", "worker.md")),
+        "agent verification must never write files during plugin load",
+      )
+
       // registration: create, idempotence, backup, mode, dry run, symlink, JSONC
       const regDir = join(root, "reg-config")
       const reg = registerPlugin({ configDir: regDir })
@@ -8113,6 +8138,19 @@ process.exit(0);
       const jsoncBefore = readFileSync(jsoncFile, "utf8")
       assert.strictEqual(registerPlugin({ configDir: jsoncDir }).status, "commented", "JSONC must not be rewritten")
       assert.strictEqual(readFileSync(jsoncFile, "utf8"), jsoncBefore, "JSONC comments must survive")
+
+      // A hand-vendored directory registered in the project config must not
+      // also get the npm package name written to the global config.
+      const vendoredProject = join(root, "vendored-project")
+      const vendoredCfg = join(root, "vendored-global")
+      mkdirSync(join(vendoredProject, ".opencode"), { recursive: true })
+      writeFileSync(
+        join(vendoredProject, ".opencode", "opencode.json"),
+        JSON.stringify({ plugins: ["./plugins/teamwork"] }) + "\n",
+      )
+      const vendored = registerPlugin({ configDir: vendoredCfg, cwd: vendoredProject })
+      assert.strictEqual(vendored.status, "vendored", "a project-scoped vendored entry must win over npm registration")
+      assert(!existsSync(join(vendoredCfg, "opencode.json")), "init must not add the npm name beside a vendored copy")
 
       // reference file: overwrite refuses a symlinked dest, keep-if-present is honoured
       const refDir = join(root, "ref-config")
