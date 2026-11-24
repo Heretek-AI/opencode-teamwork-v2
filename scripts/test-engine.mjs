@@ -22,6 +22,7 @@ import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock,
 import { renderGateStatus, evaluateStrictGate } from "../plugins/opencode-teamwork/strict.ts"
 import { evaluateVictoryGate } from "../plugins/opencode-teamwork/victory.ts"
 import { withCrossProcessLock, crossProcessLockPath, observeLockArtifact, quarantineStaleLock } from "../plugins/opencode-teamwork/locks.ts"
+import { recordWriteAnomaly, setWriteAnomalyAuditPathForTest, unacknowledgedWriteAnomalies } from "../plugins/opencode-teamwork/safe-fs.mjs"
 import { assertSafeUrl, blockedAddressReason } from "../plugins/opencode-teamwork/url-guard.ts"
 import { refreshRunBriefing, MAX_BRIEFING_BYTES, refreshAgentBriefing, readAgentBriefingExcerpt, agentBriefingRelativePath, MAX_AGENT_BRIEFING_DIRS } from "../plugins/opencode-teamwork/briefing.ts"
 import { writeHandoff, MAX_HANDOFF_ENTRIES, MAX_HANDOFF_INDEX_BYTES, HANDOFF_SECTION_LABELS, evaluateHandoffGateChecked, readWorkerHandoffBinding } from "../plugins/opencode-teamwork/handoff.ts"
@@ -66,6 +67,8 @@ import assert from "node:assert"
 const GIT_BIN = ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"].find(existsSync) ?? "/usr/bin/git"
 
 const testDir = mkdtempSync(join(tmpdir(), "teamwork-engine-test-"))
+// Keep the durable write-anomaly audit hermetic (never the real config dir).
+setWriteAnomalyAuditPathForTest(join(testDir, "write-anomalies.jsonl"))
 // Sonar S6324: build ESC without embedding a control character in a regex literal.
 const ESC_CHAR = String.fromCharCode(27)
 
@@ -2971,6 +2974,131 @@ try {
   console.log("✓ strict gate requires per-task challenge PASS + audit CLEAN, names gaps, and writes GATE_STATUS.md; standard is unchanged")
 
   // ==========================================
+  // Part 1c-ter-b: content guarantees (0.13.1)
+  // ==========================================
+  console.log("Testing report/evidence content guarantees...")
+
+  // D1: present-but-empty cites is unbound; absent cites stays legacy.
+  const citesRun = "20261018-000000-sv-emptycites"
+  await seedVerifiedRun(citesRun, ["E1"], { verification: "strict", victoryAudit: "skip", allowUnsignedLegacy: true })
+  const emptyCitesWrite = await withAgent("team/falsifier", () =>
+    registeredTools.wave_record.execute(
+      { sessionId: citesRun, taskId: "E1", kind: "challenge", verdict: "PASS", cites: [] },
+      { sessionID: "ses_empty_cites" },
+    ),
+  )
+  assert(
+    String(emptyCitesWrite.content).startsWith("refused:") && /cites is present but empty/.test(emptyCitesWrite.content),
+    `cites: [] must be refused at write time: ${emptyCitesWrite.content}`,
+  )
+  const citesReportText = readFileSync(runFile(testDir, citesRun, "verify/report-E1.json"), "utf8")
+  const emptyCitesChallenge = strictWaveFile(citesRun, "challenge", "E1")
+  mkdirSync(dirname(emptyCitesChallenge), { recursive: true })
+  writeFileSync(
+    emptyCitesChallenge,
+    JSON.stringify({
+      version: 1,
+      sessionId: citesRun,
+      taskId: "E1",
+      kind: "challenge",
+      verdict: "PASS",
+      agent: "team/falsifier",
+      agentSessionId: "ses_empty_cites",
+      reportHash: sha256(citesReportText),
+      cites: [],
+      notes: "",
+      evidence: "",
+      generatedAt: new Date().toISOString(),
+    }) + "\n",
+  )
+  const citesNext = await registeredTools.next.execute({ sessionId: citesRun, allowUnsignedLegacy: true })
+  assert.strictEqual(citesNext.status, "NEEDS_STRICT_WAVE", `an empty-cites verdict must not satisfy the gate: ${citesNext.content}`)
+  assert(citesNext.missing.some((m) => m.taskId === "E1" && m.kind === "challenge"))
+
+  // D2: requireReportBinding refuses an unbound PASS (writer and final_verify).
+  const reportBindingRun = "20261018-000000-binding"
+  await registeredTools.plan.execute(
+    {
+      sessionId: reportBindingRun,
+      topology: "iterative-coding",
+      skipInterview: true,
+      allowUnsignedLegacy: true,
+      victoryAudit: "skip",
+      victorySkipReason: "fixture: binding test does not run the victory audit",
+      requireReportBinding: true,
+      tasks: [{ id: "B1" }],
+    },
+    { sessionID: FIXTURE_ROOT_SESSION },
+  )
+  const unboundWrite = await registeredTools.report.execute(
+    { sessionId: reportBindingRun, taskId: "B1", status: "PASS", summary: "unbound fixture", checks: [{ name: "c", passed: true }] },
+    { sessionID: "ses_fixture_verifier" },
+  )
+  assert.strictEqual(unboundWrite.status, "REPORT_UNBOUND", `an unbound PASS must be refused at write time: ${unboundWrite.content}`)
+  // D4: passed/exitCode disagreement is a named refusal.
+  const conflictWrite = await registeredTools.report.execute(
+    {
+      sessionId: reportBindingRun,
+      taskId: "B1",
+      status: "PASS",
+      summary: "conflicting check",
+      checks: [{ name: "conflict", passed: true, exitCode: 1 }],
+    },
+    { sessionID: "ses_fixture_verifier" },
+  )
+  assert.strictEqual(conflictWrite.status, "CHECK_EXIT_CONFLICT", `passed=true + exitCode=1 must be refused: ${conflictWrite.content}`)
+  // A hand-written unbound PASS is refused by final_verify under the flag.
+  const bindState = JSON.parse(readFileSync(runFile(testDir, reportBindingRun, "state.json"), "utf8"))
+  bindState.tasks.B1 = { ...bindState.tasks.B1, status: "verified_pass", round: 0 }
+  writeFileSync(runFile(testDir, reportBindingRun, "state.json"), JSON.stringify(bindState, null, 2) + "\n")
+  writeFileSync(
+    runFile(testDir, reportBindingRun, "verify/report-B1.json"),
+    JSON.stringify({ taskId: "B1", status: "PASS", summary: "unbound fixture", checks: [] }) + "\n",
+  )
+  const bindFinal = await registeredTools.final_verify.execute({ sessionId: reportBindingRun, allowUnsignedLegacy: true })
+  assert.strictEqual(bindFinal.status, "REPORT_UNBOUND", `final_verify must refuse an unbound PASS: ${bindFinal.content}`)
+  assert(!existsSync(finalFileOf(reportBindingRun)), "a refused unbound PASS must not write final.json")
+
+  // D3: one report read cap; a 600 KiB PASS keeps a real digest (no null).
+  const bigReportRun = "20261018-000000-bigreport"
+  await seedVerifiedRun(bigReportRun, ["G1"], { victoryAudit: "skip", allowUnsignedLegacy: true })
+  const bigSummary = "B".repeat(600 * 1024)
+  writeFileSync(
+    runFile(testDir, bigReportRun, "verify/report-G1.json"),
+    JSON.stringify({ taskId: "G1", status: "PASS", summary: bigSummary, checks: [] }) + "\n",
+  )
+  // The audit binds the report digests it reviewed; refresh it for the new
+  // report bytes (the behaviour under test is the digest cap, not the audit).
+  await registeredTools.security_audit.execute({ sessionId: bigReportRun, status: "PASS", findings: [] })
+  const bigFinal = await registeredTools.final_verify.execute({ sessionId: bigReportRun, allowUnsignedLegacy: true })
+  assert.strictEqual(bigFinal.status, "PASS", `a 600 KiB PASS report must stay consumable: ${bigFinal.content}`)
+  const bigJson = JSON.parse(readFileSync(finalFileOf(bigReportRun), "utf8"))
+  assert(
+    /^[0-9a-f]{64}$/.test(bigJson.evidence.reportDigests.G1 || ""),
+    "the PASS digest must be hashed at the shared report cap, never null",
+  )
+
+  // D4: a hand-written PASS whose checks contradict final_verify is refused by name.
+  const exitRun = "20261018-000000-exitconflict"
+  await seedVerifiedRun(exitRun, ["X1"], { victoryAudit: "skip", allowUnsignedLegacy: true })
+  writeFileSync(
+    runFile(testDir, exitRun, "verify/report-X1.json"),
+    JSON.stringify({
+      taskId: "X1",
+      status: "PASS",
+      summary: "",
+      checks: [{ name: "conflict", passed: true, exitCode: 1 }],
+    }) + "\n",
+  )
+  const exitFinal = await registeredTools.final_verify.execute({ sessionId: exitRun, allowUnsignedLegacy: true })
+  assert.strictEqual(exitFinal.status, "FAIL")
+  assert(
+    exitFinal.reasons.some((r) => /CHECK_EXIT_CONFLICT/.test(r)),
+    `the contradiction must be named: ${JSON.stringify(exitFinal.reasons)}`,
+  )
+  console.log("✓ cites: [] is unbound, unbound PASS refused under requireReportBinding, big PASS keeps a digest, passed/exitCode conflicts refused")
+
+  // ==========================================
   // Part 1c-quater: integrity mode enforcement
   // ==========================================
   console.log("Testing integrity mode enforcement...")
@@ -3767,6 +3895,8 @@ try {
       by: "ses_attr_session",
       at: new Date().toISOString(),
       leaseUntil: new Date(Date.now() + 600000).toISOString(),
+      // 0.13.1: a protocol-2 claim with no host is cross-host (fail closed).
+      host: hostname(),
     }
     writeFileSync(sessionStateFile, JSON.stringify(sessionState, null, 2) + "\n")
     await f.tools.task_update.execute({ sessionId: RUN, taskId: "alpha", status: "worker_active" }, { sessionID: "ses_attr_session" })
@@ -11300,7 +11430,161 @@ process.exit(0);
       assert.strictEqual(legacyStatus.claimProtocol, 1, "a state.json without claimProtocol must report protocol 1")
       console.log("✓ claim protocol 2 fails closed without a resolvable caller; a legacy state.json stays protocol 1")
     }
+
+    // --- 11o: unacknowledged write anomalies block status/final_verify (A5).
+    {
+      const anomalyRun = "20261122-000018-claims-anomaly"
+      await tools.plan.execute(
+        { sessionId: anomalyRun, topology: "iterative-coding", skipInterview: true, allowUnsignedLegacy: true, tasks: [{ id: "A1" }] },
+        { sessionID: CONC_ROOT },
+      )
+      const anomalyRunDir = join(concDir, ".opencode", "teamwork", anomalyRun)
+      recordWriteAnomaly({ kind: "detective-temp", run: anomalyRunDir, name: "verify/report-A1.json", detail: "fixture refused write" })
+
+      const anomalyStatus = await tools.status.execute({ sessionId: anomalyRun }, { sessionID: CONC_ROOT })
+      assert.strictEqual(anomalyStatus.runState, "needs-inspection", "an unacknowledged anomaly must report needs-inspection")
+      assert(anomalyStatus.unacknowledgedWriteAnomalies >= 1)
+      assert(anomalyStatus.writeAnomalies.some((a) => a.kind === "detective-temp" && a.acknowledged === false))
+
+      const blockedFinal = await tools.final_verify.execute(
+        { sessionId: anomalyRun, allowUnsignedLegacy: true },
+        { sessionID: CONC_ROOT },
+      )
+      assert.strictEqual(blockedFinal.status, "NEEDS_INSPECTION", `final_verify must refuse: ${blockedFinal.content}`)
+      assert(!existsSync(runFile(anomalyRun, "verify/final.json")), "a refused final_verify must not write final.json")
+
+      const acknowledged = await tools.status.execute({ sessionId: anomalyRun, acknowledgeAnomalies: true }, { sessionID: CONC_ROOT })
+      assert.strictEqual(acknowledged.runState, "ok", "an explicit acknowledgement must clear needs-inspection")
+      assert.strictEqual(unacknowledgedWriteAnomalies(anomalyRunDir).length, 0)
+      console.log("✓ unacknowledged write anomalies report needs-inspection, block final_verify, and clear only on explicit acknowledgement")
+    }
+
+    // --- 11p: claim.history survives release/reclaim and is rehydrated.
+    {
+      const historyRun = "20261122-000019-claims-history"
+      await tools.plan.execute(
+        { sessionId: historyRun, topology: "iterative-coding", skipInterview: true, allowUnsignedLegacy: true, tasks: [{ id: "Y1" }] },
+        { sessionID: CONC_ROOT },
+      )
+      const claimOnce = async () => {
+        const res = await tools.next.execute({ sessionId: historyRun, allowUnsignedLegacy: true }, { sessionID: CONC_ROOT })
+        assert((res.readyForWorker || []).some((t) => t.id === "Y1"), `the task must be claimable: ${res.content}`)
+      }
+      const releaseOnce = async () => {
+        const res = await tools.recover.execute({ sessionId: historyRun, taskId: "Y1", action: "release" }, { sessionID: CONC_ROOT })
+        assert.strictEqual(res.status, "OK", `release must succeed: ${res.content}`)
+      }
+      await claimOnce()
+      await releaseOnce()
+      await claimOnce()
+      const rehydrated = stateOf(historyRun).tasks.Y1
+      assert(Array.isArray(rehydrated.claim.history) && rehydrated.claim.history.length >= 1, "the new claim must carry the prior chain")
+      await releaseOnce()
+      const chain = stateOf(historyRun).tasks.Y1.claimHistory
+      assert(Array.isArray(chain) && chain.length >= 2, `release/reclaim must accumulate: ${JSON.stringify(chain)}`)
+      assert(chain.every((entry) => entry.by === CONC_ROOT), "every chain entry must name the claimant")
+      assert(chain.length <= 5, "the chain must stay bounded at 5")
+      console.log("✓ claim history survives release/reclaim, rehydrates a later claim, and stays bounded")
+    }
+
+    // --- 11q: a flagged live claim is needs-inspection and no transition may change it.
+    {
+      const flaggedRun = "20261122-000020-claims-flagged"
+      await tools.plan.execute(
+        { sessionId: flaggedRun, topology: "iterative-coding", skipInterview: true, allowUnsignedLegacy: true, tasks: [{ id: "F1" }] },
+        { sessionID: CONC_ROOT },
+      )
+      await tools.next.execute({ sessionId: flaggedRun, allowUnsignedLegacy: true }, { sessionID: CONC_ROOT })
+      const flaggedState = stateOf(flaggedRun)
+      flaggedState.tasks.F1.claim.needsInspection = true
+      writeFileSync(runFile(flaggedRun, "state.json"), JSON.stringify(flaggedState, null, 2) + "\n")
+
+      const flaggedStatus = await tools.status.execute({ sessionId: flaggedRun }, { sessionID: CONC_ROOT })
+      assert.strictEqual(flaggedStatus.claims[0].state, "needs-inspection", "a live flagged claim must report needs-inspection")
+      assert(flaggedStatus.needsInspection.includes("F1"))
+      // Not only worker_active: any transition must be refused.
+      const blockedDone = await tools.task_update.execute({ sessionId: flaggedRun, taskId: "F1", status: "blocked" }, { sessionID: CONC_ROOT })
+      assert.strictEqual(blockedDone.status, "CLAIM_NEEDS_INSPECTION", `every flagged transition must be refused: ${blockedDone.content}`)
+      console.log("✓ a flagged claim is needs-inspection even with a live lease, and every transition is gated")
+    }
+
+    // --- 11r: a missing claim.host is cross-host (fail closed).
+    {
+      const hostlessRun = "20261122-000021-claims-hostless"
+      await tools.plan.execute(
+        { sessionId: hostlessRun, topology: "iterative-coding", skipInterview: true, allowUnsignedLegacy: true, tasks: [{ id: "Z1" }] },
+        { sessionID: CONC_ROOT },
+      )
+      await tools.next.execute({ sessionId: hostlessRun, allowUnsignedLegacy: true }, { sessionID: CONC_ROOT })
+      const hostlessState = stateOf(hostlessRun)
+      delete hostlessState.tasks.Z1.claim.host
+      delete hostlessState.tasks.Z1.claim.needsInspection
+      writeFileSync(runFile(hostlessRun, "state.json"), JSON.stringify(hostlessState, null, 2) + "\n")
+      const hostlessStatus = await tools.status.execute({ sessionId: hostlessRun }, { sessionID: CONC_ROOT })
+      assert.strictEqual(hostlessStatus.claims[0].state, "cross-host", "a missing claim.host must be cross-host")
+      const hostlessNext = await tools.next.execute({ sessionId: hostlessRun, allowUnsignedLegacy: true }, { sessionID: CONC_ROOT })
+      assert(!(hostlessNext.readyForWorker || []).some((t) => t.id === "Z1"), "a hostless claim must never be auto-reclaimed")
+      assert((hostlessNext.inProgress || []).some((t) => t.id === "Z1" && t.claimState === "cross-host"))
+      const hostlessRelease = await tools.recover.execute({ sessionId: hostlessRun, taskId: "Z1", action: "release" }, { sessionID: CONC_ROOT })
+      assert.strictEqual(hostlessRelease.status, "CROSS_HOST_RELEASE_REFUSED", "a hostless release must need the cross-host confirmation")
+      console.log("✓ a missing claim.host is cross-host: never auto-reclaimed, release refuses by default")
+    }
   } finally {
     rmSync(concDir, { recursive: true, force: true })
+  }
+
+  // --- 11s: prune refuses live/expired/needs-inspection/cross-host claims; --force records a reason.
+  {
+    const pruneRoot = mkdtempSync(join(testDir, "prune-project-"))
+    const worktreeBase = join(testDir, "prune-worktrees-")
+    const previousBase = process.env.TEAMWORK_WORKTREES_DIR
+    process.env.TEAMWORK_WORKTREES_DIR = worktreeBase
+    try {
+      const now = Date.now()
+      const mkRun = (id, claim, extra = {}) => {
+        const runDir = join(pruneRoot, ".opencode", "teamwork", id)
+        mkdirSync(runDir, { recursive: true })
+        writeFileSync(
+          join(runDir, "state.json"),
+          JSON.stringify(
+            {
+              claimProtocol: 2,
+              host: hostname(),
+              phase: "DONE",
+              tasks: { T1: { status: "pending", claim: claim ? { by: "ses_prune", at: new Date(now).toISOString(), ...claim } : undefined, ...extra } },
+            },
+            null,
+            2,
+          ) + "\n",
+        )
+        mkdirSync(join(worktreeBase, id, "wt"), { recursive: true })
+        writeFileSync(join(worktreeBase, id, "wt", "file.txt"), "x\n")
+      }
+      mkRun("20261122-000030-prune-live", { leaseUntil: new Date(now + 600000).toISOString(), host: hostname() })
+      mkRun("20261122-000031-prune-expired", { leaseUntil: new Date(now - 60000).toISOString(), host: hostname() })
+      mkRun("20261122-000032-prune-flagged", { leaseUntil: new Date(now + 600000).toISOString(), host: hostname(), needsInspection: true })
+      mkRun("20261122-000033-prune-crosshost", { leaseUntil: new Date(now + 600000).toISOString(), host: "other-host" })
+      mkRun("20261122-000034-prune-stale", { leaseUntil: new Date(now - 3600000).toISOString(), host: hostname() })
+
+      const first = pruneTeamworkWorktrees(pruneRoot, { all: true })
+      assert.deepStrictEqual(first.removed, ["20261122-000034-prune-stale"], `only the stale run may be pruned: ${JSON.stringify(first)}`)
+      assert.strictEqual(first.refused.length, 4, `four claims must block: ${JSON.stringify(first.refused)}`)
+      const blockedStates = first.refused.map((entry) => entry.claims[0]?.state).sort()
+      assert.deepStrictEqual(blockedStates, ["cross-host", "expired", "live", "needs-inspection"], JSON.stringify(blockedStates))
+      for (const id of ["20261122-000030-prune-live", "20261122-000033-prune-crosshost"]) {
+        assert(existsSync(join(worktreeBase, id)), `${id} must survive a refused prune`)
+      }
+
+      const forced = pruneTeamworkWorktrees(pruneRoot, { all: true, force: true, reason: "operator confirmed the claims are abandoned" })
+      assert.strictEqual(forced.count, 4, `--force must prune the blocked runs: ${JSON.stringify(forced)}`)
+      assert.strictEqual(forced.forced.length, 4)
+      assert(forced.forced.every((entry) => /operator confirmed/.test(entry.reason)), "the forced reason must be recorded")
+      console.log("✓ prune refuses live/expired/needs-inspection/cross-host claims and --force records an explicit reason")
+    } finally {
+      if (previousBase === undefined) delete process.env.TEAMWORK_WORKTREES_DIR
+      else process.env.TEAMWORK_WORKTREES_DIR = previousBase
+      rmSync(pruneRoot, { recursive: true, force: true })
+      rmSync(worktreeBase, { recursive: true, force: true })
+    }
   }
 }

@@ -7,6 +7,7 @@
 
 import { collectSecurityReport, hardenedExitCode, SECURITY_CHECK_NAMES } from "../lib/security.mjs"
 import { TEAM_AGENTS } from "../lib/team.mjs"
+import { recordWriteAnomaly, setWriteAnomalyAuditPathForTest } from "../plugins/opencode-teamwork/safe-fs.mjs"
 import { mkdtempSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
@@ -263,7 +264,68 @@ try {
     assert.strictEqual(satisfied.checks.find((c) => c.name === "containment").status, "pass")
     assert.strictEqual(hardenedExitCode(satisfied), 0)
 
-    console.log("✓ doctor reports the containment mode and env setting; an asserted policy on a detective host fails hardened")
+    // The per-run plan flag is visible even when the env is off. Doctor must
+    // hydrate it from plan.dag.json (fresh process) and the CLI also passes it.
+    const planRun = join(testDir, "plan-flag-run")
+    mkdirSync(planRun, { recursive: true })
+    writeFileSync(join(planRun, "plan.dag.json"), JSON.stringify({ requirePinnedWrites: true }, null, 2))
+    const planFlagged = collectSecurityReport(
+      allPassOptions({
+        containmentMode: "detective",
+        env: { OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: "fixture-public-key" },
+        runDir: planRun,
+      }),
+    )
+    const planCheck = planFlagged.checks.find((c) => c.name === "containment")
+    assert.strictEqual(planCheck.status, "fail", planCheck.message)
+    assert(/planRequirePinnedWrites=1/.test(planCheck.message), planCheck.message)
+    assert.strictEqual(hardenedExitCode(planFlagged), 2, "a plan-asserted policy must fail --require-hardened")
+    const planExplicit = collectSecurityReport(
+      allPassOptions({
+        containmentMode: "detective",
+        env: { OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: "fixture-public-key" },
+        planRequirePinnedWrites: true,
+      }),
+    )
+    assert(/planRequirePinnedWrites=1/.test(planExplicit.checks.find((c) => c.name === "containment").message))
+    assert.strictEqual(hardenedExitCode(planExplicit), 2)
+
+    // The CLI passes the plan flag it read from the run directory.
+    const cliProject = join(testDir, "cli-project")
+    const cliRun = "20261124-000000-plan-flag"
+    mkdirSync(join(cliProject, ".opencode", "teamwork", cliRun), { recursive: true })
+    writeFileSync(
+      join(cliProject, ".opencode", "teamwork", cliRun, "plan.dag.json"),
+      JSON.stringify({ requirePinnedWrites: true }, null, 2),
+    )
+    const cliJson = spawnSync(
+      process.execPath,
+      [cliPath, "doctor", "--json", "--session", cliRun, "--config-dir", join(testDir, "cli-config")],
+      {
+        cwd: cliProject,
+        encoding: "utf8",
+        env: { ...process.env, OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES: "", OPENCODE_TEAMWORK_ANOMALY_AUDIT: join(testDir, "cli-anomalies.jsonl") },
+      },
+    )
+    const cliParsed = JSON.parse(cliJson.stdout)
+    const cliContainment = cliParsed.security.checks.find((c) => c.name === "containment")
+    assert(/planRequirePinnedWrites=1/.test(cliContainment.message), cliContainment.message)
+
+    // A5: an unacknowledged write anomaly is a doctor failure.
+    const anomalyConfig = join(testDir, "anomaly-config")
+    setWriteAnomalyAuditPathForTest(join(anomalyConfig, "teamwork", "write-anomalies.jsonl"))
+    try {
+      recordWriteAnomaly({ kind: "containment-mode", run: join(testDir, "some-run"), mode: "detective", detail: "fixture refusal" })
+      const anomalyReport = collectSecurityReport(allPassOptions({ configDir: anomalyConfig }))
+      const anomalyCheck = anomalyReport.checks.find((c) => c.name === "write_anomalies")
+      assert.strictEqual(anomalyCheck.status, "fail", anomalyCheck.message)
+      assert(/unacknowledged write anomaly/.test(anomalyCheck.message), anomalyCheck.message)
+      assert.strictEqual(hardenedExitCode(anomalyReport), 2)
+    } finally {
+      setWriteAnomalyAuditPathForTest(null)
+    }
+
+    console.log("✓ doctor reports the containment mode, env setting and plan flag; an asserted policy on a detective host fails hardened")
   }
 
   // ==========================================================================
