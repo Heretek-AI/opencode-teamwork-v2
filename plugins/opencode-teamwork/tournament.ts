@@ -15,6 +15,7 @@ import { lstatSync, realpathSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { assertPinnedWritePolicy, readRegularBounded, readWithinBounded, writeFileAtomicWithin } from "./safe-fs.mjs"
 import type { SafeFsRead } from "./safe-fs.mjs"
+import { BUDGET_HALT_PCT, budgetPercent } from "./budget.ts"
 
 export const TOURNAMENT_LIMITS = {
   MAX_LEVELS: 4,
@@ -1003,21 +1004,22 @@ export function estimateTournamentBudget(
   )
 
   const remainingUsd = roundUsd(budget - spent)
-  const spentPct = budget > 0 ? Math.floor((spent / budget) * 100) : 100
-  // Dispatch halts at >= 80% of budget, so a budget is only sufficient when the
-  // estimated completion (including the final audit) still fits under that cap.
-  const dispatchCapUsd = budget > 0 ? roundUsd(budget * 0.8) : 0
+  const spentPct = budget > 0 ? budgetPercent(spent, budget) : 100
+  // Dispatch halts at >= BUDGET_HALT_PCT of budget, so a budget is only
+  // sufficient when the estimated completion (including the final audit) still
+  // fits under that cap.
+  const dispatchCapUsd = budget > 0 ? roundUsd(budget * (BUDGET_HALT_PCT / 100)) : 0
   const estimatedCompletionUsd = roundUsd(spent + estimatedMinUsd)
 
   let refusalReason: string | undefined
   if (budget <= 0) {
     refusalReason = "massive-proof tournament requires a positive budgetUsd (> 0)"
-  } else if (spentPct >= 80) {
-    refusalReason = `existing spend is already ${spentPct}% of $${budget} (>= 80% halt threshold)`
+  } else if (spentPct >= BUDGET_HALT_PCT) {
+    refusalReason = `existing spend is already ${spentPct}% of $${budget} (>= ${BUDGET_HALT_PCT}% halt threshold)`
   } else if (remainingUsd < estimatedMinUsd) {
     refusalReason = `insufficient remaining budget ($${remainingUsd.toFixed(2)} < minimum 1-iteration estimate $${estimatedMinUsd.toFixed(2)})`
   } else if (estimatedCompletionUsd > dispatchCapUsd) {
-    refusalReason = `budget cannot reach the last required action before the 80% dispatch halt (estimated completion $${estimatedCompletionUsd.toFixed(2)} > 80% cap $${dispatchCapUsd.toFixed(2)} of $${budget})`
+    refusalReason = `budget cannot reach the last required action before the ${BUDGET_HALT_PCT}% dispatch halt (estimated completion $${estimatedCompletionUsd.toFixed(2)} > ${BUDGET_HALT_PCT}% cap $${dispatchCapUsd.toFixed(2)} of $${budget})`
   }
 
   return {

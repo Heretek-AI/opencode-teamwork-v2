@@ -50,6 +50,7 @@ import {
   validateTreeBounds,
 } from "./document-review.ts"
 import { authorizeToolCall } from "./authorize.ts"
+import { BUDGET_HALT_PCT, budgetPercent, budgetThresholdReached } from "./budget.ts"
 import { assertSafeUrl, safeFetch } from "./url-guard.ts"
 import {
   classifyRoute as classifyLemmaRoute,
@@ -3781,8 +3782,8 @@ function describeCostLine(run: string): string {
   if (!costs || typeof costs.budgetUsd !== "number") return "Cost: unknown."
   const budget = costs.budgetUsd
   const spent = Number(costs.spentUsd) || 0
-  const pct = budget ? Math.floor((spent / budget) * 100) : 0
-  return `Cost: $${spent} of $${budget} (${pct}%)${pct >= 80 ? " — near budget, halt non-essential workers" : ""}.`
+  const pct = budgetPercent(spent, budget)
+  return `Cost: $${spent} of $${budget} (${pct}%)${pct >= BUDGET_HALT_PCT ? " — advisory budget threshold reached; halt non-essential workers (enforced only by massive-proof tournaments)" : ""}.`
 }
 
 function describeTournamentLine(run: string): string | undefined {
@@ -7657,7 +7658,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       name: "cost",
       options: { namespace: "teamwork", codemode: false },
       description:
-        "Read the run budget and report real spend across the full session tree (Sentinel + all workers/verifiers). Uses OpenCode's native cost and token tracking; falls back to manual addUsd when client/db is unavailable. Warns at 80%.",
+        "Read the run budget and report real spend across the full session tree (Sentinel + all workers/verifiers). Uses OpenCode's native cost and token tracking; falls back to manual addUsd when client/db is unavailable. Warns at 80% and returns shouldHalt; the budget is advisory outside the massive-proof tournament, which is the only topology that enforces it. budgetUsd: 0 means no budget.",
       input: { type: "object", properties: { sessionId: { type: "string" }, addUsd: { type: "number" }, taskId: { type: "string" } }, additionalProperties: false },
       execute: async (input: any, context: any) => {
         // SEC-1: the taskId becomes a costs.byTask key. Refuse unsafe ids (e.g.
@@ -7865,8 +7866,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             source = "manual (client unavailable)"
           }
 
-          const pct = budget ? Math.floor((costs.spentUsd / budget) * 100) : 0
-          const warn = pct >= 80 ? `\n⚠ ${pct}% of budget used — halt non-essential workers and ask the user.` : ""
+          const pct = budgetPercent(costs.spentUsd, budget)
+          const shouldHalt = budgetThresholdReached(costs.spentUsd, budget)
+          const warn = shouldHalt
+            ? `\n⚠ ${pct}% of budget used — advisory: halt non-essential workers and ask the user. The budget is enforced only by the massive-proof tournament.`
+            : ""
           const treeWarning =
             Array.isArray(costs.treeWarnings) && costs.treeWarnings.length
               ? `\n⚠ cost tree degraded: ${costs.treeWarnings.map((w: any) => clean(w, 300)).join("; ")}`
@@ -7875,7 +7879,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const taskBreakdown = Object.entries(costs.byTask).map(([k, v]) => `    ${clean(k, 64)}: $${v}`).join("\n")
           return {
             content: `Budget: $${budget} · spent: $${costs.spentUsd} (${pct}%)${warn}${taskBreakdown ? `\nPer-task:\n${taskBreakdown}` : ""}\n(source: ${source}${skippedDuplicate ? "; duplicate snapshot digest skipped" : ""})${treeWarning}`,
-            shouldHalt: pct >= 80,
+            shouldHalt,
+            thresholdPct: BUDGET_HALT_PCT,
             pct,
             source,
             skippedDuplicate,
@@ -8394,7 +8399,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             const budget = Number(costsRes.value?.budgetUsd) || 0
             const spent = Number(costsRes.value?.spentUsd) || 0
             const pct = budget > 0 ? Math.floor((spent / budget) * 100) : 100
-            if (budget <= 0 || spent >= budget || pct >= 80) {
+            if (budget <= 0 || spent >= budget || pct >= BUDGET_HALT_PCT) {
               const reason = `Budget threshold reached (${pct}% of $${budget})`
               const partial = finalizeTournamentPartial(run, manifest, {
                 trigger: "budget_exhausted",
@@ -8780,7 +8785,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                   const budget = Number(costsRes.value?.budgetUsd) || 0
                   const spent = Number(costsRes.value?.spentUsd) || 0
                   const pct = budget > 0 ? Math.floor((spent / budget) * 100) : 100
-                  if (budget <= 0 || spent >= budget || pct >= 80) {
+                  if (budget <= 0 || spent >= budget || pct >= BUDGET_HALT_PCT) {
                     const reason = `Budget threshold reached (${pct}% of $${budget})`
                     const partial = finalizeTournamentPartial(run, manifest, {
                       trigger: "budget_exhausted",
