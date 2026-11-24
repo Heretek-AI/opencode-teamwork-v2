@@ -75,6 +75,7 @@ import {
   TOURNAMENT_PHASES,
   MAX_MANIFEST_BYTES,
   MAX_REPORT_BYTES,
+  assertRunRootIdentity,
   auditTournament,
   classifyRoute as classifyTournamentRoute,
   ensureSafeRunSubpath as ensureSafeTournamentSubpath,
@@ -165,6 +166,7 @@ import {
   fdWithin,
   onWriteAnomaly,
   readWithinBounded,
+  setRunRequirePinnedWrites,
   supportsFdContainment,
   touchWithin,
   writeFileAtomicWithin,
@@ -249,6 +251,8 @@ function runRel(run: string, file: string): string {
 }
 
 function writeTextAtomicSafe(run: string, file: string, content: string) {
+  // ADR 0013: a signed manifest's recorded run-root identity must still match.
+  assertRunRootIdentity(run)
   // Retain the path-level policy and error vocabulary (final symlink, escape,
   // non-directory parent) before the pinned write.
   ensureSafeRunSubpath(run, file)
@@ -3418,6 +3422,7 @@ function ensureSafeRunSubpath(run: string, targetFile: string) {
 }
 
 function writeTextSafe(run: string, targetFile: string, content: string) {
+  assertRunRootIdentity(run)
   // Keep the path-level policy/error text, then write with pinned-fd
   // containment. No path-based mkdir/create/rename remains on this writer; an
   // intermediate directory swap cannot redirect it.
@@ -3518,6 +3523,11 @@ type RunManifest = {
   approvedBy?: string | null
   /** Version 3+: ISO timestamp from the approval artifact. */
   approvedAt?: string | null
+  /**
+   * ADR 0013: the run root `(dev, ino)` at plan time. Additive and optional;
+   * a later control-plane write refuses when the root no longer matches.
+   */
+  runRootIdentity?: { dev: number; ino: number }
   createdAt: string
   _auth?: AuthEnvelope
 }
@@ -4852,6 +4862,24 @@ async function createPlanRun(
       content: `refused: invalid topology "${clean(input.topology, 32)}" (accepted: ${TOPOLOGIES.join(", ")}; aliases: ${Object.keys(TOPOLOGY_ALIASES).join(", ")})`,
     }
   }
+  // Fail-closed write policy (ADR 0013). `requirePinnedWrites: true` records
+  // that this run only accepts pinned control-plane writes; the writer then
+  // refuses by name on macOS/Windows instead of silently accepting a detective
+  // write. The assertion is sticky: a re-plan cannot turn it off, and it is
+  // registered before the first mkdir so a detective host refuses immediately.
+  if (input.requirePinnedWrites !== undefined && typeof input.requirePinnedWrites !== "boolean") {
+    return { ok: false, content: "refused: requirePinnedWrites must be a boolean; nothing was written." }
+  }
+  const persistedPlan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
+  const persistedRequirePinnedWrites = persistedPlan?.requirePinnedWrites === true
+  if (persistedRequirePinnedWrites && input.requirePinnedWrites === false) {
+    return {
+      ok: false,
+      content: "refused: requirePinnedWrites is already persisted for this run and cannot be disabled by a re-plan; start a new session. Nothing was written.",
+    }
+  }
+  const requirePinnedWrites = persistedRequirePinnedWrites || input.requirePinnedWrites === true
+  setRunRequirePinnedWrites(run, requirePinnedWrites)
   const rawRoute = typeof input.route === "string" ? clean(input.route, 32).trim().toLowerCase() : ""
   const isLemma = input.lemmaMode === true || rawRoute === "lemma"
   if (input.lemmaMode === true && rawRoute && rawRoute !== "lemma") {
@@ -5687,6 +5715,7 @@ async function createPlanRun(
     ...(victorySkipReason ? { victorySkipReason } : {}),
     requireHandoffs: requireHandoffsMode,
     requireHandoffsSource,
+    ...(requirePinnedWrites ? { requirePinnedWrites: true } : {}),
     claimProtocol: CLAIM_PROTOCOL,
     claimLeaseMs,
     host: planHost,
@@ -5732,6 +5761,7 @@ async function createPlanRun(
         requireWitness,
         ...(victorySkipReason ? { victorySkipReason } : {}),
         requireHandoffs: requireHandoffsMode,
+        ...(requirePinnedWrites ? { requirePinnedWrites: true } : {}),
         claimProtocol: CLAIM_PROTOCOL,
         claimLeaseMs,
         host: planHost,
@@ -5760,6 +5790,7 @@ async function createPlanRun(
             state.requireWitness !== requireWitness ||
             state.victorySkipReason !== victorySkipReason ||
             state.requireHandoffs !== requireHandoffsMode ||
+            (requirePinnedWrites && state.requirePinnedWrites !== true) ||
             state.rootSessionId !== rootSessionId ||
             (allowUnsignedLegacy && state.allowUnsignedLegacy !== true) ||
             (state.claimProtocol >= CLAIM_PROTOCOL &&
@@ -5774,6 +5805,7 @@ async function createPlanRun(
           if (victorySkipReason) state.victorySkipReason = victorySkipReason
           else delete state.victorySkipReason
           state.requireHandoffs = requireHandoffsMode
+          if (requirePinnedWrites) state.requirePinnedWrites = true
           state.rootSessionId = rootSessionId
           if (allowUnsignedLegacy) state.allowUnsignedLegacy = true
           if (state.claimProtocol >= CLAIM_PROTOCOL) {
@@ -5864,6 +5896,16 @@ async function createPlanRun(
       }
       const boundKey = await auth.bindRunKeyId(sessionId, authReady.keyId)
       if (!boundKey.ok) throw new AuthError(boundKey.failure)
+      // ADR 0013: record the run-root identity inside the signed manifest. The
+      // identity is read from the directory itself (not caller input) and used
+      // by assertRunRootIdentity before every control-plane write.
+      let runRootIdentity: { dev: number; ino: number } | undefined
+      try {
+        const rootStat = lstatSync(run)
+        if (!rootStat.isSymbolicLink() && rootStat.dev !== 0 && rootStat.ino !== 0) {
+          runRootIdentity = { dev: rootStat.dev, ino: rootStat.ino }
+        }
+      } catch {}
       const manifest: RunManifest = {
         version: manifestVersion,
         sessionId,
@@ -5902,6 +5944,7 @@ async function createPlanRun(
             }
           : {}),
         runKeyId: authReady.keyId,
+        ...(runRootIdentity ? { runRootIdentity } : {}),
         createdAt: new Date().toISOString(),
       }
       const signed = await auth.signRunArtifact(sessionId, RUN_MANIFEST, manifest)
