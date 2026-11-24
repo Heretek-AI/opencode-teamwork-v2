@@ -87,7 +87,13 @@ const probePlugin = (capture: Capture) => ({
 
 export async function loadHost(
   project: Project,
-  options: { mode?: LoadMode; extraPlugins?: any[]; includeTeamwork?: boolean } = {},
+  options: {
+    mode?: LoadMode
+    extraPlugins?: any[]
+    includeTeamwork?: boolean
+    /** File-backed SQLite path for cross-process specs; defaults to `:memory:`. */
+    databasePath?: string
+  } = {},
 ): Promise<LoadedHost> {
   const mode = options.mode ?? "memory"
   const includeTeamwork = options.includeTeamwork ?? true
@@ -118,7 +124,7 @@ export async function loadHost(
       // In the embedded host `config.directory` is the global *config* directory
       // (packages/server/src/routes.ts replaces Global.config with it). Sessions
       // still pin their own location to project.root below.
-      database: { path: ":memory:" },
+      database: { path: options.databasePath ?? ":memory:" },
       app: { name: "opencode-l1", version: versions.core },
       config: { directory: project.configDir, project: false, content: "{}" },
       models: { fetch: false },

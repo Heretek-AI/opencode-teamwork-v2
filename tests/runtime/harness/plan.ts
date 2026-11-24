@@ -135,32 +135,52 @@ export async function withRun<T>(
   fn: (fixture: RunFixture) => Promise<T>,
 ): Promise<T> {
   return withHost(label, async (base) => {
-    const overrides = { ...(options ?? {}) }
-    // A spec fixture is written before the plan, into the run directory the
-    // plan will use. Tests that need a refusal pass `expectRefusal` and do not
-    // use this path.
-    if (typeof overrides.spec === "string") {
-      writeSpec(base.project, String(overrides.sessionId ?? DEFAULT_RUN_ID), overrides.spec)
-      delete overrides.spec
-    }
-    const plan = await planRun(base.loaded, base.root, overrides)
-    if (!plan.content.startsWith("Planned ")) {
-      throw new Error(`withRun(${label}): plan did not succeed: ${plan.content || plan.error}`)
-    }
-    const runId = String(plan.content.match(/SESSION_ID: (\S+)/)?.[1] ?? overrides.sessionId ?? DEFAULT_RUN_ID)
-    const fixture: RunFixture = {
-      ...base,
-      runId,
-      runDir: runDir(base.project, runId),
-      plan,
-      worker: await base.child("team/worker"),
-      verifier: await base.child("team/verifier"),
-      falsifier: await base.child("team/falsifier"),
-      auditor: await base.child("team/security-auditor"),
-      victoryAuditor: await base.child("team/victory-auditor"),
-    }
+    const fixture = await buildRunFixture(base, label, options)
     return fn(fixture)
   })
+}
+
+/**
+ * The same planned fixture, but with the teamwork plugin's own `ctx.storage`
+ * captured. Used when a spec must write a signed fixture artifact and therefore
+ * needs the same digest-index namespace the plugin verifies against.
+ */
+export async function withStorageRun<T>(
+  label: string,
+  options: PlanOptions | undefined,
+  fn: (fixture: RunFixture & { storage: any }) => Promise<T>,
+): Promise<T> {
+  return withStorageHost(label, async (base) => {
+    const fixture = await buildRunFixture(base, label, options)
+    return fn({ ...fixture, storage: base.storage })
+  })
+}
+
+async function buildRunFixture(base: HostFixture, label: string, options?: PlanOptions): Promise<RunFixture> {
+  const overrides = { ...(options ?? {}) }
+  // A spec fixture is written before the plan, into the run directory the
+  // plan will use. Tests that need a refusal pass `expectRefusal` and do not
+  // use this path.
+  if (typeof overrides.spec === "string") {
+    writeSpec(base.project, String(overrides.sessionId ?? DEFAULT_RUN_ID), overrides.spec)
+    delete overrides.spec
+  }
+  const plan = await planRun(base.loaded, base.root, overrides)
+  if (!plan.content.startsWith("Planned ")) {
+    throw new Error(`withRun(${label}): plan did not succeed: ${plan.content || plan.error}`)
+  }
+  const runId = String(plan.content.match(/SESSION_ID: (\S+)/)?.[1] ?? overrides.sessionId ?? DEFAULT_RUN_ID)
+  return {
+    ...base,
+    runId,
+    runDir: runDir(base.project, runId),
+    plan,
+    worker: await base.child("team/worker"),
+    verifier: await base.child("team/verifier"),
+    falsifier: await base.child("team/falsifier"),
+    auditor: await base.child("team/security-auditor"),
+    victoryAuditor: await base.child("team/victory-auditor"),
+  }
 }
 
 // ---------------------------------------------------------------------------
