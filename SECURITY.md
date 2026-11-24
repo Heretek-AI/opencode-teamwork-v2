@@ -10,7 +10,9 @@ a sibling extension of ADR 0005, specified in
 contradiction detection are specified in
 [ADR 0012](docs/adr/0012-evidence-binding-and-contradiction-detection.md).
 Verifiable witness receipts and signer protocol v2 are specified in
-[ADR 0014](docs/adr/0014-verifiable-witness-and-signer-v2.md).
+[ADR 0014](docs/adr/0014-verifiable-witness-and-signer-v2.md). Offline
+verification from bytes and a public key is specified in
+[ADR 0015](docs/adr/0015-offline-verification.md).
 
 ## What is protected
 
@@ -284,6 +286,18 @@ signer's policy is outside the plugin.
 
 ## Residual risks
 
+- **Offline verification is relational, not observational.** `opencode-teamwork
+  verify` (0.15.0) recomputes the envelopes, evidence digests, citations,
+  handoffs, branch binding and contradictions from a read-only copy and a public
+  key. It cannot execute a claimed check, so an invented `output` with a correct
+  `outputSha256` still verifies. A consistently authored false report passes
+  every check. A whole-run rollback to an earlier signed set is undetectable
+  without `--require-index <snapshot>` or an external witness. The exact
+  residual is: a verifier holding only the public key and a read-only copy can
+  recompute every byte digest, citation, branch binding and cross-artifact
+  relation; it still cannot prove an observation, a consistently authored false
+  report passes every check, and a whole-run rollback to an earlier signed set
+  is undetectable without a snapshot or witness.
 - **Same-UID key access.** A local HMAC or Ed25519 private key is only as secret
   as the process UID. Only a different privilege domain (separate UID, KMS/HSM,
   hardware token) changes that.

@@ -379,6 +379,49 @@ budget, spend, tokens), a tasks table, the security audit, and the pitfalls. See
 [`docs/ARTIFACTS.md`](docs/ARTIFACTS.md#export-report-reporthtml--reportmd) for the
 format details.
 
+## Offline verification (`verify`)
+
+`opencode-teamwork verify` recomputes a run's named relations from the bytes in
+one run directory plus a public key. It is read-only, needs no plugin, no
+database and no `ctx.storage`, and never executes a reported check.
+
+```sh
+# Ed25519: only the public key is needed
+opencode-teamwork verify --session <id> --public-key <base64url|@file> --json
+
+# Verify an archived copy directly
+opencode-teamwork verify --run-dir /path/to/run --public-key @run-pubkey.txt
+
+# HMAC run: the secret is required (an HMAC verifier is also a signer)
+opencode-teamwork verify --session <id> --hmac-key <b64url> --hmac-key-id <id>
+
+# Optional: branch head/diff and rollback snapshot
+opencode-teamwork verify --session <id> --public-key ... --repo . --require-git
+opencode-teamwork verify --session <id> --public-key ... --require-index snapshot.json
+```
+
+The signed `run.manifest.json` is the anchor: its `runNonce`, `runKeyId` and
+algorithm are covered by the envelope, and every other artifact is pinned to
+them. The verifier recomputes victory `evidenceDigests`, audit `ruleChecks` and
+`reviewedDigests`, report→worker-handoff bindings, wave `cites` (`sha256` and
+byte length), every handoff index entry's auth/body/header/cites, and the final
+verdict's report/audit/requirements digests. It also names the four
+`INCONSISTENT_*` contradictions.
+
+Exit codes: `0` verified, `1` fail, `2` unverifiable (no key, unsigned legacy,
+HMAC without a secret, required git/index unavailable), `3` usage.
+`--fail-on-warning` promotes a warning to exit 1, and `--allow-unsigned`
+analyses a legacy run without ever upgrading it to `PASS`. `--json` is the
+stable machine report; the human table is rendered from it.
+
+**Honest limit.** A verifier holding only the public key and a read-only copy can
+recompute every byte digest, citation, branch binding and cross-artifact
+relation; it still cannot prove an observation, a consistently authored false
+report passes every check, and a whole-run rollback to an earlier signed set is
+undetectable without a snapshot or witness. See
+[ADR 0015](docs/adr/0015-offline-verification.md) and
+[`docs/ARTIFACTS.md`](docs/ARTIFACTS.md#offline-verification-opencode-teamwork-verify).
+
 ## Model assignment
 
 Each agent's model lives in the `model:` frontmatter of its markdown file. The
