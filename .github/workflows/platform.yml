@@ -1,0 +1,42 @@
+name: Platform containment
+
+# The macOS/Windows detective boundary is a real platform, not a Linux-only
+# branch. These jobs run only the containment-relevant suites (not the full
+# engine suite) so the platform matrix stays fast and focused.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  containment:
+    name: containment (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      # The package has no dependencies; the suites use Node built-ins only.
+      # Node 24 strips TypeScript in the imported plugin/test modules.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Read containment (safe-fs)
+        run: node scripts/test-safe-fs.mjs
+
+      - name: Write containment (safe-fs-write)
+        run: node scripts/test-safe-fs-write.mjs
+
+      - name: Approval control plane
+        run: node scripts/test-approval.mjs
+
+      - name: Signer/witness SPI
+        run: node scripts/test-auth.mjs

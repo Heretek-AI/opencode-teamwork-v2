@@ -70,12 +70,25 @@ function assertNoSentinel(result, label) {
   assert(!text.includes(SENTINEL), `${label} leaked the outside sentinel: ${text}`)
 }
 
+// Symlink creation is privileged on some Windows runners (junctions are not).
+// A missing fixture is an explicit SKIP with a recorded line, never a silent
+// pass or a failure.
+function makeLink(target, path, kind = "file") {
+  try {
+    symlinkSync(target, path, process.platform === "win32" ? (kind === "dir" ? "junction" : "file") : kind)
+    return true
+  } catch (err) {
+    console.log(`SKIP: symlink fixture unsupported on this runner (${err?.code || err?.message}); recorded`)
+    return false
+  }
+}
+
 // ---------------------------------------------------------------- static cases
 
 check("static intermediate symlink: run/verify -> outside is refused, no sentinel", () => {
   const { run, outside } = makeFixture()
   writeFileSync(join(outside, "report.json"), `{"status":"PASS","note":"${SENTINEL}"}\n`)
-  symlinkSync(outside, join(run, "verify"))
+  if (!makeLink(outside, join(run, "verify"), "dir")) return
   const res = readBoundedRunFile(run, join(run, "verify", "report.json"), 4096)
   assert.strictEqual(res.status, "error", `expected refusal: ${JSON.stringify(res)}`)
   assert(/refused|symlink|not a regular|outside|containment/i.test(res.error), `refusal must name a reason: ${res.error}`)
@@ -85,7 +98,7 @@ check("static intermediate symlink: run/verify -> outside is refused, no sentine
 check("final symlink: run/report.json -> outside is refused, no sentinel", () => {
   const { run, outside } = makeFixture()
   writeFileSync(join(outside, "report.json"), SENTINEL + "\n")
-  symlinkSync(join(outside, "report.json"), join(run, "report.json"))
+  if (!makeLink(join(outside, "report.json"), join(run, "report.json"), "file")) return
   const res = readBoundedRunFile(run, join(run, "report.json"), 4096)
   assert.strictEqual(res.status, "error", `expected refusal: ${JSON.stringify(res)}`)
   assert(/refused|symlink|not a regular/i.test(res.error), `refusal must name a reason: ${res.error}`)
@@ -123,6 +136,10 @@ check("oversize: a file over the cap is reported, never read", () => {
 // -------------------------------------------------------------------- FIFO
 
 check("FIFO: readBoundedRunFile refuses without hanging (child timeout)", () => {
+  if (process.platform === "win32") {
+    console.log("SKIP: named pipes (mkfifo) are unavailable on this runner; FIFO refusal recorded")
+    return
+  }
   const { run } = makeFixture()
   const fifo = join(run, "events.jsonl")
   const tournamentUrl = new URL("../plugins/opencode-teamwork/tournament.ts", import.meta.url).href
