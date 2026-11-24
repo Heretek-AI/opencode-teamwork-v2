@@ -227,6 +227,8 @@ interface SessionUsageItem {
 interface TreeUsageResult {
   sessions: SessionUsageItem[]
   source: string
+  /** Non-fatal losses, e.g. a child list truncated at the pagination cap. */
+  warnings?: string[]
 }
 
 function normalizeTokens(t: any): TokenUsage {
@@ -268,36 +270,90 @@ function writeSnapshots(run: string, file: string, value: SnapshotsFile) {
   writeTextAtomicSafe(run, file, JSON.stringify(value, null, 2) + "\n")
 }
 
-function getOpencodeDbPath(): string | undefined {
-  const candidates: string[] = []
-  if (process.env.XDG_DATA_HOME) {
-    candidates.push(join(process.env.XDG_DATA_HOME, "opencode", "opencode.db"))
-  }
+/**
+ * Channel from the host app (`ctx.app.channel`). OpenCode embeds
+ * OPENCODE_CHANNEL into its CLI; the plugin sees the same value through
+ * `ctx.app`. Absent (older hosts, tests) means the "local" build.
+ */
+function opencodeChannel(ctx: any): string {
+  const channel = typeof ctx?.app?.channel === "string" ? ctx.app.channel.trim() : ""
+  return channel || "local"
+}
+
+/** Channels whose database/service file has no channel suffix. */
+const UNSCOPED_CHANNELS = new Set(["latest", "dev", "beta", "next", "prod"])
+const PLAIN_SERVICE_CHANNELS = new Set(["latest", "dev", "beta", "next"])
+
+function channelSafe(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]/g, "-")
+}
+
+/** `packages/cli/src/database-path.ts` databasePath(). */
+function opencodeDatabaseFilename(channel: string): string {
+  const disable =
+    process.env.OPENCODE_DISABLE_CHANNEL_DB === "1" || process.env.OPENCODE_DISABLE_CHANNEL_DB === "true"
+  return UNSCOPED_CHANNELS.has(channel) || disable ? "opencode.db" : `opencode-${channelSafe(channel)}.db`
+}
+
+/** `packages/cli/src/services/service-config.ts` filename(). */
+function opencodeServiceFilenames(channel: string): string[] {
+  if (PLAIN_SERVICE_CHANNELS.has(channel)) return ["service.json"]
+  // The CLI migrates a plain service.json into the channel file for
+  // non-standard channels; for "local" it does not, but reading a plain
+  // registration is still better than reporting no service at all.
+  return [`service-${channelSafe(channel)}.json`, "service.json"]
+}
+
+/** XDG roots OpenCode uses (`packages/util/src/global-roots.ts`), then platform fallbacks. */
+function opencodeRoots(envHome: string, envKey: string, fallback: string): string[] {
+  const roots: string[] = []
+  const xdg = process.env[envKey]
+  if (xdg) roots.push(join(xdg, "opencode"))
+  roots.push(join(envHome, fallback, "opencode"))
+  roots.push(join(envHome, "Library", "Application Support", "opencode"))
+  if (process.env.LOCALAPPDATA) roots.push(join(process.env.LOCALAPPDATA, "opencode"))
+  roots.push(join(envHome, "AppData", "Local", "opencode"))
+  return [...new Set(roots)]
+}
+
+function getOpencodeDbPath(ctx?: any): string | undefined {
   const home = homedir()
-  candidates.push(join(home, ".local", "share", "opencode", "opencode.db"))
-  candidates.push(join(home, "Library", "Application Support", "opencode", "opencode.db"))
-  if (process.env.LOCALAPPDATA) {
-    candidates.push(join(process.env.LOCALAPPDATA, "opencode", "opencode.db"))
+  const dataRoots = opencodeRoots(home, "XDG_DATA_HOME", ".local/share")
+  // OPENCODE_DB wins exactly as in the CLI. A relative value resolves against
+  // the data directory, and ":memory:" names a database this reader cannot use.
+  const override = process.env.OPENCODE_DB?.trim()
+  if (override) {
+    if (override === ":memory:") return undefined
+    return isAbsolute(override) ? override : resolve(dataRoots[0], override)
   }
-  candidates.push(join(home, "AppData", "Local", "opencode", "opencode.db"))
-  for (const p of candidates) {
-    try {
-      if (existsSync(p)) return p
-    } catch {}
+  const channel = opencodeChannel(ctx)
+  const names = [...new Set([opencodeDatabaseFilename(channel), "opencode.db"])]
+  for (const root of dataRoots) {
+    for (const name of names) {
+      const p = join(root, name)
+      try {
+        if (existsSync(p)) return p
+      } catch {}
+    }
   }
   return undefined
 }
 
-function getOpencodeService(): { url: string; auth: string } | undefined {
-  const candidates: string[] = []
-  if (process.env.XDG_STATE_HOME) {
-    candidates.push(join(process.env.XDG_STATE_HOME, "opencode", "service.json"))
-  }
+function getOpencodeService(ctx?: any): { url: string; auth: string } | undefined {
   const home = homedir()
-  candidates.push(join(home, ".local", "state", "opencode", "service.json"))
-  candidates.push(join(home, "Library", "Application Support", "opencode", "service.json"))
-  if (process.env.LOCALAPPDATA) {
-    candidates.push(join(process.env.LOCALAPPDATA, "opencode", "service.json"))
+  const stateRoots = opencodeRoots(home, "XDG_STATE_HOME", ".local/state")
+  const names = opencodeServiceFilenames(opencodeChannel(ctx))
+  const candidates: string[] = []
+  for (const root of stateRoots) for (const name of names) candidates.push(join(root, name))
+  // The CLI also migrates legacy `service-<hash>.json` registrations. The hash
+  // is not reproducible here, so accept any remaining service-*.json in the
+  // same state directories.
+  for (const root of stateRoots) {
+    try {
+      for (const name of readdirSync(root)) {
+        if (/^service-[A-Za-z0-9._-]+\.json$/.test(name)) candidates.push(join(root, name))
+      }
+    } catch {}
   }
   for (const p of candidates) {
     try {
@@ -313,7 +369,16 @@ function getOpencodeService(): { url: string; auth: string } | undefined {
   return undefined
 }
 
-async function fetchServiceTree(url: string, auth: string, rootIds: string[]): Promise<SessionUsageItem[] | undefined> {
+/** Maximum child pages fetched per parent; one page is 200 sessions. */
+const SERVICE_TREE_PAGE_LIMIT = 200
+const SERVICE_TREE_MAX_PAGES = 25
+
+async function fetchServiceTree(
+  url: string,
+  auth: string,
+  rootIds: string[],
+  warnings: string[] = [],
+): Promise<SessionUsageItem[] | undefined> {
   const sessions: SessionUsageItem[] = []
   const seen = new Set<string>()
   const queue: string[] = rootIds.filter(validSessionId)
@@ -345,12 +410,19 @@ async function fetchServiceTree(url: string, auth: string, rootIds: string[]): P
   while (queue.length > 0) {
     const parentId = queue.shift()!
     if (!validSessionId(parentId)) continue
-    try {
-      const res = await fetch(`${url}/api/session?parentID=${encodeURIComponent(parentId)}`, {
-        headers: { Authorization: auth },
-        signal: AbortSignal.timeout(3000),
-      })
-      if (res.ok) {
+    // session.list defaults to 50 children (packages/protocol/src/groups/
+    // session.ts "Defaults to the newest 50 sessions"), so a parent with more
+    // workers would silently lose spend unless cursor.next is followed.
+    let cursor: string | undefined
+    for (let page = 0; page < SERVICE_TREE_MAX_PAGES; page++) {
+      try {
+        const query = new URLSearchParams({ parentID: parentId, limit: String(SERVICE_TREE_PAGE_LIMIT) })
+        if (cursor) query.set("cursor", cursor)
+        const res = await fetch(`${url}/api/session?${query.toString()}`, {
+          headers: { Authorization: auth },
+          signal: AbortSignal.timeout(3000),
+        })
+        if (!res.ok) break
         const json: any = await res.json()
         const children = Array.isArray(json?.data) ? json.data : []
         for (const c of children) {
@@ -366,8 +438,18 @@ async function fetchServiceTree(url: string, auth: string, rootIds: string[]): P
             tokens: normalizeTokens(c.tokens),
           })
         }
+        const next = typeof json?.cursor?.next === "string" ? json.cursor.next : ""
+        if (!next || next === cursor) break
+        cursor = next
+        if (page === SERVICE_TREE_MAX_PAGES - 1) {
+          warnings.push(
+            `session ${parentId} has more than ${SERVICE_TREE_MAX_PAGES * SERVICE_TREE_PAGE_LIMIT} children; spend beyond the cap was not read`,
+          )
+        }
+      } catch {
+        break
       }
-    } catch {}
+    }
   }
 
   return sessions.length ? sessions : undefined
@@ -388,8 +470,8 @@ async function readSessionTreeUsage(
   if (!safeIds.length) return undefined
 
   // 1. Try local SQLite database (node:sqlite)
-  const dbPath = getOpencodeDbPath()
-  if (dbPath) {
+  const dbPath = getOpencodeDbPath(ctx)
+  if (dbPath && existsSync(dbPath)) {
     try {
       const { DatabaseSync } = await import("node:sqlite")
       const db = new DatabaseSync(dbPath, { readOnly: true })
@@ -464,14 +546,16 @@ async function readSessionTreeUsage(
   }
 
   // 3. Try OpenCode background service API
-  const svc = getOpencodeService()
+  const svc = getOpencodeService(ctx)
   if (svc) {
     try {
-      const items = await fetchServiceTree(svc.url, svc.auth, safeIds)
+      const warnings: string[] = []
+      const items = await fetchServiceTree(svc.url, svc.auth, safeIds, warnings)
       if (items && items.length > 0) {
         return {
           sessions: items,
           source: "opencode service API",
+          ...(warnings.length ? { warnings } : {}),
         }
       }
     } catch {}
@@ -7710,6 +7794,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             writeSnapshots(run, snapshotsFile, snaps)
           }
 
+          // A truncated child list is a real undercount; keep the warning with
+          // the snapshot so an operator can tell "no spend" from "not read".
+          if (treeResult?.warnings?.length) costs.treeWarnings = treeResult.warnings
+          else delete costs.treeWarnings
+
           if (treeResult && treeResult.sessions.length > 0) {
             applyUsage(
               treeResult.sessions,
@@ -7750,14 +7839,19 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
           const pct = budget ? Math.floor((costs.spentUsd / budget) * 100) : 0
           const warn = pct >= 80 ? `\n⚠ ${pct}% of budget used — halt non-essential workers and ask the user.` : ""
+          const treeWarning =
+            Array.isArray(costs.treeWarnings) && costs.treeWarnings.length
+              ? `\n⚠ cost tree degraded: ${costs.treeWarnings.map((w: any) => clean(w, 300)).join("; ")}`
+              : ""
           // SEC-3: the bucket key is echoed to the caller, so it is sanitised too.
           const taskBreakdown = Object.entries(costs.byTask).map(([k, v]) => `    ${clean(k, 64)}: $${v}`).join("\n")
           return {
-            content: `Budget: $${budget} · spent: $${costs.spentUsd} (${pct}%)${warn}${taskBreakdown ? `\nPer-task:\n${taskBreakdown}` : ""}\n(source: ${source}${skippedDuplicate ? "; duplicate snapshot digest skipped" : ""})`,
+            content: `Budget: $${budget} · spent: $${costs.spentUsd} (${pct}%)${warn}${taskBreakdown ? `\nPer-task:\n${taskBreakdown}` : ""}\n(source: ${source}${skippedDuplicate ? "; duplicate snapshot digest skipped" : ""})${treeWarning}`,
             shouldHalt: pct >= 80,
             pct,
             source,
             skippedDuplicate,
+            ...(Array.isArray(costs.treeWarnings) && costs.treeWarnings.length ? { treeWarnings: costs.treeWarnings } : {}),
             ...(appliedDigest ? { appliedSnapshotDigest: appliedDigest } : {}),
           }
         })

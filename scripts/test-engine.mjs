@@ -4078,7 +4078,7 @@ try {
               data: { id: "ses_root_ok", parentID: null, agent: "sentinel", cost: 1.25, tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } },
             }),
           )
-        } else if (req.url === "/api/session?parentID=ses_root_ok") {
+        } else if (req.url.startsWith("/api/session?parentID=ses_root_ok")) {
           res.end(
             JSON.stringify({
               data: [
@@ -4088,7 +4088,7 @@ try {
               ],
             }),
           )
-        } else if (req.url === "/api/session?parentID=ses_child_ok") {
+        } else if (req.url.startsWith("/api/session?parentID=ses_child_ok")) {
           res.end(JSON.stringify({ data: [] }))
         } else {
           res.writeHead(404)
@@ -4137,7 +4137,7 @@ try {
         assert(res.content.includes("opencode service API"), `cost must still aggregate via the service tree: ${res.content}`)
         assert.deepStrictEqual(
           requests,
-          ["/api/session/ses_root_ok", "/api/session?parentID=ses_root_ok", "/api/session?parentID=ses_child_ok"],
+          ["/api/session/ses_root_ok", "/api/session?parentID=ses_root_ok&limit=200", "/api/session?parentID=ses_child_ok&limit=200"],
           `only SESSION_ID-valid ids may reach the API: ${JSON.stringify(requests)}`,
         )
         for (const url of requests) {
@@ -4160,6 +4160,111 @@ try {
     }
   } finally {
     rmSync(secDir, { recursive: true, force: true })
+  }
+}
+
+// ==========================================
+// Part 1d-bis: service child pagination (>50 children)
+// ==========================================
+{
+  console.log("Testing service session-tree pagination...")
+  const pageDir = mkdtempSync(join(tmpdir(), "teamwork-page-test-"))
+  const home = join(pageDir, "home")
+  try {
+    const ROOT = "ses_page_root"
+    const CHILD_COUNT = 75
+    const requests = []
+    const server = createServer((req, res) => {
+      requests.push(req.url)
+      res.setHeader("content-type", "application/json")
+      const url = new URL(req.url, "http://fixture")
+      if (url.pathname === `/api/session/${ROOT}`) {
+        res.end(
+          JSON.stringify({
+            data: { id: ROOT, parentID: null, agent: "team/sentinel", cost: 0.25, tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } },
+          }),
+        )
+        return
+      }
+      if (url.pathname === "/api/session") {
+        const parentID = url.searchParams.get("parentID")
+        if (parentID !== ROOT) {
+          res.end(JSON.stringify({ data: [] }))
+          return
+        }
+        const cursor = url.searchParams.get("cursor")
+        const start = cursor === "page-2" ? 50 : 0
+        const end = cursor === "page-2" ? CHILD_COUNT : 50
+        const data = []
+        for (let i = start; i < end; i++) {
+          data.push({
+            id: `ses_page_child_${i}`,
+            parentID: ROOT,
+            agent: "team/worker",
+            cost: 0.01,
+            tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+          })
+        }
+        res.end(JSON.stringify({ data, cursor: end < CHILD_COUNT ? { next: "page-2" } : {} }))
+        return
+      }
+      res.writeHead(404)
+      res.end("{}")
+    })
+    await new Promise((r) => server.listen(0, "127.0.0.1", r))
+    const savedEnv = {}
+    for (const k of ["HOME", "USERPROFILE", "XDG_DATA_HOME", "XDG_STATE_HOME", "LOCALAPPDATA", "OPENCODE_DB"]) {
+      savedEnv[k] = process.env[k]
+    }
+    try {
+      const base = `http://127.0.0.1:${server.address().port}`
+      process.env.HOME = home
+      process.env.USERPROFILE = home
+      process.env.XDG_DATA_HOME = join(home, "data")
+      process.env.XDG_STATE_HOME = join(home, "state")
+      process.env.LOCALAPPDATA = join(home, "localappdata")
+      delete process.env.OPENCODE_DB
+      mkdirSync(join(home, "state", "opencode"), { recursive: true })
+      writeFileSync(join(home, "state", "opencode", "service-nightly.json"), JSON.stringify({ url: base, password: "test" }))
+
+      const tools = {}
+      await registerTeamworkTools(
+        {
+          tool: { transform: async (cb) => cb({ namespace: () => {}, add: (tool) => registerTool(tools, tool, withFixtureSession) }) },
+          session: { get: async () => ({ agent: "team/sentinel", cost: 0, tokens: {} }) },
+          app: { channel: "nightly" },
+          storage: storageFor(pageDir),
+        },
+        pageDir,
+      )
+      const RUN = "20261124-000000-page"
+      const planned = await tools.teamwork_plan.execute(
+        { sessionId: RUN, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "alpha" }] },
+        { sessionID: ROOT },
+      )
+      assert(planned.content.startsWith("Planned"), planned.content)
+      const res = await tools.teamwork_cost.execute({ sessionId: RUN }, { sessionID: ROOT })
+      assert(res.content.includes("76 sessions"), `every page of children must be read: ${res.content}`)
+      const childRequests = requests.filter((u) => u.includes(`parentID=${ROOT}`))
+      assert.strictEqual(childRequests.length, 2, `a second cursor page must be requested: ${JSON.stringify(childRequests)}`)
+      assert(childRequests[1].includes("cursor=page-2"), `cursor.next must be sent back: ${childRequests[1]}`)
+      const costs = JSON.parse(
+        readFileSync(join(pageDir, ".opencode", "teamwork", RUN, "costs.json"), "utf8"),
+      )
+      assert.strictEqual(costs.spentUsd, 1, `all 75 children (0.75) plus the root (0.25) must count: ${costs.spentUsd}`)
+      console.log("✓ a child list over 50 sessions is followed through cursor.next")
+    } finally {
+      for (const k of Object.keys(savedEnv)) {
+        if (savedEnv[k] === undefined) delete process.env[k]
+        else process.env[k] = savedEnv[k]
+      }
+      await new Promise((resolve) => {
+        server.close(resolve)
+        if (typeof server.closeAllConnections === "function") server.closeAllConnections()
+      })
+    }
+  } finally {
+    rmSync(pageDir, { recursive: true, force: true })
   }
 }
 
