@@ -282,7 +282,7 @@ The static claims it corroborates, without upgrading them, are `04` §2.3 L1 (ro
 | Whether the sentinel eventually times out, fails, or accepts a late reply | the process was cut at 10m while the sentinel was idle; no later turn exists | UNKNOWN |
 | Whether `folder`/`problem`/`root` would have been inferred from the prose with a human in the loop | no interview ran (`[skip-interview]`) | UNKNOWN |
 | Whether a `MISSING` verdict always means no `/teamwork` artifacts beyond the audit | one run, one route | UNKNOWN |
-| Document Review's gate | not exercised | UNKNOWN |
+| Document Review's gate | now observed once (`18` §8): no `GATE_STATUS.md`; the victory auditor is the verification; a PDF input and a second run are unobserved | OBSERVED for this run; recurrence UNKNOWN |
 
 The most important limit: **this is a negative-path observation.** It shows the gate refusing to start work, which is exactly what the static corpus claimed, but a gate that never passes is indistinguishable from a route that cannot run. The `READY` path — the one that proves the LEMMA pipeline is reachable — remains unobserved.
 

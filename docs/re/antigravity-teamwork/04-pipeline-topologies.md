@@ -184,6 +184,8 @@ Counts are per DAG edge, not per table row; a row whose type is named but whose 
 
 **Coverage.** This is the best-evidenced non-trivial topology in the corpus: the main orchestrator's prompt contains an architecture diagram in ASCII, the RSA tree shapes, the group-orchestrator dispatch, and the synthesis sub-tree. All of it is OBSERVED. The leaf-orchestrator type name and `teamwork_spec_miner`'s participation are the only gaps.
 
+**Runtime status (2026-11-24).** The route is now observed end to end on **1.5.16** — the first completed Document Review run in the corpus ([`18-live-document-review.md`](18-live-document-review.md)). It confirms the main orchestrator → pre-flight `teamwork_dependency` (`READY`) → three `teamwork_group` segment trees (`[4,2,1]`, `K=2`) → one synthesis group (`[4,1]`, `K=4`) → `DOCUMENT_REVIEW_REPORT.md` → `teamwork_document_victory_auditor` (`VICTORY CONFIRMED`). The `.tex` branch in the diagram is exercised: `DOCUMENT_TEXT_MAP.md` was written and the source read directly, with no `teamwork_ingestor` and no page images. Two qualifications are recorded in `18`: the route wrote **no `GATE_STATUS.md`** in this run (verification is the auditor), and the segment/report artifact paths were **not** the single `segment_<name>/handoff_<n>.md` form drawn here — the run used three different segment layouts and two report locations. The **PDF** branch (B2, `teamwork_ingestor`) remains unexercised. [OBSERVED — `18` §4–§9]
+
 ```text
 [SENTINEL]  --route: a document is supplied AND the deliverable is an assessment-->
    |
