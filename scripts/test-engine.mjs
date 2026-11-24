@@ -3465,6 +3465,10 @@ try {
       taskId: "feature-1",
     })
     assert(conflictMergeRes.conflict, "Should detect merge conflict")
+    // OpenCode dies when a result has `output` without an output schema, so
+    // the raw git text must stay out of that key.
+    assert(!("output" in conflictMergeRes), "a schema-less tool must not return `output`")
+    assert(String(conflictMergeRes.content).includes("MERGE CONFLICT"), "the conflict text must be in content")
     assert(conflictMergeRes.conflictArtifact, "Should generate conflict artifact path")
     assert(existsSync(conflictMergeRes.conflictArtifact), "Conflict artifact file must exist on disk")
 
