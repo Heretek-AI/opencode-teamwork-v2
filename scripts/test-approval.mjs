@@ -310,6 +310,7 @@ function writeV2SignerStub({ signerPrivateKey, signerKeyId, approverPublicKey, a
     file,
     `#!/usr/bin/env node
 import { readFileSync, writeFileSync } from "node:fs"
+import { join } from "node:path"
 import { createHash, createPrivateKey, createPublicKey, sign, verify } from "node:crypto"
 const request = JSON.parse(readFileSync(0, "utf8"))
 const die = (code, message) => { process.stdout.write(JSON.stringify({ ok: false, code, message })); process.exit(1) }
@@ -328,7 +329,7 @@ if (!/^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$/.test(request.runId)) die("E_REQUEST", "
 if (typeof request.path !== "string" || request.path.startsWith("/") || request.path.split("/").some((s) => !s || s === "." || s === "..")) die("E_PATH", "path")
 if (!/^[0-9a-f]{64}$/.test(request.digest)) die("E_DIGEST", "digest shape")
 if (typeof request.nonce !== "string" || Buffer.from(request.nonce, "base64url").length < 16) die("E_NONCE", "nonce")
-const approvalRef = ${JSON.stringify(approvalDir)} + "/" + request.runId + "/" + sha256(request.path) + ".json"
+const approvalRef = join(${JSON.stringify(approvalDir)}, request.runId, sha256(request.path) + ".json")
 if (request.approvalRef !== approvalRef) die("E_APPROVAL_REF", "approval ref layout")
 let approval
 try { approval = JSON.parse(readFileSync(approvalRef, "utf8")) } catch { die("E_APPROVAL_OPEN", "approval unreadable") }
