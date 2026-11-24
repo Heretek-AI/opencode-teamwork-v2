@@ -504,6 +504,30 @@ LEMMA is an explicit opt-in capability-gated route (`topology: "proof"`, `lemmaM
 - **Declaration and axiom binding:** each node records its Lean `declaration` and `statement`. Before a node becomes `proved`/`disproved`, the attempt must declare that name and type (comments, strings, and syntax quotations are masked; duplicate/namespaced/`private`/`protected` declarations fail closed). The verifier then runs `#print axioms <declaration>` and records `declaration`, `declarationType`, `axiomDependencies`, and `unauthorizedAxioms`, accepting only `Classical.choice`, `propext`, `Quot.sound`, plus axioms approved once at plan time via `lemmaPolicy.allowedAxioms` (persisted in `lemma/manifest.json`). `sorryAx` is always rejected, and `#`/`logInfo`/`dbg_trace`/`trace`/`run_cmd`/`println`/`IO.`/`set_option trace` probe-hijacking attempts fail closed. Node statement/declaration metadata is immutable after a PASS; `teamwork_final_verify` re-checks stamped metadata before accepting a run.
 - **Known limits:** binding compares the elaborated type text lexically (binder/negation spellings normalized), not semantic equality; the transitive-axiom allowlist is approved at plan time (`lemmaPolicy.allowedAxioms`) and persisted in `lemma/manifest.json`, never caller-supplied at verify time; and the live Lean path is not exercised on hosts without `lean`/`lake`/`leap` (the E2E test skips loudly, while stub tests cover the control flow). CI installs core Lean + the LEAP CLI (no Mathlib) so the live E2E runs on every relevant pull request.
 
+## High-assurance deployment
+
+The default package is tamper-evident against a writer limited to the run
+directory; it is not a boundary against a shell running as the same UID as
+OpenCode. If you need a real privilege boundary, the administrator-only path is
+documented separately:
+
+- [`docs/ADMIN-HARDENING.md`](docs/ADMIN-HARDENING.md) — a Linux runbook for a
+  separate signer UID, a `0700` key directory, a root-owned signer, a systemd
+  socket service, audit rules and SELinux labels. Every step has a proof, a
+  rollback and an honest limit.
+- [`docs/SIGNER-PROTOCOL.md`](docs/SIGNER-PROTOCOL.md) — the v2 signer contract
+  that turns a command signer from an oracle into a policy-enforcing signer.
+  It requires a plugin change; the 0.13.0 plugin sends v1 and cannot use a
+  v2-only signer.
+- [`scripts/hardening-check.sh`](scripts/hardening-check.sh) — a read-only
+  Linux verifier that prints `PASS`/`FAIL`/`UNKNOWN` per probe. It never
+  modifies the host; `UNKNOWN` is not a pass.
+
+These are deployment changes, not plugin features. They do not make the plugin,
+the prompts or the model trustworthy, and none of the steps is executed
+automatically. `opencode-teamwork doctor --security --require-hardened` remains
+the plugin-side posture check.
+
 ## Notes
 
 - The plugin is intentionally **dependency-free at runtime** — it does not import

@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Documentation
+
+- Add [`docs/ADMIN-HARDENING.md`](docs/ADMIN-HARDENING.md): a Linux
+  administrator runbook for a separate signer UID, a `0700` key directory, a
+  root-owned signer, a systemd socket service, audit rules, SELinux labels and
+  a read-only verification loop. Each step has a purpose, commands, a proof, a
+  rollback and an honest limit. These are deployment instructions, not claims
+  that the steps were executed on any host.
+- Add [`docs/SIGNER-PROTOCOL.md`](docs/SIGNER-PROTOCOL.md): the v2
+  policy-enforcing signer contract (`v: 2`, `runId`, `approvalRef`, the six
+  mandatory checks, failure vocabulary and the plugin-side change). A v2 signer
+  refuses v1; the 0.13.0 plugin sends v1, so the two halves must ship together.
+- Add [`scripts/hardening-check.sh`](scripts/hardening-check.sh): a read-only
+  POSIX `sh` verifier that prints `PASS`/`FAIL`/`UNKNOWN` per probe, exits
+  non-zero on any `FAIL`, and documents every probe. `UNKNOWN` is not a pass.
+- Link the runbook and protocol from `SECURITY.md`, `docs/GUARDRAILS.md` and
+  the README "High-assurance deployment" section; add the new files to the
+  packaging guard's required list.
+
 ## [0.13.0] - 2026-11-23
 
 Detective-mode containment parity on macOS/Windows, an opt-in fail-closed

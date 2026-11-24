@@ -232,7 +232,11 @@ the default is used.
 
 The hardened profile is an administrator/deployment change (a system service,
 separate UID, SELinux labels, or a remote approver). The plugin cannot create
-that boundary in-process.
+that boundary in-process. The step-by-step administrator runbook is
+[docs/ADMIN-HARDENING.md](docs/ADMIN-HARDENING.md); the policy-enforcing signer
+contract is [docs/SIGNER-PROTOCOL.md](docs/SIGNER-PROTOCOL.md); the read-only
+host verifier is [scripts/hardening-check.sh](scripts/hardening-check.sh). Those
+steps are deployment guidance, not something the plugin enforces.
 
 ## Configuration
 
