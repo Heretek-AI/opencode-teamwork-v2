@@ -9,6 +9,26 @@ permissions:
   contents: read
 
 jobs:
+  # L1: the real plugin inside the real OpenCode 2.4.1 runtime, with no model
+  # call and no network at test time. Dependencies are pinned in
+  # tests/runtime/package.json; the root package stays dependency-free.
+  runtime-l1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Install harness dependencies
+        working-directory: tests/runtime
+        run: bun install --frozen-lockfile
+
+      - name: L1 runtime suite
+        working-directory: tests/runtime
+        run: bun test
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -36,11 +56,14 @@ jobs:
           const fs = require("fs");
           const p = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/pack.json", "utf8"));
           const paths = p[0].files.map((f) => f.path);
-          const bad = paths.filter((x) => x === "docs/re" || x.startsWith("docs/re/"));
+          const bad = paths.filter((x) => x === "docs/re" || x.startsWith("docs/re/") || x === "tests" || x.startsWith("tests/"));
           const need = ["docs/ARTIFACTS.md", "docs/GUARDRAILS.md", "docs/ADMIN-HARDENING.md", "docs/SIGNER-PROTOCOL.md", "docs/adr/0005-artifact-authenticity.md", "docs/adr/0008-signer-spi-and-trust-levels.md", "docs/adr/0014-verifiable-witness-and-signer-v2.md", "docs/adr/0015-offline-verification.md", "SECURITY.md", "scripts/hardening-check.sh", "plugins/opencode-teamwork/index.ts", "plugins/opencode-teamwork/auth.ts", "plugins/opencode-teamwork/authorize.ts", "plugins/opencode-teamwork/url-guard.ts", "plugins/opencode-teamwork/strict.ts", "plugins/opencode-teamwork/briefing.ts", "plugins/opencode-teamwork/victory.ts", "plugins/opencode-teamwork/safe-fs.mjs", "lib/verify.mjs", "scripts/test-verify.mjs", "agents/team/victory-auditor.md"];
           const miss = need.filter((n) => !paths.includes(n));
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const deps = Object.keys(pkg.dependencies ?? {});
           console.log(`packed files: ${paths.length}`);
-          if (bad.length) console.error("forbidden docs/re paths:\n" + bad.join("\n"));
+          if (bad.length) console.error("forbidden docs/re or tests paths:\n" + bad.join("\n"));
           if (miss.length) console.error("missing required paths:\n" + miss.join("\n"));
-          process.exit(bad.length + miss.length ? 1 : 0);
+          if (deps.length) console.error("root dependencies must stay empty:\n" + deps.join("\n"));
+          process.exit(bad.length + miss.length + deps.length ? 1 : 0);
           '

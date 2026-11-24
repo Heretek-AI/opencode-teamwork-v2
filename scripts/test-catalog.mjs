@@ -143,6 +143,17 @@ assert.strictEqual(
   "the @opencode/plugin peer must stay optional (dependency-free installs)",
 )
 
+// The published package stays dependency-free: all harness dependencies live in
+// tests/runtime/package.json, and tests/ is excluded from the tarball by
+// omission. The CI packaging guard checks the actual pack listing too.
+const dependencies = rootPackage.dependencies ?? {}
+assert.strictEqual(Object.keys(dependencies).length, 0, "the root package must declare no runtime dependencies")
+const files = rootPackage.files ?? []
+assert(
+  !files.some((entry) => entry === "tests" || entry.startsWith("tests/")),
+  "tests/ must never be listed in package.json files",
+)
+
 console.log(
   `✓ test-catalog passed: ${ids.length} teamwork_* tools, namespace/codemode/input contract, ${referenced.size} prompt token(s) all resolve, version ${rootPackage.version}`,
 )

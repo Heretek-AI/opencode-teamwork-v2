@@ -1,0 +1,4 @@
+[test]
+# The harness must set HOME / XDG_* / OPENCODE_* before any @opencode module is
+# imported: several of them read those variables once, at module evaluation.
+preload = ["./harness/preload.ts"]
