@@ -139,6 +139,39 @@ export function createProject(name = "project"): Project {
   return project
 }
 
+/**
+ * Re-open a project created in another process, from its root alone. Used by
+ * the L3 claim-race child, which shares the parent's temp project and file DB
+ * but must create its own embedded host.
+ */
+export function openProject(root: string): Project {
+  const home = join(root, "home")
+  const configDir = join(root, "config")
+  const worktreesDir = join(root, "worktrees")
+  const dbPath = join(root, "opencode.db")
+  return {
+    root,
+    home,
+    configDir,
+    worktreesDir,
+    dbPath,
+    pluginDir: PLUGIN_DIR,
+    activate() {
+      process.env.HOME = home
+      process.env.OPENCODE_TEST_HOME = home
+      process.env.OPENCODE_CONFIG_DIR = configDir
+      process.env.OPENCODE_DB = dbPath
+      process.env.TEAMWORK_WORKTREES_DIR = worktreesDir
+    },
+    writeConfig(plugins = []) {
+      writeFileSync(join(configDir, "opencode.json"), `${JSON.stringify({ $schema: "https://opencode.ai/config.json", plugins }, null, 2)}\n`)
+    },
+    cleanup() {
+      rmSync(root, { recursive: true, force: true })
+    },
+  }
+}
+
 /** Remove every temp root. Registered on process exit from the preload. */
 export function cleanupProjects() {
   for (const root of roots) {

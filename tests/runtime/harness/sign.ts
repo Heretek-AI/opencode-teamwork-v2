@@ -18,9 +18,9 @@ import { runDir, readManifest, type RunManifest } from "./plan"
 
 const ENV_KEY = "OPENCODE_TEAMWORK_HMAC_KEY"
 const ENV_KEY_ID = "OPENCODE_TEAMWORK_HMAC_KEY_ID"
-const ENV_ED25519_PRIVATE = "OPENCODE_TEAMWORK_ED25519_PRIVATE_KEY"
-const ENV_ED25519_PUBLIC = "OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY"
-const ENV_ED25519_KEY_ID = "OPENCODE_TEAMWORK_ED25519_KEY_ID"
+export const ENV_ED25519_PRIVATE = "OPENCODE_TEAMWORK_ED25519_PRIVATE_KEY"
+export const ENV_ED25519_PUBLIC = "OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY"
+export const ENV_ED25519_KEY_ID = "OPENCODE_TEAMWORK_ED25519_KEY_ID"
 const KEY_RING_STORAGE_KEY = "auth/key/ring"
 
 export const APPROVAL_ENV_DIR = "OPENCODE_TEAMWORK_APPROVAL_DIR"
@@ -305,3 +305,27 @@ export function approvalExists(dir: string, runId: string): boolean {
 export function readSignedJson(path: string): any {
   return JSON.parse(readFileSync(path, "utf8"))
 }
+
+/**
+ * Sign a fixture payload with the same auth context the plugin uses (env HMAC
+ * key by default). Used when a spec must model a stamped artifact that the
+ * tools cannot produce in that state (L3 I3's pre-rejection PASS), mirroring
+ * `scripts/test-engine.mjs`'s `writeSignedFixture`.
+ */
+export async function signFixtureArtifact(
+  project: Project,
+  runId: string,
+  relativePath: string,
+  payload: unknown,
+  storage?: { get: (key: string) => Promise<unknown>; set: (key: string, value: unknown) => Promise<unknown> },
+): Promise<any> {
+  const module = await import(pathToFileURL(join(PLUGIN_DIR, "auth.ts")).href)
+  const kv = storage ?? { get: async () => undefined, set: async () => undefined }
+  const auth = module.createAuthContext(kv, process.env)
+  // The plugin binds the run nonce in ctx.storage at plan time; a fixture
+  // signer takes it from the manifest so the envelope pins the same run.
+  const manifest = readManifest(project, runId)
+  const nonce = typeof manifest?.runNonce === "string" ? manifest.runNonce : undefined
+  return auth.signRunArtifact(runId, relativePath, payload, nonce ? { nonce } : {})
+}
+
