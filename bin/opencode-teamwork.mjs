@@ -30,6 +30,7 @@ import { runDoctor, nextSteps } from "../lib/doctor.mjs"
 import { collectSecurityReport, hardenedExitCode } from "../lib/security.mjs"
 import { buildTimeline, renderTimeline, timelineWarnings } from "../lib/timeline.mjs"
 import { buildExportData, renderExport } from "../lib/export.mjs"
+import { verifyRun, renderVerify, verifyExitCode, VerifyUsageError } from "../lib/verify.mjs"
 
 // Echo a user-supplied value in an error message: control characters become "?"
 // and the value is capped, so a hostile argv cannot inject escapes or bloat stderr.
@@ -51,6 +52,14 @@ Commands:
   inspect    Inspect DAG, task progress, security report and costs for a run
   timeline   Show per-task lifecycle timing, rounds, and cost for a run (--json for raw data)
   export     Render a run as an offline HTML report (default) or Markdown (-m)
+  verify     Verify a run offline from bytes and a public key. Exit codes:
+               0 verified, 1 fail, 2 unverifiable, 3 usage.
+               verify --session <id> --public-key <b64url|@file>
+                      [--key-id <id>] [--repo <path>] [--require-git]
+                      [--require-index <snapshot>] [--allow-unsigned]
+                      [--fail-on-warning] [--json]
+               verify --run-dir <path> ...
+               verify --session <id> --hmac-key <b64url> --hmac-key-id <id>
   prune      Prune git worktrees for completed Teamwork runs
   doctor     Diagnose config, agents, model sync and git/worktree health
              (--security adds key source, signer/witness, ptrace, groups, DB,
@@ -71,7 +80,21 @@ Options:
       --all <model>      Use one model for every agent (e.g. anthropic/claude-sonnet-4-5)
       --model <id>=<m>   Override one agent (repeatable), id may omit the "team/" prefix
       --session <id>     Target a specific session ID (for inspect, prune or export)
-      --json             Print doctor or timeline output as raw JSON
+      --json             Print doctor, timeline or verify output as raw JSON
+      --run-dir <path>   Verify this run directory directly (instead of --session)
+      --public-key <k>   Ed25519 verify key: base64url SPKI or @file
+      --key-id <id>      Expected Ed25519 key id (defaults to the signed run key)
+      --hmac-key <k>     HMAC-SHA256 secret (base64url, 32 bytes) for verify
+      --hmac-key-id <id> Expected HMAC key id
+      --repo <path>      Repository for optional branch head/diff checks
+      --require-git      Fail as UNKNOWN when git/branch data is unavailable
+      --require-index <snapshot>
+                         Detect a whole-run rollback against a file snapshot
+      --allow-unsigned   Analyse an unsigned legacy run (never upgrades to PASS)
+      --fail-on-warning  Promote a warning to a failing exit code
+      --witness-public-key <k>  Optional Ed25519 witness key for a receipt
+      --witness-key-id <id>     Expected witness key id
+      --witness-receipt <path>  Witness receipt JSON to verify
       --force            With prune: remove a worktree even when a live/expired/
                          needs-inspection/cross-host claim still blocks it
       --reason <text>    Recorded reason for a forced prune
@@ -91,7 +114,7 @@ Options:
 `
 
 function parseArgs(argv) {
-  const options = { command: undefined, yes: false, all: undefined, assignments: {}, register: true, dryRun: false, refresh: false, configDir: undefined, session: undefined, json: false, noColor: false, help: false, markdown: false, output: undefined, security: false, requireHardened: false }
+  const options = { command: undefined, yes: false, all: undefined, assignments: {}, register: true, dryRun: false, refresh: false, configDir: undefined, session: undefined, json: false, noColor: false, help: false, markdown: false, output: undefined, security: false, requireHardened: false, runDir: undefined, publicKey: undefined, keyId: undefined, hmacKey: undefined, hmacKeyId: undefined, repo: undefined, requireIndex: undefined, requireGit: false, allowUnsigned: false, failOnWarning: false, witnessPublicKey: undefined, witnessKeyId: undefined, witnessReceipt: undefined }
   const rest = [...argv]
   options.command = rest.shift()
   while (rest.length) {
@@ -144,6 +167,48 @@ function parseArgs(argv) {
       case "--require-hardened":
         options.security = true
         options.requireHardened = true
+        break
+      case "--run-dir":
+        options.runDir = rest.shift() ?? ""
+        break
+      case "--public-key":
+        options.publicKey = rest.shift() ?? ""
+        break
+      case "--key-id":
+        options.keyId = rest.shift() ?? ""
+        break
+      case "--hmac-key":
+        options.hmacKey = rest.shift() ?? ""
+        break
+      case "--hmac-key-id":
+        options.hmacKeyId = rest.shift() ?? ""
+        break
+      case "--repo":
+        options.repo = rest.shift() ?? ""
+        break
+      case "--require-index": {
+        const next = rest[0]
+        if (next !== undefined && !next.startsWith("-")) options.requireIndex = rest.shift()
+        else options.requireIndex = true
+        break
+      }
+      case "--require-git":
+        options.requireGit = true
+        break
+      case "--allow-unsigned":
+        options.allowUnsigned = true
+        break
+      case "--fail-on-warning":
+        options.failOnWarning = true
+        break
+      case "--witness-public-key":
+        options.witnessPublicKey = rest.shift() ?? ""
+        break
+      case "--witness-key-id":
+        options.witnessKeyId = rest.shift() ?? ""
+        break
+      case "--witness-receipt":
+        options.witnessReceipt = rest.shift() ?? ""
         break
       case "--html":
         options.markdown = false
@@ -520,6 +585,49 @@ function runPlanRequirePinnedWrites(runDir) {
   }
 }
 
+async function verifyCommand(options) {
+  try {
+    const result = await verifyRun({
+      cwd: process.cwd(),
+      session: options.session,
+      runDir: options.runDir,
+      publicKey: options.publicKey || undefined,
+      keyId: options.keyId || undefined,
+      hmacKey: options.hmacKey || undefined,
+      hmacKeyId: options.hmacKeyId || undefined,
+      repo: options.repo || undefined,
+      requireIndex: options.requireIndex,
+      requireGit: options.requireGit === true,
+      allowUnsigned: options.allowUnsigned === true,
+      failOnWarning: options.failOnWarning === true,
+      witnessPublicKey: options.witnessPublicKey || undefined,
+      witnessKeyId: options.witnessKeyId || undefined,
+      witnessReceipt: options.witnessReceipt || undefined,
+    })
+    if (options.json) {
+      // JSON.stringify escapes C0 only; escape DEL and C1 (incl. 0x9b CSI) too
+      // so no raw control byte from a run file can reach the terminal.
+      const json = JSON.stringify(result, null, 2).replace(
+        /[\x7f-\x9f]/g,
+        (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"),
+      )
+      console.log(json)
+    } else {
+      const color = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR && !options.noColor
+      for (const line of renderVerify(result, { color })) console.log(line)
+    }
+    process.exitCode = verifyExitCode(result, { failOnWarning: options.failOnWarning === true })
+  } catch (err) {
+    if (err instanceof VerifyUsageError) {
+      console.error(`verify: ${safeEcho(err.message, 300)}`)
+      process.exitCode = 3
+      return
+    }
+    console.error(`verify: ${safeEcho(err?.message ?? err, 300)}`)
+    process.exitCode = 2
+  }
+}
+
 function doctorCommand(options) {
   const configDir = resolveConfigDir(options.configDir)
   const report = runDoctor({ configDir, cwd: process.cwd() })
@@ -612,7 +720,7 @@ async function main() {
     console.log(HELP)
     return
   }
-  if (!["init", "models", "install", "status", "runs", "inspect", "timeline", "export", "prune", "doctor"].includes(command)) {
+  if (!["init", "models", "install", "status", "runs", "inspect", "timeline", "export", "prune", "doctor", "verify"].includes(command)) {
     console.error(`Unknown command: ${command}\n`)
     console.log(HELP)
     process.exitCode = 1
@@ -626,6 +734,7 @@ async function main() {
   if (command === "export") return exportCommand(options)
   if (command === "prune") return pruneCommand(options)
   if (command === "doctor") return doctorCommand(options)
+  if (command === "verify") return verifyCommand(options)
   if (command === "install") {
     options.yes = true
     return run(options, { register: options.register })
