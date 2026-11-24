@@ -12,6 +12,7 @@
 import { buildTimeline, renderTimeline, timelineWarnings } from "../lib/timeline.mjs"
 import { inspectTeamworkRun, listTeamworkRuns } from "../lib/runs.mjs"
 import { registerTeamworkTools } from "../plugins/opencode-teamwork/tools.ts"
+import { registerTool } from "./tool-registry.mjs"
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, utimesSync, symlinkSync, truncateSync, existsSync, lstatSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
@@ -886,18 +887,17 @@ async function engineTools(root) {
         transform: async (cb) => {
           await cb({
             namespace: () => {},
-            add: (tool) => {
-              // Test fixture: every call is made by the trusted sentinel
-              // session unless a test supplies its own explicit context.
-              tools[tool.name] = {
-                ...tool,
+            add: (tool) =>
+              registerTool(tools, tool, (value) => ({
+                ...value,
+                // Test fixture: every call is made by the trusted sentinel
+                // session unless a test supplies its own explicit context.
                 execute: (input, context) =>
-                  tool.execute(input, {
+                  value.execute(input, {
                     ...(context && typeof context === "object" ? context : {}),
                     sessionID: context?.sessionID || "ses_timeline_root",
                   }),
-              }
-            },
+              })),
           })
         },
       },
@@ -923,7 +923,7 @@ const readLines = (file) => readFileSync(file, "utf8").split("\n").filter((l) =>
 await check("R6.6 control: task_update appends exactly one event to a plain events.jsonl", async () => {
   const { root, dir } = engineRun()
   const tools = await engineTools(root)
-  const res = await tools.task_update.execute({ sessionId: SESSION, taskId: "alpha", status: "worker_active" })
+  const res = await tools.teamwork_task_update.execute({ sessionId: SESSION, taskId: "alpha", status: "worker_active" })
   assert(res.content.includes("updated"), res.content)
   const lines = readLines(join(dir, "events.jsonl"))
   assert.strictEqual(lines.length, 1, "one event expected")
@@ -936,7 +936,7 @@ await check("R6.6 (1): a symlinked events.jsonl is refused; its target is not ap
   writeFileSync(outside, "CANARY\n")
   symlinkSync(outside, join(dir, "events.jsonl"))
   const tools = await engineTools(root)
-  await tools.task_update.execute({ sessionId: SESSION, taskId: "alpha", status: "worker_active" })
+  await tools.teamwork_task_update.execute({ sessionId: SESSION, taskId: "alpha", status: "worker_active" })
   // Proof the call ran: state.json was written, so the append path was reached.
   assert.strictEqual(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).tasks.alpha.status, "worker_active")
   assert.strictEqual(readFileSync(outside, "utf8"), "CANARY\n", "the symlink target must not receive the event")
@@ -948,7 +948,7 @@ await check("R6.6 (2): a DANGLING symlinked events.jsonl is refused; no target i
   const target = uniq("dangling") + ".jsonl" // does not exist
   symlinkSync(target, join(dir, "events.jsonl"))
   const tools = await engineTools(root)
-  await tools.task_update.execute({ sessionId: SESSION, taskId: "alpha", status: "worker_active" })
+  await tools.teamwork_task_update.execute({ sessionId: SESSION, taskId: "alpha", status: "worker_active" })
   assert.strictEqual(JSON.parse(readFileSync(join(dir, "state.json"), "utf8")).tasks.alpha.status, "worker_active")
   assert(!existsSync(target), "appending through a dangling symlink would create the target; it must not")
 })
@@ -964,7 +964,7 @@ for (const where of ["outside", "inside"]) {
     mkdirSync(join(root, ".opencode"), { recursive: true })
     symlinkSync(target, join(root, ".opencode", "teamwork"))
     const tools = await engineTools(root)
-    const res = await tools.task_update.execute({ sessionId: SESSION, taskId: "alpha", status: "worker_active" })
+    const res = await tools.teamwork_task_update.execute({ sessionId: SESSION, taskId: "alpha", status: "worker_active" })
     assert(/refused/.test(res.content), `must be refused, got: ${res.content}`)
     assert.strictEqual(JSON.parse(readFileSync(join(outDir, "state.json"), "utf8")).tasks.alpha.status, "pending", "nothing may be written through the link")
     assert(!existsSync(join(outDir, "events.jsonl")), "no event may be written through the link")
@@ -984,7 +984,7 @@ await check("R6.6 (4): control chars and newlines in every appended field cannot
   writeJson(join(dir, "plan.dag.json"), plan)
 
   const tools = await engineTools(root)
-  const res = await tools.task_update.execute({
+  const res = await tools.teamwork_task_update.execute({
     sessionId: SESSION,
     taskId: "alpha",
     status: "worker_active",
@@ -1008,7 +1008,7 @@ await check("R6.6 (4): control chars and newlines in every appended field cannot
 await check("R6.6 (4b): a hostile taskId writes no event and is not found", async () => {
   const { root, dir } = engineRun()
   const tools = await engineTools(root)
-  const res = await tools.task_update.execute({ sessionId: SESSION, taskId: "alpha\nFAKE", status: "worker_active" })
+  const res = await tools.teamwork_task_update.execute({ sessionId: SESSION, taskId: "alpha\nFAKE", status: "worker_active" })
   assert(/not found/.test(res.content), `hostile id must not match a task, got: ${res.content}`)
   assert(!existsSync(join(dir, "events.jsonl")), "no event may be written for it")
 })
@@ -1029,11 +1029,11 @@ await check("R6.6 (7): a '..' task id is REFUSED by worktree setup and deletes n
   try {
     const tools = await engineTools(root)
     // Control: a valid id really does create a worktree, so the harness is live.
-    const ok = await tools.worktree.execute({ sessionId: SESSION, action: "setup", role: "worker", taskId: "alpha" })
+    const ok = await tools.teamwork_worktree.execute({ sessionId: SESSION, action: "setup", role: "worker", taskId: "alpha" })
     assert(ok.content.includes("worker worktree ready"), `control setup must succeed, got: ${ok.content}`)
 
     for (const bad of ["..", "../../" + basenameOf(sibling), "a/b", "/abs/x", "x".repeat(65)]) {
-      const res = await tools.worktree.execute({ sessionId: SESSION, action: "setup", role: "worker", taskId: bad })
+      const res = await tools.teamwork_worktree.execute({ sessionId: SESSION, action: "setup", role: "worker", taskId: bad })
       assert(/refused/.test(res.content), `task id ${JSON.stringify(bad)} must be refused, got: ${res.content}`)
     }
     for (const kept of [join(wtBase, "keep.txt"), join(wtBase, SESSION, "keep.txt"), join(sibling, "keep.txt")]) {

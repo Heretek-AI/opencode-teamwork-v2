@@ -17,6 +17,7 @@
 // could not hold and the test would fail for environmental reasons.
 
 import { registerTeamworkTools } from "../plugins/opencode-teamwork/tools.ts"
+import { registerTool } from "./tool-registry.mjs"
 import { existsSync, mkdtempSync, rmSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
@@ -176,9 +177,7 @@ try {
       transform: async (cb) => {
         const editor = {
           namespace: () => {},
-          add: (tool) => {
-            registeredTools[tool.name] = tool
-          },
+          add: (tool) => registerTool(registeredTools, tool),
         }
         await cb(editor)
       },
@@ -202,11 +201,11 @@ try {
 
   await registerTeamworkTools(mockCtx, testDir)
 
-  assert(registeredTools.plan, "plan tool must be registered")
-  assert(registeredTools.cost, "cost tool must be registered")
+  assert(registeredTools.teamwork_plan, "plan tool must be registered")
+  assert(registeredTools.teamwork_cost, "cost tool must be registered")
 
   // 1. Test plan creates run and records root session
-  const planRes = await registeredTools.plan.execute(
+  const planRes = await registeredTools.teamwork_plan.execute(
     {
       topology: "small-focused",
       tasks: [{ id: "task-1" }],
@@ -218,13 +217,13 @@ try {
   assert(planRes.content.includes("Planned 1 task"), "Plan should succeed")
 
   // 2. Test cost tool reading real opencode DB session tree
-  const costRes = await registeredTools.cost.execute({}, { sessionID: testSessionId })
+  const costRes = await registeredTools.teamwork_cost.execute({}, { sessionID: testSessionId })
   assert(costRes.content.includes("opencode session tree"), "Should report opencode session tree as source")
   assert(costRes.content.includes("spent: $"), "Should report spent amount")
   assert(costRes.pct > 0, "Percentage should reflect total consumption")
 
   // 3. Second call should not double count
-  const costRes2 = await registeredTools.cost.execute({}, { sessionID: testSessionId })
+  const costRes2 = await registeredTools.teamwork_cost.execute({}, { sessionID: testSessionId })
   assert.strictEqual(costRes.pct, costRes2.pct, "Percentage should remain identical on immediate re-call")
 
   // 4. Test manual addUsd fallback when native client/tree is unavailable
@@ -239,14 +238,12 @@ try {
   mockOfflineCtx.tool.transform = async (cb) => {
     await cb({
       namespace: () => {},
-      add: (tool) => {
-        offlineTools[tool.name] = tool
-      },
+      add: (tool) => registerTool(offlineTools, tool),
     })
   }
   await registerTeamworkTools(mockOfflineCtx, testDir)
 
-  await offlineTools.plan.execute(
+  await offlineTools.teamwork_plan.execute(
     {
       topology: "small-focused",
       tasks: [{ id: "task-1" }],
@@ -255,7 +252,7 @@ try {
     { sessionID: "ses_offline_test" },
   )
 
-  const costOffline = await offlineTools.cost.execute({ addUsd: 1.5, taskId: "T1" }, { sessionID: "ses_offline_test" })
+  const costOffline = await offlineTools.teamwork_cost.execute({ addUsd: 1.5, taskId: "T1" }, { sessionID: "ses_offline_test" })
   assert(costOffline.content.includes("spent: $1.5"), "Should record 1.5 in manual fallback mode")
   assert(costOffline.content.includes("manual (client unavailable)"), "Source should be manual")
 

@@ -16,6 +16,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { registerTeamworkTools, setApprovalOwnerUidForTest } from "../plugins/opencode-teamwork/tools.ts"
+import { registerTool } from "./tool-registry.mjs"
 
 const input = JSON.parse(process.argv[2] || "{}")
 const root = input.root
@@ -77,7 +78,7 @@ await registerTeamworkTools(
   {
     tool: {
       transform: async (cb) => {
-        await cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = tool) })
+        await cb({ namespace: () => {}, add: (tool) => registerTool(tools, tool) })
       },
     },
     session,
@@ -105,7 +106,7 @@ try {
     writeFileSync(file, String(input.draft ?? ""), "utf8")
     reply({ ok: true, path: file, bytes: Buffer.byteLength(String(input.draft ?? "")) })
   } else if (input.action === "plan") {
-    const res = await tools.plan.execute(
+    const res = await tools.teamwork_plan.execute(
       {
         sessionId: runId,
         topology: "iterative-coding",
@@ -130,9 +131,9 @@ try {
     const taskIds = input.tasks ?? ["A1"]
     for (const taskId of taskIds) {
       for (const status of ["worker_active", "worker_done", "verifier_active"]) {
-        await tools.task_update.execute({ sessionId: runId, taskId, status }, { sessionID: ROOT_SESSION })
+        await tools.teamwork_task_update.execute({ sessionId: runId, taskId, status }, { sessionID: ROOT_SESSION })
       }
-      const report = await tools.report.execute(
+      const report = await tools.teamwork_report.execute(
         {
           sessionId: runId,
           taskId,
@@ -143,19 +144,19 @@ try {
         { sessionID: "ses_approval_verifier" },
       )
       if (String(report.content ?? "").startsWith("refused:")) throw new Error(`report refused: ${report.content}`)
-      const pass = await tools.task_update.execute(
+      const pass = await tools.teamwork_task_update.execute(
         { sessionId: runId, taskId, status: "verified_pass", verification: { status: "PASS" } },
         { sessionID: ROOT_SESSION },
       )
       if (pass.status !== "verified_pass") throw new Error(`verified_pass refused: ${pass.content}`)
     }
-    const audit = await tools.security_audit.execute(
+    const audit = await tools.teamwork_security_audit.execute(
       { sessionId: runId, status: "PASS", findings: [] },
       { sessionID: "ses_approval_auditor" },
     )
     reply({ ok: true, audit: audit.status ?? null })
   } else if (input.action === "final") {
-    const res = await tools.final_verify.execute({ sessionId: runId }, { sessionID: ROOT_SESSION })
+    const res = await tools.teamwork_final_verify.execute({ sessionId: runId }, { sessionID: ROOT_SESSION })
     reply({ ok: res.status === "PASS", status: res.status, content: res.content, reasons: res.reasons ?? [] })
   } else {
     throw new Error(`unknown action "${input.action}"`)
