@@ -27,7 +27,7 @@ type CommandSpec = {
   template: string
 }
 
-const COMMANDS: CommandSpec[] = [
+export const COMMANDS: CommandSpec[] = [
   {
     name: "teamwork",
     description:
@@ -42,7 +42,7 @@ Then:
 0. Budget preflight: call \`teamwork_budget\`. If it reports console-credit budgeting applies (opencode/ models + opencode_console connected), call \`opencode_console_get_usage\`, compute \`remaining = min(limitDollars - spentDollars)\`, and ASK THE USER whether to use the FULL remaining budget or PARTIAL (half). Pass the choice to \`teamwork_plan\` or \`teamwork_document_triage\` as \`budgetUsd\` with \`budgetSource: "credits"\`.
 1. Plan the run:
    - For \`document-review\`: call \`teamwork_document_triage\` with \`sessionId\`, the supplied \`document\` (\`path\` / \`url\` / \`content\`), \`request\`, \`fetchUrl: true\` (when a URL is supplied without inline \`content\`), and bounded tree shapes (\`maxSegments <= 8\`, \`reviewTreeShape <= [4,2,1]\`, \`synthTreeShape <= [4,1]\`). Skip git worktrees for \`document-review\`.
-   - For coding / proof topologies: load the spec, then call \`teamwork_plan\` — pass the user's **verbatim** request (the text after /teamwork, before any spec rewrite) as \`request\` so \`<run>/ORIGINAL_REQUEST.md\` is written once, and pass the spec's numbered requirements as \`requirements: [{ id, text }]\` when it has acceptance criteria (otherwise the request-derived R1 is the baseline). Leave \`victoryAudit\` at its default \`required\`; only an explicit, recorded \`skip\` may bypass the final audit. Leave \`requireHandoffs\` at its default \`required\` when a request/requirements baseline exists; an explicit, recorded \`skip\` is allowed outside benchmark mode but is not the default. Pass \`verification: "strict"\` only when the user explicitly opts into strict verification (one falsifier challenge + one security-auditor audit per task); otherwise leave the \`standard\` default. It returns the canonical \`SESSION_ID\`. Never use a session id read from a file. Provision the sentinel worktree OUTSIDE the repo, quoting both args: \`git worktree add "\${TEAMWORK_WORKTREES_DIR:-../.teamwork-worktrees}/$SESSION_ID/sentinel" -b "teamwork/base-$SESSION_ID"\` (skip if not in a git repo).
+   - For coding / proof topologies: load the spec, then call \`teamwork_plan\` with the route's \`topology\` and the concrete task list \`tasks: [{ id, dependsOn, agent, maxRounds }]\` (both are required); pass the user's **verbatim** request (the text after /teamwork, before any spec rewrite) as \`request\` so \`<run>/ORIGINAL_REQUEST.md\` is written once, and pass the spec's numbered requirements as \`requirements: [{ id, text }]\` when it has acceptance criteria (otherwise the request-derived R1 is the baseline). Leave \`victoryAudit\` at its default \`required\`; only an explicit, recorded \`skip\` may bypass the final audit. Leave \`requireHandoffs\` at its default \`required\` when a request/requirements baseline exists; an explicit, recorded \`skip\` is allowed outside benchmark mode but is not the default. Pass \`verification: "strict"\` only when the user explicitly opts into strict verification (one falsifier challenge + one security-auditor audit per task); otherwise leave the \`standard\` default. It returns the canonical \`SESSION_ID\`. Never use a session id read from a file. Provision the sentinel worktree OUTSIDE the repo, quoting both args: \`git worktree add "\${TEAMWORK_WORKTREES_DIR:-../.teamwork-worktrees}/$SESSION_ID/sentinel" -b "teamwork/base-$SESSION_ID"\` (skip if not in a git repo).
 2. Build / inspect the DAG in \`.opencode/teamwork/<session-id>/plan.dag.json\`. Independent tasks run in parallel; dependent ones in topological order.
 3. Dispatch workers in topological order. Pass the run id (\`SESSION_ID\`) in every prompt and require each child to call \`teamwork_handoff({ sessionId: SESSION_ID, taskId, observation, logicChain, caveats, conclusion, verificationMethod })\` before reporting back; read \`.opencode/teamwork/<session-id>/handoffs/\` instead of replaying the child session.
    - For \`document-review\`: dispatch \`team/segment-reviewer\` per segment (\`seg-01\`..\`seg-0K\`) to persist bounded RSA nodes and \`unit-report.md\` via \`teamwork_document_record\`, then dispatch \`team/synthesizer\` on \`doc-synthesis\` to record \`synthesis/candidate-<I>.md\` and \`DOCUMENT_REVIEW_REPORT.md\` via \`teamwork_document_record\`.
@@ -190,27 +190,76 @@ Report back: PASS or FAIL, a 1-line summary of the checks, and (if FAIL) the spe
   },
 ]
 
-// Best-effort self-heal: when this file is loaded from the published npm
-// package (rather than a hand-vendored copy) make sure the `team/*` agent
-// markdown files exist in the OpenCode config directory. Only files that are
-// completely missing are created; existing agents are never rewritten, so a
-// user's model choices from `opencode-teamwork init` are preserved. When the
-// plugin is vendored without the new package layout the import fails and this
-// quietly does nothing.
-async function ensureAgentsInstalled() {
+/**
+ * The host version this port is verified against. `package.json` declares the
+ * same window as `peerDependencies["@opencode/plugin"] = "^2.4"`; the peer is
+ * optional so installs stay dependency-free (the plugin never imports it).
+ */
+export const OPENCODE_PLUGIN_PEER = "^2.4"
+export const OPENCODE_TESTED_MAJOR = 2
+export const OPENCODE_TESTED_MINOR = 4
+
+/**
+ * `ctx.app.version` check. A different major/minor than the verified pair is a
+ * warning, not a refusal: the plugin still loads, because a hard failure in
+ * `setup` would take the whole session down. Returns the parsed pair so tests
+ * can assert the decision without capturing console output.
+ */
+export function checkOpencodeVersion(version: unknown): {
+  ok: boolean
+  major?: number
+  minor?: number
+  warning?: string
+} {
+  const raw = typeof version === "string" ? version.trim() : ""
+  const match = /^v?(\d+)\.(\d+)(?:\.\d+)?(?:[-+].*)?$/.exec(raw)
+  if (!match) {
+    return {
+      ok: false,
+      warning: `could not determine the OpenCode version (ctx.app.version=${JSON.stringify(version)}); this port is verified against ${OPENCODE_TESTED_MAJOR}.${OPENCODE_TESTED_MINOR}.x (peer ${OPENCODE_PLUGIN_PEER})`,
+    }
+  }
+  const major = Number(match[1])
+  const minor = Number(match[2])
+  if (major !== OPENCODE_TESTED_MAJOR || minor !== OPENCODE_TESTED_MINOR) {
+    return {
+      ok: false,
+      major,
+      minor,
+      warning: `OpenCode ${major}.${minor}.x is outside the verified pair ${OPENCODE_TESTED_MAJOR}.${OPENCODE_TESTED_MINOR}.x (peer ${OPENCODE_PLUGIN_PEER}); tool registration and plugin hooks may have changed`,
+    }
+  }
+  return { ok: true, major, minor }
+}
+
+// Agents are read by OpenCode's config-agent plugin before this plugin's
+// `setup` runs, so writing them here could never make them visible in the
+// current session (they would only appear after a restart). Installation
+// therefore belongs to `init`/postinstall; `setup` only verifies and warns.
+// The check is read-only and never fails the plugin load.
+export async function warnMissingAgents(configDir?: string): Promise<{ configDir?: string; targetDir?: string; missing: string[] }> {
   try {
     const lib = await import("../../lib/team.mjs")
-    const { fileURLToPath } = await import("node:url")
-    lib.ensureAgents({ packageRoot: fileURLToPath(new URL("../../", import.meta.url)) })
+    const result = configDir ? lib.verifyAgents({ configDir }) : lib.verifyAgents()
+    if (result.missing.length > 0) {
+      console.warn(
+        `[opencode-teamwork] ${result.missing.length}/${lib.TEAM_AGENTS.length} team agent file(s) missing in ${result.targetDir}: ${result.missing.join(", ")}. ` +
+          "Run `npx @heretek-ai/opencode-teamwork-v2 init` (or reinstall the package) and restart OpenCode: agents are loaded when the config is read, so this plugin cannot install them mid-session.",
+      )
+    }
+    return result
   } catch {
-    // Vendored copy without lib/, or filesystem not writable. Not fatal.
+    // Vendored copy without lib/, or an unreadable config dir. Not fatal.
+    return { missing: [] }
   }
 }
 
 export default {
   id: "opencode-teamwork",
   async setup(ctx: any) {
-    await ensureAgentsInstalled()
+    const versionCheck = checkOpencodeVersion(ctx?.app?.version)
+    if (!versionCheck.ok) console.warn(`[opencode-teamwork] ${versionCheck.warning}`)
+    await warnMissingAgents()
     const root = (ctx?.location?.directory as string) || process.cwd()
     await registerTeamworkTools(ctx, root)
     await registerTeamworkHooks(ctx, root)

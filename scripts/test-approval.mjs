@@ -24,6 +24,7 @@
 // Run with plain Node (no test framework): an uncaught assertion exits non-zero.
 
 import { registerTeamworkTools, setApprovalOwnerUidForTest } from "../plugins/opencode-teamwork/tools.ts"
+import { registerTool } from "./tool-registry.mjs"
 import { createAuthContext, canonicalJson } from "../plugins/opencode-teamwork/auth.ts"
 import { payloadDigest, contentSha256Hex } from "../plugins/opencode-teamwork/approval-format.mjs"
 import {
@@ -140,7 +141,7 @@ async function toolsFor(root, env) {
       {
         tool: {
           transform: async (cb) => {
-            await cb({ namespace: () => {}, add: (tool) => (tools[tool.name] = tool) })
+            await cb({ namespace: () => {}, add: (tool) => registerTool(tools, tool) })
           },
         },
         session: {
@@ -206,7 +207,7 @@ function readApproval(dir, runId) {
 }
 
 async function planRun(tools, runId, trustLevel = "human-approved", extra = {}) {
-  return tools.plan.execute(
+  return tools.teamwork_plan.execute(
     {
       sessionId: runId,
       topology: "iterative-coding",
@@ -224,9 +225,9 @@ async function planRun(tools, runId, trustLevel = "human-approved", extra = {}) 
 
 async function seedVerified(tools, runId) {
   for (const status of ["worker_active", "worker_done", "verifier_active"]) {
-    await tools.task_update.execute({ sessionId: runId, taskId: "A1", status }, { sessionID: ROOT_SESSION })
+    await tools.teamwork_task_update.execute({ sessionId: runId, taskId: "A1", status }, { sessionID: ROOT_SESSION })
   }
-  const report = await tools.report.execute(
+  const report = await tools.teamwork_report.execute(
     {
       sessionId: runId,
       taskId: "A1",
@@ -237,19 +238,19 @@ async function seedVerified(tools, runId) {
     { sessionID: "ses_approval_verifier" },
   )
   assert(!String(report.content).startsWith("refused:"), `fixture report refused: ${report.content}`)
-  const pass = await tools.task_update.execute(
+  const pass = await tools.teamwork_task_update.execute(
     { sessionId: runId, taskId: "A1", status: "verified_pass", verification: { status: "PASS" } },
     { sessionID: ROOT_SESSION },
   )
   assert.strictEqual(pass.status, "verified_pass", `verified_pass refused: ${pass.content}`)
-  await tools.security_audit.execute(
+  await tools.teamwork_security_audit.execute(
     { sessionId: runId, status: "PASS", findings: [] },
     { sessionID: "ses_approval_auditor" },
   )
 }
 
 async function finalVerify(tools, runId) {
-  return tools.final_verify.execute({ sessionId: runId }, { sessionID: ROOT_SESSION })
+  return tools.teamwork_final_verify.execute({ sessionId: runId }, { sessionID: ROOT_SESSION })
 }
 
 // ---------------------------------------------------------------------------
@@ -993,7 +994,7 @@ try {
           {
             tool: {
               transform: async (cb) => {
-                await cb({ namespace: () => {}, add: (tool) => (local[tool.name] = tool) })
+                await cb({ namespace: () => {}, add: (tool) => registerTool(local, tool) })
               },
             },
             session: { get: async () => ({ agent: "team/sentinel" }) },
@@ -1003,12 +1004,12 @@ try {
         )
         return local
       })
-      const refused = await tools.plan.execute(
+      const refused = await tools.teamwork_plan.execute(
         { sessionId: runId, topology: "iterative-coding", tasks: [{ id: "A1" }] },
         { sessionID: ROOT_SESSION },
       )
       assert(String(refused.content).includes("AUTH_UNAVAILABLE"), refused.content)
-      const allowed = await tools.plan.execute(
+      const allowed = await tools.teamwork_plan.execute(
         {
           sessionId: runId,
           topology: "iterative-coding",

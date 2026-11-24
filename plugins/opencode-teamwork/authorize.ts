@@ -265,7 +265,12 @@ export async function requireDescendantSession(
     return { ok: false, reason: "the caller is the root session, not a descendant (fail closed)" }
   }
   let current = sessionID
+  const visited = new Set<string>()
   for (let depth = 0; depth < SESSION_TREE_MAX_DEPTH; depth++) {
+    if (visited.has(current)) {
+      return { ok: false, reason: `session ancestry loops at ${cleanId(current)} (fail closed)` }
+    }
+    visited.add(current)
     let info: any
     try {
       if (typeof ctx?.session?.get !== "function") {
@@ -276,14 +281,24 @@ export async function requireDescendantSession(
       return { ok: false, reason: `session ${cleanId(current)} could not be resolved (fail closed)` }
     }
     const parent = info?.parentID ?? info?.parentId ?? info?.parent_id
-    if (typeof parent !== "string" || parent.trim() === "") {
-      return {
-        ok: false,
-        reason: `session ${cleanId(current)} has no parent, so it does not descend from ${cleanId(rootSessionId)} (fail closed)`,
-      }
+    if (typeof parent === "string" && parent.trim() !== "") {
+      if (parent === rootSessionId) return { ok: true }
+      current = parent
+      continue
     }
-    if (parent === rootSessionId) return { ok: true }
-    current = parent
+    // A fork has no parentID; the session it was forked from is its ancestry
+    // edge (Session.Info.fork.sessionID, the row's fork_session_id). Treating
+    // that as "no parent" would refuse a legitimate forked descendant.
+    const fork = info?.fork?.sessionID ?? info?.fork_session_id ?? info?.forkSessionID
+    if (typeof fork === "string" && fork.trim() !== "") {
+      if (fork === rootSessionId) return { ok: true }
+      current = fork
+      continue
+    }
+    return {
+      ok: false,
+      reason: `session ${cleanId(current)} has no parent, so it does not descend from ${cleanId(rootSessionId)} (fail closed)`,
+    }
   }
   return { ok: false, reason: `session ancestry exceeds ${SESSION_TREE_MAX_DEPTH} levels (fail closed)` }
 }

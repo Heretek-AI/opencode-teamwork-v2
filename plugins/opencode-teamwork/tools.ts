@@ -227,6 +227,8 @@ interface SessionUsageItem {
 interface TreeUsageResult {
   sessions: SessionUsageItem[]
   source: string
+  /** Non-fatal losses, e.g. a child list truncated at the pagination cap. */
+  warnings?: string[]
 }
 
 function normalizeTokens(t: any): TokenUsage {
@@ -268,36 +270,90 @@ function writeSnapshots(run: string, file: string, value: SnapshotsFile) {
   writeTextAtomicSafe(run, file, JSON.stringify(value, null, 2) + "\n")
 }
 
-function getOpencodeDbPath(): string | undefined {
-  const candidates: string[] = []
-  if (process.env.XDG_DATA_HOME) {
-    candidates.push(join(process.env.XDG_DATA_HOME, "opencode", "opencode.db"))
-  }
+/**
+ * Channel from the host app (`ctx.app.channel`). OpenCode embeds
+ * OPENCODE_CHANNEL into its CLI; the plugin sees the same value through
+ * `ctx.app`. Absent (older hosts, tests) means the "local" build.
+ */
+function opencodeChannel(ctx: any): string {
+  const channel = typeof ctx?.app?.channel === "string" ? ctx.app.channel.trim() : ""
+  return channel || "local"
+}
+
+/** Channels whose database/service file has no channel suffix. */
+const UNSCOPED_CHANNELS = new Set(["latest", "dev", "beta", "next", "prod"])
+const PLAIN_SERVICE_CHANNELS = new Set(["latest", "dev", "beta", "next"])
+
+function channelSafe(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]/g, "-")
+}
+
+/** `packages/cli/src/database-path.ts` databasePath(). */
+function opencodeDatabaseFilename(channel: string): string {
+  const disable =
+    process.env.OPENCODE_DISABLE_CHANNEL_DB === "1" || process.env.OPENCODE_DISABLE_CHANNEL_DB === "true"
+  return UNSCOPED_CHANNELS.has(channel) || disable ? "opencode.db" : `opencode-${channelSafe(channel)}.db`
+}
+
+/** `packages/cli/src/services/service-config.ts` filename(). */
+function opencodeServiceFilenames(channel: string): string[] {
+  if (PLAIN_SERVICE_CHANNELS.has(channel)) return ["service.json"]
+  // The CLI migrates a plain service.json into the channel file for
+  // non-standard channels; for "local" it does not, but reading a plain
+  // registration is still better than reporting no service at all.
+  return [`service-${channelSafe(channel)}.json`, "service.json"]
+}
+
+/** XDG roots OpenCode uses (`packages/util/src/global-roots.ts`), then platform fallbacks. */
+function opencodeRoots(envHome: string, envKey: string, fallback: string): string[] {
+  const roots: string[] = []
+  const xdg = process.env[envKey]
+  if (xdg) roots.push(join(xdg, "opencode"))
+  roots.push(join(envHome, fallback, "opencode"))
+  roots.push(join(envHome, "Library", "Application Support", "opencode"))
+  if (process.env.LOCALAPPDATA) roots.push(join(process.env.LOCALAPPDATA, "opencode"))
+  roots.push(join(envHome, "AppData", "Local", "opencode"))
+  return [...new Set(roots)]
+}
+
+function getOpencodeDbPath(ctx?: any): string | undefined {
   const home = homedir()
-  candidates.push(join(home, ".local", "share", "opencode", "opencode.db"))
-  candidates.push(join(home, "Library", "Application Support", "opencode", "opencode.db"))
-  if (process.env.LOCALAPPDATA) {
-    candidates.push(join(process.env.LOCALAPPDATA, "opencode", "opencode.db"))
+  const dataRoots = opencodeRoots(home, "XDG_DATA_HOME", ".local/share")
+  // OPENCODE_DB wins exactly as in the CLI. A relative value resolves against
+  // the data directory, and ":memory:" names a database this reader cannot use.
+  const override = process.env.OPENCODE_DB?.trim()
+  if (override) {
+    if (override === ":memory:") return undefined
+    return isAbsolute(override) ? override : resolve(dataRoots[0], override)
   }
-  candidates.push(join(home, "AppData", "Local", "opencode", "opencode.db"))
-  for (const p of candidates) {
-    try {
-      if (existsSync(p)) return p
-    } catch {}
+  const channel = opencodeChannel(ctx)
+  const names = [...new Set([opencodeDatabaseFilename(channel), "opencode.db"])]
+  for (const root of dataRoots) {
+    for (const name of names) {
+      const p = join(root, name)
+      try {
+        if (existsSync(p)) return p
+      } catch {}
+    }
   }
   return undefined
 }
 
-function getOpencodeService(): { url: string; auth: string } | undefined {
-  const candidates: string[] = []
-  if (process.env.XDG_STATE_HOME) {
-    candidates.push(join(process.env.XDG_STATE_HOME, "opencode", "service.json"))
-  }
+function getOpencodeService(ctx?: any): { url: string; auth: string } | undefined {
   const home = homedir()
-  candidates.push(join(home, ".local", "state", "opencode", "service.json"))
-  candidates.push(join(home, "Library", "Application Support", "opencode", "service.json"))
-  if (process.env.LOCALAPPDATA) {
-    candidates.push(join(process.env.LOCALAPPDATA, "opencode", "service.json"))
+  const stateRoots = opencodeRoots(home, "XDG_STATE_HOME", ".local/state")
+  const names = opencodeServiceFilenames(opencodeChannel(ctx))
+  const candidates: string[] = []
+  for (const root of stateRoots) for (const name of names) candidates.push(join(root, name))
+  // The CLI also migrates legacy `service-<hash>.json` registrations. The hash
+  // is not reproducible here, so accept any remaining service-*.json in the
+  // same state directories.
+  for (const root of stateRoots) {
+    try {
+      for (const name of readdirSync(root)) {
+        if (/^service-[A-Za-z0-9._-]+\.json$/.test(name)) candidates.push(join(root, name))
+      }
+    } catch {}
   }
   for (const p of candidates) {
     try {
@@ -313,7 +369,16 @@ function getOpencodeService(): { url: string; auth: string } | undefined {
   return undefined
 }
 
-async function fetchServiceTree(url: string, auth: string, rootIds: string[]): Promise<SessionUsageItem[] | undefined> {
+/** Maximum child pages fetched per parent; one page is 200 sessions. */
+const SERVICE_TREE_PAGE_LIMIT = 200
+const SERVICE_TREE_MAX_PAGES = 25
+
+async function fetchServiceTree(
+  url: string,
+  auth: string,
+  rootIds: string[],
+  warnings: string[] = [],
+): Promise<SessionUsageItem[] | undefined> {
   const sessions: SessionUsageItem[] = []
   const seen = new Set<string>()
   const queue: string[] = rootIds.filter(validSessionId)
@@ -345,12 +410,19 @@ async function fetchServiceTree(url: string, auth: string, rootIds: string[]): P
   while (queue.length > 0) {
     const parentId = queue.shift()!
     if (!validSessionId(parentId)) continue
-    try {
-      const res = await fetch(`${url}/api/session?parentID=${encodeURIComponent(parentId)}`, {
-        headers: { Authorization: auth },
-        signal: AbortSignal.timeout(3000),
-      })
-      if (res.ok) {
+    // session.list defaults to 50 children (packages/protocol/src/groups/
+    // session.ts "Defaults to the newest 50 sessions"), so a parent with more
+    // workers would silently lose spend unless cursor.next is followed.
+    let cursor: string | undefined
+    for (let page = 0; page < SERVICE_TREE_MAX_PAGES; page++) {
+      try {
+        const query = new URLSearchParams({ parentID: parentId, limit: String(SERVICE_TREE_PAGE_LIMIT) })
+        if (cursor) query.set("cursor", cursor)
+        const res = await fetch(`${url}/api/session?${query.toString()}`, {
+          headers: { Authorization: auth },
+          signal: AbortSignal.timeout(3000),
+        })
+        if (!res.ok) break
         const json: any = await res.json()
         const children = Array.isArray(json?.data) ? json.data : []
         for (const c of children) {
@@ -366,8 +438,18 @@ async function fetchServiceTree(url: string, auth: string, rootIds: string[]): P
             tokens: normalizeTokens(c.tokens),
           })
         }
+        const next = typeof json?.cursor?.next === "string" ? json.cursor.next : ""
+        if (!next || next === cursor) break
+        cursor = next
+        if (page === SERVICE_TREE_MAX_PAGES - 1) {
+          warnings.push(
+            `session ${parentId} has more than ${SERVICE_TREE_MAX_PAGES * SERVICE_TREE_PAGE_LIMIT} children; spend beyond the cap was not read`,
+          )
+        }
+      } catch {
+        break
       }
-    } catch {}
+    }
   }
 
   return sessions.length ? sessions : undefined
@@ -388,8 +470,8 @@ async function readSessionTreeUsage(
   if (!safeIds.length) return undefined
 
   // 1. Try local SQLite database (node:sqlite)
-  const dbPath = getOpencodeDbPath()
-  if (dbPath) {
+  const dbPath = getOpencodeDbPath(ctx)
+  if (dbPath && existsSync(dbPath)) {
     try {
       const { DatabaseSync } = await import("node:sqlite")
       const db = new DatabaseSync(dbPath, { readOnly: true })
@@ -464,14 +546,16 @@ async function readSessionTreeUsage(
   }
 
   // 3. Try OpenCode background service API
-  const svc = getOpencodeService()
+  const svc = getOpencodeService(ctx)
   if (svc) {
     try {
-      const items = await fetchServiceTree(svc.url, svc.auth, safeIds)
+      const warnings: string[] = []
+      const items = await fetchServiceTree(svc.url, svc.auth, safeIds, warnings)
       if (items && items.length > 0) {
         return {
           sessions: items,
           source: "opencode service API",
+          ...(warnings.length ? { warnings } : {}),
         }
       }
     } catch {}
@@ -522,16 +606,29 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
 
 /**
  * Best-effort actor lookup for the calling session. Fail-open: never throws and
- * never blocks longer than 2s. Order: the client's session.get agent, then the
- * agent recorded for that session in snapshots.json (same source as
- * bySession[*].agent). Returns the actor with its provenance (`session` for both
- * sources), or undefined when neither is available.
+ * never blocks longer than 2s.
+ *
+ * Order:
+ *   1. `context.agent` — OpenCode sets it from the tool call itself
+ *      (packages/schema/src/tool.ts Context.agent), so it is the current value
+ *      even after `switchAgent`.
+ *   2. `ctx.session.get(sessionID).agent` — `Session.Info.agent` is optional
+ *      and may be stale, but is better than nothing.
+ *   3. The agent recorded for that session in snapshots.json.
+ *
+ * `source` records which surface answered; "context" is the call's own agent,
+ * "session" is a session/snapshot lookup. Undefined only when every source is
+ * absent, which lets the authorization layer fail closed with its named
+ * refusal.
  */
 async function deriveCallerAgent(
   ctx: any,
   run: string,
   sessionID: string | undefined,
-): Promise<{ agent: string; source: "session" } | undefined> {
+  context?: any,
+): Promise<{ agent: string; source: "context" | "session" } | undefined> {
+  const fromCall = typeof context?.agent === "string" ? clean(context.agent, 64).trim() : ""
+  if (fromCall) return { agent: fromCall, source: "context" }
   if (!sessionID) return undefined
   try {
     if (typeof ctx?.session?.get === "function") {
@@ -3452,8 +3549,8 @@ async function appendEvent(
     to: string
     round?: number
     agent?: string | null
-    /** Provenance of `agent`: explicit input, session lookup, or plan declaration. */
-    agentSource?: "explicit" | "session" | "plan"
+    /** Provenance of `agent`: explicit input, the call context, a session lookup, or plan declaration. */
+    agentSource?: "explicit" | "context" | "session" | "plan"
     branch?: string | null
     worktree?: string | null
     phase?: string | null
@@ -3484,7 +3581,10 @@ async function appendEvent(
       const agent = opt(ev.agent, 64)
       const note = opt(ev.note, 200)
       const source =
-        agent && (ev.agentSource === "explicit" || ev.agentSource === "session" || ev.agentSource === "plan")
+        agent && (ev.agentSource === "explicit" ||
+        ev.agentSource === "context" ||
+        ev.agentSource === "session" ||
+        ev.agentSource === "plan")
           ? ev.agentSource
           : null
       const buildLine = (fd: number) =>
@@ -3871,6 +3971,12 @@ type RunManifest = {
   version: RunManifestVersion
   sessionId: string
   rootSessionId: string
+  /**
+   * Plan-time caller agent. `context.agent` is the current tool-call identity
+   * (preferred); `Session.Info.agent` is only a fallback. Absent on legacy
+   * manifests and when no identity could be resolved.
+   */
+  planAgent?: string | null
   integrityMode: IntegrityMode
   verification: VerificationMode
   victoryAudit: VictoryAuditMode
@@ -5209,9 +5315,9 @@ async function authorizeToolAction(
   action: string | undefined,
   context: any,
   opts: { skipSessionTree?: boolean } = {},
-): Promise<{ ok: true; caller: { agent: string; source: "session" } | undefined; sessionID: string | undefined } | { ok: false; content: string }> {
+): Promise<{ ok: true; caller: { agent: string; source: "context" | "session" } | undefined; sessionID: string | undefined } | { ok: false; content: string }> {
   const sessionID = typeof context?.sessionID === "string" ? context.sessionID : undefined
-  const caller = sessionID ? await deriveCallerAgent(ctx, run ?? "", sessionID) : undefined
+  const caller = sessionID ? await deriveCallerAgent(ctx, run ?? "", sessionID, context) : undefined
   let rootSessionId: string | undefined
   if (run && existsSync(run)) {
     const plan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
@@ -6138,6 +6244,10 @@ async function createPlanRun(
   // hand edit cannot silently drop the gate.
   const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
   const rootSessionId = callSession ?? sessionId
+  // Provenance: who planned the run. The first plan wins on a re-plan, so a
+  // later caller cannot rewrite the recorded plan-time identity.
+  const planCaller = await deriveCallerAgent(ctx, run, callSession, context)
+  const planAgent = existingManifest?.planAgent ?? planCaller?.agent ?? null
   const tasks = (input.tasks || []).map((t: any) => ({
     id: clean(t.id, 64),
     dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.map((d: any) => clean(d, 64)) : [],
@@ -6178,6 +6288,7 @@ async function createPlanRun(
   const planObject = {
     sessionId,
     rootSessionId,
+    ...(planAgent ? { planAgent } : {}),
     topology,
     integrityMode,
     verification: verificationMode,
@@ -6392,6 +6503,7 @@ async function createPlanRun(
         version: manifestVersion,
         sessionId,
         rootSessionId,
+        ...(planAgent ? { planAgent } : {}),
         integrityMode,
         verification: verificationMode,
         victoryAudit: victoryAuditMode,
@@ -6577,6 +6689,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "plan",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Create a Teamwork run directory and write plan.dag.json + state.json + costs.json. Returns the run path and the (validated) session id. Call this once before dispatching workers.",
       input: {
@@ -6748,6 +6861,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "route",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Deterministic route classifier. Evaluates Document Review (Priority 1, checked BEFORE Lean/LEMMA, massive-proof, and proof) with explicit supplied-document + critique-intent + negative-trigger guards, then Priorities 2-7. Read-only: writes nothing.",
       input: {
@@ -6878,6 +6992,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "document_triage",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Ingest and partition a supplied Markdown/LaTeX/PDF/text/URL/inline document for the document-review topology. Validates bounds, path containment, and PDF headers BEFORE creating any run directory, then writes plan.dag.json (seg-01..seg-0K + doc-synthesis) and document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}.",
       input: {
@@ -7077,6 +7192,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "document_record",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Persist bounded RSA tree node outputs, segment unit-reports, synthesis candidates, or final DOCUMENT_REVIEW_REPORT.md for a document-review run. Enforces SEGMENT_ID allowlist, manifest bounds, symlink refusal, realpath containment, and text sanitisation.",
       input: {
@@ -7321,6 +7437,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "preflight",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Re-run the input preflight for an existing run: check the files/URLs named by ORIGINAL_REQUEST.md plus any explicit inputs, write <run>/preflight.json, and append a preflight event. Never throws.",
       input: {
@@ -7394,6 +7511,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "status",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Read the active (or given) Teamwork run and summarize per-task progress. Lists unacknowledged write anomalies; a run with one reports needs-inspection. acknowledgeAnomalies: true records an explicit operator acknowledgement in the config-dir audit (never a run write).",
       input: {
@@ -7503,6 +7621,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "resume",
+      options: { namespace: "teamwork", codemode: false },
       description: "Return the tasks that still need work (pending/running/fail) so a restarted Sentinel can continue where it stopped.",
       input: { type: "object", properties: { sessionId: { type: "string" } }, additionalProperties: false },
       execute: async (input: any, context: any) => {
@@ -7536,6 +7655,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "cost",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Read the run budget and report real spend across the full session tree (Sentinel + all workers/verifiers). Uses OpenCode's native cost and token tracking; falls back to manual addUsd when client/db is unavailable. Warns at 80%.",
       input: { type: "object", properties: { sessionId: { type: "string" }, addUsd: { type: "number" }, taskId: { type: "string" } }, additionalProperties: false },
@@ -7702,6 +7822,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             writeSnapshots(run, snapshotsFile, snaps)
           }
 
+          // A truncated child list is a real undercount; keep the warning with
+          // the snapshot so an operator can tell "no spend" from "not read".
+          if (treeResult?.warnings?.length) costs.treeWarnings = treeResult.warnings
+          else delete costs.treeWarnings
+
           if (treeResult && treeResult.sessions.length > 0) {
             applyUsage(
               treeResult.sessions,
@@ -7742,14 +7867,19 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
           const pct = budget ? Math.floor((costs.spentUsd / budget) * 100) : 0
           const warn = pct >= 80 ? `\n⚠ ${pct}% of budget used — halt non-essential workers and ask the user.` : ""
+          const treeWarning =
+            Array.isArray(costs.treeWarnings) && costs.treeWarnings.length
+              ? `\n⚠ cost tree degraded: ${costs.treeWarnings.map((w: any) => clean(w, 300)).join("; ")}`
+              : ""
           // SEC-3: the bucket key is echoed to the caller, so it is sanitised too.
           const taskBreakdown = Object.entries(costs.byTask).map(([k, v]) => `    ${clean(k, 64)}: $${v}`).join("\n")
           return {
-            content: `Budget: $${budget} · spent: $${costs.spentUsd} (${pct}%)${warn}${taskBreakdown ? `\nPer-task:\n${taskBreakdown}` : ""}\n(source: ${source}${skippedDuplicate ? "; duplicate snapshot digest skipped" : ""})`,
+            content: `Budget: $${budget} · spent: $${costs.spentUsd} (${pct}%)${warn}${taskBreakdown ? `\nPer-task:\n${taskBreakdown}` : ""}\n(source: ${source}${skippedDuplicate ? "; duplicate snapshot digest skipped" : ""})${treeWarning}`,
             shouldHalt: pct >= 80,
             pct,
             source,
             skippedDuplicate,
+            ...(Array.isArray(costs.treeWarnings) && costs.treeWarnings.length ? { treeWarnings: costs.treeWarnings } : {}),
             ...(appliedDigest ? { appliedSnapshotDigest: appliedDigest } : {}),
           }
         })
@@ -7758,6 +7888,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "budget",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Preflight the run budget BEFORE teamwork_plan. Detects whether the session uses opencode/ (managed) models and whether the opencode_console MCP is connected. When both hold, tells the caller to fetch credits via opencode_console_get_usage and pass a full/partial budgetUsd to teamwork_plan. Otherwise, use the default budget.",
       input: { type: "object", properties: {}, additionalProperties: false },
@@ -7788,6 +7919,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "tournament",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Bounded massive-proof tournament state machine (`estimate`, `init`, `propose`, `falsify`, `merge`, `score`, `audit`, `cancel`, `status`). Enforces explicit opt-in, bounded levels/width/candidates, budget preflight, deterministic candidate ranking, AbortSignal/budget-halt cancellation, and team/referee verdict gating.",
       input: {
@@ -8171,7 +8303,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 : { content: mRes.error }
             }
           const manifest = mRes.manifest
-          const caller = await deriveCallerAgent(ctx, run, callSession)
+          const caller = await deriveCallerAgent(ctx, run, callSession, context)
 
           if (action === "cancel") {
             if (manifest.phase === "COMPLETED" || manifest.phase === "FAILED") {
@@ -8192,7 +8324,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 to: "CANCELLED",
                 round: manifest.iteration,
                 agent: caller?.agent ?? null,
-                agentSource: caller?.agent ? "session" : undefined,
+                agentSource: caller?.source,
                 phase: "PRESENT_PARTIAL",
                 note: partial.manifest.cancelled?.reason ?? "Cancelled explicitly",
               })
@@ -8231,7 +8363,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 to: "CANCELLED",
                 round: manifest.iteration,
                 agent: caller?.agent ?? null,
-                agentSource: caller?.agent ? "session" : undefined,
+                agentSource: caller?.source,
                 phase: "PRESENT_PARTIAL",
                 note: "Aborted via AbortSignal",
               })
@@ -8279,7 +8411,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                   to: "BUDGET_HALTED",
                   round: manifest.iteration,
                   agent: caller?.agent ?? null,
-                  agentSource: caller?.agent ? "session" : undefined,
+                  agentSource: caller?.source,
                   phase: "PRESENT_PARTIAL",
                   note: reason,
                 })
@@ -8455,6 +8587,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "pitfall",
+      options: { namespace: "teamwork", codemode: false },
       description: "Append an answer-agnostic failure mode to the run's pitfall registry.",
       input: {
         type: "object",
@@ -8478,6 +8611,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "next",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Determine the next actionable tasks in the DAG based on dependencies and current lifecycle states. Returns tasks ready for worker dispatch, tasks ready for verifier dispatch, in-progress tasks, or signals completion/deadlock. In strict mode it returns NEEDS_STRICT_WAVE (or BLOCKED_BY_STRICT_WAVE) until every task has its falsifier challenge and security-auditor audit, and never ALL_PASSED before them. When the plan requires handoffs, it returns NEEDS_HANDOFFS (missing taskId:agent pairs) or BLOCKED_BY_HANDOFFS (stale/duplicate/unknown/tampered) before ALL_PASSED.",
       input: {
@@ -8595,7 +8729,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 }
               }
               const manifest = mRes.manifest
-              const caller = await deriveCallerAgent(ctx, run, callSession)
+              const caller = await deriveCallerAgent(ctx, run, callSession, context)
 
               if (TOURNAMENT_ACTIVE_PHASES.has(manifest.phase) && context?.signal?.aborted) {
                 const partial = finalizeTournamentPartial(run, manifest, {
@@ -8613,7 +8747,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                     to: "CANCELLED",
                     round: manifest.iteration,
                     agent: caller?.agent ?? null,
-                    agentSource: caller?.agent ? "session" : undefined,
+                    agentSource: caller?.source,
                     phase: "PRESENT_PARTIAL",
                     note: "Aborted via AbortSignal",
                   })
@@ -8663,7 +8797,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                         to: "BUDGET_HALTED",
                         round: manifest.iteration,
                         agent: caller?.agent ?? null,
-                        agentSource: caller?.agent ? "session" : undefined,
+                        agentSource: caller?.source,
                         phase: "PRESENT_PARTIAL",
                         note: reason,
                       })
@@ -9348,7 +9482,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
           if (!signedRun && !wasAlreadyMerge) {
             const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
-            const caller = await deriveCallerAgent(ctx, run, callSession)
+            const caller = await deriveCallerAgent(ctx, run, callSession, context)
             await appendEvent(run, {
               event: "legacy_unsigned_bypass",
               sessionId: basename(run),
@@ -9356,7 +9490,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               to: "ALL_PASSED",
               round: 0,
               agent: caller?.agent ?? null,
-              agentSource: caller?.agent ? "session" : undefined,
+              agentSource: caller?.source,
               phase: state.phase ?? null,
               note: "allowUnsignedLegacy: true completed an unsigned legacy run; artifact _auth envelopes were not verified",
             })
@@ -9365,7 +9499,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (!stamped) {
             // Explicit legacy escape hatch: accept, but record who did it and why.
             const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
-            const caller = await deriveCallerAgent(ctx, run, callSession)
+            const caller = await deriveCallerAgent(ctx, run, callSession, context)
             await appendEvent(run, {
               event: "final_verification_bypass",
               sessionId: basename(run),
@@ -9373,7 +9507,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               to: "ALL_PASSED",
               round: 0,
               agent: caller?.agent ?? null,
-              agentSource: caller?.agent ? "session" : undefined,
+              agentSource: caller?.source,
               phase: state.phase ?? null,
               note: "unstamped verify/final.json accepted via allowUnstamped; verdict was not produced by teamwork_final_verify",
             })
@@ -9514,6 +9648,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "task_update",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Update a task's lifecycle status, round, branch, and verification report in state.json. Lifecycle: pending -> worker_active -> worker_done -> verifier_active -> verified_pass | verified_fail | blocked.",
       input: {
@@ -9578,10 +9713,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const plan = readJson<any>(run, planFile, undefined)
         const def = Array.isArray(plan?.tasks) ? plan.tasks.find((t: any) => t.id === taskId) : undefined
         const explicitAgent = typeof input.agent === "string" ? clean(input.agent, 64).trim() : ""
-        const caller = explicitAgent ? undefined : await deriveCallerAgent(ctx, run, callSession)
+        const caller = explicitAgent ? undefined : await deriveCallerAgent(ctx, run, callSession, context)
         const planAgent = def?.agent ? clean(def.agent, 64) : undefined
         const recordedAgent = explicitAgent || caller?.agent || planAgent || null
-        const agentSource = explicitAgent ? "explicit" : caller?.agent ? "session" : planAgent ? "plan" : undefined
+        const agentSource = explicitAgent ? "explicit" : (caller?.source ?? (planAgent ? "plan" : undefined))
         const sentinelCaller = isSentinelAgent(authz.caller?.agent)
         const reasonText = typeof input.reason === "string" ? clean(input.reason, 200).trim() : ""
 
@@ -10170,6 +10305,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "recover",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Explicit crash recovery for a claim (claim protocol 2). team/sentinel or team/orchestrator, from the run root or a descendant. Inspect the live and baseline fingerprints, then heartbeat, release, block, requeue or adopt the claim. inspect returns a single-use 10-minute token (stored hashed); adopt/requeue/block refuse without it and re-check the fingerprint, so a worktree that changed after inspection is INSPECTION_STALE. adopt marks a clean committed branch worker_done with a checkpoint and makes NO commit. requeue only when nothing changed, unless force+confirm explicitly discards the unverified changes. Nothing is ever auto-committed.",
       input: {
@@ -10525,7 +10661,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           to: rawAction.toUpperCase(),
           round: Number(task.round) || 0,
           agent: authz.caller?.agent ?? null,
-          agentSource: authz.caller?.agent ? "session" : undefined,
+          agentSource: authz.caller?.source,
           note: outcome.note,
         })
         await refreshBriefingSafe(run)
@@ -10542,6 +10678,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "handoff",
+      options: { namespace: "teamwork", codemode: false },
 
       description:
         "Record the five-section handoff (Observation, Logic Chain, Caveats, Conclusion, Verification Method) for this agent. Writes <run>/handoffs/<taskId|_run>-<agent>.md and updates the bounded handoffs/index.json. Identity comes from the trusted calling session; task-scoped roles must name an existing task, while victory-auditor/sentinel/orchestrator record run-level handoffs. When the plan records requireHandoffs: \"required\", final_verify/next require the derived matrix and reject missing/stale/tampered handoffs, but the prose is never parsed as a PASS/FAIL verdict.",
@@ -10647,6 +10784,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "security_audit",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Record the findings of team/security-auditor and enforce the pre-merge security gate. Writes verify/security-audit.json. If Critical or High findings exist, or the auditor reports an integrity finding forbidden at the run's mode, marks status as FAIL and blocks final merge.",
       input: {
@@ -10850,6 +10988,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "victory_audit",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Record the independent final acceptance verdict from team/victory-auditor. The auditor compares the delivered artifacts and tests against ORIGINAL_REQUEST.md and requirements.json. Only a trusted session whose agent is team/victory-auditor may call it (a caller-supplied label cannot self-authorize). Writes verify/victory.json; a CONFIRMED verdict is write-once.",
       input: {
@@ -10929,6 +11068,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "wave_record",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Record one strict-verification verdict. Only team/falsifier may record kind=challenge (verdict PASS) and only team/security-auditor may record kind=audit (verdict CLEAN); the caller identity is derived from the trusted session and cannot be supplied as an input. Requires the task to exist and its verify/report-<taskId>.json to be PASS, binds the verdict to that report's sha256, writes verify/challenge-<taskId>.json or verify/audit-<taskId>.json atomically, appends a verification_wave event, and refuses re-recording the same report (a changed report is the only overwrite path).",
       input: {
@@ -11009,6 +11149,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "evidence",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Write one bounded evidence artifact under verify/evidence/<name> (max 64 KiB, at most 32 files) through the pinned run writer. Returns {path, sha256, bytes}; cite the path from teamwork_wave_record so the strict gate re-hashes it. This records bytes, not a verdict.",
       input: {
@@ -11069,6 +11210,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "report",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Trusted writer for verify/report-<taskId>.json. Only a session whose trusted agent is team/verifier, descending from the run root, may call it. The task must exist in plan.dag.json and a PASS report must carry evidence (a summary or checks, every check passed, no fatal findings). A check may record argv-only command evidence (command/cwd/exitCode/output/durationMs); the engine computes commandSha256/outputBytes and writes a signed verify/rerun.json projection that `opencode-teamwork verify --rerun` can re-execute at the report's headSha. The report is signed for a signed run (run.manifest.json) and indexed in ctx.storage; final_verify re-checks the signature and the PASS evidence. A wrong agent, a missing task, an inconsistent PASS, a shell command line, or (under requiredProvenance \"command\") a programmatic check without a command is refused.",
       input: {
@@ -11454,6 +11596,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "final_verify",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Compute and stamp the run's final verdict from artifacts. PASS requires every task to be verified_pass, every verify/report-<taskId>.json to be PASS, verify/security-audit.json to be PASS, and (unless the plan explicitly skipped it) a CONFIRMED independent victory audit bound to the current ORIGINAL_REQUEST.md. In strict mode it also requires verify/challenge-<taskId>.json (team/falsifier, PASS) and verify/audit-<taskId>.json (team/security-auditor, CLEAN) for every task, both bound by reportHash to the current verifier report, and writes GATE_STATUS.md. When requireHandoffs is required it also requires the continuity matrix (worker + verifier per task, falsifier + security-auditor per task in strict mode, one sentinel/orchestrator run-level, and the victory-auditor run-level handoff after a confirmed audit), rejecting missing/stale/duplicate/unknown/tampered handoffs without parsing their prose. Writes verify/final.json atomically and appends a final_verification event. The verdict is computed from evidence and cannot be overridden by input.",
       input: {
@@ -11492,7 +11635,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
 
         return await withPinnedCrossProcessLock(run, runRel(run, finalFile), async () => {
-          const caller = await deriveCallerAgent(ctx, run, callSession)
+          const caller = await deriveCallerAgent(ctx, run, callSession, context)
           const state = readJson<any>(run, join(run, "state.json"), undefined)
           if (!state || typeof state.tasks !== "object") {
             return { content: `Error: No state.json found for run ${basename(run)}.` }
@@ -11542,7 +11685,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               to: "final_verify",
               round: 0,
               agent: caller?.agent ?? null,
-              agentSource: caller?.agent ? "session" : undefined,
+              agentSource: caller?.source,
               phase: state.phase ?? null,
               note: "allowUnsignedLegacy: true accepted an unsigned legacy run; artifact _auth envelopes are not verified",
             })
@@ -11989,7 +12132,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               await withPinnedCrossProcessLock(run, runRel(run, mFile), async () => {
                 const mRes = readTournamentManifest(run)
                 if (mRes.status === "ok" && TOURNAMENT_ACTIVE_PHASES.has(mRes.manifest.phase) && context?.signal?.aborted) {
-                  const callerAbort = await deriveCallerAgent(ctx, run, callSession)
+                  const callerAbort = await deriveCallerAgent(ctx, run, callSession, context)
                   const partial = finalizeTournamentPartial(run, mRes.manifest, {
                     trigger: "signal",
                     reason: "Aborted via AbortSignal",
@@ -12005,7 +12148,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                       to: "CANCELLED",
                       round: mRes.manifest.iteration,
                       agent: callerAbort?.agent ?? null,
-                      agentSource: callerAbort?.agent ? "session" : undefined,
+                      agentSource: callerAbort?.source,
                       phase: "PRESENT_PARTIAL",
                       note: "Aborted via AbortSignal",
                     })
@@ -12338,7 +12481,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             to: status,
             round: 0,
             agent: caller?.agent ?? null,
-            agentSource: caller?.agent ? "session" : undefined,
+            agentSource: caller?.source,
             phase: state.phase ?? null,
           })
           await refreshBriefingSafe(run)
@@ -12378,6 +12521,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "worktree",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Deterministic git worktree manager for Teamwork runs: setup, diff, merge, resolve, and cleanup. Prevents in-repo nesting and isolates worker branches.",
       input: {
@@ -12716,12 +12860,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
             writeJson(run, conflictFile, conflictArtifact)
 
+            // OpenCode's Tool runtime dies when a result has `output` but the
+            // tool declared no output schema (packages/core/src/tool/runtime.ts:
+            // execute() -- `if ("output" in result) Effect.die(...)`). This path
+            // has no schema, so the raw git output belongs in `content`.
             return {
               content: `MERGE CONFLICT for task ${taskId} into ${baseBranch}:\n${conflictingFiles.join("\n") || mergeRes.stderr || mergeRes.stdout}\n\nConflict artifact generated at: ${conflictFile}\n(Merge was aborted; worktree remains clean. Sentinel should dispatch team/synthesizer to resolve conflict.)`,
               conflict: true,
               conflictArtifact: conflictFile,
               conflictingFiles,
-              output: mergeRes.stdout,
+              mergeOutput: mergeRes.stdout,
             }
           }
 
@@ -12846,6 +12994,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "lemma_probe",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Read-only probe for the external LEMMA toolchain (`lean`, `lake`, and the LEAP CLI `leap`, or legacy `leap-tools`) on PATH. Never touches disk and never installs packages.",
       input: {
@@ -12874,6 +13023,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "lemma_formalize",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Manage LEMMA Phase 0 formalization (problem_draft.lean -> preSearch APPROVE/REQUEST_CHANGES -> problem.lean) and final faithfulness review (FAITHFUL/UNFAITHFUL/MISFORMALIZED).",
       input: {
@@ -12922,7 +13072,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
           if (action === "review_pre" || action === "review_final") {
-            const caller = await deriveCallerAgent(ctx, run, callSession)
+            const caller = await deriveCallerAgent(ctx, run, callSession, context)
             const explicitReviewer = input?.reviewer ? clean(input.reviewer, 64).trim() : ""
             if (explicitReviewer && explicitReviewer !== "team/formalization-reviewer") {
               return { content: `refused: formalization review must be performed by team/formalization-reviewer (got "${explicitReviewer}").` }
@@ -12963,6 +13113,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "lemma_node",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Manage bounded LEMMA decomposition tree nodes under lemma/nodes/<lemmaId>/ (create, update, blueprint, attempt) enforcing maxDepth, maxWidth, maxNodes, maxRetries, and cycle/symlink guards. Record `declaration` (Lean theorem/lemma name) and `statement` (exact Lean proposition type) so lemma_verify can bind the attempt to the approved proposition.",
       input: {
@@ -13016,6 +13167,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
     editor.add({
       name: "lemma_verify",
+      options: { namespace: "teamwork", codemode: false },
       description:
         "Execute real Lean 4 (`lean`, `lake env lean`, or `lake build`) on lemma/nodes/<lemmaId>/attempt-<r>.lean, bind the declared theorem/lemma name and type to the approved node statement, check transitive axiom dependencies via `#print axioms` against the allowlist approved in lemma/manifest.json at plan time, reject sorry/admit/unauthorized axioms even on exit 0, and stamp verify-<r>.json.",
       input: {

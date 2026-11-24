@@ -56,7 +56,6 @@ Look at the user's prompt (or call `teamwork_route`) and pick exactly one in str
 
 Topologies are defined in `ARTIFACTS.md`.
 
-AD
 > **v2 Route Note:** Priority 1 (`document-review`) uses the v2 tools (`teamwork_document_triage` / `teamwork_document_record`) and `team/segment-reviewer`. When a request classifies as `document-review`, direct the user to `/teamwork` (`team/sentinel`) instead of running the legacy v1 loop.
 >
 > Explicit Lean 4 / LEMMA runs (`proof` with `lemmaMode: true`) require the v2 engine tools (`teamwork_lemma_probe`, `teamwork_lemma_formalize`, `teamwork_lemma_node`, `teamwork_lemma_verify`) and `team/formalization-reviewer`. Direct the user to `/teamwork` (`team/sentinel`) instead of running the legacy v1 loop. The Sentinel plans with `lemmaMode: true`, `route: "lemma"`, and the verbatim user request as `request`; if `teamwork_lemma_probe` is not READY, nothing is planned or spent.

@@ -1,6 +1,6 @@
 // @heretek-ai/opencode-teamwork-v2 — postinstall hook
 //
-// Installs the 11 `team/*` agent markdown files into the OpenCode config
+// Installs the 15 `team/*` agent markdown files into the OpenCode config
 // directory and asks the user which model each agent should use.
 //
 // It deliberately does NOT edit opencode.json: OpenCode's own
@@ -13,6 +13,7 @@
 
 import {
   PACKAGE_NAME,
+  TEAM_AGENTS,
   resolveConfigDir,
   currentModels,
   writeModelMap,
@@ -57,7 +58,7 @@ async function main() {
   writeModelMap(configDir, models)
   const install = installAgents({ configDir, models })
   console.log(
-    `[${PACKAGE_NAME}] Installed ${install.created.length} agent(s), updated ${install.updated.length} in ${configDir}/agents/team.`,
+    `[${PACKAGE_NAME}] Installed ${install.created.length} agent(s), updated ${install.updated.length} of ${TEAM_AGENTS.length} in ${configDir}/agents/team.`,
   )
   console.log(`[${PACKAGE_NAME}] Models saved to ${configDir}/teamwork.json.`)
   if (!interactive) {

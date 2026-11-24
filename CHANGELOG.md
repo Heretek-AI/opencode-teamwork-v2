@@ -4,6 +4,78 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.1] - 2026-11-24
+
+OpenCode 2.4.1 plugin-contract fixes. The observable change is how the engine
+tools are exposed to the model; the rest repairs paths, pagination, caller
+identity, install timing and the version declaration.
+
+### Changed
+
+- **Tool exposure is now direct `teamwork_*` (observable).** Every registration
+  carries `options: { namespace: "teamwork", codemode: false }`. OpenCode's
+  effective id is `namespace + "_" + name`
+  (`packages/core/src/tool/runtime.ts:302-305`), so the model sees
+  `teamwork_plan`, `teamwork_next`, … instead of bare `plan`, `next`, … The 125
+  references in `agents/team/*.md` and the 7 command templates resolve again.
+  `codemode: false` keeps them as direct tools; a namespaced tool would
+  otherwise appear only as `teamwork.plan` inside Code Mode.
+- `teamwork_plan` writes the plan-time caller agent to the signed
+  `run.manifest.json` as `planAgent` (and to `plan.dag.json`). A re-plan keeps
+  the first plan's value.
+- Caller identity prefers the tool call's `context.agent` (current after
+  `switchAgent`) over `Session.Info.agent` (optional and possibly stale), then
+  the session snapshot. Authorization fails closed with the existing
+  `AUTHZ_IDENTITY_UNRESOLVED` refusal only when all of them are absent.
+- A forked session (`parentID: null` plus `fork.sessionID` /
+  `fork_session_id`) follows its fork source as the ancestry edge. A true
+  orphan or an ancestry loop still fails closed by name.
+- Agent install moved out of plugin `setup`: `init` and `postinstall` write the
+  15 `team/*.md` files, while load-time verification only warns (by filename,
+  never throws) when one is missing, because the config-agent plugin has
+  already read its documents.
+- `init`/`registerPlugin` no longer adds the npm name when the project config
+  already registers a vendored directory.
+- `/teamwork` instructs the sentinel to pass the required `topology` and
+  `tasks` to `teamwork_plan`.
+- README compatibility is now OpenCode 2.4.1 with the exact mechanism (optional
+  peer range + `ctx.app.version` warning), and documents the exposure rule.
+- `plugins/opencode-teamwork/package.json` tracks the root version.
+
+### Fixed
+
+- A merge-conflict result no longer returns `output` without an output schema;
+  OpenCode dies on that shape (`tool/runtime.ts:52-60`). The raw git output is
+  `mergeOutput` and the human text stays in `content`.
+- Cost discovery resolves `OPENCODE_DB` (absolute, relative to the data dir,
+  `:memory:` refused) and the channel-specific names OpenCode uses:
+  `opencode.db` for latest/dev/beta/next/prod or the disable-channel override,
+  `opencode-<channel>.db` otherwise; service registrations read
+  `service-<channel>.json`, plain `service.json`, and legacy
+  `service-*.json` from the same state directory. A missing database is no
+  longer created by the `sqlite3` CLI fallback.
+- `session.list` defaults to 50 children; the service walk now sends
+  `limit=200`, follows `cursor.next` up to 25 pages, and records a degradation
+  warning in `costs.json` and the cost result when the cap is reached.
+- Stray literal `AD` lines in `sentinel.md`/`orchestrator.md`, a merged
+  `DOCUMENT_REVIEW_REPORT` bullet, and the postinstall header/roster count.
+
+### Added
+
+- `package.json` declares `peerDependencies: { "@opencode/plugin": "^2.4" }`
+  with `peerDependenciesMeta["@opencode/plugin"].optional = true`, so installs
+  stay dependency-free while the supported window is explicit. `setup` warns
+  when `ctx.app.version` is outside 2.4.x.
+- `scripts/test-catalog.mjs` asserts the exact `teamwork_*` id set, namespace
+  and `codemode: false` on every registration, object input schemas, and that
+  every tool token referenced by the agent prompts and command templates
+  exists. `scripts/tool-registry.mjs` computes the effective name the same way
+  OpenCode does, and every test shim/call site uses the `teamwork_*` keys.
+- Regressions: merge-conflict result has no `output`; cost runs against a
+  synthetic `OPENCODE_DB` (plus a channel-named database); a 75-child list is
+  followed through `cursor.next`; fork ancestry resolves while an orphan is
+  refused by name; agent verification warns without writing.
+
 ## [0.16.0] - 2026-11-24
 
 Re-executable verification. A verifier `PASS` can now record argv-only command
