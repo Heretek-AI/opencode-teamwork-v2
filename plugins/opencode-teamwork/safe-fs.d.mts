@@ -89,7 +89,48 @@ export interface WriteAnomaly {
   dir?: string | null
   name?: string
   detail?: string
+  phase?: string
+  tempPath?: string
+  destRealAfter?: string | null
+  bytesWritten?: number
+  intendedSha256?: string
+  acknowledged?: boolean
+  id?: string
+  event?: string
+  through?: string
 }
+
+/** Every identity key (lexical path, realpath, dev:ino) that names a run. */
+export function runPolicyKeys(run: string): string[]
+
+/**
+ * Resolve the pinned-write policy for a run: env assertion OR a plan assertion
+ * (`requirePinnedWrites: true` in plan.dag.json), keyed by realpath + (dev, ino)
+ * with the lexical path as a fallback.
+ */
+export function resolveRunPolicy(run: string): {
+  run: string | null
+  keys: string[]
+  envAsserted: boolean
+  planAsserted: boolean
+  required: boolean
+}
+
+/** The shared `containment-mode` refusal (writer and lock layer). */
+export function containmentModeRefusal(run: string, mode?: FdTraversalMode): Error
+
+/** The durable anomaly audit path (config dir, never a run). */
+export function writeAnomalyAuditPath(env?: Record<string, string | undefined>): string
+export function setWriteAnomalyAuditPathForTest(path: string | null): void
+export function writeAnomaliesForRun(
+  run?: string,
+  options?: { includeDiagnostics?: boolean; auditPath?: string; env?: Record<string, string | undefined> },
+): WriteAnomaly[]
+export function unacknowledgedWriteAnomalies(
+  run?: string,
+  options?: { auditPath?: string; env?: Record<string, string | undefined> },
+): WriteAnomaly[]
+export function acknowledgeWriteAnomalies(run?: string): WriteAnomaly | null
 
 export function assertSingleSegment(name: string): string
 export function fdPath(fd: number): string

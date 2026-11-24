@@ -13,7 +13,7 @@
 
 import { lstatSync, realpathSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
-import { readRegularBounded, readWithinBounded, writeFileAtomicWithin } from "./safe-fs.mjs"
+import { assertPinnedWritePolicy, readRegularBounded, readWithinBounded, writeFileAtomicWithin } from "./safe-fs.mjs"
 import type { SafeFsRead } from "./safe-fs.mjs"
 
 export const TOURNAMENT_LIMITS = {
@@ -192,6 +192,14 @@ export interface RouteResult {
 export const MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 export const MAX_CANDIDATE_BYTES = 1 * 1024 * 1024
 export const MAX_REPORT_BYTES = 2 * 1024 * 1024
+
+/**
+ * The one read cap for `verify/report-<taskId>.json` across `final_verify`,
+ * the strict wave and the victory audit. Before 0.13.1 `final_verify` parsed a
+ * report at 8 MiB but hashed it at 512 KiB, so a report between those sizes
+ * produced a `null` digest for a PASS artifact.
+ */
+export const MAX_VERIFIER_REPORT_BYTES = 1024 * 1024
 
 export function clean(value: unknown, max = 64): string {
   const s = typeof value === "string" ? value : typeof value === "number" || typeof value === "boolean" ? String(value) : ""
@@ -473,6 +481,10 @@ export function assertRunRootIdentity(run: string): void {
 }
 
 export function writeSafeRunFile(run: string, targetPath: string, content: string): void {
+  // The policy is resolved here (not only inside the lock path) so an unlocked
+  // writer such as `tournament/candidates/<id>.json` is covered in a fresh
+  // process, before any path or manifest check.
+  assertPinnedWritePolicy(run)
   assertRunRootIdentity(run)
   // Keep the path-level policy and its exact error text: `ensureSafeRunSubpath`
   // refuses symlinks/escapes before any syscall and is the documented contract

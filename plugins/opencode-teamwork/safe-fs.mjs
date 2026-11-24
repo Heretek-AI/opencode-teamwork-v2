@@ -45,10 +45,12 @@ import {
   renameSync,
   statSync,
   unlinkSync,
+  writeFileSync,
   writeSync,
 } from "node:fs"
-import { randomBytes } from "node:crypto"
-import { basename, dirname, isAbsolute, relative, resolve, sep, win32 as win32Path } from "node:path"
+import { createHash, randomBytes } from "node:crypto"
+import { homedir } from "node:os"
+import { basename, dirname, isAbsolute, join, relative, resolve, sep, win32 as win32Path } from "node:path"
 
 const PROC_SELF_FD = "/proc/self/fd"
 const DELETED_SUFFIX = " (deleted)"
@@ -330,7 +332,23 @@ export function setFdTraversalModeForTest(mode) {
 
 export const REQUIRE_PINNED_WRITES_ENV = "OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES"
 
-const pinnedRequiredRuns = new Set()
+const MAX_PINNED_REQUIRED_RUNS = 512
+const MAX_PLAN_HYDRATIONS = 512
+const MAX_PLAN_BYTES = 64 * 1024
+
+// A run is keyed by its lexical path, its realpath and its (dev, ino). One key
+// would fail open on a case-insensitive volume (APFS/NTFS) where "Run" and
+// "run" are the same directory, and a lexical-only key would fail open through
+// a symlinked ancestor. `resolveRunPolicy` writes every key for a run, so a
+// lookup through any spelling finds the same policy.
+const pinnedRequiredRuns = new Map()
+// An explicit `setRunRequirePinnedWrites(run, false)` must not be undone by the
+// next plan rehydration in the same process.
+const pinnedPolicyCleared = new Set()
+// plan.dag.json is untrusted input. Rehydrate at most once per mtime/size; only
+// a literal `true` is honoured, so a malformed plan can never loosen the
+// default.
+const planHydrationCache = new Map()
 let requirePinnedWritesOverride = null
 
 function envFlagEnabled(raw) {
@@ -349,28 +367,152 @@ export function setRequirePinnedWritesForTest(enabled) {
   requirePinnedWritesOverride = typeof enabled === "boolean" ? enabled : null
 }
 
-/** Register a plan's `requirePinnedWrites` for one run in this process. */
-export function setRunRequirePinnedWrites(run, enabled) {
-  let key
+function boundMap(map, max) {
+  while (map.size > max) {
+    const oldest = map.keys().next().value
+    if (oldest === undefined) return
+    map.delete(oldest)
+  }
+}
+
+/** Every identity key that names this run (lexical path, realpath, dev:ino). */
+export function runPolicyKeys(run) {
+  const keys = []
+  const add = (key) => {
+    if (key && !keys.includes(key)) keys.push(key)
+  }
+  let lexical
   try {
-    key = resolve(String(run))
+    lexical = resolve(String(run))
+  } catch {
+    return keys
+  }
+  add(`path:${lexical}`)
+  try {
+    const real = realpathSync(lexical)
+    add(`path:${real}`)
+    const st = lstatSync(real)
+    if (st.isDirectory() && (st.dev !== 0 || st.ino !== 0)) add(`id:${st.dev}:${st.ino}`)
+  } catch {
+    // A run that does not exist yet is keyed lexically; the identity keys are
+    // added as soon as it exists.
+  }
+  return keys
+}
+
+function markPinnedPolicy(keys) {
+  // An explicit clear on any identity of this run suppresses rehydration for
+  // all of its identities, including ones discovered after the clear.
+  if (keys.some((key) => pinnedPolicyCleared.has(key))) return
+  for (const key of keys) {
+    pinnedRequiredRuns.delete(key)
+    pinnedRequiredRuns.set(key, true)
+  }
+  boundMap(pinnedRequiredRuns, MAX_PINNED_REQUIRED_RUNS)
+}
+
+/**
+ * Rehydrate a plan's `requirePinnedWrites` from `<run>/plan.dag.json`. The plan
+ * is read bounded (O_NOFOLLOW, 64 KiB) and cached by mtime/size. Only
+ * `requirePinnedWrites === true` is honoured. This lives in the resolver (not
+ * only in the lock layer) so unlocked writers (`tournament`, LEMMA, `verify/*`)
+ * are covered in a fresh process too.
+ */
+function hydratePlanPolicy(keys, run) {
+  if (!keys.length) return
+  let dir
+  try {
+    dir = resolve(String(run))
   } catch {
     return
   }
-  if (enabled === true) pinnedRequiredRuns.add(key)
-  else pinnedRequiredRuns.delete(key)
+  const file = join(dir, "plan.dag.json")
+  let stat
+  try {
+    stat = lstatSync(file)
+  } catch {
+    return
+  }
+  if (!stat.isFile() || stat.size > MAX_PLAN_BYTES) return
+  let cacheKey = null
+  for (const key of keys) {
+    const cached = planHydrationCache.get(key)
+    if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return
+    if (!cacheKey) cacheKey = key
+  }
+  const read = readRegularBounded(file, MAX_PLAN_BYTES)
+  if (read.status !== "ok") return
+  if (cacheKey) {
+    for (const key of keys) planHydrationCache.set(key, { mtimeMs: stat.mtimeMs, size: stat.size })
+    boundMap(planHydrationCache, MAX_PLAN_HYDRATIONS)
+  }
+  try {
+    const parsed = JSON.parse(read.text)
+    if (parsed && typeof parsed === "object" && parsed.requirePinnedWrites === true) {
+      markPinnedPolicy(keys)
+    }
+  } catch {
+    // A malformed plan leaves the default policy (off).
+  }
+}
+
+/**
+ * Resolve the pinned-write policy for one run. This is the one entry point used
+ * by the writer, the lock layer, the plan tool and `doctor`: env assertion OR a
+ * plan assertion, keyed by realpath + (dev, ino) with the lexical path as a
+ * fallback.
+ */
+export function resolveRunPolicy(run) {
+  const keys = runPolicyKeys(run)
+  const envAsserted = requirePinnedWritesEnabled()
+  if (keys.length) hydratePlanPolicy(keys, run)
+  let planAsserted = false
+  for (const key of keys) {
+    if (pinnedRequiredRuns.has(key)) {
+      planAsserted = true
+      break
+    }
+  }
+  return {
+    run: keys.length ? keys[0].slice("path:".length) : null,
+    keys,
+    envAsserted,
+    planAsserted,
+    required: envAsserted || planAsserted,
+  }
+}
+
+/** Register a plan's `requirePinnedWrites` for one run in this process. */
+export function setRunRequirePinnedWrites(run, enabled) {
+  const keys = runPolicyKeys(run)
+  if (!keys.length) return
+  if (enabled === true) {
+    for (const key of keys) pinnedPolicyCleared.delete(key)
+    markPinnedPolicy(keys)
+    return
+  }
+  for (const key of keys) {
+    pinnedRequiredRuns.delete(key)
+    pinnedPolicyCleared.add(key)
+  }
+  boundMap(pinnedPolicyCleared, MAX_PINNED_REQUIRED_RUNS)
 }
 
 /** True when this run's writes must be pinned. */
 export function runRequiresPinnedWrites(run) {
-  if (requirePinnedWritesEnabled()) return true
-  let key
-  try {
-    key = resolve(String(run))
-  } catch {
-    return false
-  }
-  return pinnedRequiredRuns.has(key)
+  return resolveRunPolicy(run).required
+}
+
+/**
+ * The one refusal used by both the writer and the lock layer, so the message
+ * (including the run id) and the machine-readable reason are identical.
+ */
+export function containmentModeRefusal(run, mode = currentTraversalMode()) {
+  const id = typeof run === "string" && run ? sanitize(basename(resolve(run))) : "unknown"
+  return refusalError(
+    "containment-mode",
+    `refused: run "${id}" requires pinned write containment (${REQUIRE_PINNED_WRITES_ENV}/requirePinnedWrites), but this host's write containment mode is "${mode}"; nothing was written`,
+  )
 }
 
 /**
@@ -380,18 +522,10 @@ export function runRequiresPinnedWrites(run) {
  * an env assertion.
  */
 export function assertPinnedWritePolicy(run, options = {}) {
-  const envOn = requirePinnedWritesEnabled()
-  let runOn = false
-  if (!envOn && options.requirePinnedWrites !== true) {
-    let key
-    try {
-      key = resolve(String(run))
-    } catch {
-      key = null
-    }
-    runOn = key !== null && options.requirePinnedWrites !== false && pinnedRequiredRuns.has(key)
-  }
-  if (!envOn && !runOn && options.requirePinnedWrites !== true) return
+  const policy = resolveRunPolicy(run)
+  const explicit = options.requirePinnedWrites
+  const asserted = explicit === true || policy.envAsserted || (explicit !== false && policy.planAsserted)
+  if (!asserted) return
   const mode = currentTraversalMode()
   if (mode === "pinned") return
   recordWriteAnomaly({
@@ -400,10 +534,7 @@ export function assertPinnedWritePolicy(run, options = {}) {
     mode,
     detail: `${REQUIRE_PINNED_WRITES_ENV}/requirePinnedWrites is asserted, but write containment is "${mode}"`,
   })
-  throw refusalError(
-    "containment-mode",
-    `refused: this run requires pinned write containment (${REQUIRE_PINNED_WRITES_ENV}/requirePinnedWrites), but this host's write containment mode is "${mode}"; nothing was written`,
-  )
+  throw containmentModeRefusal(run, mode)
 }
 
 // One `detective_mode` diagnostic per run, never per write. It is diagnostic
@@ -448,12 +579,233 @@ export function onWriteAnomaly(sink) {
   writeAuditSink = typeof sink === "function" ? sink : null
 }
 
+// ---------------------------------------------------------------------------
+// Durable write-anomaly audit (config dir, never the run)
+// ---------------------------------------------------------------------------
+//
+// A containment refusal means the writer must not touch the run again, so an
+// anomaly can never be appended to `<run>/events.jsonl` (the policy itself
+// refuses that path). The durable audit lives under the operator's OpenCode
+// config directory, outside every run, and every anomaly is appended there
+// best-effort. `teamwork_status` and `doctor --security` read it; a run with an
+// unacknowledged write anomaly reports `needs-inspection`.
+//
+// Acknowledgement is an explicit operator record in the same audit file
+// (`{"event":"anomaly_ack","run":...,"through":"<ISO>"}`); it acknowledges
+// every anomaly for that run at or before the timestamp. `detective_mode` and
+// `detective-lock` are diagnostics of the documented non-pinned fallback, not
+// refusals, and never block a run.
+
+const MAX_ANOMALY_AUDIT_BYTES = 1024 * 1024
+const MAX_ANOMALY_AUDIT_TAIL_BYTES = 256 * 1024
+const MAX_ANOMALY_READ_BYTES = 1024 * 1024
+const DIAGNOSTIC_ANOMALY_KINDS = new Set(["detective_mode", "detective-lock"])
+const AUDIT_PATH_ENV = "OPENCODE_TEAMWORK_ANOMALY_AUDIT"
+let anomalyAuditPathOverride = null
+
+function configDirForAudit(env) {
+  const explicit = env?.OPENCODE_TEAMWORK_CONFIG || env?.OPENCODE_CONFIG_DIR
+  if (explicit) return resolve(String(explicit))
+  const base = env?.XDG_CONFIG_HOME ? resolve(String(env.XDG_CONFIG_HOME)) : join(homedir(), ".config")
+  return join(base, "opencode")
+}
+
+/** The durable anomaly audit path (overridable for hermetic tests). */
+export function writeAnomalyAuditPath(env = process.env) {
+  if (anomalyAuditPathOverride) return anomalyAuditPathOverride
+  if (env?.[AUDIT_PATH_ENV]) return resolve(String(env[AUDIT_PATH_ENV]))
+  return join(configDirForAudit(env), "teamwork", "write-anomalies.jsonl")
+}
+
+/** Test seam: point the durable audit at a temp file (null restores default). */
+export function setWriteAnomalyAuditPathForTest(path) {
+  anomalyAuditPathOverride = typeof path === "string" && path ? resolve(path) : null
+}
+
+function anomalyKey(record) {
+  return `${record.at}|${record.kind}|${record.run ?? ""}|${record.name ?? ""}|${record.detail ?? ""}`
+}
+
+function persistWriteAnomaly(record) {
+  try {
+    const file = writeAnomalyAuditPath()
+    mkdirSync(dirname(file), { recursive: true })
+    let size = 0
+    try {
+      size = statSync(file).size
+    } catch {}
+    if (size > MAX_ANOMALY_AUDIT_BYTES) {
+      const tail = readRegularBounded(file, MAX_ANOMALY_AUDIT_TAIL_BYTES)
+      const text = tail.status === "ok" ? tail.text.slice(tail.text.indexOf("\n") + 1) : ""
+      writeFileSync(file, text, { mode: 0o600 })
+    }
+    const line = JSON.stringify({ ...record, id: record.id ?? anomalyKey(record).slice(0, 256) }) + "\n"
+    const fd = openSync(file, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND, 0o600)
+    try {
+      writeAllSync(fd, Buffer.from(line, "utf8"))
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    // A diagnostic must never break the writer.
+  }
+}
+
+function readAnomalyAuditRecords(options = {}) {
+  const records = []
+  try {
+    const file = options?.auditPath
+      ? resolve(String(options.auditPath))
+      : writeAnomalyAuditPath(options?.env ?? process.env)
+    const read = readRegularBounded(file, MAX_ANOMALY_READ_BYTES)
+    if (read.status !== "ok") return records
+    for (const line of read.text.split("\n")) {
+      if (!line.trim()) continue
+      try {
+        const parsed = JSON.parse(line)
+        if (parsed && typeof parsed === "object") records.push(parsed)
+      } catch {}
+    }
+  } catch {}
+  return records
+}
+
+function sameRun(recordRun, run) {
+  if (typeof recordRun !== "string" || !recordRun) return false
+  if (!run) return true
+  let a = recordRun
+  let b
+  try {
+    b = resolve(String(run))
+  } catch {
+    b = String(run)
+  }
+  if (a === b) return true
+  try {
+    a = realpathSync(a)
+  } catch {}
+  try {
+    b = realpathSync(b)
+  } catch {}
+  return a === b || basename(a) === basename(b)
+}
+
+/**
+ * Persist a pre-rename intent for a detective atomic write. A process that is
+ * SIGKILLed between the rename and the post-check leaves this record with no
+ * matching commit; readers surface it as a `detective-temp` needs-inspection
+ * anomaly instead of losing the crash silently.
+ */
+function beginDetectiveWriteIntent(fields) {
+  const intent = {
+    at: new Date().toISOString(),
+    event: "write_intent",
+    id: randomBytes(12).toString("hex"),
+    ...fields,
+  }
+  persistWriteAnomaly(intent)
+  return intent
+}
+
+function completeDetectiveWriteIntent(intent) {
+  if (!intent?.id) return
+  persistWriteAnomaly({ at: new Date().toISOString(), event: "write_commit", intentId: intent.id })
+}
+
+/**
+ * Anomalies recorded for one run (or all runs), merged from the durable audit
+ * and this process's ring, deduped, oldest first. `acknowledged` is per record.
+ * An uncommitted `write_intent` is surfaced as a `detective-temp` anomaly.
+ */
+export function writeAnomaliesForRun(run, options = {}) {
+  const includeDiagnostics = options.includeDiagnostics === true
+  const all = [...readAnomalyAuditRecords(options), ...writeAnomalies]
+  const acks = all.filter((r) => r.event === "anomaly_ack" && sameRun(r.run, run))
+  const acknowledgedAt = (record) => {
+    const at = Date.parse(record.at)
+    if (!Number.isFinite(at)) return false
+    return acks.some((ack) => {
+      const through = Date.parse(ack.through)
+      return Number.isFinite(through) && at <= through
+    })
+  }
+  const committedIntents = new Set(
+    all.filter((r) => r && r.event === "write_commit" && typeof r.intentId === "string").map((r) => r.intentId),
+  )
+  const seen = new Set()
+  const out = []
+  for (const record of all) {
+    if (!record || record.event === "anomaly_ack" || record.event === "write_commit") continue
+    if (!sameRun(record.run, run)) continue
+    if (record.event === "write_intent") {
+      if (committedIntents.has(record.id)) continue
+      const key = `intent|${record.id}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push({
+        ...record,
+        kind: "detective-temp",
+        detail: `uncommitted write intent (${record.phase ?? "unknown"}): the process stopped before the post-write check; temp bytes may have leaked`,
+        acknowledged: acknowledgedAt(record),
+      })
+      continue
+    }
+    const kind = typeof record.kind === "string" ? record.kind : ""
+    if (!kind && !record.event) continue
+    if (!includeDiagnostics && DIAGNOSTIC_ANOMALY_KINDS.has(kind)) {
+      // Diagnostic of a documented fallback: listed only on request.
+      continue
+    }
+    const key = anomalyKey(record)
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ ...record, acknowledged: acknowledgedAt(record) })
+  }
+  out.sort((a, b) => String(a.at).localeCompare(String(b.at)))
+  return out
+}
+
+/** Unacknowledged, non-diagnostic write anomalies for a run (or all runs). */
+export function unacknowledgedWriteAnomalies(run, options = {}) {
+  return writeAnomaliesForRun(run, options).filter((r) => r.acknowledged !== true)
+}
+
+/**
+ * Acknowledge the anomalies currently recorded for `run` (or every run when
+ * omitted). Returns the ack record, or null when there was nothing to
+ * acknowledge. The ack is durable (config-dir audit), never a run write.
+ */
+export function acknowledgeWriteAnomalies(run) {
+  const pending = unacknowledgedWriteAnomalies(run)
+  if (!pending.length) return null
+  const through = pending.reduce((max, r) => (String(r.at) > max ? String(r.at) : max), "")
+  const record = {
+    at: new Date().toISOString(),
+    event: "anomaly_ack",
+    run: typeof run === "string" ? resolve(run) : null,
+    through,
+    note: `operator acknowledged ${pending.length} write anomaly(ies)`,
+  }
+  persistWriteAnomaly(record)
+  return record
+}
+
 export function recordWriteAnomaly(entry) {
   const record = { at: new Date().toISOString(), ...entry }
   writeAnomalies.push(record)
   if (writeAnomalies.length > MAX_WRITE_ANOMALIES) {
     writeAnomalies.splice(0, writeAnomalies.length - MAX_WRITE_ANOMALIES)
   }
+  // Policy and lock anomalies must be visible even when the run itself is not
+  // writable: stderr plus the config-dir audit, never events.jsonl.
+  if (record.kind === "containment-mode" || record.kind === "detective-lock") {
+    try {
+      process.stderr.write(
+        `[teamwork] write anomaly ${sanitize(record.kind)}: ${sanitize(record.detail ?? record.name ?? "")}\n`,
+      )
+    } catch {}
+  }
+  persistWriteAnomaly(record)
   try {
     writeAuditSink?.(record)
   } catch {
@@ -705,6 +1057,10 @@ function writeAllSync(fd, buffer) {
 function toBuffer(content) {
   if (Buffer.isBuffer(content)) return content
   return Buffer.from(String(content ?? ""), "utf8")
+}
+
+function sha256Bytes(buffer) {
+  return createHash("sha256").update(buffer).digest("hex")
 }
 
 let identityUnavailableForTest = false
@@ -1377,6 +1733,7 @@ function detectiveTarget(run, relPath, options = {}) {
   }
   // Pre-check every existing component is not a symlink (detective; not atomic).
   let cur = runRoot
+  let brokeAtMissing = null
   for (let i = 0; i < segments.length - 1; i++) {
     cur = resolve(cur, segments[i])
     try {
@@ -1384,7 +1741,10 @@ function detectiveTarget(run, relPath, options = {}) {
       if (st.isSymbolicLink()) throw refusalError("symlink", `refused: "${sanitize(segments[i])}" is a symlink`)
       if (!st.isDirectory()) throw refusalError("directory", `refused: "${sanitize(segments[i])}" is not a directory`)
     } catch (err) {
-      if (err?.code === "ENOENT") break
+      if (err?.code === "ENOENT") {
+        brokeAtMissing = segments[i]
+        break
+      }
       throw err
     }
   }
@@ -1399,6 +1759,21 @@ function detectiveTarget(run, relPath, options = {}) {
     throw refusalError("postcheck", "refused: the target parent cannot be resolved")
   }
   if (dirReal !== runReal && !isPathWithin(runReal, dirReal)) {
+    // The per-segment walk stops at the first missing component, so a later
+    // component that is (or resolves through) a symlink is invisible to the
+    // walk. The realpath containment refusal is the pre-create evidence for
+    // that shape and is recorded, never silent.
+    recordWriteAnomaly({
+      kind: brokeAtMissing ? "detective-precreate" : "detective-containment",
+      run: run ?? null,
+      name: segments[segments.length - 1],
+      phase: "pre-create",
+      detail: brokeAtMissing
+        ? `the walk stopped at missing component "${sanitize(brokeAtMissing)}" and the target parent now resolves to "${sanitize(
+            dirReal,
+          )}", outside the run realpath`
+        : `the target parent resolves to "${sanitize(dirReal)}", outside the run realpath`,
+    })
     throw refusalError("containment", "refused: target parent is outside the run realpath")
   }
   const ancestors = pinAncestorIdentities(runRoot, runReal, dest, run)
@@ -1428,6 +1803,22 @@ function detectivePostCheck(target, recorded) {
       })
       throw refusalError("identity", `refused: "${sanitize(target.name)}" failed the post-write identity check`)
     }
+    // (dev, ino) is a hint, not a byte guarantee: a same-inode overwrite keeps
+    // the inode and changes the bytes. Re-hash the destination, bounded by the
+    // exact byte count that was written. A short read, an oversize read, or a
+    // digest mismatch is an identity refusal.
+    if (typeof recorded.sha256 === "string" && Number.isFinite(recorded.bytes)) {
+      const reread = readRegularBounded(target.dest, recorded.bytes)
+      if (reread.status !== "ok" || sha256Bytes(reread.bytes ?? Buffer.from(reread.text, "utf8")) !== recorded.sha256) {
+        recordWriteAnomaly({
+          kind: "detective-identity",
+          run: target.run ?? null,
+          name: target.name,
+          detail: "post-write bytes do not match the bytes that were written (same inode, different content)",
+        })
+        throw refusalError("identity", `refused: "${sanitize(target.name)}" failed the post-write byte-identity check`)
+      }
+    }
   } catch (err) {
     if (err?.code === "EREFUSED") throw err
     recordWriteAnomaly({
@@ -1443,37 +1834,96 @@ function detectivePostCheck(target, recorded) {
 function writeFileAtomicDetective(run, relPath, content, options) {
   const target = detectiveTarget(run, relPath)
   const data = toBuffer(content)
+  const intendedSha256 = sha256Bytes(data)
   const temp = `${target.dest}.${randomBytes(9).toString("hex")}.tmp`
   let fd = null
   let recorded = null
+  // `phase` names where the operation failed. A raw ENOENT from a swapped
+  // parent is still a containment event, not an ordinary missing file.
+  let phase = "pre-create"
+  let bytesWritten = 0
+  let renamed = false
+  let failed = null
+  let intent = null
   try {
     if (typeof options.afterTarget === "function") {
       options.afterTarget({ dest: target.dest, tempPath: temp, run: target.run })
     }
     verifyAncestorIdentities(target, "pre-create")
+    phase = "temp-create"
     fd = openSync(temp, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600)
+    phase = "temp-write"
     writeAllSync(fd, data)
+    bytesWritten = data.length
     const st = fstatSync(fd)
     if (!st.isFile()) throw refusalError("not-regular", `refused: temp inode for "${target.name}" is not a regular file`)
-    recorded = { dev: st.dev, ino: st.ino }
+    recorded = { dev: st.dev, ino: st.ino, size: st.size, bytes: data.length, sha256: intendedSha256 }
     if (options.durable !== false) fsyncSync(fd)
     closeSync(fd)
     fd = null
     if (typeof options.afterTemp === "function") {
       options.afterTemp({ dest: target.dest, tempPath: temp, run: target.run })
     }
+    phase = "pre-rename"
+    // Evidence that this write existed at all: if the process is killed after
+    // the rename but before the post-check, the durable intent has no commit
+    // and readers surface it as needs-inspection.
+    intent = beginDetectiveWriteIntent({
+      run: target.run ?? null,
+      name: target.name,
+      tempPath: temp,
+      intendedSha256,
+      bytesWritten,
+      phase,
+    })
     verifyAncestorIdentities(target, "pre-rename")
+    phase = "rename"
     renameSync(temp, target.dest)
+    renamed = true
     if (typeof options.afterRename === "function") {
       options.afterRename({ dirFd: null, tempName: temp, destName: target.name, destPath: target.dest })
     }
+    phase = "post-check"
     detectivePostCheck(target, recorded)
+    completeDetectiveWriteIntent(intent)
     return { status: "ok", bytes: data.length, name: target.name, path: target.dest }
   } catch (err) {
-    try {
-      unlinkSync(temp)
-    } catch {}
-    throw err
+    failed = err
+    // Our own policy refusals are already recorded and must pass through
+    // unchanged. A filesystem error here (ENOENT/EACCES/ENOTDIR/...) means the
+    // path moved under the writer after the pin: record the temp bytes as a
+    // possible leak and refuse by name instead of surfacing a bare ENOENT.
+    if (err?.code !== "EREFUSED") {
+      let destRealAfter = null
+      try {
+        destRealAfter = realpathSync(dirname(target.dest))
+      } catch {}
+      recordWriteAnomaly({
+        kind: "detective-temp",
+        run: target.run ?? null,
+        name: target.name,
+        phase,
+        tempPath: temp,
+        destRealAfter,
+        bytesWritten,
+        intendedSha256,
+        detail: `${phase}: ${sanitize(err?.code || err?.message)} after the target was pinned; the temp bytes may have leaked`,
+      })
+      failed = refusalError(
+        "postcheck",
+        `refused: "${sanitize(target.name)}" could not be written atomically (${phase}: ${sanitize(
+          err?.code || err?.message,
+        )}); the write is not trusted and nothing is reported as written`,
+      )
+    }
+    // Only a temp that was not renamed over the destination may be unlinked. A
+    // containment refusal must never remove a path after the fact.
+    if (!renamed) {
+      try {
+        unlinkSync(temp)
+      } catch {}
+    }
+    throw failed
   } finally {
     if (fd !== null) {
       try {
@@ -1497,7 +1947,7 @@ function writeOnceDetective(run, relPath, content, options) {
     writeAllSync(fd, data)
     const st = fstatSync(fd)
     if (!st.isFile()) throw refusalError("not-regular", `refused: "${target.name}" is not a regular file`)
-    recorded = { dev: st.dev, ino: st.ino }
+    recorded = { dev: st.dev, ino: st.ino, size: st.size, bytes: data.length, sha256: sha256Bytes(data) }
     if (options.durable !== false) fsyncSync(fd)
     closeSync(fd)
     fd = null
