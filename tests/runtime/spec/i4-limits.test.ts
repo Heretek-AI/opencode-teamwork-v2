@@ -4,15 +4,16 @@
 // engine refuses another round and blocks the task, `next` reports DEADLOCK,
 // the run records PRESENT_PARTIAL, and nothing outside the run is written.
 //
-// I4b (budget exhaustion mid-run) is skipped: the plugin records `budgetUsd`
-// and `teamwork_cost` reports `shouldHalt` at the threshold, but no
-// non-tournament tool consumes that signal, so a standard run does not block or
-// enter PRESENT_PARTIAL when the budget is exhausted. Tests must not assert a
-// cap the engine does not enforce; FINDINGS.md records the observation and the
-// exact transcript.
+// I4b records spend at 1000% of the plan budget. The budget is advisory outside
+// the massive-proof tournament (README/ARTIFACTS): `teamwork_cost` warns and
+// returns `shouldHalt`, but `teamwork_next` still dispatches and `task_update`
+// still starts a round. Only `teamwork_tournament`/`next`'s tournament branch
+// enforce the threshold. The spec asserts that documented behaviour rather than
+// a cap the engine does not apply.
 
 import { expect, test } from "bun:test"
-import { readState, snapshotTree, treeDiff, withRun } from "../harness/plan"
+import { readFileSync, writeFileSync } from "node:fs"
+import { readState, runFile, snapshotTree, treeDiff, withRun } from "../harness/plan"
 import { call, next, readFinal, state, transition } from "../harness/flow"
 import { execute } from "../harness/run"
 
@@ -86,10 +87,79 @@ test("I4a maxRounds exhaustion blocks the task, reports DEADLOCK, and writes onl
   )
 })
 
-test.skip("I4b budgetUsd exhaustion halts a standard run mid-run (plugin defect: budget is advisory outside tournaments)", () => {
-  // Reproduced by hand on 0.17.1: plan with budgetUsd: 0.5, record $5 of manual
-  // spend through teamwork_cost (`shouldHalt: true`, pct 1000), then call
-  // teamwork_next. The task is still dispatched (no BUDGET/BLOCKED status, no
-  // PRESENT_PARTIAL) because only `teamwork_tournament` consumes the budget
-  // signal. See tests/runtime/FINDINGS.md §4b.
+test("I4b budgetUsd is advisory outside the massive-proof tournament", async () => {
+  await withRun(
+    "i4b-budget-advisory",
+    {
+      sessionId: "20261124-000000-i4b",
+      request: "Dispatch a task after the advisory budget threshold is reached.",
+      requireHandoffs: "skip",
+      budgetUsd: 0.5,
+      tasks: [{ id: "T1" }],
+    },
+    async (fx) => {
+      // Seed an over-budget record. `byTask` is the accounting source: the real
+      // cost tool recomputes `spentUsd` from the buckets, so the seeded spend
+      // survives a real `teamwork_cost` read.
+      const costsFile = runFile(fx.project, fx.runId, "costs.json")
+      const costs = JSON.parse(readFileSync(costsFile, "utf8"))
+      writeFileSync(
+        costsFile,
+        JSON.stringify({ ...costs, budgetUsd: 0.5, spentUsd: 5, byTask: { _unattributed: 5 } }, null, 2) + "\n",
+      )
+
+      const cost = await call(fx, fx.root, "cost", {})
+      expect(cost.content).toContain("Budget: $0.5")
+      expect(cost.content).toContain("1000%")
+      expect(cost.content).toContain("advisory")
+      expect(cost.shouldHalt).toBe(true)
+      expect(cost.pct).toBe(1000)
+      expect(cost.thresholdPct).toBe(80)
+
+      // The standard-run engine does not gate dispatch on that signal.
+      const dispatched = await next(fx)
+      expect(dispatched.status).toBeUndefined()
+      expect(dispatched.content).toContain("READY FOR WORKER (1)")
+      expect((dispatched.readyForWorker as any[]).map((task) => task.id)).toEqual(["T1"])
+      expect(dispatched.content).not.toContain("BUDGET")
+      expect(state(fx).phase).toBe("DISPATCH")
+      expect(readState(fx.project, fx.runId).tasks.T1.status).toBe("pending")
+
+      // `task_update` still starts the round; the budget is not a transition gate.
+      const started = await transition(fx, "T1", "worker_active")
+      expect(started.content).toContain("status=worker_active")
+      expect(state(fx).tasks.T1.round).toBe(1)
+
+      // No partial verdict was forced by the budget.
+      expect(readFinal(fx)).toBeUndefined()
+      expect(state(fx).phase).not.toBe("PRESENT_PARTIAL")
+    },
+  )
+})
+
+test("I4b2 budgetUsd: 0 is an explicit no-budget run", async () => {
+  await withRun(
+    "i4b2-budget-unlimited",
+    {
+      sessionId: "20261124-000000-i4b2",
+      request: "Dispatch with no budget recorded.",
+      requireHandoffs: "skip",
+      budgetUsd: 0,
+      tasks: [{ id: "T1" }],
+    },
+    async (fx) => {
+      const costsFile = runFile(fx.project, fx.runId, "costs.json")
+      const costs = JSON.parse(readFileSync(costsFile, "utf8"))
+      writeFileSync(costsFile, JSON.stringify({ ...costs, budgetUsd: 0, spentUsd: 99, byTask: { _unattributed: 99 } }, null, 2) + "\n")
+
+      const cost = await call(fx, fx.root, "cost", {})
+      expect(cost.content).toContain("Budget: $0")
+      expect(cost.pct).toBe(0)
+      expect(cost.shouldHalt).toBe(false)
+
+      const dispatched = await next(fx)
+      expect((dispatched.readyForWorker as any[]).map((task) => task.id)).toEqual(["T1"])
+      expect(dispatched.content).not.toContain("BUDGET")
+    },
+  )
 })
