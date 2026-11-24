@@ -6,6 +6,8 @@ Companion documents: [`00-artifact-identity.md`](00-artifact-identity.md) (binar
 
 **Scope.** This document covers dispatch edges only — entry, parent/child, loop, and terminal-verification edges for the six routes — and the artifacts that carry state between nodes. It does not re-derive the command surface (`01-command-contract.md`), the roster and its type bindings (`02-agent-registry.md`), the board/member substrate (`05-coordination-and-artifacts.md`), or model tiers and admin gating (deferred to the planned `06-config-gates-and-model-tiers.md`). Offsets quoted here are evidence pointers into the same artifact, not independent re-measurements.
 
+**Version scope.** Every offset in this document is a **1.5.14** offset (the static axis). The live CLI is now **1.5.16** (SHA-256 `05245f43…430934e785`); **1.5.15** (`7b004d26…41fa2d`) is the historical live axis that produced the 2026-11-23 gate runs. The sentinel prompt this graph is read from is byte-identical across all three (36,482 B, `3e8c347e…`), but its slice start moved 113,241,709 → 113,300,479 → 113,868,721, so these offsets do **not** resolve on a later build without re-anchoring. See [`PROVENANCE.md`](PROVENANCE.md) *version axes*.
+
 ## Confidence Legend
 
 | Label | Meaning |

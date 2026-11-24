@@ -6,6 +6,8 @@ Companion documents: `00-artifact-identity.md` (binary identity, section map), `
 
 **Reconciliation with the materialised source.** This edition is cross-checked against the shipped builtin tree under `/home/john/.gemini/antigravity-cli/builtin` (captured into `assets/builtin/`). Statements taken from it are cited as `path:line` and analysed in `09-swarm-board-and-skills.md`; the binary-offset citations of this document are unchanged. The two evidence kinds are labelled separately: **OBSERVED** with a decimal offset means read from the binary, **OBSERVED — source** with `file:line` means read from the shipped text. Where the binary left the board's storage, ordering or channel semantics `UNKNOWN`, the sidecar that reads those files settles them; the Go struct shapes below remain the **in-memory superset**, and the persisted record is the subset that survives `omitempty` (§2.1).
 
+**Version scope.** Every offset in this document is a **1.5.14** offset (the static axis). The live CLI is now **1.5.16** (SHA-256 `05245f43…430934e785`); **1.5.15** (`7b004d26…41fa2d`) is the historical live axis that produced the 2026-11-23 gate runs. The sentinel prompt is byte-identical across all three, but its slice start moved 113,241,709 → 113,300,479 → 113,868,721, and the builtin tree `.checksum` changed at each step (`f46b8917…` → `930df4a7…` → `3499ad60…`), so the `file:line` citations also belong to the 1.5.14 capture. See [`PROVENANCE.md`](PROVENANCE.md) *version axes*.
+
 ## Confidence Legend
 
 | Label | Meaning |

@@ -1,6 +1,6 @@
 # Live LEMMA Run — the Blocking Pre-flight Gate Observed (`MISSING`)
 
-**Status: OBSERVED — one LEMMA-route attempt reached its blocking pre-flight audit, received the verdict `MISSING`, relayed the prerequisites notice and stopped before any Lean work. The process then hit its 10-minute print ceiling and exited `3`.** Recorded on **2026-11-23** against the installed Antigravity CLI **1.5.15** (binary SHA-256 `7b004d26…41fa2d`, 273,879,752 bytes). [OBSERVED — `agy --version`; the run's server log, `~/.gemini/antigravity-cli/log/cli-20261123_073544.log:3`, `Language server version: 1.5.15`] This is **not** the 1.5.14 build the static documents `00`–`06` and `09` analyse; see [`PROVENANCE.md`](PROVENANCE.md) *live axis vs static axis*. The **control probe** recorded at `12:32:36Z`, three minutes earlier, ran on the previous **1.5.14** binary and is a **cross-version** control, not this run's identity (§8.3). This is the first runtime record in the set of the **LEMMA** route and of the **`teamwork_dependency` gate actually firing**. It is deliberately narrow: **one** run, one verdict, no route agent. It does not exercise the LEMMA pipeline, the `READY` path, or install mode.
+**Status: OBSERVED — one LEMMA-route attempt reached its blocking pre-flight audit, received the verdict `MISSING`, relayed the prerequisites notice and stopped before any Lean work. The process then hit its 10-minute print ceiling and exited `3`.** Recorded on **2026-11-23** against the installed Antigravity CLI **1.5.15** (binary SHA-256 `7b004d26…41fa2d`, 273,879,752 bytes). [OBSERVED — `agy --version`; the run's server log, `~/.gemini/antigravity-cli/log/cli-20261123_073544.log:3`, `Language server version: 1.5.15`] This is **not** the 1.5.14 build the static documents `00`–`06` and `09` analyse; see [`PROVENANCE.md`](PROVENANCE.md) *version axes*. The **control probe** recorded at `12:32:36Z`, three minutes earlier, ran on the previous **1.5.14** binary and is a **cross-version** control, not this run's identity (§8.3). This is the first runtime record in the set of the **LEMMA** route and of the **`teamwork_dependency` gate actually firing**. It is deliberately narrow: **one** run, one verdict, no route agent. It does not exercise the LEMMA pipeline, the `READY` path, or install mode.
 
 The run is the reference sample for five things the corpus previously held only statically:
 
@@ -16,9 +16,9 @@ Confidence labels follow [`PROVENANCE.md`](PROVENANCE.md): **OBSERVED** means re
 
 | Placeholder | Resolves to |
 |---|---|
-| `<capture>` | `/tmp/opencode/re-0.9/` — `lemma.stream.jsonl`, `lemma.err`, `lemma.exit`, `probe.*` |
-| `<state>` | `<appDataDir>/scratch/teamwork/9461e3b4-2958-43d9-80fd-685a850fc4af/.agents/teamwork/` — this run's teamwork state root |
-| `<workspace>` | `/tmp/opencode/re-0.9/lemma-ws/` — the run's working directory (empty when the audit began) |
+| `<capture>` | `/tmp/opencode/re-0.9/` — **LOST** (absent on re-check, 2026-11-24). It held `lemma.stream.jsonl`, `lemma.err`, `lemma.exit`, `probe.*`; the surviving copies are the bundle's `stream-tail.jsonl` and the transcripts and logs cited below |
+| `<state>` | `<appDataDir>/scratch/teamwork/9461e3b4-2958-43d9-80fd-685a850fc4af/.agents/teamwork/` — this run's teamwork state root (survives) |
+| `<workspace>` | `/tmp/opencode/re-0.9/lemma-ws/` — **LOST** with the capture; it was the run's working directory (empty when the audit began). Its only file, `PREREQUISITES.md`, survives redacted in the bundle |
 
 Three transcripts are cited: the **parent** (`<appDataDir>/brain/c9bb22c0-05b0-4674-a348-1c06fdf7ed91/.system_generated/logs/transcript_full.jsonl`, the top-level conversation), the **sentinel** (`<appDataDir>/brain/<coordinator>/.system_generated/logs/transcript_full.jsonl`), and the **auditor** (`<appDataDir>/brain/<auditor>/.system_generated/logs/transcript_full.jsonl`). The redacted evidence bundle is in [`live/2026-11-23-lemma-gate/`](live/2026-11-23-lemma-gate/).
 
@@ -28,9 +28,9 @@ Three transcripts are cited: the **parent** (`<appDataDir>/brain/c9bb22c0-05b0-4
 
 | Field | Value | Label |
 |---|---|---|
-| CLI | `agy` **1.5.15** | OBSERVED — `agy --version` (current install); the run's server log `~/.gemini/antigravity-cli/log/cli-20261123_073544.log:3` reads `Language server version: 1.5.15` |
-| Binary | SHA-256 `7b004d26c3fdea25a7c9d456de4bfaccef4be1e4cc7fd6db628859c5c941fa2d`, 273,879,752 bytes | OBSERVED — `sha256sum /home/john/.local/bin/agy`; `stat -c %s` |
-| Control probe (separate, earlier) | `agy` **1.5.14**, SHA-256 `37873b80…97d8c94` | OBSERVED — `<capture>/probe.meta` lines 2–3, written `2026-11-23T12:32:36Z`. This is a **cross-version** control on the previous binary, **not** the LEMMA run's identity (§8.3) |
+| CLI | `agy` **1.5.15** | OBSERVED at run time — `agy --version` reported 1.5.15 then; the run's server log `~/.gemini/antigravity-cli/log/cli-20261123_073544.log:3` reads `Language server version: 1.5.15`. The installed binary is now **1.5.16**, so `agy --version` today does **not** name this run |
+| Binary | SHA-256 `7b004d26c3fdea25a7c9d456de4bfaccef4be1e4cc7fd6db628859c5c941fa2d`, 273,879,752 bytes | OBSERVED at run time — `sha256sum` / `stat` on `/home/john/.local/bin/agy`. That file has since been replaced; no copy remains to re-hash, so the value is recorded, not re-verified |
+| Control probe (separate, earlier) | `agy` **1.5.14**, SHA-256 `37873b80…97d8c94` | OBSERVED at run time — `<capture>/probe.meta` lines 2–3, written `2026-11-23T12:32:36Z` (the file is lost with the capture). This is a **cross-version** control on the previous binary, **not** the LEMMA run's identity (§8.3) |
 | Host | Linux x86-64 (`fc46` kernel), UTC−05:00 local | OBSERVED — `<capture>/probe.meta` line 4; unchanged across the upgrade, and the run's server log timestamps are UTC−05:00 |
 | Top-level conversation | `c9bb22c0-05b0-4674-a348-1c06fdf7ed91` | OBSERVED — `<capture>/lemma.stream.jsonl` `init`; parent transcript |
 | Top-level model | `gemini-4-argon-medium` | OBSERVED — parent transcript step 1 `model` |
@@ -368,38 +368,39 @@ Do not read the timeout as a failure of the gate, and do not read the gate's `MI
 
 ## 9. Verification
 
-Every quoted artifact is reproduced, redacted, in [`live/2026-11-23-lemma-gate/`](live/2026-11-23-lemma-gate/), with a `MANIFEST.sha256`. To re-check the primary evidence:
+Every quoted artifact is reproduced, redacted, in [`live/2026-11-23-lemma-gate/`](live/2026-11-23-lemma-gate/), with a `MANIFEST.sha256` covering the five evidence files (the prose README is excluded by rule — see that bundle's *Integrity*). **The working capture `/tmp/opencode/re-0.9/` is lost**: it was absent when re-checked on 2026-11-24, so `lemma.err`, `lemma.exit`, the full `lemma.stream.jsonl` and `probe.*` cannot be re-read. What survives is the bundle, the transcripts under `brain/<conv>/.system_generated/logs/`, the server logs, and the 1.5.14 archive. Re-check the primary evidence with (from the repository root):
 
 ```sh
-capture=/tmp/opencode/re-0.9
-state=<appDataDir>/scratch/teamwork/9461e3b4-2958-43d9-80fd-685a850fc4af/.agents/teamwork
-ws=/tmp/opencode/re-0.9/lemma-ws
+bundle=docs/re/antigravity-teamwork/live/2026-11-23-lemma-gate
+state=$HOME/.gemini/antigravity-cli/scratch/teamwork/9461e3b4-2958-43d9-80fd-685a850fc4af/.agents/teamwork
 
-# version identity (the run is 1.5.15; the probe is 1.5.14)
-agy --version                                   # 1.5.15
-sha256sum /home/john/.local/bin/agy             # 7b004d26…41fa2d
-sed -n '3p' ~/.gemini/antigravity-cli/log/cli-20261123_073544.log   # 1.5.15
-sed -n '3p' ~/.gemini/antigravity-cli/log/cli-20261123_073238.log   # 1.5.14 (control probe)
-cat "$capture/probe.meta"                       # 1.5.14 control probe, 12:32:36Z
+# bundle integrity (five evidence files; README excluded by rule)
+(cd "$bundle" && sha256sum -c MANIFEST.sha256)          # all OK
 
-# run outcome
-cat "$capture/lemma.exit"                 # EXIT=3
-cat "$capture/lemma.err"                  # DEADLINE_EXCEEDED / print_timeout / 10m0s
-tail -n 1 "$capture/lemma.stream.jsonl"   # ERROR / individual quota / print_timeout
+# version identity: the RUN is 1.5.15; the INSTALLED binary is now 1.5.16
+sed -n '3p' ~/.gemini/antigravity-cli/log/cli-20261123_073544.log   # 1.5.15 — the run's process
+sed -n '3p' ~/.gemini/antigravity-cli/log/cli-20261123_073238.log   # 1.5.14 — control probe
+agy --version                                                       # 1.5.16 today, NOT the run
+sha256sum /home/john/.local/bin/agy                                 # 05245f43… (1.5.16)
+sha256sum ~/Downloads/cli_linux_x64.tar.gz                          # d5838632… (1.5.14 archive)
+# the run's recorded 1.5.15 hash (7b004d26…41fa2d) has no file on disk to re-hash
+
+# run outcome (the .err/.exit files are lost; the bundle carries the result line)
+cat "$bundle/stream-tail.jsonl"          # ERROR / individual quota / 127h44m31s / print_timeout
 
 # verdict
-sed -n '7,16p' "$state/dependency_preflight/handoff.md"
-sed -n '37,43p' "$state/dependency_preflight/handoff.md"
-cat "$ws/PREREQUISITES.md"
+grep -n 'missing:' "$bundle/handoff.md"
+grep -n 'Verdict:\|Install mode' "$bundle/PREREQUISITES.md"
+grep -n 'MISSING\|Install mode' "$bundle/sentinel-BRIEFING.md"
 
-# what was NOT produced
+# what was NOT produced (state root still on disk)
 find "$state" -type d
-find "$ws" -name '*.lean' -o -name 'problem*'
+find "$state" -name '*.lean' -o -name 'problem*'
 ```
 
-Expected: exit `3`; `DEADLINE_EXCEEDED`; four `missing:` tool lines and three `missing:` input lines; exactly two state subdirectories (`sentinel/`, `dependency_preflight/`); `PREREQUISITES.md` as the workspace's only file; no `*.lean`.
+Expected: five `OK`; three `missing:` input lines and four `missing:` tool lines in the handoff; `Verdict: MISSING` and `Install mode: Not active` in the notice; exactly two state subdirectories (`sentinel/`, `dependency_preflight/`), no `*.lean` anywhere under the state root. The workspace itself was a temporary directory and is gone with the capture; `PREREQUISITES.md` is preserved in the bundle instead.
 
-The auditor's transcript (`<appDataDir>/brain/<auditor>/.system_generated/logs/transcript_full.jsonl`) shows the work order directly: step 1 writes `DISPATCH.md`, `BRIEFING.md` and `progress.md` and lists the workspace; step 9 writes the three empty scratch input files; step 13 runs the inputs check and the CLI lookup; step 16 runs the installer probe; step 18 removes the scratch directory; step 20 writes the workspace notice and the handoff; step 25 sends the verdict.
+The auditor's transcript (`~/.gemini/antigravity-cli/brain/<auditor>/.system_generated/logs/transcript_full.jsonl`) shows the work order directly: step 1 writes `DISPATCH.md`, `BRIEFING.md` and `progress.md` and lists the workspace; step 9 writes the three empty scratch input files; step 13 runs the inputs check and the CLI lookup; step 16 runs the installer probe; step 18 removes the scratch directory; step 20 writes the workspace notice and the handoff; step 25 sends the verdict.
 
 ---
 

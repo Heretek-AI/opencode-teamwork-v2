@@ -25,13 +25,15 @@ The fixture tree was produced by the exact binary analysed in `00-artifact-ident
 - Analysed artifact, re-extracted from the archived tarball to `/tmp/opencode/ver-fix-1.5.14/antigravity`: 273,240,776 bytes; same SHA-256.
 - `cmp` against that 1.5.14 copy exits 0. (The old working path `/tmp/opencode/antigravity-re/antigravity` no longer exists; the archive `~/Downloads/cli_linux_x64.tar.gz` is the durable copy.)
 
-### Version fork (2026-11-23) [OBSERVED]
+### Version fork (2026-11-23, extended 2026-11-24) [OBSERVED]
 
-The installed CLI is now **1.5.15** — `/home/john/.local/bin/agy`, 273,879,752 bytes, SHA-256 `7b004d26c3fdea25a7c9d456de4bfaccef4be1e4cc7fd6db628859c5c941fa2d`. Its materialised builtin tree differs from this capture:
+The installed CLI was **1.5.15** on 2026-11-23 — `/home/john/.local/bin/agy`, 273,879,752 bytes, SHA-256 `7b004d26c3fdea25a7c9d456de4bfaccef4be1e4cc7fd6db628859c5c941fa2d`, since replaced. Its materialised builtin tree differed from this capture:
 
-- `.checksum` is `builtin:930df4a72b3ebb9547221dbd601535185717e8e73bac68ca96713e69832d3aaa` (vs this capture's `builtin:f46b8917…`).
-- Five `plugins/swarm/sidecars/swarm_board/` files differ: `app.js`, `board_cache.mjs`, `hive.js`, `main.mjs`, `README.md`.
-- The live tree has 46 files (vs 24 here) because it includes `keep.txt` and the eleven unrelated skills listed above.
+- `.checksum` was `builtin:930df4a72b3ebb9547221dbd601535185717e8e73bac68ca96713e69832d3aaa` (vs this capture's `builtin:f46b8917…`).
+- Five `plugins/swarm/sidecars/swarm_board/` files differed: `app.js`, `board_cache.mjs`, `hive.js`, `main.mjs`, `README.md`.
+- That tree had 46 files (vs 24 here) because it includes `keep.txt` and the eleven unrelated skills listed above.
+
+On 2026-11-24 the install auto-updated to **1.5.16** (275,067,592 bytes, SHA-256 `05245f43…430934e785`). Its tree's `.checksum` is `builtin:3499ad6076a126f6e771af72116f855fe25dd61709f7fc2565ac0aba63701e4446`, and it has 46 files, 13 of them under `plugins/swarm/sidecars/swarm_board/`. The 1.5.16 tree was **not** diffed against 1.5.15 — that tree is gone — so the changed-file set for the second step is `UNKNOWN`. [OBSERVED — `.checksum`, `find`; diff UNKNOWN]
 
 This directory remains the **1.5.14** capture and is intentionally not re-captured; `09` cites it by `file:line` and those are 1.5.14 line numbers. See [`../live/VERSION-FORK.md`](../live/VERSION-FORK.md).
 

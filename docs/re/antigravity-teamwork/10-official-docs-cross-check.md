@@ -10,6 +10,8 @@
 
 **Disagreement is the finding, not an error.** A DOCS/OBSERVED mismatch means either (a) the docs describe a different (older, newer, or other-surface) build, (b) the docs simplify a mechanism the binary implements in more detail, or (c) the docs describe intent that the shipped build does not enforce. Each verdict below says which, where the evidence supports saying.
 
+**Version scope.** Every binary offset in this document is a **1.5.14** offset (the static axis). The live CLI is now **1.5.16** (SHA-256 `05245f43…430934e785`); **1.5.15** (`7b004d26…41fa2d`) is the historical live axis that produced the 2026-11-23 gate runs. The docs page was read against the static build, and its claims are about product intent; none of them is re-scoped to 1.5.15 or 1.5.16. See [`PROVENANCE.md`](PROVENANCE.md) *version axes*.
+
 **Method.** The docs page was re-fetched on 2026-11-21 and its text compared claim-by-claim against the offsets already established in `00`–`08` of this corpus. Where a docs claim had no counterpart in the corpus, the binary was searched directly for it (`grep -aobF`) and, if found, the surrounding region was dumped and read. Those searches are the source of the four "new" mechanisms in §2 — all four turned out to be **in the binary already**, so none remains DOCS-ONLY. The commands are in *Reproduction*.
 
 **Labels.** `DOCS` — asserted by the documentation page, cited to its section. `OBSERVED` — a byte string at a cited decimal offset, or a prompt statement quoted from it. `INFERRED` — reasoned from stated OBSERVED premises. `UNKNOWN` — not measured. The confidence legend is [`PROVENANCE.md`](PROVENANCE.md)'s.

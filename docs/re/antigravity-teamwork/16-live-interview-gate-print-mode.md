@@ -1,6 +1,6 @@
 # Live Task-Interview Gate in Print Mode — the Interviewer Dispatch and Its Draft
 
-**Status: OBSERVED — two print-mode conversations entered the task-interview gate without `[skip-interview]`. The coordinator (`teamwork`) relayed the preparation notice and spawned `teamwork_interviewer`; one interviewer wrote `interviewer/prompt_draft.md` with seven `[OPEN: …]` gaps. No approval, no `ORIGINAL_REQUEST.md`, no route decision and no orchestrator folder exist in either conversation.** Recorded on **2026-11-23** against the installed Antigravity CLI **1.5.15** (binary SHA-256 `7b004d26…41fa2d`, 273,879,752 bytes). [OBSERVED — `agy --version`; server logs `cli-20261123_104212.log`, `_105147.log`, `_105431.log`, `_110054.log` each read `Language server version: 1.5.15`] This is **not** the 1.5.14 build the static documents analyse; see [`PROVENANCE.md`](PROVENANCE.md) *live axis vs static axis*. The **control probe** at `12:32:36Z` ran on the previous **1.5.14** binary and is cited only as a **cross-version** control. The redacted evidence bundle is [`live/2026-11-23-interview-print/`](live/2026-11-23-interview-print/).
+**Status: OBSERVED — two print-mode conversations entered the task-interview gate without `[skip-interview]`. The coordinator (`teamwork`) relayed the preparation notice and spawned `teamwork_interviewer`; one interviewer wrote `interviewer/prompt_draft.md` with seven `[OPEN: …]` gaps. No approval, no `ORIGINAL_REQUEST.md`, no route decision and no orchestrator folder exist in either conversation.** Recorded on **2026-11-23** against the installed Antigravity CLI **1.5.15** (binary SHA-256 `7b004d26…41fa2d`, 273,879,752 bytes). [OBSERVED — `agy --version`; server logs `cli-20261123_104212.log`, `_105147.log`, `_105431.log`, `_110054.log` each read `Language server version: 1.5.15`] This is **not** the 1.5.14 build the static documents analyse; see [`PROVENANCE.md`](PROVENANCE.md) *version axes*. The **control probe** at `12:32:36Z` ran on the previous **1.5.14** binary and is cited only as a **cross-version** control. The redacted evidence bundle is [`live/2026-11-23-interview-print/`](live/2026-11-23-interview-print/).
 
 This is the first runtime record in the set of the **interview gate itself**. `12`, `13` and `15` all used `[skip-interview]`, so none of them exercised it; `11` inferred the gate's artifact shape from `prompt_draft.md` files in **prior** state roots. What this run adds is the gate's runtime behaviour, not its completion:
 
@@ -16,11 +16,11 @@ Confidence labels follow [`PROVENANCE.md`](PROVENANCE.md): **OBSERVED** is read 
 
 | Placeholder | Resolves to |
 |---|---|
-| `<capture>` | `/tmp/opencode/re-0.9/` — `interview.*`, `interview2.*`, `interview3.*`, `interview4.*`, `probe.*` |
+| `<capture>` | `/tmp/opencode/re-0.9/` — **LOST** (absent on re-check, 2026-11-24). It held `interview.*`, `interview2.*`, `interview3.*`, `interview4.*`, `probe.*`; the surviving copies are the bundle's `stream-tail.jsonl`, `parent-notice.txt` and `sentinel-BRIEFING.md`, plus the transcripts and logs cited below |
 | `<state-default>` | `<appDataDir>/brain/a004d6df-2a76-4a73-87a6-c4832e82cdcf/scratch/.agents/teamwork/` |
 | `<state-flash>` | `<appDataDir>/scratch/teamwork/cf78cfbd-cdcc-453a-a94b-71e2d22d6954/.agents/teamwork/` |
-| `<workspace-default>` | `/tmp/opencode/re-0.9/interview-ws/` |
-| `<workspace-flash>` | `/tmp/opencode/re-0.9/interview-ws2/` |
+| `<workspace-default>` | `/tmp/opencode/re-0.9/interview-ws/` — **LOST** with the capture |
+| `<workspace-flash>` | `/tmp/opencode/re-0.9/interview-ws2/` — **LOST** with the capture |
 
 The transcripts cited are the **parent** (`<appDataDir>/brain/<top-level>/.system_generated/logs/transcript.jsonl`), the **coordinator** (`…/brain/<coordinator>/…`), and the **interviewer** (`…/brain/<interviewer>/…`). The full ids are listed in §1 and quoted in the text; the bundle substitutes them.
 
@@ -30,9 +30,9 @@ The transcripts cited are the **parent** (`<appDataDir>/brain/<top-level>/.syste
 
 | Field | Default-model run | flash-low run | Label |
 |---|---|---|---|
-| CLI | `agy` **1.5.15** | same | OBSERVED — `agy --version`; server logs `cli-20261123_104212.log:3`, `_105147.log:3`, `_105431.log:3`, `_110054.log:3` = `Language server version: 1.5.15` |
-| Binary | `7b004d26…41fa2d` (273,879,752 B) | same | OBSERVED — `sha256sum` / `stat` on `/home/john/.local/bin/agy` |
-| Control probe (separate, earlier) | `agy` **1.5.14**, `37873b80…97d8c94` | — | OBSERVED — `<capture>/probe.meta`; **cross-version control**, not these runs' identity (§8.2) |
+| CLI | `agy` **1.5.15** | same | OBSERVED at run time — `agy --version` reported 1.5.15 then; server logs `cli-20261123_104212.log:3`, `_105147.log:3`, `_105431.log:3`, `_110054.log:3` = `Language server version: 1.5.15`. The installed binary is now **1.5.16**, so `agy --version` today does **not** name these runs |
+| Binary | `7b004d26…41fa2d` (273,879,752 B) | same | OBSERVED at run time — `sha256sum` / `stat` on `/home/john/.local/bin/agy`; the file has since been replaced and no copy remains to re-hash |
+| Control probe (separate, earlier) | `agy` **1.5.14**, `37873b80…97d8c94` | — | OBSERVED at run time — `<capture>/probe.meta` (lost with the capture); **cross-version control**, not these runs' identity (§8.2) |
 | Host | Linux x86-64, UTC−05:00 local | same | OBSERVED — `<capture>/probe.meta` line 4; server-log timestamps are UTC−05:00 |
 | Top-level conversation | `84b1064f-61b5-4c8b-8561-a4f037299bb2` | `62ca5ebf-e58b-459b-b264-ac48451582dd` | OBSERVED — `<capture>/interview*.stream.jsonl` `init` |
 | Top-level model | `gemini-4-argon-medium` | `gemini-4-neon-high` (selected as `gemini-3.8-flash-low`) | OBSERVED — parent transcripts step 1/3/5 `model`; log alias line quoted in §8.2 |
@@ -453,41 +453,45 @@ The most important limit: **this is a gate-entry observation.** It shows the gat
 
 ## 10. Verification
 
-Every quoted artifact is reproduced, redacted, in [`live/2026-11-23-interview-print/`](live/2026-11-23-interview-print/), with a `MANIFEST.sha256`. To re-check the primary evidence:
+Every quoted artifact is reproduced, redacted, in [`live/2026-11-23-interview-print/`](live/2026-11-23-interview-print/), with a `MANIFEST.sha256` covering the four evidence files (the prose README is excluded by rule — see that bundle's *Integrity*). **The working capture `/tmp/opencode/re-0.9/` is lost**: it was absent when re-checked on 2026-11-24, so `interview*.stream.jsonl`, `interview*.err`, `interview.exit` and `probe.*` cannot be re-read. What survives is the bundle, the transcripts under `brain/<conv>/.system_generated/logs/`, the server logs and the state roots. Re-check with (from the repository root):
 
 ```sh
-capture=/tmp/opencode/re-0.9
-state_default=<appDataDir>/brain/a004d6df-2a76-4a73-87a6-c4832e82cdcf/scratch/.agents/teamwork
-state_flash=<appDataDir>/scratch/teamwork/cf78cfbd-cdcc-453a-a94b-71e2d22d6954/.agents/teamwork
+bundle=docs/re/antigravity-teamwork/live/2026-11-23-interview-print
+state_default=$HOME/.gemini/antigravity-cli/brain/a004d6df-2a76-4a73-87a6-c4832e82cdcf/scratch/.agents/teamwork
+state_flash=$HOME/.gemini/antigravity-cli/scratch/teamwork/cf78cfbd-cdcc-453a-a94b-71e2d22d6954/.agents/teamwork
+interviewer=$HOME/.gemini/antigravity-cli/brain/f5245580-b4bd-444e-969b-12d767a7eb6f/.system_generated/logs/transcript_full.jsonl
 
-# version identity (both runs 1.5.15; the probe is 1.5.14)
-agy --version                                                     # 1.5.15
-sha256sum /home/john/.local/bin/agy                               # 7b004d26…41fa2d
+# bundle integrity (four evidence files; README excluded by rule)
+(cd "$bundle" && sha256sum -c MANIFEST.sha256)          # all OK
+
+# version identity: both RUNS are 1.5.15; the INSTALLED binary is now 1.5.16
 for f in cli-20261123_104212.log cli-20261123_105147.log \
          cli-20261123_105431.log cli-20261123_110054.log; do
-  sed -n '3p' ~/.gemini/antigravity-cli/log/$f; done              # all 1.5.15
-cat "$capture/probe.meta"                                         # 1.5.14 control probe
+  sed -n '3p' ~/.gemini/antigravity-cli/log/$f; done              # all 1.5.15 — the runs' processes
+agy --version                                                     # 1.5.16 today, NOT these runs
+sha256sum /home/john/.local/bin/agy                               # 05245f43… (1.5.16)
+sha256sum ~/Downloads/cli_linux_x64.tar.gz                        # d5838632… (1.5.14 archive)
+# the runs' recorded 1.5.15 hash (7b004d26…41fa2d) has no file on disk to re-hash
 
 # gate entry and blocking
-grep -o '\[OPEN:' "$state_flash/interviewer/prompt_draft.md" | wc -l   # 7
+grep -o '\[OPEN:' "$bundle/prompt_draft.md" | wc -l                   # 7 occurrences
+grep -n '\[OPEN:' "$bundle/prompt_draft.md" | wc -l                   # 6 lines (line 1 has two)
 find "$state_default" "$state_flash" -name 'ORIGINAL_REQUEST.md' -o -name 'PROJECT.md' -o -name 'GATE_STATUS.md'
 find "$state_default" -type d; find "$state_flash" -type d
-wc -c "$state_flash/interviewer/prompt_draft.md"                     # 1206
+wc -c "$bundle/prompt_draft.md"                                       # 1189 (1206 before redaction)
 
 # the caller notice and the pause
-grep -n 'Teamwork run is being prepared' <parent transcripts>
-grep -n 'stopped due to server restart' <parent transcripts>
+grep -n 'Teamwork run is being prepared' "$bundle/parent-notice.txt"
+grep -n 'stopped due to server restart' "$bundle/parent-notice.txt"
 
-# the two outcomes
-tail -n 1 "$capture/interview2.stream.jsonl"   # ERROR / individual quota / 124h28m56s
-tail -n 1 "$capture/interview4.stream.jsonl"   # ERROR / print_timeout
-cat "$capture/interview4.err"                  # 6m0s
-cat "$capture/interview.exit"                  # EXIT=0
+# the two outcomes (the .err/.exit files are lost; the bundle carries the result lines)
+cat "$bundle/stream-tail.jsonl"        # 124h28m56s quota ERROR and print_timeout ERROR
+
+# the work order
+grep -n '"step_index"\|write_file\|ls -la\|read_file' "$interviewer" | head
 ```
 
-Expected: seven `[OPEN:` occurrences; no request/project/gate file; two state directories per root; 1,206 bytes; the notice in both parents; the restart notice in both; a quota `ERROR` then a `print_timeout` `ERROR`.
-
-The interviewer transcript (`<appDataDir>/brain/f5245580-b4bd-444e-969b-12d767a7eb6f/.system_generated/logs/transcript.jsonl`) shows the work order directly: step 2 `read_file` on a missing draft, step 4 `ls -la` on the empty workspace, step 6 `write_file`. The default interviewer's transcript has one step and no planner turn.
+Expected: four `OK`; seven `[OPEN:` occurrences on six lines; no request/project/gate file; two state directories per root; 1,189 bytes redacted; the notice and the restart notice in `parent-notice.txt`; a quota `ERROR` and a `print_timeout` `ERROR` in `stream-tail.jsonl`. The interviewer transcript shows the work order directly: step 2 `read_file` on a missing draft, step 4 `ls -la` on the empty workspace, step 6 `write_file`. The default interviewer's transcript has one step and no planner turn.
 
 ---
 
@@ -507,7 +511,7 @@ This record is one of a set of planned runs and is the only one that entered the
 | Run | Status |
 |---|---|
 | Task interview (this document) | **gate entry observed; approval path pending** |
-| Document Review, route L | pending |
+| Document Review (`teamwork_document`) | pending |
 | Config gate (disabled / admin-controlled command) | pending |
 | Native swarm (composition beyond the single 2026-11-22 capture) | pending |
 

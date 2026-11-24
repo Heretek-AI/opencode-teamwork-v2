@@ -2,6 +2,8 @@
 
 This document set records the identity, provenance, and static-analysis findings for the Google Antigravity Linux CLI binary under investigation, focused on the `/teamwork` command. [OBSERVED] All facts were measured by static inspection of the archive and extracted binary. No execution of the target binary was performed for this document. [OBSERVED]
 
+**Version scope.** Every offset in this document is a **1.5.14** offset (the static axis). The live CLI is now **1.5.16** (SHA-256 `05245f43…430934e785`, 275,067,592 bytes); **1.5.15** (`7b004d26…41fa2d`, 273,879,752 bytes) is the historical live axis that produced the 2026-11-23 gate runs. The sentinel prompt is byte-identical across all three, but its slice start moved 113,241,709 → 113,300,479 → 113,868,721, and the builtin tree `.checksum` changed at each step. These offsets do **not** resolve on either later build without re-anchoring. See [`PROVENANCE.md`](PROVENANCE.md) *version axes* and [`live/VERSION-FORK.md`](live/VERSION-FORK.md).
+
 ## Chain of Custody [OBSERVED]
 
 | Stage | Path | Size (bytes) | SHA-256 |
