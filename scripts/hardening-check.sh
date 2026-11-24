@@ -26,6 +26,7 @@ APPROVER_USER=teamwork-approver
 KEY_DIR=/var/lib/teamwork-signer/keys
 KEY_FILE=
 APPROVAL_DIR=/var/lib/teamwork-approvals
+SIGNER_APPROVAL_DIR=/var/lib/teamwork-approvals/signer
 SIGNER_PATH=/usr/local/libexec/teamwork/signer
 PUBLIC_KEY=/etc/teamwork/signer-ed25519.pub
 SOCKET_PATH=/run/teamwork-signer/sign.sock
@@ -45,6 +46,8 @@ Options:
   --key-dir PATH          Signer key directory (default: /var/lib/teamwork-signer/keys)
   --key-file PATH         Signer private key (default: <key-dir>/signer.pem)
   --approval-dir PATH     External approval directory (default: /var/lib/teamwork-approvals)
+  --signer-approval-dir PATH
+                          Signer approval directory (default: /var/lib/teamwork-approvals/signer)
   --signer PATH           Root-owned signer executable (default: /usr/local/libexec/teamwork/signer)
   --public-key PATH       Verify-only signer public key (default: /etc/teamwork/signer-ed25519.pub)
   --socket PATH           Signer Unix socket (default: /run/teamwork-signer/sign.sock)
@@ -64,6 +67,7 @@ Checks and their exact read probes:
   key_dir                 stat -c '%u %g %a %F' <key-dir>
   key_file                stat -c '%u %g %a %F' <key-file>
   approval_dir            stat -c '%u %g %a %F' <approval-dir>
+  signer_approval_dir     stat -c '%u %g %a %F' <signer-approval-dir>
   public_key              stat -c '%u %g %a %F' <public-key>
   signer_code             stat on <signer> and each parent directory
   signer_service          systemctl show hardening directives on <service-unit>
@@ -72,6 +76,8 @@ Checks and their exact read probes:
   selinux_contexts        stat -c '%C' on the key, approval, signer and socket paths
   agent_key_read          sudo -n -u <agent-user> test -r <key-dir>
   agent_approval_write    sudo -n -u <agent-user> test -w <approval-dir>
+  agent_signer_approval_read
+                          sudo -n -u <agent-user> test -r <signer-approval-dir> (must fail)
   agent_signer_write      sudo -n -u <agent-user> test -w <signer>
 
 Exit status: 0 when no FAIL (UNKNOWN is reported but is not a pass);
@@ -90,6 +96,7 @@ while [ "$#" -gt 0 ]; do
     --key-dir) KEY_DIR=${2:?--key-dir needs a value}; shift 2 ;;
     --key-file) KEY_FILE=${2:?--key-file needs a value}; shift 2 ;;
     --approval-dir) APPROVAL_DIR=${2:?--approval-dir needs a value}; shift 2 ;;
+    --signer-approval-dir) SIGNER_APPROVAL_DIR=${2:?--signer-approval-dir needs a value}; shift 2 ;;
     --signer) SIGNER_PATH=${2:?--signer needs a value}; shift 2 ;;
     --public-key) PUBLIC_KEY=${2:?--public-key needs a value}; shift 2 ;;
     --socket) SOCKET_PATH=${2:?--socket needs a value}; shift 2 ;;
@@ -396,6 +403,48 @@ check_approval_dir() {
   emit PASS approval_dir "mode $(printf '%04o' "$_mode"), owner uid $_uid differs from the workload" "stat -c '%u %g %a %F' $APPROVAL_DIR"
 }
 
+check_signer_approval_dir() {
+  if ! have stat; then
+    emit UNKNOWN signer_approval_dir "stat is unavailable" "stat -c '%u %g %a %F' $SIGNER_APPROVAL_DIR"
+    return
+  fi
+  _info=$(stat_info "$SIGNER_APPROVAL_DIR") || {
+    emit UNKNOWN signer_approval_dir "$SIGNER_APPROVAL_DIR does not exist or cannot be stat'ed" "stat -c '%u %g %a %F' $SIGNER_APPROVAL_DIR"
+    return
+  }
+  # shellcheck disable=SC2086
+  set -- $_info
+  _uid=$1 _gid=$2 _mode=$3 _type=$4
+  case "$_type" in
+    Directory) _type=directory ;;
+    "Symbolic Link") _type=symlink ;;
+  esac
+  if [ "$_type" != directory ]; then
+    emit FAIL signer_approval_dir "$SIGNER_APPROVAL_DIR is not a real directory ($_type)" "stat -c '%u %g %a %F' $SIGNER_APPROVAL_DIR"
+    return
+  fi
+  _mode=$((0$_mode))
+  if [ $((_mode & 0007)) -ne 0 ]; then
+    emit FAIL signer_approval_dir "mode $(printf '%04o' "$_mode") grants other access; the workload must not read signer approvals" "stat -c '%u %g %a %F' $SIGNER_APPROVAL_DIR"
+    return
+  fi
+  if [ $((_mode & 0022)) -ne 0 ]; then
+    emit FAIL signer_approval_dir "mode $(printf '%04o' "$_mode") is group/other writable" "stat -c '%u %g %a %F' $SIGNER_APPROVAL_DIR"
+    return
+  fi
+  _agent_uid=$(uid_of "$AGENT_USER")
+  if [ -n "$_agent_uid" ] && [ "$_uid" = "$_agent_uid" ]; then
+    emit FAIL signer_approval_dir "owned by the workload uid $_uid; signer approvals must come from a different principal" "stat -c '%u %g %a %F' $SIGNER_APPROVAL_DIR"
+    return
+  fi
+  _approver_uid=$(uid_of "$APPROVER_USER")
+  if [ -n "$_approver_uid" ] && [ "$_uid" != "$_approver_uid" ]; then
+    emit UNKNOWN signer_approval_dir "owner uid $_uid is not $APPROVER_USER (uid $_approver_uid) but is not the workload" "stat -c '%u %g %a %F' $SIGNER_APPROVAL_DIR"
+    return
+  fi
+  emit PASS signer_approval_dir "mode $(printf '%04o' "$_mode"), owner uid $_uid differs from the workload; layout is <dir>/<runId>/<sha256(path)>.json" "stat -c '%u %g %a %F' $SIGNER_APPROVAL_DIR"
+}
+
 check_public_key() {
   if ! have stat; then
     emit UNKNOWN public_key "stat is unavailable" "stat -c '%u %g %a %F' $PUBLIC_KEY"
@@ -675,6 +724,26 @@ check_agent_approval_write() {
   fi
 }
 
+check_agent_signer_approval_read() {
+  if ! user_exists "$AGENT_USER"; then
+    emit UNKNOWN agent_signer_approval_read "user $AGENT_USER not found" "sudo -n -u $AGENT_USER test -r $SIGNER_APPROVAL_DIR"
+    return
+  fi
+  if [ "$USE_SUDO" -eq 0 ]; then
+    emit UNKNOWN agent_signer_approval_read "not run; pass --sudo for the read-only sudo probe" "sudo -n -u $AGENT_USER test -r $SIGNER_APPROVAL_DIR"
+    return
+  fi
+  if ! sudo_ready; then
+    emit UNKNOWN agent_signer_approval_read "sudo -n -u $AGENT_USER test -d / failed; no usable NOPASSWD test probe" "sudo -n -u $AGENT_USER test -r $SIGNER_APPROVAL_DIR"
+    return
+  fi
+  if sudo -n -u "$AGENT_USER" test -r "$SIGNER_APPROVAL_DIR" 2>/dev/null; then
+    emit FAIL agent_signer_approval_read "workload user can read $SIGNER_APPROVAL_DIR; signer approvals are policy input for the signer only" "sudo -n -u $AGENT_USER test -r $SIGNER_APPROVAL_DIR"
+  else
+    emit PASS agent_signer_approval_read "workload user cannot read $SIGNER_APPROVAL_DIR (test -r false; absence/inaccessibility is not distinguished)" "sudo -n -u $AGENT_USER test -r $SIGNER_APPROVAL_DIR"
+  fi
+}
+
 check_agent_signer_write() {
   if ! user_exists "$AGENT_USER"; then
     emit UNKNOWN agent_signer_write "user $AGENT_USER not found" "sudo -n -u $AGENT_USER test -w $SIGNER_PATH"
@@ -717,6 +786,7 @@ check_auditd
 check_key_dir
 check_key_file
 check_approval_dir
+check_signer_approval_dir
 check_public_key
 check_signer_code
 check_signer_service
@@ -725,6 +795,7 @@ check_selinux
 check_selinux_contexts
 check_agent_key_read
 check_agent_approval_write
+check_agent_signer_approval_read
 check_agent_signer_write
 
 if [ "$JSON" -eq 1 ]; then
