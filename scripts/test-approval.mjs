@@ -389,8 +389,12 @@ try {
       assert.strictEqual(signed.status, 0, `${signed.stdout}${signed.stderr}`)
       const approvalFile = join(approvalsDir, `${runId}.json`)
       assert(existsSync(approvalFile), "the approval must be written outside the run")
-      const mode = statSync(approvalFile).mode & 0o777
-      assert.strictEqual(mode, 0o600, `the approval must be 0600 (got ${mode.toString(8)})`)
+      if (process.platform === "win32") {
+        console.log("SKIP: win32 does not report POSIX file modes; the 0600 approval assertion is recorded")
+      } else {
+        const mode = statSync(approvalFile).mode & 0o777
+        assert.strictEqual(mode, 0o600, `the approval must be 0600 (got ${mode.toString(8)})`)
+      }
       assert(!existsSync(runFile(root, runId, "approvals")), "no approval may be written inside the run")
 
       // Turn 3: only now can the sentinel plan.
