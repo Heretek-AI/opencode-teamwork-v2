@@ -8,7 +8,7 @@ There are **three axes**, and they are never pooled:
 |---|---|---|---:|---|---|---:|---|
 | Static (historical) | 1.5.14 | archived tarball, re-extracted for this pass | 273,240,776 | `37873b8062391b6202a3d3199ec012abc9e53aab720d26cd65699441497d8c94` | 113,241,709 | 113,265,667 | `00`–`06`, `09`, `prompts/`; runtime `07` (2026-11-21), `12`/`13` (2026-11-22) |
 | Previous live (historical) | 1.5.15 | not on disk in this pass; recorded from the 2026-11-23 runs | 273,879,752 | `7b004d26c3fdea25a7c9d456de4bfaccef4be1e4cc7fd6db628859c5c941fa2d` | 113,300,479 | 113,324,437 | runtime `15` (LEMMA gate), `16` (interview gate), 2026-11-23 |
-| Live | 1.5.16 | `/home/john/.local/bin/agy`, mtime 2026-11-24 14:02:08 −05:00 | 275,067,592 | `05245f4346d16b679fd059a73081af0161607a76b4a164642bd007430934e785` | 113,868,721 | 113,892,679 | `17` — a zero-turn config-gate probe (2026-11-24); **no workflow run** — this axis is the live identity and the target for any new capture |
+| Live | 1.5.16 | `/home/john/.local/bin/agy`, mtime 2026-11-24 14:02:08 −05:00 | 275,067,592 | `05245f4346d16b679fd059a73081af0161607a76b4a164642bd007430934e785` | 113,868,721 | 113,892,679 | `17` — a zero-turn config-gate probe; `18` — a completed Document Review workflow run (both 2026-11-24) |
 
 [OBSERVED — `sha256sum`, `stat`, byte-slice hashing. The 1.5.14 archive is `/home/john/Downloads/cli_linux_x64.tar.gz`, SHA-256 `d5838632…c7b5`, 101,195,950 bytes, re-extracted and hashed in this pass. The 1.5.15 row is reproduced from the 2026-11-23 records: that binary is no longer on disk, and the `.old` copy named in the run notes (`/home/john/.local/bin/agy.1795546924480305380.old`) is absent on 2026-11-24, so its size and hash cannot be re-measured here.]
 
@@ -23,6 +23,7 @@ The version is taken from the CLI's own server log, **not** from `probe.meta`, w
 - 1.5.14 control probe: `~/.gemini/antigravity-cli/log/cli-20261123_073238.log:3` → `Language server version: 1.5.14`; `probe.meta` (12:32:36Z) records `1.5.14`.
 - 1.5.16 host processes: `cli-20261124_142128.log:3` and `cli-20261124_142542.log:3` → `Language server version: 1.5.16`. These are host sessions, **not** a `/teamwork` run.
 - 1.5.16 probe: the four arms of `17` each wrote `server.go:2782 … Language server version: 1.5.16` into the capture's own CLI logs (`T.cli.txt` line 1, and the C1/C2 logs). No model turn was taken, so this binds the version to a process without producing run behaviour.
+- 1.5.16 run: `18` wrote the same version line at `cli-20261124_160951.log:3` for the resumed Document Review run, and the same binary hash above was measured after it. This is the axis's first workflow run; it is one Document Review route on one `.tex` input, not a sample of all routes.
 - `14`'s 2026-11-15/16 prior run: `UNKNOWN` — it predates the earliest surviving server log (`cli-20261117_180830.log`, which reports 1.5.9), so no server-log line survives for it.
 
 [OBSERVED] An earlier draft of `15`/`16` cited `probe.meta` for the run identity; that conflated a 1.5.14 control probe three minutes earlier with the 1.5.15 run. Corrected in both documents.
@@ -55,4 +56,4 @@ When they disagree, the **hash is authoritative for what executed**. A server-lo
 - Whether the changed swarm sidecar behaviour is substantive or cosmetic: the five 1.5.14→1.5.15 files differ, but this pass did not diff their content line by line; the 1.5.16 tree was not compared at all. [UNKNOWN]
 - The 1.5.15 and 1.5.16 build IDs and Go toolchain strings (only the 1.5.14 values were measured). [UNKNOWN]
 - Whether any prompt literal elsewhere (outside the byte-identical 36,482-byte slice) changed wording between versions. The slice was compared; the rest of each binary was not. [UNKNOWN]
-- Anything about `/teamwork` workflow behaviour on 1.5.16: that axis has **no workflow run** in this corpus. Its only execution is `17`'s zero-turn probe, which observes the client-side slash-command expansion and the rejection of one `--settings` key — not a route, gate, dispatch or model turn. [UNKNOWN]
+- `/teamwork` workflow behaviour on 1.5.16 beyond one Document Review run: `18` observes that route's pre-flight, partition, `[4,2,1]`/`[4,1]` trees, no gate table and auditor verdict, but the PDF branch, other routes, and whether the layout recurs are `UNKNOWN`. `17`'s zero-turn probe observes only the client-side slash-command expansion and the rejection of one `--settings` key — not a route, gate, dispatch or model turn. [UNKNOWN]
