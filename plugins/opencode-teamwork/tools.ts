@@ -148,6 +148,18 @@ import {
   type AuthFailure,
 } from "./auth.ts"
 import { contentSha256Hex, isApprovalNonce } from "./approval-format.mjs"
+import {
+  ATTESTATION_PATH,
+  ENV_ATTESTATION_ISSUER,
+  ENV_ATTESTATION_KEY_ID,
+  ENV_ATTESTATION_PUBLIC_KEY,
+  attestationKeyIdFromPublicKey,
+  evaluateAttestation,
+  loadAttestationPublicKey,
+  manifestAttestationPolicy,
+  normalizeAttestationPolicy,
+  attestationPolicyRank,
+} from "./attestation.mjs"
 import type { RequirementsFile, VictoryAuditMode } from "./victory.ts"
 import { readAgentBriefingExcerpt, readBriefingExcerpt, refreshAgentBriefing, refreshRunBriefing } from "./briefing.ts"
 import {
@@ -3943,17 +3955,35 @@ const RUN_MANIFEST = "run.manifest.json"
  *
  * 0.16.0 bumps to version 4: the manifest records `requiredProvenance`
  * (`declared` | `command`). Versions 1–3 keep their meaning (declared).
+ *
+ * 0.18.0 bumps to version 5: the manifest records `attestationPolicy`
+ * (`off` | `optional` | `required`), `attestationKeyId` and
+ * `attestationIssuer` for a signed CI attestation. Versions 1–4 keep their
+ * meaning (`off`).
  */
-const RUN_MANIFEST_VERSION = 4
-const SUPPORTED_RUN_MANIFEST_VERSIONS = [1, 2, 3, 4] as const
+const RUN_MANIFEST_VERSION = 5
+const SUPPORTED_RUN_MANIFEST_VERSIONS = [1, 2, 3, 4, 5] as const
 type RunManifestVersion = (typeof SUPPORTED_RUN_MANIFEST_VERSIONS)[number]
 /** First manifest version that can require re-executable command evidence. */
 const COMMAND_PROVENANCE_MIN_VERSION = 4
+/** First manifest version that records the CI attestation policy. */
+const ATTESTATION_MIN_VERSION = 5
 const PROVENANCE_MODES = ["declared", "command"] as const
 type ProvenanceMode = (typeof PROVENANCE_MODES)[number]
 
+type AttestationPolicyMode = "off" | "optional" | "required"
+
 function normalizeProvenance(value: unknown): ProvenanceMode | undefined {
   return value === "declared" || value === "command" ? value : undefined
+}
+
+function normalizeAttestationMode(value: unknown): AttestationPolicyMode | undefined {
+  return normalizeAttestationPolicy(value) as AttestationPolicyMode | undefined
+}
+
+/** Manifest attestation policy, typed for the engine. */
+function manifestAttestationMode(manifest: RunManifest | undefined): AttestationPolicyMode {
+  return manifestAttestationPolicy(manifest) as AttestationPolicyMode
 }
 
 /** Manifest authority for re-execution: version < 4 is always `declared`. */
@@ -4022,6 +4052,15 @@ type RunManifest = {
    */
   requiredProvenance?: ProvenanceMode
   /**
+   * Version 5+: CI attestation requirement. Absent = `off` for versions 1–4.
+   * A re-plan may upgrade off→optional→required but never downgrade.
+   */
+  attestationPolicy?: AttestationPolicyMode
+  /** Version 5+: expected `_auth.keyId` of the CI attestation. */
+  attestationKeyId?: string | null
+  /** Version 5+: expected `oidc.issuer` of the CI attestation. */
+  attestationIssuer?: string | null
+  /**
    * ADR 0013: the run root `(dev, ino)` at plan time. Additive and optional;
    * a later control-plane write refuses when the root no longer matches.
    */
@@ -4052,6 +4091,19 @@ function planBaselineHash(plan: any): string {
       route: plan?.route ?? null,
       lemmaBounds: plan?.lemmaBounds ?? null,
       ...(plan?.requireSameHost === true ? { requireSameHost: true } : {}),
+      // 0.18.0: bind the CI attestation policy to the plan baseline when it is
+      // asserted. `off` is omitted so a legacy plan hash is unchanged.
+      ...(plan?.attestationPolicy && plan.attestationPolicy !== "off"
+        ? {
+            attestationPolicy: plan.attestationPolicy,
+            ...(typeof plan.attestationKeyId === "string" && plan.attestationKeyId !== ""
+              ? { attestationKeyId: plan.attestationKeyId }
+              : {}),
+            ...(typeof plan.attestationIssuer === "string" && plan.attestationIssuer !== ""
+              ? { attestationIssuer: plan.attestationIssuer }
+              : {}),
+          }
+        : {}),
       tasks: Array.isArray(plan?.tasks) ? plan.tasks : [],
     }),
   )
@@ -4158,6 +4210,12 @@ function manifestDriftReason(drift: string): string {
   }
   if (drift.startsWith("requireHandoffs")) {
     return `[AUTH_STALE] handoff gate downgrade/change refused (${drift})`
+  }
+  if (drift.startsWith("attestationPolicy")) {
+    return `[AUTH_STALE] CI attestation policy downgrade/change refused (${drift})`
+  }
+  if (drift.startsWith("attestationKeyId") || drift.startsWith("attestationIssuer")) {
+    return `[AUTH_STALE] CI attestation identity change refused (${drift})`
   }
   if (drift.startsWith("requiredProvenance")) {
     return `[AUTH_STALE] re-execution requirement downgrade/change refused (${drift})`
@@ -4272,6 +4330,22 @@ function manifestDrift(
   if (baselineProvenance === "command" && currentProvenance !== "command") {
     drift.push(`requiredProvenance downgraded: manifest=command current=${currentProvenance}`)
   }
+  // 0.18.0: the attestation requirement is sticky in the same direction. An
+  // off→optional→required upgrade is allowed; the reverse is drift. Once a key
+  // id or issuer is pinned, changing it is drift too.
+  const baselineAttestation = manifestAttestationMode(manifest)
+  const currentAttestation = normalizeAttestationMode(current.attestationPolicy) ?? "off"
+  if (attestationPolicyRank(currentAttestation) < attestationPolicyRank(baselineAttestation)) {
+    drift.push(`attestationPolicy downgraded: manifest=${baselineAttestation} current=${currentAttestation}`)
+  }
+  if (manifest.attestationKeyId && manifest.attestationKeyId !== (current.attestationKeyId ?? null)) {
+    drift.push(
+      `attestationKeyId drifted (manifest=${manifest.attestationKeyId} current=${current.attestationKeyId ?? "null"})`,
+    )
+  }
+  if (manifest.attestationIssuer && manifest.attestationIssuer !== (current.attestationIssuer ?? null)) {
+    drift.push(`attestationIssuer drifted (manifest pinned, current=${current.attestationIssuer ? "changed" : "null"})`)
+  }
   for (const key of ["requestHash", "requirementsHash", "planHash", "lemmaPolicyHash"] as const) {
     const a = manifest[key]
     const b = current[key]
@@ -4347,6 +4421,15 @@ function currentManifestDrift(manifest: RunManifest, plan: any, state: any, run:
     approvalKeyId: currentApprovalKey,
     handoffAuth: plan?.allowUnsignedLegacy === true || state?.allowUnsignedLegacy === true ? "legacy" : "signed",
     requiredProvenance: manifestProvenance(manifest),
+    attestationPolicy: normalizeAttestationMode(plan?.attestationPolicy ?? state?.attestationPolicy) ?? "off",
+    attestationKeyId:
+      (typeof plan?.attestationKeyId === "string" ? plan.attestationKeyId : undefined) ??
+      (typeof state?.attestationKeyId === "string" ? state.attestationKeyId : undefined) ??
+      null,
+    attestationIssuer:
+      (typeof plan?.attestationIssuer === "string" ? plan.attestationIssuer : undefined) ??
+      (typeof state?.attestationIssuer === "string" ? state.attestationIssuer : undefined) ??
+      null,
     requestHash: originalRequestHash(run),
     requirementsHash: currentRequirementsHash(run),
     planHash: planHashOf(plan),
@@ -5445,6 +5528,72 @@ async function createPlanRun(
   }
   const requiredProvenance: ProvenanceMode =
     persistedProvenance === "command" || input.requiredProvenance === "command" ? "command" : "declared"
+  // 0.18.0: CI attestation policy. Chosen at plan time and sticky: a re-plan
+  // may upgrade off→optional→required, never downgrade. The key id and issuer
+  // are part of the same signed baseline.
+  if (input.attestationPolicy !== undefined && normalizeAttestationMode(input.attestationPolicy) === undefined) {
+    return {
+      ok: false,
+      content: `refused: attestationPolicy must be "off", "optional" or "required" (got "${clean(input.attestationPolicy, 32)}"); nothing was written.`,
+    }
+  }
+  const persistedAttestationPolicy =
+    normalizeAttestationMode(persistedPlan?.attestationPolicy) ?? manifestAttestationMode(existingManifest)
+  const requestedAttestationPolicy = normalizeAttestationMode(input.attestationPolicy)
+  if (
+    requestedAttestationPolicy !== undefined &&
+    attestationPolicyRank(requestedAttestationPolicy) < attestationPolicyRank(persistedAttestationPolicy)
+  ) {
+    return {
+      ok: false,
+      content: `refused: [AUTH_STALE] attestationPolicy is already persisted as "${persistedAttestationPolicy}" for this run and cannot be downgraded by a re-plan; omit it to keep the requirement or start a new session. Nothing was written.`,
+      refused: "AUTH_STALE",
+    }
+  }
+  const attestationPolicy: AttestationPolicyMode =
+    requestedAttestationPolicy !== undefined &&
+    attestationPolicyRank(requestedAttestationPolicy) > attestationPolicyRank(persistedAttestationPolicy)
+      ? requestedAttestationPolicy
+      : persistedAttestationPolicy
+  const requestedAttestationKeyId =
+    input.attestationKeyId === undefined ? undefined : clean(input.attestationKeyId, 128).trim()
+  if (requestedAttestationKeyId !== undefined && requestedAttestationKeyId === "") {
+    return { ok: false, content: "refused: attestationKeyId must be non-empty when supplied; nothing was written." }
+  }
+  const persistedAttestationKeyId = existingManifest?.attestationKeyId ?? null
+  if (
+    persistedAttestationKeyId &&
+    requestedAttestationKeyId !== undefined &&
+    requestedAttestationKeyId !== persistedAttestationKeyId
+  ) {
+    return {
+      ok: false,
+      content: `refused: [AUTH_STALE] attestationKeyId is already pinned as "${persistedAttestationKeyId}" for this run and cannot be changed by a re-plan; omit it to keep the pin or start a new session. Nothing was written.`,
+      refused: "AUTH_STALE",
+    }
+  }
+  const envAttestationKeyId =
+    attestationKeyIdFromPublicKey(process.env[ENV_ATTESTATION_PUBLIC_KEY], process.env[ENV_ATTESTATION_KEY_ID]) ?? null
+  const attestationKeyId = persistedAttestationKeyId ?? requestedAttestationKeyId ?? envAttestationKeyId
+  const requestedAttestationIssuer =
+    input.attestationIssuer === undefined ? undefined : clean(input.attestationIssuer, 512).trim()
+  if (requestedAttestationIssuer !== undefined && requestedAttestationIssuer === "") {
+    return { ok: false, content: "refused: attestationIssuer must be non-empty when supplied; nothing was written." }
+  }
+  const persistedAttestationIssuer = existingManifest?.attestationIssuer ?? null
+  if (
+    persistedAttestationIssuer &&
+    requestedAttestationIssuer !== undefined &&
+    requestedAttestationIssuer !== persistedAttestationIssuer
+  ) {
+    return {
+      ok: false,
+      content: `refused: [AUTH_STALE] attestationIssuer is already pinned for this run and cannot be changed by a re-plan; omit it to keep the pin or start a new session. Nothing was written.`,
+      refused: "AUTH_STALE",
+    }
+  }
+  const attestationIssuer =
+    persistedAttestationIssuer ?? requestedAttestationIssuer ?? (String(process.env[ENV_ATTESTATION_ISSUER] ?? "").trim() || null)
   const rawRoute = typeof input.route === "string" ? clean(input.route, 32).trim().toLowerCase() : ""
   const isLemma = input.lemmaMode === true || rawRoute === "lemma"
   if (input.lemmaMode === true && rawRoute && rawRoute !== "lemma") {
@@ -5813,9 +5962,11 @@ async function createPlanRun(
     }
   }
   const manifestVersion =
-    requiredProvenance === "command" && manifestVersionBase < COMMAND_PROVENANCE_MIN_VERSION
-      ? COMMAND_PROVENANCE_MIN_VERSION
-      : manifestVersionBase
+    attestationPolicy !== "off"
+      ? Math.max(manifestVersionBase, ATTESTATION_MIN_VERSION)
+      : requiredProvenance === "command" && manifestVersionBase < COMMAND_PROVENANCE_MIN_VERSION
+        ? COMMAND_PROVENANCE_MIN_VERSION
+        : manifestVersionBase
   const approvalPrereq = checkApprovalPrerequisites(root, run, trustLevel, manifestVersion, process.env)
   if (!approvalPrereq.ok) {
     return {
@@ -6303,6 +6454,13 @@ async function createPlanRun(
     ...(requirePinnedWrites ? { requirePinnedWrites: true } : {}),
     ...(requireReportBinding ? { requireReportBinding: true } : {}),
     ...(requiredProvenance === "command" ? { requiredProvenance: "command" as const } : {}),
+    ...(manifestVersion >= ATTESTATION_MIN_VERSION
+      ? {
+          attestationPolicy,
+          ...(attestationKeyId ? { attestationKeyId } : {}),
+          ...(attestationIssuer ? { attestationIssuer } : {}),
+        }
+      : {}),
     claimProtocol: CLAIM_PROTOCOL,
     claimLeaseMs,
     host: planHost,
@@ -6351,6 +6509,13 @@ async function createPlanRun(
         ...(requirePinnedWrites ? { requirePinnedWrites: true } : {}),
         ...(requireReportBinding ? { requireReportBinding: true } : {}),
         ...(requiredProvenance === "command" ? { requiredProvenance: "command" as const } : {}),
+        ...(manifestVersion >= ATTESTATION_MIN_VERSION
+          ? {
+              attestationPolicy,
+              ...(attestationKeyId ? { attestationKeyId } : {}),
+              ...(attestationIssuer ? { attestationIssuer } : {}),
+            }
+          : {}),
         claimProtocol: CLAIM_PROTOCOL,
         claimLeaseMs,
         host: planHost,
@@ -6382,6 +6547,10 @@ async function createPlanRun(
             (requirePinnedWrites && state.requirePinnedWrites !== true) ||
             (requireReportBinding && state.requireReportBinding !== true) ||
             (requiredProvenance === "command" && state.requiredProvenance !== "command") ||
+            (manifestVersion >= ATTESTATION_MIN_VERSION &&
+              (state.attestationPolicy !== attestationPolicy ||
+                (attestationKeyId && state.attestationKeyId !== attestationKeyId) ||
+                (attestationIssuer && state.attestationIssuer !== attestationIssuer))) ||
             state.rootSessionId !== rootSessionId ||
             (allowUnsignedLegacy && state.allowUnsignedLegacy !== true) ||
             (state.claimProtocol >= CLAIM_PROTOCOL &&
@@ -6399,6 +6568,11 @@ async function createPlanRun(
           if (requirePinnedWrites) state.requirePinnedWrites = true
           if (requireReportBinding) state.requireReportBinding = true
           if (requiredProvenance === "command") state.requiredProvenance = "command"
+          if (manifestVersion >= ATTESTATION_MIN_VERSION) {
+            state.attestationPolicy = attestationPolicy
+            if (attestationKeyId) state.attestationKeyId = attestationKeyId
+            if (attestationIssuer) state.attestationIssuer = attestationIssuer
+          }
           state.rootSessionId = rootSessionId
           if (allowUnsignedLegacy) state.allowUnsignedLegacy = true
           if (state.claimProtocol >= CLAIM_PROTOCOL) {
@@ -6445,6 +6619,9 @@ async function createPlanRun(
           : approvalPrereq.approvalKeyId,
       handoffAuth: allowUnsignedLegacy ? "legacy" : "signed",
       requiredProvenance,
+      attestationPolicy: manifestVersion >= ATTESTATION_MIN_VERSION ? attestationPolicy : "off",
+      attestationKeyId: manifestVersion >= ATTESTATION_MIN_VERSION ? attestationKeyId : null,
+      attestationIssuer: manifestVersion >= ATTESTATION_MIN_VERSION ? attestationIssuer : null,
       requestHash: baselineRequestHash,
       requirementsHash: baselineRequirementsHash,
       planHash: baselinePlanHash,
@@ -6520,6 +6697,13 @@ async function createPlanRun(
         ...(runNonce ? { runNonce } : {}),
         handoffAuth: allowUnsignedLegacy ? "legacy" : "signed",
         ...(manifestVersion >= COMMAND_PROVENANCE_MIN_VERSION ? { requiredProvenance } : {}),
+        ...(manifestVersion >= ATTESTATION_MIN_VERSION
+          ? {
+              attestationPolicy,
+              attestationKeyId,
+              attestationIssuer,
+            }
+          : {}),
         requestHash: baselineRequestHash,
         requirementsHash: baselineRequirementsHash,
         planHash: baselinePlanHash,
@@ -6753,6 +6937,21 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             type: "string",
             description:
               "declared | command. Default declared (compatibility). command records a manifest-v4 requirement that every PASS verifier report carries at least one programmatic check with argv/cwd/exitCode/output digest, and writes a signed verify/rerun.json that `opencode-teamwork verify --rerun --repo <clean-checkout>` can re-execute. A re-plan may upgrade declared→command but never downgrade it.",
+          },
+          attestationPolicy: {
+            type: "string",
+            description:
+              "off | optional | required. Default off. required makes final_verify demand a signed verify/ci/attestation.json from a CI principal whose key is distinct from the run key, bound to the run nonce, plan hash, report headSha and the report's command/output digests. optional records the status without failing the run. A re-plan may upgrade off→optional→required but never downgrade it (manifest v5).",
+          },
+          attestationKeyId: {
+            type: "string",
+            description:
+              "Optional pinned _auth.keyId of the CI attestation (manifest v5). A re-plan cannot change it once pinned.",
+          },
+          attestationIssuer: {
+            type: "string",
+            description:
+              "Optional pinned OIDC issuer of the CI attestation (manifest v5). A re-plan cannot change it once pinned.",
           },
           requireSameHost: {
             type: "boolean",
@@ -11942,6 +12141,76 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               '[RERUN_MISSING] requiredProvenance is "command" but verify/rerun.json is missing',
             )
           }
+          // 0.18.0: signed CI attestation. The policy is part of the signed
+          // manifest; `off` ignores the artifact, `optional` records a status
+          // without failing, and `required` makes every non-ATTESTED outcome a
+          // named refusal. The engine never runs the attested commands; it
+          // binds the CI observation to the reports and the signed plan.
+          let attestationEvidence: Record<string, unknown> | undefined
+          const attestationPolicy: AttestationPolicyMode = signedRun
+            ? manifestAttestationMode(manifestCheck.manifest)
+            : "off"
+          if (attestationPolicy !== "off") {
+            const rawAttestation = readBoundedRunFile(run, join(run, ATTESTATION_PATH), MAX_RUN_FILE_BYTES)
+            let attestationArtifact: any
+            if (rawAttestation.status === "ok") {
+              try {
+                attestationArtifact = JSON.parse(rawAttestation.text)
+              } catch {
+                // A present but unparseable artifact is untrusted, not absent.
+                attestationArtifact = {}
+              }
+            }
+            const attestationKeyRaw = String(process.env[ENV_ATTESTATION_PUBLIC_KEY] ?? "").trim()
+            const attestationPublicKey = attestationKeyRaw ? loadAttestationPublicKey(attestationKeyRaw) : undefined
+            const envAttestationKeyId = attestationKeyRaw
+              ? attestationKeyIdFromPublicKey(attestationKeyRaw, process.env[ENV_ATTESTATION_KEY_ID])
+              : undefined
+            const attestedManifest = manifestCheck.manifest
+            const attestationReports = Object.entries(reportValues).map(([id, report]) => ({
+              taskId: id,
+              headSha: typeof report?.headSha === "string" && report.headSha !== "" ? report.headSha : undefined,
+              checks: Array.isArray(report?.checks)
+                ? report.checks
+                    .filter((check: any) => Array.isArray(check?.command))
+                    .map((check: any) => ({
+                      argv: check.command,
+                      cwd: typeof check.cwd === "string" ? check.cwd : ".",
+                      exitCode: Number.isInteger(check.exitCode) ? check.exitCode : undefined,
+                      output: typeof check.output === "string" ? check.output : "",
+                      outputTruncated: check.outputTruncated === true,
+                    }))
+                : [],
+            }))
+            const evaluated = evaluateAttestation({
+              artifact: attestationArtifact,
+              policy: attestationPolicy,
+              publicKey: attestationPublicKey,
+              expectedKeyId: attestedManifest.attestationKeyId ?? envAttestationKeyId,
+              expectedIssuer:
+                attestedManifest.attestationIssuer ??
+                (String(process.env[ENV_ATTESTATION_ISSUER] ?? "").trim() || undefined),
+              runId: basename(run),
+              runNonce: attestedManifest.runNonce,
+              runKeyId: attestedManifest.runKeyId,
+              planHash: attestedManifest.planHash,
+              promptHash: typeof attestedManifest.specHash === "string" ? attestedManifest.specHash : undefined,
+              reports: attestationReports,
+            })
+            attestationEvidence = {
+              policy: attestationPolicy,
+              status: evaluated.status,
+              ...(evaluated.code ? { code: evaluated.code } : {}),
+              ...(evaluated.commitSha ? { commitSha: evaluated.commitSha } : {}),
+              ...(evaluated.keyId ? { keyId: evaluated.keyId } : {}),
+              ...(evaluated.issuer ? { issuer: evaluated.issuer } : {}),
+            }
+            if (attestationPolicy === "required" && evaluated.status !== "ATTESTED") {
+              contentIntegrityReasons.push(
+                `[${evaluated.code ?? "AUTH_ATTESTATION_MISSING"}] ${evaluated.message ?? "the CI attestation is not valid"}`,
+              )
+            }
+          }
           const allTasksVerifiedPass = tasks.length > 0 && tasks.every((t) => t.status === "verified_pass")
 
           const reasons: string[] = []
@@ -12414,6 +12683,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               ...(lemmaEvidence ? { lemma: lemmaEvidence } : {}),
               ...(tournamentEvidence ? { tournament: tournamentEvidence } : {}),
               ...(witnessEvidence ? { witness: witnessEvidence } : {}),
+              ...(attestationEvidence ? { attestation: attestationEvidence } : {}),
               handoffs: handoffGate.skipped
                 ? { mode: "skip", status: "SKIPPED", required: [], entries: [], reasons: [] }
                 : {
