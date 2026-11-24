@@ -211,6 +211,27 @@ incomplete (`AUTH_APPROVAL_DIR` / `AUTH_APPROVAL_UNTRUSTED` /
 principal for it. Version 2 (0.10.2) keeps its manifestDigest-bound approval
 semantics.
 
+### CI attestation (`attestationPolicy`, 0.18.0)
+
+`attestationPolicy` (`off` | `optional` | `required`, default `off`) is a
+separate, post-plan requirement. A CI job holding an Ed25519 key the run does
+not have signs `verify/ci/attestation.json` over the run nonce, plan hash,
+prompt hash, commit and the argv/cwd/exit/output digest of every command it
+ran. `final_verify` and `verify --attestation-public-key` bind it to the signed
+manifest and every report head; a run-key signature is
+`AUTH_ATTESTATION_UNTRUSTED`, and a foreign run id/nonce is
+`AUTH_ATTESTATION_REPLAY`.
+
+This establishes that **a second configured identity signed the same plan and
+commit and observed the same command outputs**. It does not establish that the
+suite is meaningful, that a test was not edited in the same commit, or that the
+CI principal is independent of the agent's UID. Configure the verify-only key
+with `OPENCODE_TEAMWORK_ATTESTATION_PUBLIC_KEY`; the private key belongs only
+to the CI producer. `doctor --security` fails `attestation_key` when private
+material is visible to this process and warns when `attestationPolicy` is
+`required` but no key is configured. See
+[ADR 0018](docs/adr/0018-ci-attestation.md).
+
 Benchmark integrity refuses an explicit `local-hmac` trust level and warns when
 the default is used.
 
@@ -240,6 +261,12 @@ the default is used.
    public key the receipt is recorded and labelled `unverified` in
    `verify/final.json`; a local file/command witness is detection-only and
    shares the same UID either way.
+5. **You need an observer outside the agent's process.** Run
+   `.github/workflows/attest.yml` (or `scripts/attest-sign.mjs`) under a CI
+   principal, set `attestationPolicy: "required"`, and give the verifier only
+   `OPENCODE_TEAMWORK_ATTESTATION_PUBLIC_KEY`. The attestation binds the signed
+   plan, the report's commit and the command outputs to a key the run does not
+   hold. It is only a boundary when the agent's UID cannot read the CI key.
 
 The hardened profile is an administrator/deployment change (a system service,
 separate UID, SELinux labels, or a remote approver). The plugin cannot create
@@ -272,6 +299,10 @@ steps are deployment guidance, not something the plugin enforces.
 | `OPENCODE_TEAMWORK_APPROVAL_TTL_MS` | Default approval lifetime when `expiresAt` is omitted (24 h; max 7 days). |
 | `OPENCODE_TEAMWORK_APPROVAL_PRIVATE_KEY` | PKCS#8 Ed25519 private key (base64url DER) used **only by the approver's own process** (`approve sign`). Never give it to the agent's process. |
 | `OPENCODE_TEAMWORK_APPROVAL_KEY_FILE` | Path to a PEM or base64url PKCS#8 approver key for `approve sign` (alternative to the env/`--key`). |
+| `OPENCODE_TEAMWORK_ATTESTATION_PUBLIC_KEY` | SPKI Ed25519 CI attestation key (base64url or PEM) for `final_verify`/`verify`. Verify-only. |
+| `OPENCODE_TEAMWORK_ATTESTATION_KEY_ID` | Optional attestation key id; defaults to a digest of the public key. |
+| `OPENCODE_TEAMWORK_ATTESTATION_ISSUER` | Optional expected `oidc.issuer` when the manifest does not pin one. |
+| `OPENCODE_TEAMWORK_ATTESTATION_PRIVATE_KEY`, `_KEY_FILE` | CI producer key; must never be visible to the agent's UID (`doctor --security` fails if it is). |
 
 The command signer receives `{v, alg, keyId, path, digest, nonce, at, message}`
 when `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` is unset, or
@@ -342,6 +373,19 @@ signer's policy is outside the plugin.
   configuration. There is no human-presence enforcement: the CLI asks for a
   typed digest prefix and the word `approve`, but a script holding the key can
   reproduce both.
+- **CI attestation is an identity claim plus a binding, not a proof of quality.**
+  With `attestationPolicy: "required"` (0.18.0) the declared commands ran at the
+  recorded commit under a separate signing identity, and the key is distinct
+  from `runKeyId`; the attestation also binds the run nonce, plan hash, report
+  head and command/output digests. It still does not prove the suite is
+  meaningful, and a compromised CI, a weak suite, or a test edited in the same
+  commit still pass. A CI principal reachable by the agent's UID (a repository
+  secret readable from the workload, a key file in the same account) is not a
+  boundary: the signature then proves the binding, not independence. The OIDC
+  claims are checked only as a signed/pinned issuer string; no token is fetched
+  or validated. A malicious dispatcher with write access to the protected
+  branch can change what CI runs, which is exactly the CI privilege boundary
+  the deployment must protect.
 - **Display spoofing.** The CLI hashes the bytes on disk and prints the digest.
   It cannot prove that the approver's review surface showed those same bytes; a
   redirect, a different checkout, or a renderer that hides text is outside the

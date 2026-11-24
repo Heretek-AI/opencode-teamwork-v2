@@ -201,6 +201,9 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
   "requireHandoffs": "required|skip",
   "handoffAuth": "signed|legacy",
   "requiredProvenance": "declared|command",
+  "attestationPolicy": "off|optional|required",
+  "attestationKeyId": "attestation_... | null",
+  "attestationIssuer": "https://issuer | null",
   "requestHash": "sha256 | null",
   "requirementsHash": "sha256 | null",
   "planHash": "sha256",
@@ -236,7 +239,8 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
   `approval_unbound`; version 2 keeps its manifestDigest-bound approval
   semantics. Version 4 (0.16.0+) adds `requiredProvenance`; versions 1–3 are
   read as `declared`. A re-plan may upgrade `declared → command` but never
-  downgrade it (`AUTH_STALE`).
+  downgrade it (`AUTH_STALE`). Version 5 (0.18.0+) adds the CI attestation
+  policy and pins; versions 1–4 are read as `attestationPolicy: "off"`.
 - `specHash` is an **unkeyed SHA-256 of the exact file bytes** (not the keyed
   artifact digest), and `specBytes` is the byte length. `teamwork_plan` reads
   the draft through the bounded no-follow run reader before any `mkdir`, so a
@@ -278,6 +282,12 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
   `opencode-teamwork verify --rerun --repo <clean-checkout>` re-executes it
   before a verdict can be `PASS`. A re-plan may upgrade to `command` but a
   downgrade is `AUTH_STALE`.
+- `attestationPolicy`/`attestationKeyId`/`attestationIssuer` are the CI
+  attestation requirement (0.18.0). `off` (the default and the meaning of
+  versions 1–4) ignores `verify/ci/attestation.json`; `optional` records its
+  status without failing the run; `required` refuses completion without a
+  valid artifact. A re-plan may upgrade `off → optional → required`, never
+  downgrade, and cannot change a pinned key id or issuer (`AUTH_STALE`).
 - **Legacy:** `allowUnsignedLegacy: true` at plan time creates/keeps an
   unsigned run. Its completion gates return `AUTH_LEGACY` until the caller
   explicitly passes `allowUnsignedLegacy: true`; that bypass is recorded as a
@@ -1731,6 +1741,84 @@ and stamps `evidence.rerunDigest` (keyed digest of the file bytes) into
 <clean-checkout>` is the only path that turns this record into a `PASS` under
 `requiredProvenance: "command"`.
 
+### `verify/ci/attestation.json` — signed CI attestation (0.18.0)
+
+Produced outside the agent's process by `scripts/attest-sign.mjs` under a CI
+principal whose Ed25519 key is distinct from the run's `runKeyId`:
+
+```json
+{
+  "v": 1,
+  "provider": "github-actions",
+  "workflow": "ci-attestation",
+  "runId": "20261124-120000-abcd",
+  "runAttempt": 1,
+  "repository": "owner/repo",
+  "commitSha": "0123456789abcdef0123456789abcdef01234567",
+  "baseSha": "fedcba9876543210fedcba9876543210fedcba98",
+  "promptHash": "<sha256 of prompt_draft.md>",
+  "planHash": "<manifest planHash>",
+  "manifestDigest": "<payload digest of run.manifest.json>",
+  "commands": [
+    {
+      "argv": ["npm", "test"],
+      "cwd": ".",
+      "exitCode": 0,
+      "outputSha256": "<unkeyed sha256 of stdout+stderr>",
+      "outputBytes": 8421
+    }
+  ],
+  "oidc": {
+    "issuer": "https://token.actions.githubusercontent.com",
+    "subject": "repo:owner/repo:ref:refs/heads/main",
+    "audience": "opencode-teamwork"
+  },
+  "issuedAt": "2026-11-24T12:05:00.000Z",
+  "expiresAt": "2026-11-24T13:05:00.000Z",
+  "_auth": {
+    "v": 1,
+    "alg": "ed25519",
+    "keyId": "attestation_...",
+    "path": "verify/ci/attestation.json",
+    "digest": "<sha256 of the payload without _auth>",
+    "sig": "<base64url Ed25519>",
+    "nonce": "<the manifest runNonce>",
+    "at": "2026-11-24T12:05:00.000Z"
+  }
+}
+```
+
+`_auth` uses the same envelope as every artifact, with the distinct
+`teamwork-ci-attestation-v1` signing domain. The artifact is valid only when:
+
+- it verifies under the configured attestation public key
+  (`OPENCODE_TEAMWORK_ATTESTATION_PUBLIC_KEY` or
+  `--attestation-public-key`), and `_auth.keyId` matches the manifest pin or the
+  key's derived id;
+- `_auth.keyId` is **not** `manifest.runKeyId`;
+- `_auth.nonce` equals `manifest.runNonce` and `runId` names this run;
+- `planHash` and (when pinned) `promptHash` equal the manifest, and `expiresAt`
+  is in the future;
+- `commitSha` equals `headSha` for every report that records one;
+- every command matches a report `checks[]` entry by argv, cwd, exit code,
+  unkeyed `outputSha256` and `outputBytes` (a truncated check cannot match).
+
+`outputSha256` is unkeyed, like `verify/rerun.json`. The engine never executes
+the attested commands.
+
+| Code | Meaning |
+| --- | --- |
+| `AUTH_ATTESTATION_MISSING` | policy `required` and no artifact |
+| `AUTH_ATTESTATION_STALE` | expired, wrong `planHash`/`promptHash`, or a command/output that no report check records |
+| `AUTH_ATTESTATION_UNTRUSTED` | bad envelope/signature, wrong key id, pinned issuer mismatch, signed by the run key, or no configured public key |
+| `AUTH_ATTESTATION_COMMIT_MISMATCH` | `commitSha` differs from a report's `headSha` |
+| `AUTH_ATTESTATION_REPLAY` | `runId`/`_auth.nonce` is from another run |
+
+`final_verify` records the outcome in `evidence.attestation` (see below).
+`verify --attestation-public-key` reports
+`attestation: {status, commitSha, keyId, issuer}` and `attested: boolean`;
+without a key a present attestation is `UNKNOWN` (exit 2), never `PASS`.
+
 ### `verify/challenge-<taskId>.json` (strict challenge verdict)
 
 ```json
@@ -1940,6 +2028,14 @@ audit input: PASS/FAIL is recomputed from task/report/audit semantics.
     "reportDigests": { "R1-impl": "<sha256 of report bytes>" },
     "auditDigest": "<sha256 of security-audit.json bytes>",
     "rerunDigest": "<sha256 of verify/rerun.json bytes | null>",
+    "attestation": {
+      "policy": "off|optional|required",
+      "status": "OFF|MISSING|UNKNOWN|ATTESTED|INVALID",
+      "code": "AUTH_ATTESTATION_* (present when not ATTESTED)",
+      "commitSha": "<the attested commit | absent>",
+      "keyId": "<the CI key id | absent>",
+      "issuer": "<the OIDC issuer | absent>"
+    },
     "victory": { "mode": "required", "status": "CONFIRMED", "auditor": "team/victory-auditor", "requestHash": "...", "requirementsHash": "..." },
     "handoffs": {
       "mode": "required",
@@ -1994,7 +2090,10 @@ For a skip, `evidence.victory` is
 verdict is signed and the evidence digests let `teamwork_next` detect a report
 or audit edited after the verdict (`AUTH_STALE`). `evidence.rerunDigest` binds
 the signed re-execution record (or `null` when absent); editing
-`verify/rerun.json` after the verdict is `AUTH_STALE` in the offline verifier. `evidence.handoffs.entries`
+`verify/rerun.json` after the verdict is `AUTH_STALE` in the offline verifier. `evidence.attestation`
+records the CI attestation outcome when `attestationPolicy` is not `off`; it
+is absent for `off`. Under `required`, a non-`ATTESTED` status already made the
+verdict `FAIL` with the named code. `evidence.handoffs.entries`
 records each matched handoff's `auth` (`signed|unsigned|invalid`) and `keyId`
 from the checked continuity gate. An unsigned legacy run needs
 the explicit `allowUnsignedLegacy` bypass. `status` is `PASS` **only**
@@ -2304,6 +2403,9 @@ opencode-teamwork verify --run-dir <path> --public-key ...
 opencode-teamwork verify --session <id> --hmac-key <base64url> --hmac-key-id <id>
 opencode-teamwork verify --run-dir <path> --public-key ... \
   --rerun --repo <clean-checkout> [--timeout <s>] [--keep-worktree]
+opencode-teamwork verify --run-dir <path> --public-key ... \
+  --attestation-public-key <base64url|@file> [--attestation-key-id <id>] \
+  [--attestation-issuer <issuer>]
 ```
 
 The manifest is the trust anchor. Its `_auth` is verified first; `runNonce`,
@@ -2318,6 +2420,7 @@ fails on path, nonce, key id or digest.
 | `run.manifest.json` | `_auth`; `requestHash`, `requirementsHash`, `planHash`, `lemmaPolicyHash`, `specHash`/`specBytes` against the artifacts on disk; plan/state mode drift |
 | `verify/report-<task>.json` | `_auth`; task id and PASS schema; each check's `outputSha256`; `passed` vs `exitCode` (`CHECK_EXIT_CONFLICT`); checks[] v2 `commandSha256`/`outputBytes`; workerHandoff path+sha256 vs the current body and `handoffs/index.json` |
 | `verify/rerun.json` | `_auth`; schema; every command check matches the report projection; `evidence.rerunDigest` in `verify/final.json` |
+| `verify/ci/attestation.json` | `_auth` under the attestation key; distinct from `runKeyId`; run nonce/id, `planHash`, `promptHash`, issuer, expiry, `commitSha` vs every report head, and every command/output digest vs a report check |
 | `verify/security-audit.json` | `_auth`; one `ruleChecks` entry for every rule forbidden by the integrity mode parsed from `ORIGINAL_REQUEST.md`; `reviewedDigests.reports`/`final` vs current bytes; violations on a PASS |
 | `verify/challenge-<task>.json`, `verify/audit-<task>.json` | `_auth`; `kind`/`verdict`/`agent`/`sessionId`; `reportHash` (unkeyed sha256) vs the current report; every `cites[].sha256` and `bytes`; `cites: []` is unbound (fail), absent is `legacy_unbound_wave` (warn) |
 | `verify/victory.json` | `_auth`; `evidenceDigests.reports` vs every current report (including "appeared after" and "never reviewed"); `securityAudit` and a pre-existing PASS `final`; `requestHash`/`requirementsHash`; requirement coverage |
@@ -2363,6 +2466,12 @@ usage. `--fail-on-warning` promotes a warning to exit 1. `--json` prints the
 stable object described in ADR 0015; the human table is rendered from it.
 `--allow-unsigned` analyses an unsigned legacy run but the verdict stays
 `UNKNOWN`: a missing signature is exactly what the verifier cannot supply.
+
+Since 0.18.0 `--json` also carries `attestation: {status, commitSha, keyId,
+issuer}` and `attested: boolean`. Without `--attestation-public-key` a present
+attestation is `UNKNOWN` (exit 2) and is never promoted to `PASS`; under
+`required` a supplied key turns a missing artifact into `FAIL`
+(`AUTH_ATTESTATION_MISSING`) and a bad one into its named code.
 
 ### Index snapshot (`--require-index`)
 
