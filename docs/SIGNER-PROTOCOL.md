@@ -222,6 +222,12 @@ same artifact as the prompt approval used by `human-approved`/`ci-attested`
 optional and covered by the signature but is not used for authorization; do not
 let free text change a decision.
 
+In 0.14.0 the producer is
+`opencode-teamwork approve signer --session <runId> --path <relPath> --digest
+<64hex>`, which writes the file at the §4.1 layout. It sets `nonce` to the run
+nonce read from the signed `run.manifest.json` (not a fresh random value, which
+could not match the request) and carries no prompt-approval field.
+
 ### 4.3 Approval signature input
 
 Use a distinct domain so an artifact signature can never be reused as an
@@ -551,8 +557,8 @@ Service and integration:
 23. Key file unreadable/wrong mode; startup fails closed.
 24. Plugin sends v2 with `runId`/`approvalRef`; happy path writes `_auth`.
 25. Plugin with signer stopped: `AUTH_SIGNER_UNAVAILABLE`; no HMAC fallback.
-26. v2-only signer + unmodified 0.13.0 plugin: every request refused; the
-    failure is visible and does not silently downgrade.
+26. v2-only signer + an unmodified/v1 client (directory unset): every request
+    refused; the failure is visible and does not silently downgrade.
 27. External verifier accepts only the signer public key; a local HMAC
     envelope fails the trust level.
 28. Key rotation: old artifacts verify with the old public key; new requests

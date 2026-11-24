@@ -4,7 +4,55 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.14.0] - 2026-11-24
+
+Verifiable witness receipts, honest approval-key diagnostics, and the
+policy-signer half of the v2 contract with its approval producer. Additive
+schemas; a deployment that does not set the new variables keeps the 0.13
+behaviour.
+
+### Added
+
+- **Signed witness receipts (ADR 0014).** The witness request is
+  `{v:2, runId, path, digest, keyId, nonce, at}`. With
+  `OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY` (SPKI base64url, optional `_KEY_ID`) a
+  witness must return `{receipt, alg:"ed25519", keyId, sig}` over
+  `teamwork-witness-v1\0runId\0path\0digest\0nonce\0at`; the record stores
+  `{receipt, alg, keyId, sig, at}`. `final_verify` verifies the receipt against
+  the manifest digest/nonce: a missing receipt is `AUTH_WITNESS_UNAVAILABLE`, a
+  forged/foreign/different-digest record is `AUTH_INVALID`. Without the public
+  key the receipt is stored as `unverified` and `verify/final.json` records
+  that label. A local file/command witness remains detection-only.
+- **Signer protocol v2.** With `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` set,
+  `signerEnvelope` sends `{v:2, op:"sign-artifact", runId, …, approvalRef,
+  message}` and derives `approvalRef` as
+  `<DIR>/<runId>/<plain sha256(path)>.json`; `runId` is threaded through
+  `signRunArtifact` → `signArtifact` (`SignOptions.runId`). The directory must
+  be absolute, real, and not owned by this process. With the variable unset the
+  exact v1 request is unchanged. A v1-only signer with the directory set, or a
+  v2-only signer without it, fails `AUTH_SIGNER_UNAVAILABLE`; there is no HMAC
+  fallback.
+- **`opencode-teamwork approve signer`.** Produces a
+  `kind:"teamwork.signer-approval"` artifact with
+  `{v:1, runId, path, digest, nonce, approvedAt, expiresAt, approvedBy,
+  approvalId, _auth}` signed over `teamwork-signer-approval-v1`. It uses the
+  run nonce from the signed manifest, writes mode `0600` at the documented
+  one-file-per-(run,path) layout, refuses an output inside the run/repo, and
+  reuses no prompt-approval field. The plugin never reads the approval; the
+  signer does.
+- **Approval-key and signer-directory diagnostics.** `doctor --security` now
+  fails `approval_key` when the approver private key is inline or a readable
+  key file is visible to the workload UID. A new `signer_approval_dir` check
+  fails a relative/missing/symlinked/in-repo/in-run/caller-owned directory.
+  `scripts/hardening-check.sh` adds `signer_approval_dir` and
+  `agent_signer_approval_read` read-only probes.
+
+### Fixed
+
+- `docs/SIGNER-PROTOCOL.md` and `docs/ADMIN-HARDENING.md` state the same
+  `approvalRef` layout (`<DIR>/<runId>/<sha256(path)>.json`, plain SHA-256).
+  `ADMIN-HARDENING.md` now says the signer is not in this repository and must be
+  built; the plugin only speaks the protocol.
 
 ### Documentation
 
@@ -16,14 +64,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that the steps were executed on any host.
 - Add [`docs/SIGNER-PROTOCOL.md`](docs/SIGNER-PROTOCOL.md): the v2
   policy-enforcing signer contract (`v: 2`, `runId`, `approvalRef`, the six
-  mandatory checks, failure vocabulary and the plugin-side change). A v2 signer
-  refuses v1; the 0.13.0 plugin sends v1, so the two halves must ship together.
+  mandatory checks, failure vocabulary and the plugin-side change).
 - Add [`scripts/hardening-check.sh`](scripts/hardening-check.sh): a read-only
   POSIX `sh` verifier that prints `PASS`/`FAIL`/`UNKNOWN` per probe, exits
   non-zero on any `FAIL`, and documents every probe. `UNKNOWN` is not a pass.
-- Link the runbook and protocol from `SECURITY.md`, `docs/GUARDRAILS.md` and
-  the README "High-assurance deployment" section; add the new files to the
-  packaging guard's required list.
+- Add [ADR 0014](docs/adr/0014-verifiable-witness-and-signer-v2.md) and link the
+  runbook/protocol from `SECURITY.md`, `docs/GUARDRAILS.md` and the README; add
+  the new files to the packaging guard's required list.
 
 ## [0.13.1] - 2026-11-24
 
