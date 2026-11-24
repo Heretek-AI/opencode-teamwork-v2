@@ -604,26 +604,35 @@ expired claims reclaimable without a fingerprint, no fence enforcement).
 `claim.host` is the **claiming process**, not necessarily the host that planned
 the run (`claim.runHost`). Cross-host checks compare `claim.host`; a protocol-2
 claim written by 0.10.0 with the run host is read as local on a local run and is
-never rewritten.
+never rewritten. **A protocol-2 claim with no `host` is cross-host** (fail
+closed): it is never auto-reclaimed, and `release` needs the cross-host
+confirmation. A protocol-1 run predates the field and keeps the legacy local
+behaviour. The same rule applies to `runHostOf`: a protocol-2 state/plan with no
+recorded host reports `unknown`, not this host.
 
 * **Derived state** (`teamwork_status`, `teamwork_resume`, `teamwork_next`):
   * `live` — the lease is still in the future.
   * `expired` — past the lease, inside the grace window. **Not reclaimable.**
   * `stale` — past lease + grace. Reclaimable only by the rules below.
-  * `needs-inspection` — a stale claim whose side effects changed, whose
-    baseline is missing/unknown, or a claim explicitly flagged by a forced
-    expiry. It **always wins**: excluded from
-    `readyForWorker`/`readyForVerifier`, never reclaimed even when the
-    fingerprint is unchanged, and listed in `status.needsInspection`.
+  * `needs-inspection` — a claim explicitly flagged by a forced expiry (or any
+    later flag), whose side effects changed, or whose baseline is
+    missing/unknown. A flag is reported even while the lease is **live**. It
+    **always wins**: excluded from `readyForWorker`/`readyForVerifier`, never
+    renewed or reclaimed even when the fingerprint is unchanged, gated on every
+    `task_update` transition (not only `worker_active`), and listed in
+    `status.needsInspection`.
   * `cross-host` — `claim.host` (the claiming process) is not this host.
     **Never auto-reclaimed.**
   `status.claims[]` carries `remainingMs`, `heartbeatAgeMs`, `fence` and
   `fingerprintChanged`; `status.warnings` names `FOREIGN_HOST` /
   `SHARED_FS_SUSPECTED` when the run host differs.
 * **Fence.** Every task has a monotonic `fence` that increments on a claim,
-  reclaim, release, explicit Sentinel override, or round change — and only when
-  the owner/epoch actually changes, so the fence returned by `next` is valid for
-  the immediate `task_update`. `teamwork_next`
+  reclaim, release, explicit Sentinel override, or round change. A **round
+  change and a release are separate events**, so a transition that does both
+  increments twice (a new round is a new epoch; the release is a new owner
+  slot). A heartbeat and a renewal of the same owner/epoch never increment, so
+  the fence returned by `next` is valid for the immediate `task_update` in the
+  common path (owner and round unchanged). `teamwork_next`
   returns it; `teamwork_task_update` accepts an optional `fence` and refuses a
   mismatch with `STALE_FENCE` **without changing state**. A live claim held by a
   non-owner/non-descendant is `CLAIM_OWNED_BY_OTHER`; an expired claim the caller
@@ -654,8 +663,11 @@ never rewritten.
   `previousClaimant`/`history` recorded. Changed / unknown / missing /
   `needs-inspection` → `needs-inspection`. A cross-host claim is never reclaimed
   automatically. Released/adopted/requeued/blocked claims keep a bounded
-  task-level `claimHistory`, and a terminal `teamwork_task_update` emits
-  `claim_released`.
+  task-level `claimHistory`: `claim.history` is merged into `task.claimHistory`
+  before `claim` is deleted, and a later claim rehydrates its `history` from the
+  task-level chain, so release → reclaim → release never erases an earlier
+  claimant. The chain is capped at 5 entries. A terminal
+  `teamwork_task_update` emits `claim_released`.
 * **Recovery (`teamwork_recover`).** `team/sentinel` or `team/orchestrator`,
   from the run root or a descendant. `inspect` returns claim, baseline and
   observed fingerprints, diffstat, commits, dirty/untracked paths, and writes a
@@ -687,10 +699,24 @@ never rewritten.
   `BRANCH_MOVED`; `worktree merge` refuses a verified report whose head no longer
   matches the branch. A legacy report without these fields is accepted with a
   `legacy_unbound_report` warning; it is never silently treated as current.
+  A plan may set `requireReportBinding: true` (sticky, default off) to make an
+  unbound PASS unconsumable: `teamwork_report` and `final_verify` refuse it with
+  `REPORT_UNBOUND`. A check whose `exitCode` contradicts `passed` is refused by
+  name (`CHECK_EXIT_CONFLICT`). The report digest is read at one shared cap
+  (1 MiB) by `final_verify`, the strict wave and the victory audit; a PASS
+  artifact with no readable digest is rejected, never recorded as `null`.
+  A strict wave verdict that provides `cites` must cite at least one artifact;
+  `cites: []` is **unbound** and fails the gate (an absent field is the legacy
+  shape and only warns).
 * **Worktree host/claim guards.** `setup` records the baseline and renews the
   claim; `diff` returns `HEAD`/`baseSha`/`diffHash`; `cleanup` refuses while any
   claim is `live`, `expired` (inside grace), `needs-inspection`, or `cross-host`
-  (only a stale claim is recoverable). `setup`/`merge`/`resolve`/`cleanup`
+  (only a stale claim is recoverable). `opencode-teamwork prune` uses the **same
+  predicate** (one shared `claim-state.mjs`): it refuses a run directory whose
+  state has any blocking claim, and an unreadable `state.json` also refuses
+  (an unreadable claim is not proof that no claim exists). `--force` proceeds
+  only with an explicit operator warning and records the blocking claims and
+  the reason in the result; it never runs silently. `setup`/`merge`/`resolve`/`cleanup`
   refuse when `state.host` differs from this host, unless
   `allowSharedWorktrees: true` — and never when the plan set
   `requireSameHost: true`. `TEAMWORK_ALLOW_CROSS_HOST` stays `0` by default for
@@ -1344,6 +1370,42 @@ plugin process. The lock is a sibling artifact named `<artifact>.lock`:
   `requireSameHost` (worktree refusal) and the default-refused cross-host claim
   release exist for exactly this case. Use a local filesystem for the run root,
   or an external lock service, when strict cross-host exclusion is required.
+* **Shared-filesystem contract.** These guarantees hold **only among processes
+  on one host with a coherent filesystem**. Multi-host coordination is
+  best-effort duplicate suppression, **never exactly-once**: two hosts can both
+  believe they own a claim or a lock when the filesystem view is delayed. A
+  missing `claim.host` is read as cross-host, so an incomplete record fails
+  closed instead of being treated as local.
+
+#### Write-anomaly audit and quarantine
+
+A containment refusal means the writer must not touch the run again, so an
+anomaly is **never** appended to `<run>/events.jsonl` (the policy itself refuses
+that path). Every write anomaly is appended best-effort to
+`<config-dir>/teamwork/write-anomalies.jsonl` (`OPENCODE_TEAMWORK_ANOMALY_AUDIT`
+overrides the path), and `containment-mode` / `detective-lock` anomalies are also
+printed to stderr. The file is bounded (1 MiB; it keeps a tail when it grows) and
+is outside every run, so it survives a refused or renamed run.
+
+Detective (`macOS`/`Windows`) atomic writes record a **write intent** before the
+rename and a matching commit after the post-check. A process killed between
+those two points leaves an uncommitted intent, which readers surface as a
+`detective-temp` anomaly rather than losing the crash. The other recorded kinds
+are `detective-containment`, `detective-precreate`, `detective-identity`,
+`detective-identity-changed`, `detective-append`, `detective-unlink`,
+`detective-lock`, `detective_mode`, `containment-mode` and `detective-temp`
+(with `phase`, `tempPath`, `destRealAfter`, `bytesWritten`, `intendedSha256`).
+
+A run with an **unacknowledged** write anomaly reports `needs-inspection` in
+`teamwork_status` (`runState`, `writeAnomalies`, `unacknowledgedWriteAnomalies`)
+and `teamwork_final_verify` refuses to consume it (status `NEEDS_INSPECTION`,
+no `final.json`). Acknowledgement is an explicit operator record written to the
+same config-dir audit (`teamwork_status { acknowledgeAnomalies: true }`); it
+acknowledges every anomaly for that run up to the recorded timestamp. The
+`detective_mode` and `detective-lock` diagnostics describe the documented
+non-pinned fallback and never block a run. `doctor --security` reports
+unacknowledged anomalies as a `write_anomalies` failure, so
+`--require-hardened` exits 2.
 
 ### `events.jsonl` — lifecycle event log (JSON Lines)
 

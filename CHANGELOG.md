@@ -25,6 +25,63 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the README "High-assurance deployment" section; add the new files to the
   packaging guard's required list.
 
+## [0.13.1] - 2026-11-24
+
+Patch release closing the defects found by the post-0.13.0 audit. No new
+capability and no schema version bump; every new plan field is additive and
+default-off.
+
+### Fixed
+
+- **Detective evidence.** The failure path never unlinks a destination after a
+  containment refusal. A temp/rename failure records `detective-temp`
+  (`phase`, `tempPath`, `destRealAfter`, `bytesWritten`, `intendedSha256`) and
+  refuses with `postcheck` instead of a bare `ENOENT`. The pre-create
+  containment refusal is recorded (`detective-containment` /
+  `detective-precreate`), and the post-check re-hashes the destination bytes so
+  a same-inode overwrite is an `identity` refusal.
+- **Crash evidence.** A detective atomic write records a pre-rename intent and a
+  post-check commit; a SIGKILL in between leaves an uncommitted intent that
+  surfaces as `detective-temp`.
+- **Fail-closed policy.** One `resolveRunPolicy` (realpath + `(dev, ino)` with a
+  lexical fallback) hydrates `plan.dag.json` for every writer, so a case-varied
+  run spelling on APFS/NTFS and an unlocked `tournament/candidates/*.json` write
+  in a fresh process cannot fail open. The lock layer throws the writer's
+  `containment-mode` error, including the run id. `doctor --security` reports
+  `planRequirePinnedWrites` and fails when either the env or the plan asserts
+  the policy.
+- **Anomaly audit.** Write anomalies are appended to
+  `<config-dir>/teamwork/write-anomalies.jsonl` (and policy/lock anomalies to
+  stderr), never to `events.jsonl`. `teamwork_status` and `doctor --security`
+  list unacknowledged anomalies; such a run reports `needs-inspection` and
+  `teamwork_final_verify` refuses it. Acknowledgement is an explicit operator
+  record.
+- **Prune guard.** `opencode-teamwork prune` uses the same claim predicate as
+  `worktree cleanup` and refuses `live`, `expired`, `needs-inspection` and
+  `cross-host` claims (and an unreadable `state.json`). `--force` proceeds with
+  a recorded warning and reason.
+- **Claim history and host.** `claim.history` is merged into the task-level
+  `claimHistory` before deletion and rehydrated by a later claim, so
+  release/adopt/requeue/block keep the chain (5-entry bound). A flagged claim is
+  `needs-inspection` even while its lease is live and gates every `task_update`
+  transition. A protocol-2 claim or run with no `host` is cross-host (a
+  protocol-1 run keeps the legacy shape).
+- **Content guarantees.** `cites: []` is unbound under strict (an absent field
+  remains the legacy shape). A new sticky plan flag `requireReportBinding: true`
+  (default off) refuses an unbound PASS with `REPORT_UNBOUND`. Report digests
+  use one shared 1 MiB cap across `final_verify`, the strict wave and the
+  victory audit, so a PASS digest is never `null` by size. A check whose
+  `exitCode` contradicts `passed` is refused as `CHECK_EXIT_CONFLICT`.
+
+### Documentation
+
+- `docs/ARTIFACTS.md`: the anomaly/quarantine record, the prune guard, claim
+  history, cross-host fail-closed and report binding.
+- `docs/GUARDRAILS.md`: the single-host shared-filesystem contract and the
+  0.13.1 boundary.
+- ADR 0013: amendment recording detective anomalies, the policy resolver and
+  the no-rollback boundary.
+
 ## [0.13.0] - 2026-11-23
 
 Detective-mode containment parity on macOS/Windows, an opt-in fail-closed
