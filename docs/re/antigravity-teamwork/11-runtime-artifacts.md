@@ -1,6 +1,6 @@
 # Runtime Artifacts — Live Dispatch and the On-Disk Teamwork Contract
 
-**Status: OBSERVED — seven live invocations (one quota-partial, one native swarm, one completed General teamwork run, two SWE Light runs — one interrupted, one completed with `VICTORY CONFIRMED` — one gate-only LEMMA run, and one interview-gate run that produced a draft); second evidence class: the state tree of the user's own prior runs.** Recorded on **2026-11-21**, **2026-11-22** and **2026-11-23**. The 2026-11-21/22 runs ran on `agy --version` **1.5.14**, the static binary analysed throughout this corpus (`00-artifact-identity.md`; `07` §1 re-proves byte identity); the 2026-11-23 gate runs (`15`, `16`) ran on **1.5.15** (SHA-256 `7b004d26…41fa2d`). See [`PROVENANCE.md`](PROVENANCE.md) *live axis vs static axis*. The completed General run is recorded in full in [`12-live-general-run.md`](12-live-general-run.md) and both SWE Light runs in [`13-live-swe-light-run.md`](13-live-swe-light-run.md); the LEMMA gate is in [`15-live-lemma-gate-observed.md`](15-live-lemma-gate-observed.md) and the interview gate's entry in [`16-live-interview-gate-print-mode.md`](16-live-interview-gate-print-mode.md); a 2026-11-15/16 completed prior run supplies the interview-gate chain, analysed in [`14-interview-gate-observed.md`](14-interview-gate-observed.md). This document uses them to correct the gate and state-root sections below. It does three things the rest of the set could not:
+**Status: OBSERVED — seven live invocations (one quota-partial, one native swarm, one completed General teamwork run, two SWE Light runs — one interrupted, one completed with `VICTORY CONFIRMED` — one gate-only LEMMA run, and one interview-gate run that produced a draft); second evidence class: the state tree of the user's own prior runs.** Recorded on **2026-11-21**, **2026-11-22** and **2026-11-23**. The 2026-11-21/22 runs ran on `agy --version` **1.5.14**, the static binary analysed throughout this corpus (`00-artifact-identity.md`; `07` §1 re-proves byte identity); the 2026-11-23 gate runs (`15`, `16`) ran on **1.5.15** (then the live axis; now historical; the installed CLI is **1.5.16** with no `/teamwork` run). See [`PROVENANCE.md`](PROVENANCE.md) *version axes*. The completed General run is recorded in full in [`12-live-general-run.md`](12-live-general-run.md) and both SWE Light runs in [`13-live-swe-light-run.md`](13-live-swe-light-run.md); the LEMMA gate is in [`15-live-lemma-gate-observed.md`](15-live-lemma-gate-observed.md) and the interview gate's entry in [`16-live-interview-gate-print-mode.md`](16-live-interview-gate-print-mode.md); a 2026-11-15/16 completed prior run supplies the interview-gate chain, analysed in [`14-interview-gate-observed.md`](14-interview-gate-observed.md). This document uses them to correct the gate and state-root sections below. It does three things the rest of the set could not:
 
 1. It records a **live `/teamwork-preview` print-mode run** that the client recognised, dispatched to a subagent, lost twice to HTTP 429 quota, and then completed **inline** — §1.1–§1.5.
 2. It records a **second invocation of the same command** that started a lean **native swarm** instead — a `coordinator` + `coder` + `monitor` with a `board.jsonl`, no `.agents/teamwork/` anywhere — and it states the divergence between the two runs with the cause `UNKNOWN` — §1.6–§1.7.
@@ -242,7 +242,7 @@ Run 2 (§1.6) is an independent second instance, and a stronger one because it d
 
 ---
 
-## 3. The nine artifact kinds: producer, consumer, content
+## 3. The ten artifact kinds: producer, consumer, content
 
 Each row is a contract observed on disk. "Producer" and "consumer" are read from the document's own `Read FIRST` lists, its identity block, and the gate file's `Source` column; where the sample does not show a reader, the row says `UNKNOWN` rather than guessing.
 
@@ -256,7 +256,8 @@ Each row is a contract observed on disk. "Producer" and "consumer" are read from
 | 6 | `BRIEFING.md` | the **agent itself**, at start and on significant state change | the agent itself after context loss; the **sentinel's Cron 1** reads the active orchestrator's copy plus subagents' progress (`prompts/sentinel-routing.md:328-334`) | `# BRIEFING — <UTC>`, `## Mission`, `## 🔒 My Identity` (archetype, roles, working dir, state folder, parent conversation, milestone), `## 🔒 Key Constraints`, `## Current Parent`, `## Task Summary`, `## Change Tracker`, `## Key Decisions Made`, `## Artifact Index` | 1.6–7.1 KB; the 🔒 sections are the append-only part (`prompts/sentinel-routing.md:115-124`) |
 | 7 | `progress.md` | the **agent**, appended during work | the **parent** and the sentinel's Cron 1 (change detection beyond `Last visited`) | `# Progress Log — M<N> (<slug>) <role>`, `Last visited: <UTC>`, `Status: …`, then the step log | 0.1–2.0 KB; timestamp discipline is a stated rule in every dispatch |
 | 8 | `handoff.md` | the **agent**, at the end of its turn | the **parent** (aggregation) and the **gate file's `Source` column**; later agents read upstream handoffs via `Read FIRST` | role-specific title, then the 5-part protocol: `## 1. Observation`, `## 2. Logic Chain`, `## 3. Caveats`, `## 4. Conclusion`, `## 5. Verification Method`; auditor/reviewer handoffs add their own phase tables above it | 4.3–36.5 KB; **the largest artifact kind** in the sample. In the 2026-11-22 General run every gate agent and both explorers use the five headings; the reviewer inserts `Quality Review Report` and `Adversarial Challenge Report` between Logic Chain and Caveats, while the auditor prefixes a `Forensic Audit Report` (`12` §7). The SWE Light runs qualify this: Run 1 wrote no handoffs (implementer/reviewer reported by `send_message`); Run 2 wrote sentinel, `teamwork_swe_1` and auditor handoffs, while implementer/reviewer folders remained empty due to the `write_file` sandbox (`13` §12.7-§12.8). So handoffs are role- and sandbox-dependent, not universal |
-| 9 | `GATE_STATUS.md` | the **project orchestrator** for a single cycle (`orchestrator/GATE_STATUS.md`) or the **sub-orchestrator** for a milestone gate (`sub_orch_m<N>/GATE_STATUS.md`); **SWE Light writes none** — its gate is the sequential verifier loop in both observed runs (`13` §4-§5, §12) | the parent orchestrator and the user | one table per iteration (`\| Agent \| Role \| Verdict \| Source \|`) plus a final `Gate Result:` line stating the rule | 1.0–1.9 KB; 4 instances, 1 iteration each; absent in both SWE Light runs — see §5 |
+| 9 | `GATE_STATUS.md` | the **project orchestrator** for a single cycle (`orchestrator/GATE_STATUS.md`) or the **sub-orchestrator** for a milestone gate (`sub_orch_m<N>/GATE_STATUS.md`); **SWE Light writes none** — its gate is the sequential verifier loop in both observed runs (`13` §4-§5, §12) | the parent orchestrator and the user | one table per iteration (`\| Agent \| Role \| Verdict \| Source \|`) plus a final `Gate Result:` line stating the rule | 84 B–8.4 KB; **12 instances** in the current sample, with **1–5 iterations** per file and **two header-only templates** (84 B and 114 B, no rows); both the 4-row and 6-row compositions occur — see §5. Absent in both SWE Light runs |
+| 10 | `DEAD_ENDS.md` | the **sub-orchestrator** for a milestone whose iterations failed; observed at `sub_orch_m1_issue1/DEAD_ENDS.md`, beside that folder's `SCOPE.md`, `GATE_STATUS.md` and `handoff.md`, in a five-iteration gate that failed four times before passing | the sub-orchestrator itself on later iterations, and the parent via the handoff; no reader is shown in the file | a table of failed approaches: `\| Iteration \| Approach Tried \| Why It Failed \| Files Touched \|`, one row per failed iteration | 977 B in the one instance; 2 rows, both `document-review.ts` attempts, matching the four FAIL iterations of its sibling `GATE_STATUS.md` (the last failure is not restated). [OBSERVED — disk] |
 
 ### 3.1 Two testing-track files, from a completed prior run
 
@@ -271,7 +272,7 @@ Both are written at the **run root**, beside `ORIGINAL_REQUEST.md` and `PROJECT.
 
 The 2026-11-18 multi-milestone root independently has `TEST_INFRA.md` (12,870 B, mtime `10:05:26`) but **no `TEST_READY.md`**; the two files are therefore phase- and run-dependent, not a guaranteed pair. [OBSERVED — disk]
 
-**What is still missing from the sample.** `DEAD_ENDS.md`, `plan.md` and `context.md` did not appear in any sampled root, including the two roots above. That is `OBSERVED` absence in this sample, not proof they are never written: they may be route-specific (LEMMA, SWE, Document Review), written only on failure, or renamed in practice. Treat the nine kinds above plus the two testing-track files as the observed vocabulary and the remaining three as `UNKNOWN`.
+**What the sample now shows, and what it still does not.** `DEAD_ENDS.md` **is** observed: one instance, `sub_orch_m1_issue1/DEAD_ENDS.md` (977 B, two failed-iteration rows, mtime `2026-11-22 00:25`), in the same folder as a five-iteration `GATE_STATUS.md` — row 10 above. `TEST_INFRA.md` and `TEST_READY.md` are observed in the 2026-11-15 completed run (§3.1). What remains `UNKNOWN` is `context.md` and a teamwork-state `plan.md`: neither appears in any `.agents/teamwork/` root. A `plan.md` does exist at a **conversation root** — `brain/<conv>/plan.md` with a sibling `plan.md.metadata.json` — but it is an **agent-authored project plan** for a coding session, not a teamwork state document: it lives outside `.agents/teamwork/`, no dispatch lists it under `Read FIRST`, and no gate or briefing cites it. Treat plan.md/context.md as `UNKNOWN` vocabulary; do not equate the agent's own plan file with the prompt's state file. [OBSERVED — disk; the earlier "not observed at all" wording is withdrawn]
 
 ---
 
@@ -291,7 +292,7 @@ These are folder names **inside the shared state root**; the folder is not itsel
 | `_m<N>` | milestone number | `_m1`, `_m2`, `_m3` |
 | `_r<R>` | round | `_r1` present on every agent in one sampled run; **absent** in another run's folders (`teamwork_reviewer_m1_1`) — so the `r` segment is conditional, exactly as the `[_…]` brackets imply |
 | `_<N>` | **parallel instance** (`prompts/sentinel-routing.md:308`) | `teamwork_reviewer_m1_r1_1` / `_2`, `teamwork_challenger_m1_r1_1` / `_2`, `teamwork_explorer_m1_r1_1`…`_3` — the suffix distinguishes **sibling agents of the same type, milestone and round**, not retries |
-| `_gen<N>` | successor generation | not observed in this sample (`UNKNOWN`) |
+| `_gen<N>` | successor generation | **observed**: `sub_orch_m1_gen2/` under the same run root, beside `sub_orch_m1/`; its `BRIEFING.md` records work `[done in gen1 — Gate FAIL]` and takes over the same milestone for Iteration 3–4, ending `Gate Result: PASS`. So `_gen<N>` marks the **successor generation of the same agent for the same scope**, and gen1's gate file (3 iterations, Iteration 3 `PENDING`) is carried forward into gen2's (4 iterations, PASS). The prompt's `<succession_threshold>` self-succession rule is the mechanism this matches; that the threshold caused this particular split is `INFERRED`. [OBSERVED — disk (`scratch/teamwork/1e28850f-…/.agents/teamwork/`)] |
 
 Two refinements the prompt does not state, both observed:
 
@@ -306,15 +307,24 @@ Consequence for a reimplementation: the folder name is the agent's **identity on
 
 ### 5.1 Composition
 
-Four `GATE_STATUS.md` files are compared: the 2026-11-22 General live run, the 2026-11-15 multi-milestone run, and two further milestone gates from the 39-root sample. Their compositions are **not the same**:
+**Twelve `GATE_STATUS.md` files** are compared across both root forms (`scratch/teamwork/<run-id>/.agents/teamwork/` and `brain/<conv>/scratch/`). Their compositions are **not the same**, and neither is their iteration count:
 
-| Sample | Rows | Composition | Verdict values seen |
-|---|---:|---|---|
-| General live run, single cycle (`12` §5) | **4** | 1 worker + **1 reviewer** + **1 challenger** + 1 auditor | `DONE`, `APPROVE`, `PASS`, `CLEAN` |
-| 2026-11-15 multi-milestone run (3 milestones) | **6** | 1 worker + **2 reviewers** + **2 challengers** + 1 auditor | `DONE`, `APPROVE`, `CONFIRMED`/`APPROVE`, `CLEAN` |
-| Two further prior milestones | **6** | same 2+2+1 pattern | `DONE`, `APPROVE`, `CONFIRMED`, `CLEAN` |
+| Observed form | Files | Rows per iteration | Iterations per file | Verdict values seen |
+|---|---:|---:|---|---|
+| **4-row** (the General form, `12` §5) | 4 | **4** | 1, 3, 3, **5** | `DONE`, `APPROVE`, `PASS`, `CLEAN`, `FAIL`, `REQUEST_CHANGES`, `PENDING` |
+| **6-row** (2 reviewers + 2 challengers) | 6 | **6** | 1 (four files), 3, 4 | `DONE`, `APPROVE`, `CONFIRMED`, `CLEAN`, `FAIL`, `PENDING` |
+| **Header-only template** | 2 | **0** | 0 / 0 (one file has the `## Gate — Iteration 1` heading and no table) | none |
 
-The six-row form is:
+The 4-row form is:
+
+| Row | `Role` (runtime type) | Verdict values seen |
+|---|---|---|
+| `worker_<N>` | `teamwork_worker` | `DONE (…)` |
+| `reviewer_<N>` | `teamwork_reviewer` | `APPROVE (…)`, `APPROVE` |
+| `challenger_<N>` | `teamwork_challenger` | `CONFIRMED`, `PASS (…)`, `FAIL (…)` |
+| `auditor_<N>` | `teamwork_auditor` | `CLEAN` |
+
+The 6-row form doubles the reviewer and challenger rows:
 
 | Row | `Role` (runtime type) | Verdict values seen |
 |---|---|---|
@@ -325,9 +335,9 @@ The six-row form is:
 | `challenger_<N>_2` | `teamwork_challenger` | `APPROVE / CONFIRMED`, `CONFIRMED (…)` |
 | `auditor_<N>` | `teamwork_auditor` | `CLEAN` |
 
-The **minimum observed composition** is the four-row General form: worker + one reviewer + one challenger + one auditor. The **larger observed composition** doubles the reviewer and challenger rows for a multi-milestone effort. Both close with a strict AND over their verdicts plus an independent test/audit result. [OBSERVED — disk]
+The **minimum observed composition** is the four-row form: worker + one reviewer + one challenger + one auditor. The **larger composition** doubles the reviewer and challenger rows. Both close with a strict AND over their verdicts plus an independent test/audit result, and the file records intermediate `FAIL` iterations rather than only the passing one. [OBSERVED — disk]
 
-**The composition is variable, not fixed.** It scales with scope/iteration: the single-cycle run used the minimum independent set, and the multi-milestone run used 2+2+1. This is the correct conclusion to carry into a reimplementation: **do not encode six rows as the gate**. Encode the rule shape and the *minimum* independent roles, and allow redundancy to grow with milestone scope. One route family and four samples cannot establish the composition for LEMMA, Document Review, SWE Light or a tournament gate; those remain `UNKNOWN`. [OBSERVED for the two compositions; `INFERRED` for the scaling relationship; universality `UNKNOWN`]
+**The composition and the iteration count are both variable.** One milestone in a `brain/<conv>/scratch` root ran five iterations (four `FAIL`, one `PASS`) in a single four-row file. A different M1, in a `scratch/teamwork/<run-id>` root, used a six-row verification wave and then a `_gen2` successor folder for its last two iterations, carrying the earlier gate history forward. Two files are header-only templates, i.e. a gate can exist before it has been evaluated. This is the correct conclusion to carry into a reimplementation: **do not encode four or six rows as the gate**, and do not assume one evaluation per file. Encode the rule shape and the *minimum* independent roles, allow redundancy to grow with milestone scope, and treat iterations as append-only history. One route family and a dozen samples cannot establish the composition for LEMMA, Document Review, SWE Light or a tournament gate; those remain `UNKNOWN`. [OBSERVED for the compositions and iteration counts; `INFERRED` for the scaling relationship; universality `UNKNOWN`]
 
 ### 5.2 Redacted template
 
@@ -393,13 +403,13 @@ The corpus and the binary use shorter names than the state tree does, and the di
 |---|---|---|
 | Public docs | a "project plan artifact" and a "progress artifact", plus an `ORIGINAL_REQUEST`-style record | `10` §1 rows 19–20, §2.4 |
 | Prompt/binary | state files `BRIEFING.md` / `progress.md` / `DISPATCH.md` / `handoff.md`; `SCOPE.md` / `GATE_STATUS.md` / `DEAD_ENDS.md`; shared `PROJECT.md` / `TEST_INFRA.md` / `TEST_READY.md` / `ORIGINAL_REQUEST.md`; `plan.md`, `context.md` in the state tree | `prompts/sentinel-routing.md:186-191`, `:219`; `01` §7; `05` §6 |
-| On disk | `ORIGINAL_REQUEST.md` **and** `PROJECT.md` (no `plan.md`); `progress.md`; `prompt_draft.md`; the nine kinds in §3 | §3 table; `OBSERVED — disk` |
+| On disk | `ORIGINAL_REQUEST.md` **and** `PROJECT.md` (no `plan.md`); `progress.md`; `prompt_draft.md`; the ten kinds in §3 | §3 table; `OBSERVED — disk` |
 
 Resolution, in three parts:
 
 1. **The docs' "plan artifact" is a category, not a filename.** The binary's own mapping is split: project-level plan in `PROJECT.md`, milestone scope in `SCOPE.md`, and per-agent state in `BRIEFING.md`/`progress.md`. `plan.md` is an available literal (`10` §2.4) that this sample never used. **Authoritative for naming: the on-disk vocabulary** — it is what a run actually produces.
 2. **The path prefix `.agents/teamwork/` is logical, not workspace-relative.** `05` §6 records the prompt's relocatable-root prose; this sample resolves it to `brain/<conv>/scratch/.agents/teamwork/`, and the dispatch text forbids writing it into the project. **Authoritative for location: the runtime root** (`<appDataDir>/brain/<conv>/scratch/…`); `05` §6's `.agents/teamwork/…` paths should be read as paths *inside that root*.
-3. **The nine kinds are the observed floor, not a closed schema.** `DEAD_ENDS.md`, `TEST_INFRA.md`, `TEST_READY.md`, `plan.md`, `context.md`, `_gen<N>` folders and the segment/synthesis artifacts of `05` §6 did not appear at all. Neither source should be read as excluding them; the disk sample simply did not exercise those routes.
+3. **The ten kinds are the observed floor, not a closed schema.** `plan.md` and `context.md` as teamwork state files still did not appear in any root; `DEAD_ENDS.md` is now observed once (§3 row 10), `TEST_INFRA.md`/`TEST_READY.md` in the 2026-11-15 root, and `_gen<N>` in the 1e28850f successor. The segment/synthesis artifacts of `05` §6 are a separate source. Neither source should be read as excluding the rest; the disk sample simply did not exercise those routes.
 
 For anyone reconciling this corpus: cite the **structure and vocabulary** from this document, cite the **intent** from the prompt, and do not present a docs filename as an implemented one without a disk instance.
 
@@ -426,8 +436,8 @@ For anyone reconciling this corpus: cite the **structure and vocabulary** from t
 | Does `[skip-interview]` suppress the interview at runtime? | **The positive half is now observed.** `16` records a request *without* the token entering the gate: notice, `teamwork_interviewer`, `interviewer/`, one seven-gap draft, no route. The 2026-11-22 General run records the token in `## Parameters`, runs no interviewer and creates no `interviewer/` folder. Together the two sides make the token→gate link strongly supported, but still `INFERRED` — no log line records the parse (`12` §2.2, §6; `16` §6). The approval path is unobserved: the draft was never delivered (`16` §7). |
 | Is the inline fallback a client policy or the sentinel's choice? | The recovered prompt neither mandates nor forbids it; no log line attributes the edit (§1.5) |
 | Is `Model:"flash"` the sentinel's retry choice or a client default? | **ANSWERED for the observed instance — a new planner turn chose it.** Step 32 is a fresh `PLANNER_RESPONSE` containing both the reasoning and the `"Model":"flash"` call, after step 26's 429. It is not evidence of a deterministic client retry; whether such a retry policy exists is `UNKNOWN` and static-RE only (§1.4) |
-| When are `DEAD_ENDS.md`, `TEST_INFRA.md`, `TEST_READY.md`, `plan.md`, `context.md` written? | **PARTLY ANSWERED.** `TEST_INFRA.md` and `TEST_READY.md` are observed in the 2026-11-15 completed prior run, written by the project orchestrator at the testing-track setup and test-ready phases; `TEST_INFRA.md` is also present in a 2026-11-18 multi-milestone root. `DEAD_ENDS.md`, `plan.md` and `context.md` remain unobserved in every root sampled (§3) |
-| What does `_gen<N>` mark? | No successor-generation folder occurred in the sample (§4) |
+| When are `DEAD_ENDS.md`, `TEST_INFRA.md`, `TEST_READY.md`, `plan.md`, `context.md` written? | **PARTLY ANSWERED.** `TEST_INFRA.md` and `TEST_READY.md` are observed in the 2026-11-15 completed prior run, written by the project orchestrator at the testing-track setup and test-ready phases; `TEST_INFRA.md` is also present in a 2026-11-18 multi-milestone root. `DEAD_ENDS.md` is observed once, in the sub-orchestrator of a milestone that failed four gate iterations (`sub_orch_m1_issue1/`, §3 row 10). `plan.md` and `context.md` remain unobserved as **teamwork state files**; a conversation-root `brain/<conv>/plan.md` exists but is a different, agent-authored artifact (§3) |
+| What does `_gen<N>` mark? | **ANSWERED.** `sub_orch_m1_gen2/` is the successor generation of the same milestone sub-orchestrator: its briefing records gen1's two failed iterations and takes over Iteration 3, and its gate file carries the earlier iterations forward to a PASS (§4). The prompt's self-succession rule is the matching mechanism; that the threshold triggered this split is `INFERRED` |
 | Does the state root ever use the `<appDataDir>/scratch/teamwork/<run_id>/` form rather than the `brain/<conv>/scratch/` fallback? | **ANSWERED — both occur.** The primary form is observed in the 2026-11-15 prior run, the 2026-11-22 General run and SWE Light Run 1; the `brain/<conv>/scratch/` fallback is observed in the 39-root sample and SWE Light Run 2 (§2.1, `12` §6, `13` §6, §12.7) |
 | Does a completed run write anything at all into the workspace? | All observed product files are project code/outputs; no teamwork state document appeared in a workspace in either run (§2.3, §1.6) |
 | What selects native swarm over the teamwork path for one `/teamwork-preview` invocation? | Both runs used `--print` and `[skip-interview]` and diverged; no flag, task feature or log line is attributed (§1.7) |

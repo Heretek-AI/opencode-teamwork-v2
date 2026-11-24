@@ -66,11 +66,11 @@ Do not read the absence of a route artifact as a route property: it is the shape
 
 ## Integrity
 
-`MANIFEST.sha256` lists the SHA-256 of each file in this directory after redaction.
+`MANIFEST.sha256` lists the SHA-256 of every **evidence** file in this directory after redaction. The prose `README.md` is **excluded by rule**, not by oversight: it names the manifest and the file list, so including it makes the manifest self-referential — any edit to the README (including this note) would break its own digest and `sha256sum -c` would fail. Verify this bundle with `sha256sum -c MANIFEST.sha256`; every entry in it must be `OK`. The exclusion applies to evidence bundles in this corpus whose README is prose commentary rather than captured bytes.
 
 ## Limits at capture time
 
-- The remaining planned live runs are **pending**: Document Review (route L), the configuration/disabled-command gate, and a native-swarm composition beyond the single 2026-11-22 capture. None is represented here.
+- The remaining planned live runs are **pending**: Document Review (`teamwork_document`), the configuration/disabled-command gate, and a native-swarm composition beyond the single 2026-11-22 capture. None is represented here.
 - The quota state at capture was reported as **weekly Gemini-models ≈10.86 % remaining**; the individual/default tier then refused further caller turns (`15:54:23Z`). Those percentages are not recorded in any capture file and are labelled `REPORTED` in `16` §8.4.
 - No TUI run exists in this bundle. Every statement about print mode is about print mode only.
 - No human approval is recorded. The draft was written at 16:06:59Z and the turn ended at 16:07:05Z; it was never sent to the user.

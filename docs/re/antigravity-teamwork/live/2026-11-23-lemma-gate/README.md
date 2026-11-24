@@ -60,4 +60,4 @@ Do not read the absence of a route artifact as a route property: it is the docum
 
 ## Integrity
 
-`MANIFEST.sha256` lists the SHA-256 of each file in this directory after redaction.
+`MANIFEST.sha256` lists the SHA-256 of every **evidence** file in this directory after redaction. The prose `README.md` is **excluded by rule**, not by oversight: it names the manifest and the file list, so including it makes the manifest self-referential — any edit to the README (including this note) would break its own digest and `sha256sum -c` would fail. Verify this bundle with `sha256sum -c MANIFEST.sha256`; every entry in it must be `OK`. The exclusion applies to evidence bundles in this corpus whose README is prose commentary rather than captured bytes.

@@ -4,6 +4,8 @@
 
 **Confidence legend:** `OBSERVED` — directly read from the artifact (byte string present at a cited offset, or machine-code bytes). `INFERRED` — reasoned from stated observed premises. `UNKNOWN` — not measured; written as unknown rather than guessed. Confidence definitions follow [`PROVENANCE.md`](PROVENANCE.md).
 
+**Version scope.** Every offset in this document is a **1.5.14** offset (the static axis). The live CLI is now **1.5.16** (SHA-256 `05245f43…430934e785`); **1.5.15** (`7b004d26…41fa2d`) is the historical live axis that produced the 2026-11-23 gate runs. The recovered sentinel prompt is byte-identical across all three, but its slice start moved 113,241,709 → 113,300,479 → 113,868,721, so no static offset resolves unchanged on a later build. See [`PROVENANCE.md`](PROVENANCE.md) *version axes*.
+
 **Evidence classes.** Three distinct classes of evidence are used, and they do not have equal force:
 
 1. **Machine code** (e.g. the `teamwork` immediates at 174,580,885) — the only class that proves the CLI itself acts on a token.

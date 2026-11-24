@@ -1,28 +1,37 @@
 <!--
 PROVENANCE — Antigravity sentinel/orchestrator system prompt (verbatim)
 
-Source artifact   : 1.5.14 — /tmp/opencode/ver-fix-1.5.14/antigravity
-                    (re-extracted from /home/john/Downloads/cli_linux_x64.tar.gz)
+Source artifact   : 1.5.14 — re-extracted from /home/john/Downloads/cli_linux_x64.tar.gz
+                    (the 2026-11-23 working path /tmp/opencode/ver-fix-1.5.14/ is gone; re-extract
+                    to any scratch directory — the archive is the durable copy)
 Artifact size     : 273,240,776 bytes (stripped ELF)
 Artifact SHA-256  : 37873b8062391b6202a3d3199ec012abc9e53aab720d26cd65699441497d8c94
 Byte range used   : 1.5.14  start offset 113241709 (1-based file offset of the leading " SENTINEL"),
                     length 36482 bytes -> file bytes 113241709..113278190 inclusive
                     1.5.15  start offset 113300479 (1-based), same length 36482 and same bytes,
                     -> file bytes 113300479..113336960 inclusive
-                    (= slice offsets 0..36481 of the raw extraction, identical in both builds)
+                    1.5.16  start offset 113868721 (1-based), same length 36482 and same bytes,
+                    -> file bytes 113868721..113905202 inclusive
+                    (= slice offsets 0..36481 of the raw extraction, identical in all three builds)
 Extraction method : tail -c +113241709 antigravity | head -c 36482 > sentinel.prompt   (1.5.14)
-                    tail -c +113300479 /home/john/.local/bin/agy | head -c 36482 > sentinel.prompt   (1.5.15)
-Date              : 2026-11-21 (1.5.14 capture); 2026-11-23 (1.5.15 re-verification)
+                    tail -c +113300479 <1.5.15 binary> | head -c 36482 > sentinel.prompt   (1.5.15)
+                    tail -c +113868721 /home/john/.local/bin/agy | head -c 36482 > sentinel.prompt   (1.5.16)
+Date              : 2026-11-21 (1.5.14 capture); 2026-11-23 (1.5.15 re-verification);
+                    2026-11-24 (1.5.16 re-verification)
 
 VERSION SCOPE
-  The two binaries carry the SAME 36,482-byte prompt, byte-for-byte:
-  SHA-256 3e8c347eb2db6059ef9f010873062c41bc7d95fd640746674b4caddd0fabf4c1 at both offsets.
+  All three binaries carry the SAME 36,482-byte prompt, byte-for-byte:
+  SHA-256 3e8c347eb2db6059ef9f010873062c41bc7d95fd640746674b4caddd0fabf4c1 at every offset.
   1.5.14 (static axis) is the corpus build; every offset below in this file is a 1.5.14 offset.
-  On 1.5.15 (live axis, installed /home/john/.local/bin/agy, SHA-256 7b004d26…41fa2d,
-  273,879,752 B) the whole prompt is shifted by +58,770 bytes — the slice start moves
-  113,241,709 -> 113,300,479, and `### Route Summary` moves 113,265,667 -> 113,324,437.
-  In-slice (slice-relative) offsets are UNCHANGED because the bytes are identical. To convert a
-  1.5.14 file offset below to 1.5.15, add 58,770. See ../PROVENANCE.md *live axis vs static axis*.
+  1.5.15 (historical live axis, 273,879,752 B, SHA-256 7b004d26…41fa2d) shifted the whole
+  prompt by +58,770: slice start 113,241,709 -> 113,300,479, `### Route Summary`
+  113,265,667 -> 113,324,437.
+  1.5.16 (current live axis, 275,067,592 B, SHA-256 05245f43…430934e785) shifts it by
+  +627,012 against 1.5.14: slice start 113,241,709 -> 113,868,721, `### Route Summary`
+  113,265,667 -> 113,892,679.
+  In-slice (slice-relative) offsets are UNCHANGED because the bytes are identical. To convert
+  a 1.5.14 file offset below to 1.5.15 add 58,770; to 1.5.16 add 627,012. See
+  ../PROVENANCE.md *version axes*.
 
 FIDELITY
   Recovered from `.rodata` as a single contiguous byte slice. Boundaries chosen at the
@@ -43,7 +52,8 @@ HASH NOTE
   The SHA-256 above was recomputed for this extraction and is the authoritative value
   (64 hex chars). It matches the 1.5.14 extracted-binary row in `PROVENANCE.md`
   *Source Identity* exactly, and the same 36,482 bytes hash identically in the
-  1.5.15 live binary (re-verified 2026-11-23). It is cited identically in every
+  1.5.15 binary (re-verified 2026-11-23) and the 1.5.16 install (re-verified
+  2026-11-24). It is cited identically in every
   document in this corpus; a superseded 62-character reading appeared in an earlier
   draft of this note and was withdrawn. The digest is therefore correct and consistent
   across the corpus; no correction is outstanding.
@@ -57,15 +67,15 @@ Antigravity binary. Reproduced for interoperability analysis only; see
 
 ## Structure observed
 
-Offsets in this list and in the text below are **1.5.14** file offsets (the static axis). On 1.5.15 add **+58,770** to every file offset; the slice-relative offsets are identical. The `### Route Summary` row is shown for both versions because the re-verification measured it explicitly.
+Offsets in this list and in the text below are **1.5.14** file offsets (the static axis). On 1.5.15 add **+58,770** to every file offset; on 1.5.16 add **+627,012**; the slice-relative offsets are identical. The `### Route Summary` row is shown for all three because each was measured explicitly, and every other row's 1.5.16 value follows from the verified identical slice.
 
-- `## Sentinel Monitoring` — slice offset 13552, file offset 113,255,260 (1.5.14) / 113,314,030 (1.5.15)
-- `## Routing Decision Table` — slice offset 24875, file offset 113,266,583 (1.5.14) / 113,325,353 (1.5.15)
-- `## Decision Process` — slice offset 28637, file offset 113,270,345 (1.5.14) / 113,329,115 (1.5.15)
-- `## Anti-Patterns` — slice offset 29855, file offset 113,271,563 (1.5.14) / 113,330,333 (1.5.15)
-- `## Route Completion Verification` — slice offset 31767, file offset 113,273,475 (1.5.14) / 113,332,245 (1.5.15)
-- `## Workflow Protocol` — slice offset 34543, file offset 113,276,251 (1.5.14) / 113,335,021 (1.5.15)
-- `### Route Summary` (inside Routing Decision Table) — file offset 113,265,667 (1.5.14) / 113,324,437 (1.5.15)
+- `## Sentinel Monitoring` — slice offset 13552, file offset 113,255,260 (1.5.14) / 113,314,030 (1.5.15) / 113,882,272 (1.5.16)
+- `## Routing Decision Table` — slice offset 24875, file offset 113,266,583 (1.5.14) / 113,325,353 (1.5.15) / 113,893,595 (1.5.16)
+- `## Decision Process` — slice offset 28637, file offset 113,270,345 (1.5.14) / 113,329,115 (1.5.15) / 113,897,357 (1.5.16)
+- `## Anti-Patterns` — slice offset 29855, file offset 113,271,563 (1.5.14) / 113,330,333 (1.5.15) / 113,898,575 (1.5.16)
+- `## Route Completion Verification` — slice offset 31767, file offset 113,273,475 (1.5.14) / 113,332,245 (1.5.15) / 113,900,487 (1.5.16)
+- `## Workflow Protocol` — slice offset 34543, file offset 113,276,251 (1.5.14) / 113,335,021 (1.5.15) / 113,903,263 (1.5.16)
+- `### Route Summary` (inside Routing Decision Table) — file offset 113,265,667 (1.5.14) / 113,324,437 (1.5.15) / 113,892,679 (1.5.16)
 
 Slice and file offsets below are 0-based (`grep -aob`); the range start is 1-based. The slice
 also contains the shared prompt preamble that precedes these sections

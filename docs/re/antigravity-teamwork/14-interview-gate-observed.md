@@ -16,6 +16,8 @@ Paths are normalised to placeholders so no unrelated project content or machine-
 
 Confidence labels follow [`PROVENANCE.md`](PROVENANCE.md). `OBSERVED — transcript` means a `step_index` in `<appDataDir>/brain/<conv>/.system_generated/logs/transcript_full.jsonl`; `OBSERVED — disk` means a state file read under `<state>`; `INFERRED` means reasoned from those observations.
 
+**CLI version: `UNKNOWN`.** [OBSERVED — absence] This run is dated 2026-11-15/16, which **predates the earliest surviving server log** on the host (`~/.gemini/antigravity-cli/log/cli-20261117_180830.log`, which reports `Language server version: 1.5.9`). The run's transcripts survive, but a transcript carries no `Language server version:` line, and the binary that executed it was replaced by later auto-updates. So neither of the two identity readings that could name the version — the server-log line or a hashable copy of the binary — exists for this run. The document therefore records `UNKNOWN` and does not assign it to 1.5.14, 1.5.15 or 1.5.16. See [`PROVENANCE.md`](PROVENANCE.md) *version axes* and the version identity rule.
+
 ---
 
 ## 1. Why this run is usable
