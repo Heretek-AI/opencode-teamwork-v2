@@ -1,10 +1,10 @@
 # ADR 0010: Pinned-fd Write Containment for Run-Directory Writes
 
-- **Status:** Implemented for the write path on Linux
+- **Status:** Implemented for the write path on Linux; macOS/Windows detective parity in [ADR 0013](0013-containment-parity-and-the-detective-boundary.md)
 - **Date:** 2026-11-23
 - **Workstream:** 0.11.0 (follow-up to ADR 0004)
 - **Classification:** ADR / security design gate
-- **Related:** [ADR 0004](0004-intermediate-symlink-races.md), [`docs/spikes/shared-safe-fs.md`](../spikes/shared-safe-fs.md), [`docs/ARTIFACTS.md`](../ARTIFACTS.md), [`docs/GUARDRAILS.md`](../GUARDRAILS.md)
+- **Related:** [ADR 0004](0004-intermediate-symlink-races.md), [ADR 0013](0013-containment-parity-and-the-detective-boundary.md), [`docs/spikes/shared-safe-fs.md`](../spikes/shared-safe-fs.md), [`docs/ARTIFACTS.md`](../ARTIFACTS.md), [`docs/GUARDRAILS.md`](../GUARDRAILS.md)
 
 ## 1. Context
 

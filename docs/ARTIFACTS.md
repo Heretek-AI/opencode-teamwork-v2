@@ -2058,16 +2058,31 @@ The cross-process lock file is created inside the same pinned directory
 (`withPinnedCrossProcessLock`), keyed in-process by the stable realpath plus
 relative path. Known run subdirectories are pre-created at plan time.
 
-**Boundary.** This is a Linux guarantee. On Linux where `/proc/self/fd` is
-absent or unusable, run writes fail closed. On **macOS and Windows** there is no
-pure-JS fd-to-path primitive, so writers keep the path-based atomic
-write and add only a **detective** post-write containment/identity check; a
-transient swap that is reverted before the check can be missed. That is the
-permanent platform stance. The first `mkdir` of the run root is still
-path-based, and a same-UID process that can ptrace the plugin is outside this
-boundary. Containment does not authenticate artifact content: a writer that can
-already modify the run directory can still forge content inside it, which is why
-verdicts are recomputed from evidence.
+**Boundary.** This is a Linux guarantee. **Linux without procfs fails closed**
+(nothing is written). **macOS and Windows are detective**: there is no pure-JS
+dir-relative write without a native addon, so writers keep the path-based atomic
+write plus a **detective** containment/identity check. 0.13.0 pins the run root
+and every existing ancestor `(dev, ino)` at target time, re-stats them
+immediately before the create/rename/unlink and again in the post-check, and
+refuses a mismatch as `identity-changed`; a legitimately renamed run root fails
+closed. The signed `run.manifest.json` also records the run-root identity at
+plan time, re-checked before control-plane writes. **A detected write is a
+report about an event that already happened, not a prevented one:** a transient
+swap that is reverted before the check can be missed, and a detected write is
+not rolled back. That is the permanent platform stance. The first `mkdir` of the
+run root is still path-based, and a same-UID process that can ptrace the plugin
+is outside this boundary. Containment does not authenticate artifact content: a
+writer that can already modify the run directory can still forge content inside
+it, which is why verdicts are recomputed from evidence.
+
+**Pinned-write policy.** `OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES=1` (or a
+plan's `requirePinnedWrites: true`) makes the fail-closed stance explicit: on a
+host whose write-containment mode is not `pinned`, control-plane writes
+(manifest, state, costs, `verify/*`, handoffs, plan) are refused with a named
+`containment-mode` refusal and nothing is written. It is off by default.
+`doctor --security` reports the mode and the env setting; when the policy is
+asserted and the mode is not pinned, the check is a failure and
+`--require-hardened` exits 2.
 
 - `tournament/manifest.json`: 5-phase bounded state machine (`PROPOSE → FALSIFY_PRUNE → MERGE → REFEREE_SCORE → VICTORY_AUDIT` → `COMPLETED | FAILED | CANCELLED | BUDGET_HALTED`), `optInProof`, `budgetEstimate`, `candidates`, and deterministic `rankedCandidates`.
 - `tournament/verdict.json`: written by `team/referee` on `audit` (`ACCEPT`/`REJECT`) or by `finalizeTournamentPartial` on cancellation/budget halt (`PARTIAL`).

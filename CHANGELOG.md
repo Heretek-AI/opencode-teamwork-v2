@@ -4,6 +4,67 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-11-23
+
+Detective-mode containment parity on macOS/Windows, an opt-in fail-closed
+policy, a run-root identity recorded in the signed manifest, and platform CI
+that actually runs the boundary suites. No schema version bump; new manifest and
+plan fields are additive.
+
+### Added
+
+- **Ancestor identity pin (ADR 0013).** At detective `detectiveTarget` time the
+  writer records `(dev, ino)` for the run root and every existing ancestor
+  component (bounded to 32, never following a symlink), re-stats each before the
+  create/rename/unlink and again in the post-check, and refuses a mismatch with
+  a named `identity-changed` refusal plus a `detective-identity-changed`
+  anomaly. A legitimately renamed run root fails closed. On darwin the run root
+  is additionally opened and `fstat`'ed against the pinned identity before each
+  mutation (identity confidence, not prevention).
+- **`OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES=1` and plan
+  `requirePinnedWrites`.** On a host whose traversal mode is not `pinned`,
+  control-plane writes (manifest, state, costs, `verify/*`, handoffs, plan) are
+  refused with a named `containment-mode` refusal. Default off; the plan
+  assertion is sticky and is rehydrated on restart; the env assertion cannot be
+  cleared by a caller.
+- **Run-root identity in the signed manifest.** `run.manifest.json` records
+  `runRootIdentity {dev, ino}` at plan time; `assertRunRootIdentity` re-checks
+  it before control-plane writes and refuses a renamed/replaced root. Legacy
+  manifests without the field are a no-op.
+- **`detective_mode` diagnostic.** One diagnostic per run (not per write) names
+  the non-pinned mode and the honest boundary.
+- **Platform CI** (`.github/workflows/platform.yml`): macOS and Windows, Node
+  24, running `test-safe-fs`, `test-safe-fs-write`, `test-approval` and
+  `test-auth`. Platform-native cases: darwin case-insensitive run spelling,
+  `/tmp` → `/private/tmp`, final-component append symlink, non-zero `dev`/`ino`;
+  win32 junction refusal, `.. ` / `CON` / ADS segments, case-varied run path,
+  non-zero `dev`/`ino`. Unsupported runner fixtures print an explicit
+  `SKIP`/`RECORD` line.
+
+### Changed
+
+- `doctor --security` reports the containment mode and
+  `OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES`; an asserted policy on a non-pinned
+  host is a failure, so `--require-hardened` exits 2.
+- The detective tests now run on macOS/Windows instead of being gated on Linux
+  pinned mode.
+
+### Tests
+
+- New safe-fs-write cases for the identity pin (pre-create, pre-rename,
+  renamed root, append post-check, darwin fd seam), the pinned-write policy
+  (env, default off, per-run, pinned success, once-per-run diagnostic), and the
+  signed-manifest root identity. New security cases for the doctor containment
+  output and hardened exit code.
+- Linux suites stay green; the packaging guard is unchanged.
+
+### Residuals
+
+- A transient swap that is reverted before the check is missed. A detected
+  write already happened and is not rolled back. `(dev, ino)` can be reused.
+  There is no pure-JS dir-relative write on macOS/Windows without a native
+  addon. Same-UID ptrace remains outside the boundary. See ADR 0013.
+
 ## [0.12.0] - 2026-11-23
 
 Minor release binding verdicts to the evidence they reviewed and making
