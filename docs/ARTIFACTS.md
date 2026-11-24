@@ -1312,6 +1312,19 @@ from console credits (`opencode_console_get_usage` →
 full remaining budget or a partial (half) amount. `budgetSource` records where
 the budget came from.
 
+**The budget is advisory outside the massive-proof tournament.** `teamwork_cost`
+warns when floored usage reaches 80% of a positive `budgetUsd` and returns
+`shouldHalt: true` plus the explicit `thresholdPct: 80`; the Sentinel is
+expected to halt non-essential workers and ask the user. No standard-run tool
+refuses work on that signal: `teamwork_next` can still lease a ready task,
+`teamwork_task_update` can start another round, and `teamwork_final_verify` can
+still stamp a verdict. The only enforced budget is the tournament preflight and
+dispatch halt described under [Tournament artifacts](#tournament-artifacts-massive-proof-explicit-opt-in),
+which writes `BUDGET_HALTED` and a `PRESENT_PARTIAL` report. `budgetUsd: 0` is
+an explicit no-budget run: `teamwork_cost` reports 0% and never returns
+`shouldHalt`, and a standard run keeps dispatching. A missing `budgetUsd` key is
+not the same as `0`; a new plan resolves it to the default budget.
+
 Cost and token consumption are read directly from OpenCode, not self-reported.
 The engine discovers the full OpenCode session tree rooted at the run's sentinel
 session (`opencode.db` SQLite tree query, background service API, or client get),
@@ -2203,7 +2216,9 @@ When `massive-proof` runs in tournament mode (`teamwork_plan` with explicit opt-
 `teamwork_tournament({ action: "init" })`), the engine validates bounds (`levels <= 4`,
 `branchingFactor <= 8`, `maxCandidates <= 64`, `maxIterations <= 32`, `unitCostUsd >= 0.05`)
 and runs budget preflight (`budgetUsd > 0`, `spentPct < 80`, `remainingUsd >= estimatedMinUsd`)
-**strictly before `mkdirSync`**. All tournament IDs match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`,
+**strictly before `mkdirSync`**. This tournament path is the **only** topology that
+enforces the run budget; outside it, the budget is advisory (see
+[`costs.json`](#costsjson)). All tournament IDs match `^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`,
 and every path under `tournament/` enforces segment-wise `lstatSync` symlink refusal,
 `realpathSync` containment, bounded `O_NOFOLLOW | O_NONBLOCK` reads, and
 `O_CREAT | O_EXCL` temp files (a planted symlink/hard link at a temp path cannot

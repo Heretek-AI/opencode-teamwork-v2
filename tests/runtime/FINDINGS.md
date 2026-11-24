@@ -69,15 +69,16 @@ real tool; only the on-disk artifact is hand-built, as in the engine suite.
 
 # L3 findings
 
-## 4. The run budget is advisory outside the massive-proof tournament (defect)
+## 4. The run budget is advisory outside the massive-proof tournament (documented limitation, resolved in 0.17.2)
 
-**Observed — genuine limitation.** `teamwork_plan` records `budgetUsd` and
-`teamwork_cost` computes the percentage and returns `shouldHalt: true` at the
-80% threshold, but no non-tournament consumer of that signal exists. Only
-`teamwork_tournament` cancels or halts on `budget <= 0 || spent >= budget ||
-pct >= 80` (`plugins/opencode-teamwork/tools.ts:8397` for the tournament tool,
-`:8783` for `next`'s tournament branch). A standard run keeps dispatching after
-the budget is exhausted.
+**Observed — documented limitation, not a missing gate.** `teamwork_plan`
+records `budgetUsd` and `teamwork_cost` computes the percentage and returns
+`shouldHalt: true` at the explicit 80% threshold, but no non-tournament consumer
+of that signal exists. Only `teamwork_tournament` cancels or halts on
+`budget <= 0 || spent >= budget || pct >= 80`
+(`plugins/opencode-teamwork/tools.ts:8402` for the tournament tool, `:8788` for
+`next`'s tournament branch). A standard run keeps dispatching after the budget
+is exhausted.
 
 Reproduced on this branch with a real plan (`budgetUsd: 0.5`, one task),
 `costs.json` at `spentUsd: 5`, and a real `teamwork_cost` read followed by
@@ -85,20 +86,32 @@ Reproduced on this branch with a real plan (`budgetUsd: 0.5`, one task),
 
 ```text
 COST: Budget: $0.5 · spent: $5 (1000%)
-⚠ 1000% of budget used — halt non-essential workers and ask the user.
-SHOULD_HALT: true PCT: 1000
+⚠ 1000% of budget used — advisory: halt non-essential workers and ask the user. The budget is enforced only by the massive-proof tournament.
+SHOULD_HALT: true PCT: 1000 THRESHOLD: 80
 NEXT_STATUS: undefined
 NEXT_HAS_ALL_PASSED: false
 NEXT_READY_COUNT: 1        # the task is still dispatched
 PHASE: DISPATCH
 ```
 
-`next` returns an ordinary dispatch (`readyForWorker` with one entry; no
-`status`, no `PRESENT_PARTIAL`, no `blocked`). The I4 spec therefore keeps
-I4a (`maxRounds` exhaustion) green and **skips I4b** with the reason in the test
-name; asserting a cap the engine does not enforce would be a false claim. This
-is a plugin change (a general budget gate before dispatch), not a harness change,
-and is not made on this branch.
+**Documentation is the authority here.** The shipped docs promise a warning and
+an agent instruction, not an engine gate: `README.md` says `teamwork_cost`
+"warns at 80%", `docs/ARTIFACTS.md` calls `costs.json` a "budget tracker" and
+puts the only budget preflight/halt under "Tournament artifacts", and
+`agents/team/sentinel.md` tells the Sentinel to "halt non-essential workers"
+without claiming `next` refuses. The gap analysis already recorded
+"Halt non-essential workers at 80% budget" as **prompt prose only (not
+enforced)**: `teamwork_cost` returns `shouldHalt` but nothing enforces a halt
+(`docs/re/antigravity-teamwork/08-gap-analysis-opencode-teamwork-v2.md` §1.6).
+Adding a global gate would invent a product promise the docs never made.
+
+**0.17.2 resolution.** The limitation is now stated plainly in `README.md` and
+`docs/ARTIFACTS.md`; the 80% threshold is one exported constant
+(`BUDGET_HALT_PCT` in `plugins/opencode-teamwork/budget.ts`) shared by the cost
+warning and the tournament halt; `teamwork_cost` returns `thresholdPct: 80`;
+`budgetUsd: 0` is documented and tested as unlimited; and I4b is unskipped to
+assert the advisory behaviour (dispatch at 1000%, no `blocked`, no
+`PRESENT_PARTIAL`). The cost accounting itself is unchanged.
 
 ## 5. A bare `next` claim appends no event (observation, not a defect)
 

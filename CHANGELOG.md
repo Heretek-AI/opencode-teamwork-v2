@@ -4,6 +4,44 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.2] - 2026-11-24
+
+Budget-enforcement honesty. The L3 runtime suite reported that `teamwork_cost`
+returned `shouldHalt` while a standard run kept dispatching. The shipped docs
+promise a warning and an agent instruction, not an engine gate, so this release
+states that scope plainly, makes the threshold explicit, and turns the skipped
+I4b spec into an assertion of the documented behaviour. No dispatch gate is
+added and cost accounting is unchanged.
+
+### Changed
+
+- **The run budget is documented as advisory outside the massive-proof
+  tournament.** `README.md` and `docs/ARTIFACTS.md` now say that `teamwork_cost`
+  warns at 80%, `teamwork_next`/`teamwork_task_update`/`teamwork_final_verify`
+  do not refuse work on that signal, and only `teamwork_tournament` /
+  `next`'s tournament branch halt with `BUDGET_HALTED` + `PRESENT_PARTIAL`.
+- `teamwork_cost` names the threshold explicitly: the warning says the budget is
+  advisory, the result carries `thresholdPct: 80`, and `budgetUsd: 0` is
+  documented and tested as an unlimited no-budget run.
+- The 80% threshold is one exported constant (`BUDGET_HALT_PCT`) shared by the
+  cost warning, the run-context cost line, and both tournament halt paths, so
+  the paths cannot drift. The finding's 1000% figure was observed usage, not a
+  second threshold.
+- The `/teamwork` command and the Sentinel prompt now say "advisory budget
+  threshold" instead of implying the engine stops the loop at budget.
+
+### Added
+
+- Regressions in `scripts/test-engine.mjs`: the threshold at 79/80/100/1000%
+  and exactly at the budget; a standard run still dispatches and starts a round
+  at 1000%; `budgetUsd: 0` reports 0% and never halts; a replayed snapshot at
+  the boundary adds no spend and does not flip the signal.
+- L3 I4b (and I4b2 for `budgetUsd: 0`) now run instead of being skipped. They
+  assert the advisory transcript from `tests/runtime/FINDINGS.md` §4 against the
+  real plugin.
+- `tests/runtime/FINDINGS.md` §4 is now a documented limitation with the doc
+  evidence and the 0.17.2 resolution, not an open defect.
+
 ## [0.17.1] - 2026-11-24
 
 OpenCode 2.4.1 plugin-contract fixes. The observable change is how the engine

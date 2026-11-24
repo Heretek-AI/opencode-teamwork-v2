@@ -21,6 +21,7 @@ import {
   verifyLeanFile,
 } from "../plugins/opencode-teamwork/lemma.ts"
 import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
+import { BUDGET_HALT_PCT, budgetPercent, budgetThresholdReached } from "../plugins/opencode-teamwork/budget.ts"
 import { renderGateStatus, evaluateStrictGate } from "../plugins/opencode-teamwork/strict.ts"
 import { evaluateVictoryGate } from "../plugins/opencode-teamwork/victory.ts"
 import { withCrossProcessLock, crossProcessLockPath, observeLockArtifact, quarantineStaleLock } from "../plugins/opencode-teamwork/locks.ts"
@@ -6174,6 +6175,8 @@ try {
       const haltedNext = await tools9.teamwork_next.execute({ sessionId: sidBud })
       assert.strictEqual(haltedNext.status, "BUDGET_HALTED")
       assert.strictEqual(haltedNext.phase, "PRESENT_PARTIAL")
+      assert.strictEqual(haltedNext.readyForWorker, undefined, "a halted tournament must not hand out work")
+      assert.strictEqual(haltedNext.shouldHalt, true)
       const refusedBud = await tools9.teamwork_tournament.execute({ action: "propose", sessionId: sidBud, candidateId: "b2", summary: "Over budget" })
       assert(refusedBud.content.startsWith("refused:"), "must refuse dispatch after BUDGET_HALTED")
     }
@@ -11009,6 +11012,99 @@ process.exit(0);
     assertClose(costs.byTask._sentinel, 0.7, "the bucket must be cumulative, not double-counted")
     assert.strictEqual(costs.budgetUsd, 20, "budget buckets must stay unchanged")
     console.log("✓ cost digest is idempotent across crash replay; new snapshots add only the delta; budget preserved")
+
+    // --- 11f-budget: the run budget is advisory outside the massive-proof
+    // tournament. The threshold is one explicit constant (80%); a standard run
+    // still dispatches at/over it, and budgetUsd: 0 means no budget.
+    {
+      assert.strictEqual(BUDGET_HALT_PCT, 80, "the budget threshold must be explicit")
+      assert.strictEqual(budgetPercent(0, 20), 0)
+      assert.strictEqual(budgetPercent(5, 0), 0, "budgetUsd: 0 reports 0%")
+      assert.strictEqual(budgetThresholdReached(15.99, 20), false, "79% is below the threshold")
+      assert.strictEqual(budgetThresholdReached(16, 20), true, "80% exactly reaches the threshold")
+      assert.strictEqual(budgetThresholdReached(20, 20), true, "spend exactly at the budget reaches it")
+      assert.strictEqual(budgetThresholdReached(200, 20), true, "1000% reaches it")
+      assert.strictEqual(budgetThresholdReached(5, 0), false, "budgetUsd: 0 is unlimited")
+
+      const planBudgetRun = async (runId, budgetUsd) => {
+        // Each fixture run starts from a zero baseline; the plan records the
+        // calling session's cost cursor, so a stale value would be subtracted.
+        costUsage = undefined
+        const planned = await costTools.teamwork_plan.execute(
+          {
+            sessionId: runId,
+            topology: "iterative-coding",
+            skipInterview: true,
+            allowUnsignedLegacy: true,
+            budgetUsd,
+            tasks: [{ id: "K1" }],
+          },
+          { sessionID: COST_ROOT },
+        )
+        assert(planned.content.includes("Planned"), `budget fixture plan failed: ${planned.content}`)
+      }
+      const nextBudgetRun = (runId) =>
+        costTools.teamwork_next.execute({ sessionId: runId, allowUnsignedLegacy: true }, { sessionID: COST_ROOT })
+
+      // Below the threshold: cost is quiet, next dispatches.
+      const belowRun = "20261124-000000-budget-below"
+      await planBudgetRun(belowRun, 1)
+      costUsage = { cost: 0.79, tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } }
+      const belowCost = await costTools.teamwork_cost.execute({ sessionId: belowRun }, { sessionID: COST_ROOT })
+      assert.strictEqual(belowCost.pct, 79)
+      assert.strictEqual(belowCost.shouldHalt, false)
+      const belowNext = await nextBudgetRun(belowRun)
+      assert.strictEqual(belowNext.readyForWorker.length, 1, "below the threshold must dispatch")
+
+      // At 1000%: shouldHalt is true but `next` and `task_update` still work,
+      // because the standard-run budget is advisory.
+      const overRun = "20261124-000000-budget-over"
+      await planBudgetRun(overRun, 0.5)
+      costUsage = { cost: 5, tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } }
+      const overCost = await costTools.teamwork_cost.execute({ sessionId: overRun }, { sessionID: COST_ROOT })
+      assert.strictEqual(overCost.pct, 1000)
+      assert.strictEqual(overCost.shouldHalt, true)
+      assert.strictEqual(overCost.thresholdPct, BUDGET_HALT_PCT)
+      assert(/advisory/i.test(overCost.content), overCost.content)
+      const overNext = await nextBudgetRun(overRun)
+      assert.strictEqual(overNext.readyForWorker.length, 1, "the advisory budget must not block next")
+      assert(!/BLOCKED_BY_BUDGET|BUDGET_HALTED/.test(String(overNext.content)), overNext.content)
+      const overUpdate = await costTools.teamwork_task_update.execute(
+        { sessionId: overRun, taskId: "K1", status: "worker_active" },
+        { sessionID: COST_ROOT },
+      )
+      assert(overUpdate.content.includes("status=worker_active"), "the advisory budget must not block task_update")
+      assert.strictEqual(stateOf(overRun).tasks.K1.round, 1)
+
+      // budgetUsd: 0 is no budget: 0%, never halts, next dispatches.
+      const unlimitedRun = "20261124-000000-budget-unlimited"
+      await planBudgetRun(unlimitedRun, 0)
+      costUsage = { cost: 99, tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } }
+      const unlimitedCost = await costTools.teamwork_cost.execute({ sessionId: unlimitedRun }, { sessionID: COST_ROOT })
+      assert.strictEqual(unlimitedCost.pct, 0, "budgetUsd: 0 reports 0%")
+      assert.strictEqual(unlimitedCost.shouldHalt, false, "budgetUsd: 0 never halts")
+      const unlimitedNext = await nextBudgetRun(unlimitedRun)
+      assert.strictEqual(unlimitedNext.readyForWorker.length, 1, "budgetUsd: 0 must not block next")
+
+      // A replayed digest at exactly 80% adds no spend and does not flip the
+      // signal by double-counting.
+      const replayRun = "20261124-000000-budget-replay"
+      await planBudgetRun(replayRun, 1)
+      costUsage = { cost: 0.8, tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } }
+      const replayFirst = await costTools.teamwork_cost.execute({ sessionId: replayRun }, { sessionID: COST_ROOT })
+      const replaySecond = await costTools.teamwork_cost.execute({ sessionId: replayRun }, { sessionID: COST_ROOT })
+      assert.strictEqual(replayFirst.pct, 80)
+      assert.strictEqual(replayFirst.shouldHalt, true, "80% exactly reaches the threshold")
+      assert.strictEqual(replaySecond.skippedDuplicate, true, "the replay must be idempotent")
+      assert.strictEqual(replaySecond.pct, 80, "the replay must not double-count")
+      assert.strictEqual(replaySecond.shouldHalt, true)
+      const replayCosts = JSON.parse(readFileSync(runFile(replayRun, "costs.json"), "utf8"))
+      assertClose(replayCosts.spentUsd, 0.8, "the replay must not grow spentUsd")
+
+      console.log(
+        "✓ budget threshold is explicit (80%); standard runs stay advisory at/over it; budgetUsd: 0 is unlimited; replay is idempotent",
+      )
+    }
     // --- 11g: protocol-2 claim states, grace, and fingerprint-checked reclaim.
     const statePathIn = (rootDir, id) => join(rootDir, ".opencode", "teamwork", id, "state.json")
     const writeStateFile = (file, value) => writeFileSync(file, JSON.stringify(value, null, 2) + "\n")
