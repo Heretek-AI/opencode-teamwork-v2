@@ -190,6 +190,48 @@ Report back: PASS or FAIL, a 1-line summary of the checks, and (if FAIL) the spe
   },
 ]
 
+/**
+ * The host version this port is verified against. `package.json` declares the
+ * same window as `peerDependencies["@opencode/plugin"] = "^2.4"`; the peer is
+ * optional so installs stay dependency-free (the plugin never imports it).
+ */
+export const OPENCODE_PLUGIN_PEER = "^2.4"
+export const OPENCODE_TESTED_MAJOR = 2
+export const OPENCODE_TESTED_MINOR = 4
+
+/**
+ * `ctx.app.version` check. A different major/minor than the verified pair is a
+ * warning, not a refusal: the plugin still loads, because a hard failure in
+ * `setup` would take the whole session down. Returns the parsed pair so tests
+ * can assert the decision without capturing console output.
+ */
+export function checkOpencodeVersion(version: unknown): {
+  ok: boolean
+  major?: number
+  minor?: number
+  warning?: string
+} {
+  const raw = typeof version === "string" ? version.trim() : ""
+  const match = /^v?(\d+)\.(\d+)(?:\.\d+)?(?:[-+].*)?$/.exec(raw)
+  if (!match) {
+    return {
+      ok: false,
+      warning: `could not determine the OpenCode version (ctx.app.version=${JSON.stringify(version)}); this port is verified against ${OPENCODE_TESTED_MAJOR}.${OPENCODE_TESTED_MINOR}.x (peer ${OPENCODE_PLUGIN_PEER})`,
+    }
+  }
+  const major = Number(match[1])
+  const minor = Number(match[2])
+  if (major !== OPENCODE_TESTED_MAJOR || minor !== OPENCODE_TESTED_MINOR) {
+    return {
+      ok: false,
+      major,
+      minor,
+      warning: `OpenCode ${major}.${minor}.x is outside the verified pair ${OPENCODE_TESTED_MAJOR}.${OPENCODE_TESTED_MINOR}.x (peer ${OPENCODE_PLUGIN_PEER}); tool registration and plugin hooks may have changed`,
+    }
+  }
+  return { ok: true, major, minor }
+}
+
 // Agents are read by OpenCode's config-agent plugin before this plugin's
 // `setup` runs, so writing them here could never make them visible in the
 // current session (they would only appear after a restart). Installation
@@ -215,6 +257,8 @@ export async function warnMissingAgents(configDir?: string): Promise<{ configDir
 export default {
   id: "opencode-teamwork",
   async setup(ctx: any) {
+    const versionCheck = checkOpencodeVersion(ctx?.app?.version)
+    if (!versionCheck.ok) console.warn(`[opencode-teamwork] ${versionCheck.warning}`)
     await warnMissingAgents()
     const root = (ctx?.location?.directory as string) || process.cwd()
     await registerTeamworkTools(ctx, root)

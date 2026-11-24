@@ -15,7 +15,10 @@ an effect or setup function. (cause: SchemaError(Expected object at ["default"])
 This repo is the ported, V2-native version: the original 10 agents plus a
 security auditor, document segment reviewer, formalization reviewer,
 tournament referee, and independent victory auditor (15 total) and 7 slash commands,
-rewritten for the V2 plugin + agent APIs. Verified against **OpenCode `v2.0.26`**.
+rewritten for the V2 plugin + agent APIs. Verified against **OpenCode 2.4.1**.
+`package.json` declares an **optional** peer range `@opencode/plugin: ^2.4` (optional so
+the package stays dependency-free), and `setup` warns when `ctx.app.version` is outside
+the verified 2.4 pair.
 
 ## What changed (V1 → V2)
 
@@ -59,7 +62,12 @@ postinstall.mjs                   # asks for models during npm install
 ## Engine (tools + hooks)
 
 The run mechanics are real, not prompt prose. The plugin registers deterministic
-tools (named `teamwork_*` after the `teamwork` namespace) and runtime permission hooks:
+tools and runtime permission hooks. Each registration carries
+`options: { namespace: "teamwork", codemode: false }`: OpenCode's effective id is
+`namespace + "_" + name` (`packages/core/src/tool/runtime.ts`), so the model sees
+direct `teamwork_*` tools (the same ids the agents and command templates call)
+rather than Code Mode-only `teamwork.plan` entries. The table below lists the
+exposed ids:
 
 | Tool | Purpose |
 | --- | --- |
@@ -161,12 +169,14 @@ topologies, and the JSON schemas (`spec.json`, `plan.dag.json`, `state.json`,
 ## Install
 
 > **About the install prompt.** OpenCode installs plugins with **Bun**, and Bun
-> blocks dependency lifecycle scripts (`postinstall`) by default. The interactive
-> model prompt therefore may not appear during `opencode plugin add`, but the
-> agents are still created — the plugin self-heals them on load with the DeepSeek
-> defaults. To choose models, run the `init` command below. (`postinstall` does
-> fire for a plain `npm install`, and is intentionally skipped under `npx` /
-> `npm exec` so the `init` run doesn't prompt twice.)
+> blocks dependency lifecycle scripts (`postinstall`) by default, so the
+> interactive model prompt and the agent files may be skipped. Run the `init`
+> command below: it installs all 15 agents and writes the model map. On load the
+> plugin only verifies the agent files and warns (by filename) when any are
+> missing — it cannot install them mid-session because OpenCode has already read
+> its config. (`postinstall` does fire for a plain `npm install`, and is
+> intentionally skipped under `npx` / `npm exec` so the `init` run doesn't prompt
+> twice.)
 
 ### From GitHub (no npm account needed)
 
@@ -232,9 +242,11 @@ agent files are never overwritten wholesale — only their `model:` line is
 rewritten — and a one-time backup of touched files lands in
 `~/.config/opencode/.opencode-teamwork-backup/<timestamp>/`.
 
-The plugin also self-heals: if the agent files are missing when the plugin
-loads (e.g. the install prompt was skipped), it recreates them from the packaged
-defaults without touching files that already exist.
+`init` and the postinstall hook are the only writers of agent files. On load the
+plugin only **verifies** them and warns (by filename, without failing the load)
+when any are missing: OpenCode's config-agent plugin has already read its
+documents by then, so a write during plugin `setup` would not appear until a
+restart. Re-run `init` (or reinstall) and restart to repair a partial install.
 
 ### Manually (no npm)
 
@@ -606,8 +618,8 @@ the plugin-side posture check.
   `@opencode/plugin`, so the loader never needs to resolve `node_modules` for it.
   The exported object shape is identical to `Plugin.define({ id, setup })`.
 - V2 agents cannot be created by a plugin, so the plugin only registers commands,
-  ships the `teamwork_*` engine tools, and (in the npm package) recreates any
-  missing `team/*.md` agent files from the packaged defaults on load. If you
+  ships the `teamwork_*` engine tools, and verifies (never writes) the `team/*.md`
+  agent files on load; `init`/postinstall install them. If you
   prefer no plugin at all, move the 7 command definitions into markdown files
   under `~/.config/opencode/commands/` (V2 discovers them natively).
 - Prompt invariants (one artifact root, one topology enum, no stale references,
