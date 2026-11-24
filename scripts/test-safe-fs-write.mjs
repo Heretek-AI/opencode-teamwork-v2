@@ -763,6 +763,34 @@ check("detective identity pin: an ancestor swap after the pin refuses with ident
   })
 })
 
+check("detective identity pin: a symlinked ancestor above the run still pins the real subdirectory", () => {
+  // macOS /var -> /private/var and Windows 8.3 short names make the lexical run
+  // path differ from its realpath. The ancestor chain must be re-rooted at the
+  // real path, or a swapped subdirectory would not be detected.
+  const base = mkdtempSync(join(testDir, "symroot-"))
+  const real = join(base, "real")
+  const outside = join(base, "outside")
+  mkdirSync(real, { recursive: true })
+  mkdirSync(outside, { recursive: true })
+  if (!makeTestLink(real, join(base, "link"), "dir")) return
+  const run = join(base, "link", "run")
+  mkdirSync(join(run, "sub"), { recursive: true })
+  if (!makeTestLink(outside, join(run, "sub.swap"), "dir")) return
+  withDetectiveMode(() => {
+    assert.throws(
+      () =>
+        writeFileAtomicWithin(run, "sub/report.json", "NOPE", {
+          afterTarget: () => {
+            renameSync(join(run, "sub"), join(run, "sub.real"))
+            renameSync(join(run, "sub.swap"), join(run, "sub"))
+          },
+        }),
+      (err) => err.reason === "identity-changed",
+    )
+    assert.strictEqual(existsSync(join(outside, "report.json")), false)
+  })
+})
+
 check("detective identity pin: an ancestor swapped after the temp create refuses before the rename", () => {
   const { run, outside } = makeFixture()
   mkdirSync(join(run, "sub"), { recursive: true })
@@ -797,6 +825,12 @@ check("detective identity pin: a legitimately renamed run root refuses (fail clo
 })
 
 check("detective identity pin: appending through a renamed run root refuses in the post-check", () => {
+  if (process.platform === "win32") {
+    console.log(
+      "SKIP: win32 does not permit renaming a directory while an open append descriptor is inside it; the post-append identity mismatch case covers the check",
+    )
+    return
+  }
   const { root, run } = makeFixture()
   withDetectiveMode(() => {
     assert.throws(
@@ -981,7 +1015,10 @@ function writeThroughRunCaseVariant(label) {
   const variant = join(root, basename(run).toUpperCase())
   let caseInsensitive = false
   try {
-    caseInsensitive = realpathSync(variant) === realpathSync(run)
+    // Compare case-insensitively: some platforms canonicalise the on-disk case
+    // in realpath, others echo the caller's spelling.
+    caseInsensitive =
+      existsSync(variant) && realpathSync(variant).toLowerCase() === realpathSync(run).toLowerCase()
   } catch {}
   if (!caseInsensitive) {
     console.log(`SKIP: ${label} — this runner's filesystem is case-sensitive; recorded`)

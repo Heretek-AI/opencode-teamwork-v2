@@ -1203,11 +1203,16 @@ function identityPair(stat, label) {
  * pinning) and an unreadable component; both are `identity-changed` so the
  * caller sees one named refusal for "the tree moved".
  */
-function pinAncestorIdentities(runReal, dest, run) {
+function pinAncestorIdentities(runRoot, runReal, dest, run) {
   const chain = [runReal]
+  // Derive the relative components from the lexical root (which contains
+  // `dest`) and re-root them at the real run path. Comparing runReal to dest
+  // directly is wrong when an ancestor above the run is a symlink or an 8.3
+  // short name: macOS `/var` -> `/private/var`, Windows `RUNNER~1`, and any
+  // symlinked temp root all make the lexical and real trees differ.
   let relDir
   try {
-    relDir = relative(runReal, dirname(dest))
+    relDir = relative(runRoot, dirname(dest))
   } catch {
     relDir = null
   }
@@ -1396,7 +1401,7 @@ function detectiveTarget(run, relPath, options = {}) {
   if (dirReal !== runReal && !isPathWithin(runReal, dirReal)) {
     throw refusalError("containment", "refused: target parent is outside the run realpath")
   }
-  const ancestors = pinAncestorIdentities(runReal, dest, run)
+  const ancestors = pinAncestorIdentities(runRoot, runReal, dest, run)
   return { dest, dirReal, runReal, run, name: segments[segments.length - 1], segments, ancestors }
 }
 
