@@ -1,9 +1,13 @@
-# L1 runtime harness
+# L1/L2 runtime harness
 
 The real plugin registered in the real **OpenCode 2.4.1** runtime, exercised
 through the host's own tool executor, with **no model and no network**. This
 directory is development-only: it is not in the root package's `files` list and
 is excluded from the published tarball by omission.
+
+L1 covers loading, the catalog, commands, schema rejection, permission hooks,
+storage and result shape. L2 drives the engine tools themselves — plan,
+claims, evidence, approvals — through real sessions and real host storage.
 
 ## Run
 
@@ -93,6 +97,26 @@ Two host details the harness relies on:
 | A6 | Two real plugin instances with different ids write the same key through `ctx.storage` and read back only their own value; values round-trip as JSON. |
 | A7 | Every `agents/team/*.md` parses as a config agent with `id`, `name`, non-empty `description`; no stray `AD` lines. |
 | A8 | `teamwork_route` through the runtime: raw `content` is a string with no `output` key; the normalized result has text content and `output === undefined` because no output schema is declared. |
+| B1–B9 | Plan baseline: spec gate (missing, whitespace-only, `skipInterview`), signed manifest v4 (`runKeyId`, 128-bit `runNonce`, request/requirements/plan hashes, signed handoffs, `planAgent`) from both the env HMAC key and the plugin's storage key ring, `AUTH_APPROVAL_DIR` refusal, benchmark downgrade refusals, re-plan stickiness and the declared→command provenance upgrade, write-once `ORIGINAL_REQUEST.md`, and eight representative route-table entries that write nothing. |
+| C10–C14 | Claims: `next` fences, `STALE_FENCE`, a second Sentinel gets no claim and `CLAIM_OWNED_BY_OTHER`, descendant updates, `verified_pass` evidence rules, and `recover inspect`/`adopt` with a single-use token, no new commit, and token replay refusal. |
+| D15–D19 | Evidence: five-section handoffs and signed index entries, report→worker-handoff binding and `REPORT_HANDOFF_STALE`, victory-audit `evidenceDigests` and post-mutation `AUTH_STALE`, cited/empty/absent strict-wave evidence (`STALE`, unbound, `legacy_unbound_wave`), and `INCONSISTENT_VICTORY_TASK` without auto-repair. |
+| F20–F24 | Approvals: `approve sign` + `human-approved` plan with the full prompt binding recorded, one-byte draft edit (`AUTH_APPROVAL_STALE`), replay (`AUTH_APPROVAL_REPLAY`), HMAC approval (`AUTH_APPROVAL_NOT_HUMAN`), and `approvedBy` identity rules. |
+
+## L2 execution model
+
+Each L2 spec gets **its own temp project** (git repo, temp `HOME`/XDG/config,
+`TEAMWORK_WORKTREES_DIR`) and its own embedded host. Sessions are created
+through `host.sessions.create` — roots with `location`, children with
+`parentID` — and agent selection uses `host.sessions.switchAgent`. Storage is
+the host's real KV, not a Map.
+
+**OBSERVED — no output schemas:** no Teamwork tool declares an output schema,
+and the 2.4.1 snapshot executor keeps only `content` (`tool/runtime.ts`). L2
+therefore calls the tool object the host registered (`rawExecute`) when an
+assertion needs the plugin's structured result (`status`, `fence`, `token`,
+`report`), and uses the snapshot executor for representative calls (B1, B9) to
+prove the runtime boundary still decodes and executes the same tool. This is
+the same raw/normalized distinction L1 A8 documents.
 
 ## Findings
 
@@ -105,13 +129,26 @@ nothing). Rejecting unknown input properties requires the plugin to validate
 the raw input with a strict standard schema; that is a plugin change, not a
 harness change, and is not made on this branch.
 
+**No L2 plugin defects were found.** `FINDINGS.md` records the three
+spec-wording observations that are not defects: structured results are invisible
+through snapshot normalization, an unrelated root session is refused by the
+control-plane tree check before it can contend for a claim, and
+`teamwork_wave_record` refuses `cites: []` at write time while the gate treats a
+pre-existing empty array as unbound.
+
 ## Deliberately not covered
 
-- **L2** (scripted `TestLLM` turns), **L3** (real git worktrees), and **L4**
-  (live provider) — this harness is L1 only. It never sends a model request.
+- **L3** (real git worktrees beyond the single clean-worktree adopt fixture),
+  and **L4** (live provider) — this harness never sends a model request.
 - TUI rendering, prompt judgment, cost/provider truth, same-UID forgery, NFS
   lock semantics, and transient filesystem swaps. These are residuals in
-  `docs/OPENCODE-COMPATIBILITY.md` §7 and are not made provable by L1.
+  `docs/OPENCODE-COMPATIBILITY.md` §7 and are not made provable here.
+- The literal spec sentence "a second root Sentinel gets no claim": an
+  unrelated root session cannot call a run-bound tool at all (the control plane
+  requires the run root or a descendant, fail closed). L2 exercises the
+  reachable contention case — two Sentinel sessions under the run root — and
+  also asserts the unrelated-root refusal.
 - The published tarball's installability (T4): `npm pack --dry-run` in CI checks
   the file list, but nothing here installs the packed tarball.
 - Channel/dev builds and `@opencode/*@latest` drift (T3).
+
