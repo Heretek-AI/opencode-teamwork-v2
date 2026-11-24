@@ -382,8 +382,10 @@ format details.
 ## Offline verification (`verify`)
 
 `opencode-teamwork verify` recomputes a run's named relations from the bytes in
-one run directory plus a public key. It is read-only, needs no plugin, no
-database and no `ctx.storage`, and never executes a reported check.
+one run directory plus a public key. It needs no plugin, no database and no
+`ctx.storage`, and never writes into the run. Without `--rerun` it never
+executes a reported check; with `--rerun` it re-executes the signed
+`verify/rerun.json` in a disposable worktree (0.16.0).
 
 ```sh
 # Ed25519: only the public key is needed
@@ -398,7 +400,25 @@ opencode-teamwork verify --session <id> --hmac-key <b64url> --hmac-key-id <id>
 # Optional: branch head/diff and rollback snapshot
 opencode-teamwork verify --session <id> --public-key ... --repo . --require-git
 opencode-teamwork verify --session <id> --public-key ... --require-index snapshot.json
+
+# 0.16.0: re-execute recorded command evidence at the report's commit
+opencode-teamwork verify --run-dir /path/to/run --public-key ... \
+  --rerun --repo /path/to/clean-checkout [--timeout 300] [--keep-worktree]
 ```
+
+Under a plan that recorded `requiredProvenance: "command"`, a PASS report must
+carry at least one programmatic check with an argv-only `command`, an exit code,
+an untruncated output digest and a `headSha`; the engine writes a signed
+`verify/rerun.json`. `verify` without `--rerun` reports that claim as
+`provenance: claimed` and returns `UNKNOWN` (exit 2) — never `PASS`.
+`--rerun` creates a detached worktree at the report's commit, runs the argv with
+no shell and a minimal environment, enforces the recorded timeout, and compares
+the exit code and stdout+stderr digest. A changed digest is
+`output-digest-mismatch`, a non-zero exit is `command-failed`, a missing binary
+is exit 2 `command-unavailable`, a timeout is `command-timeout`, and a shell line
+or escaping `cwd` is `command-refused`. The source checkout is hashed before and
+after; the worktree is removed unless `--keep-worktree`. `declared` runs keep the
+0.15 behaviour.
 
 The signed `run.manifest.json` is the anchor: its `runNonce`, `runKeyId` and
 algorithm are covered by the envelope, and every other artifact is pinned to
@@ -418,8 +438,11 @@ stable machine report; the human table is rendered from it.
 recompute every byte digest, citation, branch binding and cross-artifact
 relation; it still cannot prove an observation, a consistently authored false
 report passes every check, and a whole-run rollback to an earlier signed set is
-undetectable without a snapshot or witness. See
-[ADR 0015](docs/adr/0015-offline-verification.md) and
+undetectable without a snapshot or witness. Re-execution narrows this: a false
+PASS under `command` must survive `--rerun`. It does not prove the command is
+meaningful or that a test was not edited in the same commit; see
+[ADR 0015](docs/adr/0015-offline-verification.md),
+[ADR 0016](docs/adr/0016-re-executable-verification.md) and
 [`docs/ARTIFACTS.md`](docs/ARTIFACTS.md#offline-verification-opencode-teamwork-verify).
 
 ## Model assignment

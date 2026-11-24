@@ -44,6 +44,7 @@ Every run writes under one root:
 ├── verify/security-audit.json # pre-merge security gate report
 ├── verify/victory.json        # independent final acceptance verdict (team/victory-auditor)
 ├── verify/final.json          # stamped final verification verdict
+├── verify/rerun.json          # signed re-execution record (0.16.0, requiredProvenance: command)
 ├── verify/evidence/<name>     # optional bounded evidence artifacts cited by wave verdicts (0.12.0)
 ├── GATE_STATUS.md             # strict mode: final verification gate table
 ├── lemma/                     # optional: LEMMA (Lean 4) formal-proof state when lemmaMode=true
@@ -199,6 +200,7 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
   "victorySkipReason": "why an explicit victory skip was recorded (only when skip)",
   "requireHandoffs": "required|skip",
   "handoffAuth": "signed|legacy",
+  "requiredProvenance": "declared|command",
   "requestHash": "sha256 | null",
   "requirementsHash": "sha256 | null",
   "planHash": "sha256",
@@ -232,7 +234,9 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
   (pre-0.10.2) manifests remain readable. Version 1 in-run
   `approvals/<runId>.json` is honoured only for those runs and is recorded as
   `approval_unbound`; version 2 keeps its manifestDigest-bound approval
-  semantics.
+  semantics. Version 4 (0.16.0+) adds `requiredProvenance`; versions 1–3 are
+  read as `declared`. A re-plan may upgrade `declared → command` but never
+  downgrade it (`AUTH_STALE`).
 - `specHash` is an **unkeyed SHA-256 of the exact file bytes** (not the keyed
   artifact digest), and `specBytes` is the byte length. `teamwork_plan` reads
   the draft through the bounded no-follow run reader before any `mkdir`, so a
@@ -265,6 +269,15 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
   `"legacy"`; a 0.8.0 manifest without the field is read as `"legacy"`. A
   re-plan may upgrade `legacy → signed`, but a `signed → legacy` downgrade is
   `AUTH_STALE` and refused.
+- `requiredProvenance` is the re-execution requirement (0.16.0). `declared`
+  (the default, and the meaning of versions 1–3) means a PASS report's checks
+  are authenticated but not re-executed. `command` means every `PASS` report
+  must carry at least one `type: "programmatic"` check with an argv-only
+  `command`, a `cwd`, an `exitCode`, an untruncated output digest, and a
+  `headSha`; the engine writes a signed `verify/rerun.json`, and
+  `opencode-teamwork verify --rerun --repo <clean-checkout>` re-executes it
+  before a verdict can be `PASS`. A re-plan may upgrade to `command` but a
+  downgrade is `AUTH_STALE`.
 - **Legacy:** `allowUnsignedLegacy: true` at plan time creates/keeps an
   unsigned run. Its completion gates return `AUTH_LEGACY` until the caller
   explicitly passes `allowUnsignedLegacy: true`; that bypass is recorded as a
@@ -733,6 +746,9 @@ recorded host reports `unknown`, not this host.
   `BRANCH_MOVED`; `worktree merge` refuses a verified report whose head no longer
   matches the branch. A legacy report without these fields is accepted with a
   `legacy_unbound_report` warning; it is never silently treated as current.
+  A plan may set `requiredProvenance: "command"` (0.16.0, sticky) to require at
+  least one re-executable programmatic check per PASS report; `verified_pass`
+  then refuses a report without a command or a `headSha` (`REPORT_UNBOUND`).
   A plan may set `requireReportBinding: true` (sticky, default off) to make an
   unbound PASS unconsumable: `teamwork_report` and `final_verify` refuse it with
   `REPORT_UNBOUND`. A check whose `exitCode` contradicts `passed` is refused by
@@ -1101,6 +1117,7 @@ not bypass that binding (the approval is refused with
 | `requirements` | `Array<{id, text}>` | omitted | Up to 50 plan-time requirements. `id` matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$` and must be unique; `text` is non-empty and ≤2,000 chars. Persisted to `requirements.json` (source `caller`). Invalid/duplicate items refuse the plan before anything is written. |
 | `victoryAudit` | `required \| skip` | `required` when a request/requirements baseline exists | Recorded in `plan.dag.json`, `state.json` and the signed `run.manifest.json`. A run with no request and no requirements records the legacy default `skip`; `required` without a baseline is refused. An explicit `skip` requires `victorySkipReason` (non-empty, trimmed, ≤500 chars, sanitized) and makes `final_verify` record `victory: "SKIPPED (explicit): <reason>"`. A re-plan may repeat but not change the mode or reason; `benchmark` refuses skip. |
 | `requireHandoffs` | `required \| skip` | `required` for a new run with a request/requirements baseline; `skip` for legacy/unsigned runs | Recorded in `plan.dag.json`, `state.json`, and the signed `run.manifest.json`. `required` makes `final_verify` and `next` demand the continuity matrix. An explicit `skip` is recorded (surface in `verify/final.json` as `handoffs: "SKIPPED (explicit)"`). A re-plan may repeat but not change the mode. `benchmark` refuses `skip`; a run that cannot be signed records `skip` under `allowUnsignedLegacy`. |
+| `requiredProvenance` | `declared \| command` | `declared` | Recorded in `plan.dag.json`, `state.json`, and the signed (v4) `run.manifest.json`. `command` requires at least one re-executable programmatic check per PASS report, binds each report to a `headSha`, and makes the engine write a signed `verify/rerun.json`; offline `verify --rerun --repo <clean-checkout>` must reproduce exit 0 and the output digest before `PASS`. Sticky: a re-plan may upgrade `declared → command`, never downgrade it (`AUTH_STALE`). |
 
 The request record is a separate artifact from the approved spec: it does not
 satisfy the spec presence gate, and the spec presence gate does not replace it. `teamwork_security_audit`
@@ -1598,7 +1615,21 @@ to derived mode, with start and duration unknown.
   "timestamp": "ISO8601",
   "summary": "Rubric and programmatic checks passed.",
   "checks": [
-    { "name": "...", "type": "programmatic|adversarial|rubric", "passed": true, "output": "..." }
+    {
+      "name": "npm test",
+      "type": "programmatic",
+      "passed": true,
+      "exitCode": 0,
+      "output": "73 suites green\n",
+      "outputSha256": "<keyed digest of output>",
+      "command": ["npm", "test", "--silent"],
+      "cwd": ".",
+      "commandSha256": "<unkeyed sha256 of canonical {argv,cwd}>",
+      "outputBytes": 15,
+      "outputTruncated": false,
+      "durationMs": 8421
+    },
+    { "name": "rubric", "type": "review", "passed": true }
   ],
   "feedbackForWorker": "...",
   "fatalFindings": [
@@ -1622,6 +1653,23 @@ descend from the run's `rootSessionId`, and name a task that exists in
 signed run the report is signed and indexed; `final_verify` requires that
 signature. A hand-written unsigned report is `AUTH_MISSING`.
 
+**checks[] v2 (0.16.0).** A check may declare re-executable evidence:
+`command` (argv only, at most 32 args; never a shell line — `sh -c`/`bash -c`
+is refused), `cwd` (a relative directory inside the re-execution worktree,
+default `.`), `exitCode`, `output` (the exact captured output), and
+`durationMs`. The engine computes `commandSha256 =
+contentSha256Hex(canonicalJson({argv,cwd}))`, `outputBytes`, and
+`outputTruncated`, and still computes `outputSha256` (the keyed digest of
+`output`). `passed` must equal `exitCode === 0`; a conflict is
+`CHECK_EXIT_CONFLICT` and nothing is written. A check without a `command` keeps
+the 0.15 shape. Under `requiredProvenance: "command"`, a `type:
+"programmatic"` check must declare a command, a PASS needs at least one
+untruncated programmatic command, and the report must carry `headSha`
+(`REPORT_UNBOUND` otherwise). A `type: "review"` check is prose and may omit
+one. `teamwork_report` writes a signed `verify/rerun.json` projection of the
+command checks; `final_verify` re-checks that the projection still mirrors the
+reports and stamps `evidence.rerunDigest`.
+
 **Worker-handoff binding (0.12.0).** The engine fills `workerHandoff` from
 `plan.dag.json` and `handoffs/index.json` (never from caller input): the task's
 assigned agent (default `team/worker`), the indexed path, and the hash of the
@@ -1631,6 +1679,44 @@ report is refused as `REPORT_HANDOFF_MISSING` when the handoff is absent and
 `final_verify` re-checks the binding; re-recording the worker handoff changes
 its body hash and makes the old report stale, so write the worker handoff before
 the report.
+
+### `verify/rerun.json` — signed re-execution record (0.16.0)
+
+```json
+{
+  "version": 1,
+  "sessionId": "20261124-120000-abcd",
+  "tasks": {
+    "R1-impl": {
+      "checks": [
+        {
+          "name": "npm test",
+          "argv": ["npm", "test", "--silent"],
+          "cwd": ".",
+          "expectedExit": 0,
+          "outputSha256": "<unkeyed sha256 of stdout+stderr bytes>",
+          "outputBytes": 15,
+          "timeoutMs": 120000
+        }
+      ]
+    }
+  },
+  "generatedAt": "ISO8601",
+  "_auth": { "v": 1, "alg": "hmac-sha256", "keyId": "k_...", "path": "verify/rerun.json", "digest": "sha256", "mac": "sha256", "at": "ISO8601" }
+}
+```
+
+`teamwork_report` writes this file (signed on a signed run) from the
+`command` checks of the reports; a re-report merges its task entry into the
+existing verified record. `outputSha256` is unkeyed and covers the exact
+stdout+stderr bytes; `outputBytes` is their length. A check whose capture is
+truncated is kept as display evidence but is not recorded here.
+`final_verify` refuses a record whose envelope does not verify, that no longer
+mirrors the report's command checks, or that records a task no report claims,
+and stamps `evidence.rerunDigest` (keyed digest of the file bytes) into
+`verify/final.json`. `opencode-teamwork verify --rerun --repo
+<clean-checkout>` is the only path that turns this record into a `PASS` under
+`requiredProvenance: "command"`.
 
 ### `verify/challenge-<taskId>.json` (strict challenge verdict)
 
@@ -1840,6 +1926,7 @@ audit input: PASS/FAIL is recomputed from task/report/audit semantics.
     "allTasksVerifiedPass": true,
     "reportDigests": { "R1-impl": "<sha256 of report bytes>" },
     "auditDigest": "<sha256 of security-audit.json bytes>",
+    "rerunDigest": "<sha256 of verify/rerun.json bytes | null>",
     "victory": { "mode": "required", "status": "CONFIRMED", "auditor": "team/victory-auditor", "requestHash": "...", "requirementsHash": "..." },
     "handoffs": {
       "mode": "required",
@@ -1892,7 +1979,9 @@ For a skip, `evidence.victory` is
 
 `teamwork_final_verify` writes this file atomically. On a signed run the final
 verdict is signed and the evidence digests let `teamwork_next` detect a report
-or audit edited after the verdict (`AUTH_STALE`). `evidence.handoffs.entries`
+or audit edited after the verdict (`AUTH_STALE`). `evidence.rerunDigest` binds
+the signed re-execution record (or `null` when absent); editing
+`verify/rerun.json` after the verdict is `AUTH_STALE` in the offline verifier. `evidence.handoffs.entries`
 records each matched handoff's `auth` (`signed|unsigned|invalid`) and `keyId`
 from the checked continuity gate. An unsigned legacy run needs
 the explicit `allowUnsignedLegacy` bypass. `status` is `PASS` **only**
@@ -2188,14 +2277,18 @@ asserted and the mode is not pinned, the check is a failure and
 ## Offline verification (`opencode-teamwork verify`)
 
 `opencode-teamwork verify` recomputes a run's named relations from the bytes in
-one run directory plus a public key. It never writes into the run, never reads
-`ctx.storage`, and never executes a reported check. See
-[ADR 0015](adr/0015-offline-verification.md).
+one run directory plus a public key. It never writes into the run and never
+reads `ctx.storage`. Without `--rerun` it never executes a reported check; with
+`--rerun` it re-executes the signed `verify/rerun.json` commands in a disposable
+worktree (0.16.0). See [ADR 0015](adr/0015-offline-verification.md) and
+[ADR 0016](adr/0016-re-executable-verification.md).
 
 ```sh
 opencode-teamwork verify --session <id> --public-key <base64url|@file> [--key-id <id>] [--json]
 opencode-teamwork verify --run-dir <path> --public-key ...
 opencode-teamwork verify --session <id> --hmac-key <base64url> --hmac-key-id <id>
+opencode-teamwork verify --run-dir <path> --public-key ... \
+  --rerun --repo <clean-checkout> [--timeout <s>] [--keep-worktree]
 ```
 
 The manifest is the trust anchor. Its `_auth` is verified first; `runNonce`,
@@ -2208,7 +2301,8 @@ fails on path, nonce, key id or digest.
 | Artifact | Recomputed relation |
 | --- | --- |
 | `run.manifest.json` | `_auth`; `requestHash`, `requirementsHash`, `planHash`, `lemmaPolicyHash`, `specHash`/`specBytes` against the artifacts on disk; plan/state mode drift |
-| `verify/report-<task>.json` | `_auth`; task id and PASS schema; each check's `outputSha256`; `passed` vs `exitCode` (`CHECK_EXIT_CONFLICT`); `workerHandoff` path+sha256 vs the current body and `handoffs/index.json` |
+| `verify/report-<task>.json` | `_auth`; task id and PASS schema; each check's `outputSha256`; `passed` vs `exitCode` (`CHECK_EXIT_CONFLICT`); checks[] v2 `commandSha256`/`outputBytes`; workerHandoff path+sha256 vs the current body and `handoffs/index.json` |
+| `verify/rerun.json` | `_auth`; schema; every command check matches the report projection; `evidence.rerunDigest` in `verify/final.json` |
 | `verify/security-audit.json` | `_auth`; one `ruleChecks` entry for every rule forbidden by the integrity mode parsed from `ORIGINAL_REQUEST.md`; `reviewedDigests.reports`/`final` vs current bytes; violations on a PASS |
 | `verify/challenge-<task>.json`, `verify/audit-<task>.json` | `_auth`; `kind`/`verdict`/`agent`/`sessionId`; `reportHash` (unkeyed sha256) vs the current report; every `cites[].sha256` and `bytes`; `cites: []` is unbound (fail), absent is `legacy_unbound_wave` (warn) |
 | `verify/victory.json` | `_auth`; `evidenceDigests.reports` vs every current report (including "appeared after" and "never reviewed"); `securityAudit` and a pre-existing PASS `final`; `requestHash`/`requirementsHash`; requirement coverage |
@@ -2221,6 +2315,31 @@ Wave `cites` and `reportHash` use **unkeyed** SHA-256 (matching `strict.ts`);
 `evidenceDigests`, `reviewedDigests`, handoff hashes and final digests use the
 keyed domain-separated digest from `approval-format.mjs`. The two are never
 mixed.
+
+### Re-execution (`--rerun`, 0.16.0)
+
+`--rerun` needs `--repo <clean-checkout>` and a recorded `verify/rerun.json`.
+For each check it creates a detached worktree at the report's `headSha`, runs
+the recorded argv with `spawnSync` (no shell, a minimal environment, `cwd`
+inside the worktree), enforces `timeoutMs` (capped by `--timeout <s>`), and
+compares the exit code and the unkeyed sha256 of stdout+stderr to the recorded
+values. `sh -c`/`bash -c` and a `cwd` that escapes the worktree are refused.
+The source checkout is hashed before and after and a change is
+`source-tree-modified`. The worktree is removed unless `--keep-worktree`.
+
+| Outcome | Exit | Code |
+| --- | --- | --- |
+| exit 0 and digest match | 0 | `PASS` |
+| output digest or byte count changed | 1 | `output-digest-mismatch` |
+| re-executed exit is non-zero (or differs from `expectedExit`) | 1 | `command-failed` |
+| binary cannot be executed (ENOENT/EACCES) | 2 | `command-unavailable` |
+| `timeoutMs` exceeded | 1 | `command-timeout` |
+| shell line or escaping `cwd` | 1 | `command-refused` |
+
+Under `requiredProvenance: "command"`, `verify` without `--rerun` reports the
+claim as `provenance: claimed` and returns `UNKNOWN`, never `PASS`. Under
+`declared` the 0.15 behaviour is unchanged, with a `provenance: declared` note;
+`--rerun` can still be used opportunistically.
 
 ### Exit codes and JSON
 

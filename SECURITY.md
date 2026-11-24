@@ -12,7 +12,9 @@ contradiction detection are specified in
 Verifiable witness receipts and signer protocol v2 are specified in
 [ADR 0014](docs/adr/0014-verifiable-witness-and-signer-v2.md). Offline
 verification from bytes and a public key is specified in
-[ADR 0015](docs/adr/0015-offline-verification.md).
+[ADR 0015](docs/adr/0015-offline-verification.md). Re-execution of recorded
+command evidence is specified in
+[ADR 0016](docs/adr/0016-re-executable-verification.md).
 
 ## What is protected
 
@@ -298,6 +300,19 @@ signer's policy is outside the plugin.
   relation; it still cannot prove an observation, a consistently authored false
   report passes every check, and a whole-run rollback to an earlier signed set
   is undetectable without a snapshot or witness.
+- **Re-execution narrows the residual; it does not close it.** Under
+  `requiredProvenance: "command"` (0.16.0) a `PASS` must now survive
+  `opencode-teamwork verify --rerun --repo <clean-checkout>`: the signed
+  `verify/rerun.json` commands are re-executed at the report's commit in a
+  disposable worktree and their exit code and output digest must match. The
+  engine itself never runs the command (`teamwork_report` records the
+  observation; `final_verify` only checks the record shape), so a compromised
+  verifier can still author a consistent claim that the deployed environment
+  later reproduces. A meaningless command (for example `true`), a test edited in
+  the same commit, a non-deterministic command, or one whose output exceeds the
+  bounded capture still passes; re-execution proves reproducibility of the
+  recorded command at that commit, not that the command tests the requirement.
+  `declared` runs keep the 0.15 residual unchanged.
 - **Same-UID key access.** A local HMAC or Ed25519 private key is only as secret
   as the process UID. Only a different privilege domain (separate UID, KMS/HSM,
   hardware token) changes that.
