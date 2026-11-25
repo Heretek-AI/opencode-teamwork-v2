@@ -85,6 +85,19 @@ jobs:
           git fetch --tags --force
           node scripts/check-release-tag.mjs
 
+      # T4: pack the tarball, install into a clean project, verify sha256 and
+      # file whitelist, and run L1 catalog/commands specs against the install.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Install runtime harness dependencies (T4)
+        working-directory: tests/runtime
+        run: bun install --frozen-lockfile
+
+      - name: Packed-tarball install test (T4)
+        run: node scripts/test-packed-tarball.mjs
+
       # `repository.url` in package.json must exactly match this GitHub repo or
       # provenance/OIDC verification fails. npm generates provenance
       # automatically under trusted publishing — no --provenance flag needed.

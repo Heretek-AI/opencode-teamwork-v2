@@ -102,7 +102,10 @@ export async function loadHost(
 
   // The directory path is the on-disk `plugins` entry; the memory path passes
   // the object to the host. Never both, or the host reports a duplicate id.
-  if (mode === "directory") project.writeConfig([{ package: project.pluginDir }])
+  // TEAMWORK_PACKED_PACKAGE lets the T4 packed-tarball test load the installed
+  // npm artifact instead of the working tree.
+  const directoryPackage = process.env.TEAMWORK_PACKED_PACKAGE || project.pluginDir
+  if (mode === "directory") project.writeConfig([{ package: directoryPackage }])
   else project.writeConfig([])
 
   const capture = {} as Capture
