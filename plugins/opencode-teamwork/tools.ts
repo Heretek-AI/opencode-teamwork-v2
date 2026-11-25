@@ -186,6 +186,7 @@ import {
   setRunRequirePinnedWrites,
   supportsFdContainment,
   touchWithin,
+  listContainmentIncidents,
   unacknowledgedWriteAnomalies,
   writeFileAtomicWithin,
   writeOnceWithin,
@@ -7749,6 +7750,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (input?.acknowledgeAnomalies === true) acknowledgeWriteAnomalies(run)
         const writeAnomalies = writeAnomaliesForRun(run)
         const unacknowledgedAnomalies = writeAnomalies.filter((entry: any) => entry.acknowledged !== true)
+        const containmentIncidents = listContainmentIncidents(run)
         const lines = Object.entries(tasks).map(([id, t]: any) => {
           const claim = publicClaim(t?.claim)
           const derived = deriveClaimState(t, now, { legacyHostless: protocol < CLAIM_PROTOCOL })
@@ -7814,6 +7816,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           warnings,
           writeAnomalies,
           unacknowledgedWriteAnomalies: unacknowledgedAnomalies.length,
+          containmentIncidents,
           runState: writeAnomalyState,
           ...(protocol >= CLAIM_PROTOCOL ? { storage: state.storage ?? null, lockDiagnostics: recentLockDiagnostics(5) } : {}),
         }
@@ -11866,17 +11869,19 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // have landed where it was reported; re-verify after inspecting and
           // acknowledging (teamwork_status { acknowledgeAnomalies: true }).
           const pendingAnomalies = unacknowledgedWriteAnomalies(run)
+          const incidents = listContainmentIncidents(run)
           if (pendingAnomalies.length > 0) {
             return {
               status: "NEEDS_INSPECTION",
               content: `FINAL VERIFICATION REFUSED: run ${basename(run)} has ${pendingAnomalies.length} unacknowledged write anomaly(ies): ${pendingAnomalies
                 .slice(-5)
                 .map((entry: any) => clean(entry.kind, 32))
-                .join(", ")}. Inspect the config-dir write-anomaly audit and re-record any refused artifact before final verification; nothing was written.`,
+                .join(", ")} (${incidents.length} durable incident manifest(s) recorded). Detection is a report about an event that already happened; no rollback was attempted. Inspect the config-dir incident manifests and re-record any refused artifact before final verification; nothing was written.`,
               reasons: pendingAnomalies.map(
                 (entry: any) => `[WRITE_ANOMALY] ${clean(entry.kind, 32)}${entry.name ? ` ${clean(entry.name, 64)}` : ""}: ${clean(entry.detail, 200)}`,
               ),
               unacknowledgedWriteAnomalies: pendingAnomalies.length,
+              containmentIncidents: incidents,
             }
           }
           const allowUnsignedLegacy = input?.allowUnsignedLegacy === true

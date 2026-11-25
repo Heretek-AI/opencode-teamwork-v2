@@ -122,6 +122,13 @@ export function containmentModeRefusal(run: string, mode?: FdTraversalMode): Err
 /** The durable anomaly audit path (config dir, never a run). */
 export function writeAnomalyAuditPath(env?: Record<string, string | undefined>): string
 export function setWriteAnomalyAuditPathForTest(path: string | null): void
+export function writeIncidentDir(env?: Record<string, string | undefined>): string
+export function setIncidentDirForTest(dir: string | null): void
+export function setMaxIncidentFilesForTest(limit: number | null): void
+export function listContainmentIncidents(
+  run?: string,
+  options?: { incidentDir?: string; env?: Record<string, string | undefined> },
+): Array<Record<string, unknown>>
 export function writeAnomaliesForRun(
   run?: string,
   options?: { includeDiagnostics?: boolean; auditPath?: string; env?: Record<string, string | undefined> },

@@ -40,6 +40,7 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readSync,
   realpathSync,
   renameSync,
@@ -599,9 +600,14 @@ export function onWriteAnomaly(sink) {
 const MAX_ANOMALY_AUDIT_BYTES = 1024 * 1024
 const MAX_ANOMALY_AUDIT_TAIL_BYTES = 256 * 1024
 const MAX_ANOMALY_READ_BYTES = 1024 * 1024
+const DEFAULT_MAX_INCIDENT_FILES = 100
+const MAX_INCIDENT_FILE_BYTES = 64 * 1024
 const DIAGNOSTIC_ANOMALY_KINDS = new Set(["detective_mode", "detective-lock"])
 const AUDIT_PATH_ENV = "OPENCODE_TEAMWORK_ANOMALY_AUDIT"
+const INCIDENTS_DIR_ENV = "OPENCODE_TEAMWORK_INCIDENTS_DIR"
 let anomalyAuditPathOverride = null
+let incidentDirOverride = null
+let maxIncidentFilesOverride = null
 
 function configDirForAudit(env) {
   const explicit = env?.OPENCODE_TEAMWORK_CONFIG || env?.OPENCODE_CONFIG_DIR
@@ -620,6 +626,131 @@ export function writeAnomalyAuditPath(env = process.env) {
 /** Test seam: point the durable audit at a temp file (null restores default). */
 export function setWriteAnomalyAuditPathForTest(path) {
   anomalyAuditPathOverride = typeof path === "string" && path ? resolve(path) : null
+}
+
+/**
+ * Directory for per-incident structured JSON manifests (outside every run).
+ * When the audit path is overridden for hermetic tests, defaults beside it so
+ * tests never touch the operator's real config directory.
+ */
+export function writeIncidentDir(env = process.env) {
+  if (incidentDirOverride) return incidentDirOverride
+  if (env?.[INCIDENTS_DIR_ENV]) return resolve(String(env[INCIDENTS_DIR_ENV]))
+  if (anomalyAuditPathOverride) return join(dirname(anomalyAuditPathOverride), "incidents")
+  return join(configDirForAudit(env), "teamwork", "incidents")
+}
+
+/** Test seam: point per-incident manifests at a temp directory (null restores default). */
+export function setIncidentDirForTest(dir) {
+  incidentDirOverride = typeof dir === "string" && dir ? resolve(dir) : null
+}
+
+/** Test seam: override the bounded incident-file retention cap (null restores default). */
+export function setMaxIncidentFilesForTest(limit) {
+  maxIncidentFilesOverride = Number.isInteger(limit) && limit > 0 ? limit : null
+}
+
+function maxIncidentFiles() {
+  return maxIncidentFilesOverride ?? DEFAULT_MAX_INCIDENT_FILES
+}
+
+function buildIncidentManifest(record) {
+  return {
+    v: 1,
+    id: record.id ?? `${Date.now()}-${randomBytes(6).toString("hex")}`,
+    at: record.at ?? new Date().toISOString(),
+    kind: record.kind ?? "unknown",
+    mode: record.mode ?? fdTraversalMode(),
+    platform: record.platform ?? process.platform,
+    phase: record.phase ?? null,
+    run: record.run ?? null,
+    name: record.name ?? null,
+    targetRealpathBefore: record.targetRealpathBefore ?? record.dir ?? null,
+    targetRealpathAfter: record.targetRealpathAfter ?? record.destRealAfter ?? null,
+    pinnedIdentity: record.pinnedIdentity ?? null,
+    observedIdentity: record.observedIdentity ?? null,
+    intendedDigest: record.intendedDigest ?? record.intendedSha256 ?? null,
+    intendedBytes: Number.isFinite(record.intendedBytes)
+      ? record.intendedBytes
+      : Number.isFinite(record.bytesWritten)
+        ? record.bytesWritten
+        : null,
+    tempName: record.tempName ?? (typeof record.tempPath === "string" ? basename(record.tempPath) : null),
+    detail: record.detail ?? null,
+    rollbackAttempted: false,
+    note: "detection is a report about an event that already happened; no rollback was attempted",
+  }
+}
+
+function pruneIncidentDir(dir) {
+  try {
+    const cap = maxIncidentFiles()
+    const files = readdirSync(dir)
+      .filter((name) => name.endsWith(".json") && !name.startsWith("."))
+      .sort()
+    if (files.length <= cap) return
+    const excess = files.length - cap
+    for (let i = 0; i < excess; i++) {
+      try {
+        unlinkSync(join(dir, files[i]))
+      } catch {}
+    }
+  } catch {}
+}
+
+/**
+ * Persist one structured JSON manifest per non-diagnostic containment refusal,
+ * outside the run directory, bounded and pruned. Never throws into the writer.
+ */
+function persistIncidentManifest(record) {
+  if (!record || record.event === "anomaly_ack" || record.event === "write_intent" || record.event === "write_commit") {
+    return null
+  }
+  if (DIAGNOSTIC_ANOMALY_KINDS.has(record.kind)) return null
+  try {
+    const dir = writeIncidentDir()
+    mkdirSync(dir, { recursive: true })
+    const manifest = buildIncidentManifest(record)
+    const stamp = String(manifest.at).replace(/[:.]/g, "-")
+    const fileName = `${stamp}-${randomBytes(4).toString("hex")}.json`
+    const tempPath = join(dir, `.${fileName}.tmp`)
+    const finalPath = join(dir, fileName)
+    writeFileSync(tempPath, JSON.stringify(manifest, null, 2) + "\n", { mode: 0o600 })
+    renameSync(tempPath, finalPath)
+    pruneIncidentDir(dir)
+    return finalPath
+  } catch {
+    return null
+  }
+}
+
+/**
+ * List structured containment incident manifests recorded outside the run
+ * (optionally filtered to one `run`). Oldest first.
+ */
+export function listContainmentIncidents(run, options = {}) {
+  const dir = options?.incidentDir ? resolve(String(options.incidentDir)) : writeIncidentDir(options?.env ?? process.env)
+  const out = []
+  let files = []
+  try {
+    files = readdirSync(dir)
+      .filter((name) => name.endsWith(".json") && !name.startsWith("."))
+      .sort()
+  } catch {
+    return out
+  }
+  for (const name of files) {
+    const full = join(dir, name)
+    const read = readRegularBounded(full, MAX_INCIDENT_FILE_BYTES)
+    if (read.status !== "ok") continue
+    try {
+      const parsed = JSON.parse(read.text)
+      if (!parsed || typeof parsed !== "object") continue
+      if (run && !sameRun(parsed.run, run)) continue
+      out.push({ ...parsed, file: full })
+    } catch {}
+  }
+  return out
 }
 
 function anomalyKey(record) {
@@ -806,6 +937,8 @@ export function recordWriteAnomaly(entry) {
     } catch {}
   }
   persistWriteAnomaly(record)
+  const incidentFile = persistIncidentManifest(record)
+  if (incidentFile) record.incidentFile = incidentFile
   try {
     writeAuditSink?.(record)
   } catch {
@@ -1780,26 +1913,44 @@ function detectiveTarget(run, relPath, options = {}) {
   return { dest, dirReal, runReal, run, name: segments[segments.length - 1], segments, ancestors }
 }
 
-function detectivePostCheck(target, recorded) {
+function detectivePostCheck(target, recorded, tempName = null) {
   try {
     verifyAncestorIdentities(target, "post-write")
     const dirReal = realpathSync(dirname(target.dest))
+    const pinnedIdentity = recorded ? { dev: recorded.dev, ino: recorded.ino } : null
     if (dirReal !== target.runReal && !isPathWithin(target.runReal, dirReal)) {
       recordWriteAnomaly({
         kind: "detective-containment",
+        phase: "post-write",
         run: target.run ?? null,
         name: target.name,
-        detail: "post-write parent realpath is outside the run",
+        targetRealpathBefore: target.dirReal ?? null,
+        targetRealpathAfter: dirReal,
+        pinnedIdentity,
+        observedIdentity: null,
+        intendedDigest: recorded?.sha256 ?? null,
+        intendedBytes: recorded?.bytes ?? null,
+        tempName,
+        detail: "post-write parent realpath is outside the run; detection is a report about an event that already happened",
       })
       throw refusalError("containment", "refused: post-write containment check failed")
     }
     const after = lstatSync(target.dest)
+    const observedIdentity = { dev: after.dev, ino: after.ino }
     if (!after.isFile() || !sameIdentity(after, recorded)) {
       recordWriteAnomaly({
         kind: "detective-identity",
+        phase: "post-write",
         run: target.run ?? null,
         name: target.name,
-        detail: "post-write inode does not match the temp inode",
+        targetRealpathBefore: target.dirReal ?? null,
+        targetRealpathAfter: dirReal,
+        pinnedIdentity,
+        observedIdentity,
+        intendedDigest: recorded?.sha256 ?? null,
+        intendedBytes: recorded?.bytes ?? null,
+        tempName,
+        detail: "post-write inode does not match the temp inode; detection is a report about an event that already happened",
       })
       throw refusalError("identity", `refused: "${sanitize(target.name)}" failed the post-write identity check`)
     }
@@ -1812,19 +1963,39 @@ function detectivePostCheck(target, recorded) {
       if (reread.status !== "ok" || sha256Bytes(reread.bytes ?? Buffer.from(reread.text, "utf8")) !== recorded.sha256) {
         recordWriteAnomaly({
           kind: "detective-identity",
+          phase: "post-write",
           run: target.run ?? null,
           name: target.name,
-          detail: "post-write bytes do not match the bytes that were written (same inode, different content)",
+          targetRealpathBefore: target.dirReal ?? null,
+          targetRealpathAfter: dirReal,
+          pinnedIdentity,
+          observedIdentity,
+          intendedDigest: recorded.sha256,
+          intendedBytes: recorded.bytes,
+          tempName,
+          detail: "post-write bytes do not match the bytes that were written (same inode, different content); detection is a report about an event that already happened",
         })
         throw refusalError("identity", `refused: "${sanitize(target.name)}" failed the post-write byte-identity check`)
       }
     }
   } catch (err) {
     if (err?.code === "EREFUSED") throw err
+    let dirRealAfter = null
+    try {
+      dirRealAfter = realpathSync(dirname(target.dest))
+    } catch {}
     recordWriteAnomaly({
       kind: "detective-postcheck",
+      phase: "post-write",
       run: target.run ?? null,
       name: target.name,
+      targetRealpathBefore: target.dirReal ?? null,
+      targetRealpathAfter: dirRealAfter,
+      pinnedIdentity: recorded ? { dev: recorded.dev, ino: recorded.ino } : null,
+      observedIdentity: null,
+      intendedDigest: recorded?.sha256 ?? null,
+      intendedBytes: recorded?.bytes ?? null,
+      tempName,
       detail: sanitize(err?.message),
     })
     throw refusalError("postcheck", "refused: post-write containment check failed")
@@ -1884,7 +2055,7 @@ function writeFileAtomicDetective(run, relPath, content, options) {
       options.afterRename({ dirFd: null, tempName: temp, destName: target.name, destPath: target.dest })
     }
     phase = "post-check"
-    detectivePostCheck(target, recorded)
+    detectivePostCheck(target, recorded, basename(temp))
     completeDetectiveWriteIntent(intent)
     return { status: "ok", bytes: data.length, name: target.name, path: target.dest }
   } catch (err) {
