@@ -30,8 +30,8 @@ symbol, and the tool output or observed `agy` behaviour that produced it.
 | Source | Baseline | After remediation (local) | Remote state |
 | --- | ---: | ---: | --- |
 | fallow dead-code | **255** issues: 18 unused files, 214 unused exports, 15 unused types, 5 duplicate exports, 1 unresolved import, 2 unlisted deps | **0** issues (exit 0) | n/a (local tool) |
-| SonarCloud open issues | **1,234** total; **1,050** outside `docs/re` (55 bugs, 45 vulnerabilities, 950 code smells) | Targeted bugs/vulnerabilities and the dead-code/duplication findings are fixed in the tree; the secrets scan is clean | The merge is pushed to `main`; the next SonarCloud analysis of `main` will replace this baseline (see §7) |
-| GitHub code scanning | **44** alerts: 22 open, 14 fixed, 8 dismissed. Open: 19 `js/file-system-race`, 2 `js/file-access-to-http`, 1 `actions/unpinned-tag` | All 22 are addressed in the tree | The merge is pushed to `main`; CodeQL is re-analyzing it (see §7) |
+| SonarCloud open issues | **1,234** total; **1,050** outside `docs/re` (55 bugs, 45 vulnerabilities, 950 code smells) | Target bugs/vulnerabilities and the dead-code/duplication findings are fixed; the secrets scan is clean. After the merge, `main` @ `34cc451` reports **1,289** open (8 bugs, 16 vulnerabilities, 1,265 smells); 15 of the 24 bugs/vulns are in `docs/re`, 9 outside (tracked in #49) | Re-analyzed on `main` after the merge; the remaining 9 non-`docs/re` findings are logged in #49 |
+| GitHub code scanning | **44** alerts: 22 open, 14 fixed, 8 dismissed. Open: 19 `js/file-system-race`, 2 `js/file-access-to-http`, 1 `actions/unpinned-tag` | All 22 are fixed, plus the 3 new alerts introduced by the merge (`#66-68`) | **47 alerts: 0 open, 39 fixed, 8 dismissed** after the `c770dd8` CodeQL run |
 | Runtime gates | 52 pass, 1 skip (L4 live), 0 fail | 113 pass, 1 skip (L4 live), 0 fail | local |
 | Rust signer | 5/5 | 5/5 | local |
 | Packaging | 103 files, 0 deps | 108 files, 0 deps (`text-utils.ts` added; the parity script now ships with the other test scripts); no `tests/`, `docs/re/`, or `signer/` | local |
@@ -152,6 +152,20 @@ proof column names the reproducible tests.
 | E2E | 20 | 152 L0 cases + 61 runtime specs, `npm run test:agy-parity`, `docs/TEST_INFRA.md`, `docs/TEST_READY.md` |
 | M5 | 21 | this report, final re-audit, five-surface rubric, full suite |
 
+### Post-merge follow-ups
+
+- The first `main` CI run exposed a test-only inode-reuse assumption in
+  `scripts/test-safe-fs-write.mjs`; it was fixed in `34cc451` (the product
+  already refused the same-inode byte change) and the rerun is green.
+- The merge introduced three new CodeQL alerts; `c770dd8` fixes the survey
+  markdown escaping, the lock-owner read and the parity fixture write. CodeQL
+  now reports **0 open**.
+- The parity script is shipped with the other test scripts so the published
+  `test:agy-parity` entry is valid (108-file tarball).
+- Residual work is tracked in #49 (9 Sonar bugs/vulnerabilities outside
+  `docs/re`), #50 (LEMMA live-toolchain CI), #51 (document-review visual audit)
+  and #52 (per-dispatch model override).
+
 ### Findings from the independent verification waves
 
 The adversarial agents found defects that the implementation workers had not:
@@ -218,10 +232,11 @@ secrets**.
 
 ## 7. Unresolved items and residual risks
 
-1. **Remote scanner state is being refreshed.** The merge is pushed to `main`
-   (`884744e`) and CodeQL is re-analyzing it; SonarCloud follows its own
-   `main` analysis. Until those finish, the baseline counts in §2 are the
-   pre-merge state, not a claim that the remote findings are already closed.
+1. **Remote scanner state.** CodeQL is clean on `main` (`c770dd8`: 0 open,
+   39 fixed, 8 dismissed). SonarCloud re-analyzed `main` at `34cc451`: 1,289
+   open (8 bugs, 16 vulnerabilities, 1,265 smells); 9 bugs/vulnerabilities
+   remain outside `docs/re` and are tracked in #49. The larger smell count is
+   new code, not a regression in the shipped behaviour.
 2. **Sonar code smells remain.** The targeted bug/vulnerability/dead-code set is
    fixed; the large `S3776` cognitive-complexity family (and other style rules)
    was not mass-refactored. Reducing it safely is a separate change.
