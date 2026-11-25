@@ -25,9 +25,9 @@ jobs:
         working-directory: tests/runtime
         run: bun install --frozen-lockfile
 
-      - name: L1/L2 runtime suite
+      - name: L1/L2/L3 runtime suite
         working-directory: tests/runtime
-        run: bun test
+        run: bun test --timeout 30000
 
   test:
     runs-on: ubuntu-latest
