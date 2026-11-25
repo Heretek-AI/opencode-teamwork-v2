@@ -1929,7 +1929,7 @@ describe("Tier 4: Real-World E2E Scenarios [M1, M3, M4]", () => {
     )
   })
 
-  test("[T4.4 M4] document-review PDF pre-flight MISSING vs valid Markdown full segment-review -> synthesis -> finalVerify", async () => {
+  test("[T4.4 M4] document-review PDF pre-flight MISSING vs valid Markdown full segment-review -> synthesis -> finalVerify fails closed on unsigned route evidence", async () => {
     await withHost("t4-4-doc-review-e2e", async ({ project, loaded, root, child }) => {
       // (a) Unreadable PDF with missing python deps refuses pre-mkdir + PREREQUISITES.md
       writeFileSync(join(project.root, "scan.pdf"), IMAGE_ONLY_PDF)
@@ -2032,7 +2032,8 @@ describe("Tier 4: Real-World E2E Scenarios [M1, M3, M4]", () => {
       await execute(loaded, root, "handoff", { sessionId: runId, ...HANDOFF })
 
       const fv = await execute(loaded, root, "final_verify", { sessionId: runId })
-      expect(fv.status).toBe("PASS")
+      expect(fv.status).toBe("FAIL")
+      expect(String(fv.content)).toContain("DOCUMENT_REVIEW_EVIDENCE_UNSIGNED")
     })
   })
 

@@ -3781,7 +3781,7 @@ addCase({
   milestone: "M4",
   feature: "A7+A8",
   tier: "T3",
-  title: "A7+A8: document-review PDF completes document_record, victory_audit, and final_verify when extracted cleanly",
+  title: "A7+A8: document-review completes document_record + victory_audit, then final_verify fails closed on unsigned route evidence",
   fn: () =>
     withSandbox("pair-10", async (dir) => {
       const pdf = join(dir, "clean.pdf")
@@ -3831,7 +3831,11 @@ addCase({
       await h.tools.teamwork_handoff.execute(makeHandoffInput(runId, undefined, "Victory"), { sessionID: "ses_victory" })
       await h.tools.teamwork_handoff.execute(makeHandoffInput(runId, undefined, "Done"), { sessionID: "ses_sentinel" })
       const fv = await h.tools.teamwork_final_verify.execute({ sessionId: runId }, { sessionID: "ses_verifier" })
-      assert.equal(fv.status, "PASS", fv.content)
+      assert.equal(fv.status, "FAIL", fv.content)
+      assert.ok(
+        fv.reasons?.some((r) => r.includes("DOCUMENT_REVIEW_EVIDENCE_UNSIGNED")),
+        `final_verify must name the unsigned document-review evidence: ${JSON.stringify(fv.reasons)}`,
+      )
     }),
 })
 
@@ -4135,7 +4139,7 @@ addCase({
   milestone: "M4",
   feature: "A7+M1.4",
   tier: "T4",
-  title: "Scenario 4: PDF Document Review pre-flight MISSING (PREREQUISITES.md) vs valid PDF full workflow PASS",
+  title: "Scenario 4: PDF Document Review pre-flight MISSING (PREREQUISITES.md) vs valid PDF full workflow blocked at final_verify by unsigned route evidence",
   fn: () =>
     withSandbox("e2e-04", async (dir) => {
       const binDir = join(dir, "bin")
@@ -4189,7 +4193,11 @@ addCase({
       await h2.tools.teamwork_handoff.execute(makeHandoffInput(okRun, undefined, "Victory"), { sessionID: "ses_victory" })
       await h2.tools.teamwork_handoff.execute(makeHandoffInput(okRun, undefined, "Done"), { sessionID: "ses_sentinel" })
       const fv = await h2.tools.teamwork_final_verify.execute({ sessionId: okRun }, { sessionID: "ses_verifier" })
-      assert.equal(fv.status, "PASS", fv.content)
+      assert.equal(fv.status, "FAIL", fv.content)
+      assert.ok(
+        fv.reasons?.some((r) => r.includes("DOCUMENT_REVIEW_EVIDENCE_UNSIGNED")),
+        `final_verify must name the unsigned document-review evidence: ${JSON.stringify(fv.reasons)}`,
+      )
     }),
 })
 

@@ -437,6 +437,18 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
   `legacy_unsigned_bypass` event. An unsigned baseline cannot require the
   handoff gate, so it records `requireHandoffs: "skip"`. `benchmark` refuses the
   bypass and refuses both `victoryAudit: "skip"` and `requireHandoffs: "skip"`.
+- **Route evidence (LEMMA / tournament / document-review):** these writers
+  currently emit plain JSON (`lemma/manifest.json`,
+  `lemma/formalization-review.json`, `lemma/nodes/<id>/verify-*.json`,
+  `tournament/manifest.json`, `tournament/verdict.json`,
+  `document-review/manifest.json`) and plain-text reports
+  (`document-review/segments/<id>/unit-report.md`,
+  `DOCUMENT_REVIEW_REPORT.md`) without `_auth` envelopes. On a signed run
+  `final_verify` therefore refuses to stamp PASS, naming
+  `LEMMA_EVIDENCE_UNSIGNED`, `TOURNAMENT_EVIDENCE_UNSIGNED`, or
+  `DOCUMENT_REVIEW_EVIDENCE_UNSIGNED`. An explicitly unsigned legacy run keeps
+  the historical behavior. This is a fail-closed guardrail, not a claim that
+  the evidence is authentic; signing these route artifacts is a later phase.
 
 ### `_auth` envelopes and the digest index (ADR 0005/0008)
 
