@@ -43,7 +43,7 @@ await registerTeamworkTools(
   },
   ROOT,
 )
-tools.sort((a, b) => a.id.localeCompare(b.id))
+tools.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
 
 const commands = COMMANDS.map((c) => c.name).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
 const snapshot = { tools, commands, toolCount: tools.length, commandCount: commands.length }

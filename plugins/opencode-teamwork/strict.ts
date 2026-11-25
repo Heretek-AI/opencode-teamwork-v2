@@ -25,22 +25,21 @@ import { createHash } from "node:crypto"
 import { basename, join } from "node:path"
 import {
   MAX_VERIFIER_REPORT_BYTES,
-  clean,
-  cleanBlock,
   readBoundedRunFile,
   readBoundedRunJson,
   writeSafeRunJson,
 } from "./tournament.ts"
+import { clean, cleanBlock } from "./text-utils.ts"
 import type { AuthContext, AuthEnvelope, AuthFailure } from "./auth.ts"
 
-export const VERIFICATION_MODES = ["standard", "strict"] as const
+const VERIFICATION_MODES = ["standard", "strict"] as const
 export type VerificationMode = (typeof VERIFICATION_MODES)[number]
 export const DEFAULT_VERIFICATION_MODE: VerificationMode = "standard"
 
-export const CHALLENGE_AGENT = "team/falsifier"
-export const AUDIT_AGENT = "team/security-auditor"
+const CHALLENGE_AGENT = "team/falsifier"
+const AUDIT_AGENT = "team/security-auditor"
 
-export const WAVE_KINDS = ["challenge", "audit"] as const
+const WAVE_KINDS = ["challenge", "audit"] as const
 export type WaveKind = (typeof WAVE_KINDS)[number]
 
 export const WAVE_AGENTS: Record<WaveKind, string> = {
@@ -48,7 +47,7 @@ export const WAVE_AGENTS: Record<WaveKind, string> = {
   audit: AUDIT_AGENT,
 }
 
-export const WAVE_VERDICTS: Record<WaveKind, string> = {
+const WAVE_VERDICTS: Record<WaveKind, string> = {
   challenge: "PASS",
   audit: "CLEAN",
 }
@@ -81,7 +80,7 @@ export function normalizeWaveKind(value: unknown): WaveKind | undefined {
 }
 
 /** True when `id` is safe as one run-relative path segment. */
-export function isSafeStrictTaskId(id: unknown): id is string {
+function isSafeStrictTaskId(id: unknown): id is string {
   return typeof id === "string" && STRICT_TASK_ID.test(id)
 }
 
@@ -663,6 +662,7 @@ export function renderGateStatus(input: {
     "",
     `- Session: \`${cell(input.sessionId)}\``,
     `- Mode: strict`,
+    `- Wave: reviewer (team/verifier) + challenger (${cell(WAVE_AGENTS.challenge)}) + forensic auditor (${cell(WAVE_AGENTS.audit)})`,
     `- Generated: ${cell(input.generatedAt ?? new Date().toISOString())}`,
     "",
     "| Agent | Role | Verdict | Source |",

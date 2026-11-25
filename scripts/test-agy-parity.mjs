@@ -367,7 +367,7 @@ async function invokeFollowUpAppend(tools, sessionId, message, callCtx) {
   // Check dedicated follow-up / append tools first
   const candidateToolNames = Object.keys(tools)
     .filter((k) => /^teamwork_.*(append|follow|request)/i.test(k) && k !== "teamwork_route")
-    .sort((a, b) => a.localeCompare(b))
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
   for (const name of candidateToolNames) {
     const tool = tools[name]
     const props = tool?.input?.["~standard"]?.jsonSchema?.input?.({ target: "draft-2020-12" })?.properties ?? {}
@@ -384,10 +384,9 @@ async function invokeFollowUpAppend(tools, sessionId, message, callCtx) {
     const msgKey = ["followUp", "followup", "appendRequest", "followUpMessage"].find((k) => k in props)
     if (msgKey) {
       if (name === "teamwork_plan") {
-        return await tool.execute(
-          { sessionId, topology: "small-focused", tasks: [{ id: "t1" }], [msgKey]: message },
-          callCtx,
-        )
+        // A3: the documented minimal call is `{ sessionId, followUp }`; the
+        // tool reads the persisted topology/tasks from the run.
+        return await tool.execute({ sessionId, [msgKey]: message }, callCtx)
       }
       return await tool.execute({ sessionId, [msgKey]: message }, callCtx)
     }
@@ -1213,6 +1212,28 @@ addCase({
       const orig = readFileSync(join(dir, ".opencode", "teamwork", runId, "ORIGINAL_REQUEST.md"), "utf8")
       assert.match(orig, /^## Parameters$/m)
       assert.ok(orig.includes("Implement  exact  spacing"), "verbatim request spacing preserved")
+
+      // A1 residual: leading whitespace is only consumed when it introduces a
+      // bracketed token. No leading bracket -> byte-identical request text.
+      const spacedRun = "20261125-120000-a1t4s"
+      await h.tools.teamwork_plan.execute(
+        { sessionId: spacedRun, topology: "small-focused", request: "  Implement  exact  spacing", skipInterview: true, tasks: [{ id: "t1" }] },
+        { sessionID: "ses_sentinel" },
+      )
+      const spaced = readFileSync(join(dir, ".opencode", "teamwork", spacedRun, "ORIGINAL_REQUEST.md"), "utf8")
+      assert.equal(spaced.split("## Request\n\n")[1], "  Implement  exact  spacing\n", "a request without a leading bracket keeps meaningful leading whitespace")
+
+      // With a leading bracket, the indentation is launch formatting and the
+      // [skip-interview] marker is recorded in ## Parameters, not ## Request.
+      const bracketedRun = "20261125-120000-a1t4b"
+      const bracketed = await h.tools.teamwork_plan.execute(
+        { sessionId: bracketedRun, topology: "small-focused", request: "  [skip-interview] build parser", tasks: [{ id: "t1" }] },
+        { sessionID: "ses_sentinel" },
+      )
+      assert.ok(!String(bracketed.content).startsWith("refused:"), bracketed.content)
+      const bracketedOrig = readFileSync(join(dir, ".opencode", "teamwork", bracketedRun, "ORIGINAL_REQUEST.md"), "utf8")
+      assert.equal(bracketedOrig.split("## Request\n\n")[1], "build parser\n", "indented [skip-interview] is parsed and stripped")
+      assert.match(bracketedOrig, /- skipInterview: true/)
     }),
 })
 
@@ -1350,7 +1371,19 @@ addCase({
         { sessionId: runId, topology: "small-focused", request: "Initial request.", skipInterview: true, tasks: [{ id: "t1" }] },
         { sessionID: "ses_sentinel" },
       )
-      await invokeFollowUpAppend(h.tools, runId, "Also support JSON output.", { sessionID: "ses_sentinel" })
+      // B1: the documented minimal payload validates and does not require the
+      // normal-plan fields; a bare normal plan still fails validation.
+      const planSchema = h.tools.teamwork_plan.input?.["~standard"]
+      const minimal = planSchema.validate({ sessionId: runId, followUp: "Also support JSON output." })
+      assert.equal(minimal.issues, undefined, `minimal followUp payload must validate: ${JSON.stringify(minimal.issues)}`)
+      const missingBoth = planSchema.validate({ sessionId: runId })
+      assert.ok(Array.isArray(missingBoth.issues) && missingBoth.issues.length > 0, "a plan without topology/tasks/followUp must fail schema validation")
+      const appended = await invokeFollowUpAppend(h.tools, runId, "Also support JSON output.", { sessionID: "ses_sentinel" })
+      assert.equal(appended.topology, "small-focused", "follow-up must return the persisted topology")
+      assert.equal(appended.tasks.length, 1, "follow-up must return the persisted tasks")
+      // A direct execute (schema bypassed) without topology/tasks refuses.
+      const normalNoFields = await h.tools.teamwork_plan.execute({ sessionId: runId, skipInterview: true }, { sessionID: "ses_sentinel" })
+      assert.ok(String(normalNoFields.content).startsWith("refused:"), `normal plan without topology/tasks must refuse: ${normalNoFields.content}`)
       const orig = readFileSync(join(dir, ".opencode", "teamwork", runId, "ORIGINAL_REQUEST.md"), "utf8")
       assert.match(orig, /^## \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/m, `expected UTC header in:\n${orig}`)
       assert.ok(orig.includes("Also support JSON output."), orig)
@@ -1655,10 +1688,12 @@ addCase({
         )
       }
       const runDir = join(dir, ".opencode", "teamwork", runId)
-      const next = await h.tools.teamwork_next.execute({ sessionId: runId }, { sessionID: "ses_sentinel" })
       const deadEndsExists = existsSync(join(runDir, "DEAD_ENDS.md"))
-      const mentionsOsc = /oscillation|dead.?end/i.test(next.content)
-      assert.ok(deadEndsExists || mentionsOsc, "2 consecutive identical failures must trigger DEAD_ENDS.md or Oscillation Guard")
+      assert.ok(deadEndsExists, "2 consecutive identical failures must write DEAD_ENDS.md")
+      const deadEnds = readFileSync(join(runDir, "DEAD_ENDS.md"), "utf8")
+      assert.match(deadEnds, /oscillation|dead.?end/i)
+      const next = await h.tools.teamwork_next.execute({ sessionId: runId }, { sessionID: "ses_sentinel" })
+      assert.match(String(next.content), /Oscillation Guard:.*DEAD_ENDS\.md/i, `teamwork_next must surface the oscillation guard, got:\n${next.content}`)
     }),
 })
 
@@ -1819,7 +1854,7 @@ addCase({
   fn: () =>
     withSandbox("a7-t1-02", async (dir) => {
       const binDir = join(dir, "bin")
-      writeStubBin(binDir, "python3", `process.exit(1);`)
+      writeStubBin(binDir, "python3", `console.error("ModuleNotFoundError: No module named 'pypdfium2'"); process.exit(1);`)
       const pdfPath = join(dir, "scan.pdf")
       writeFileSync(pdfPath, makeUnreadableImagePdfBuffer())
       await withEnv({ PATH: `${binDir}:${process.env.PATH ?? ""}` }, async () => {
@@ -1830,7 +1865,9 @@ addCase({
           { sessionID: "ses_sentinel" },
         )
         assert.match(res.content, /MISSING|pypdfium2|Pillow/i, res.content)
+        assert.match(String(res.content), /^refused: MISSING PDF text extraction prerequisites/, res.content)
         assert.equal(existsSync(join(dir, "PREREQUISITES.md")), true, "PREREQUISITES.md must be written on MISSING PDF deps")
+        assert.match(readFileSync(join(dir, "PREREQUISITES.md"), "utf8"), /^- Status: MISSING$/m)
       })
     }),
 })
@@ -1858,6 +1895,8 @@ addCase({
       )
       assert.ok(String(res.content).includes("MISSING") || String(res.content).startsWith("refused:"), res.content)
       assert.equal(existsSync(join(dir, "PREREQUISITES.md")), true, "PREREQUISITES.md must be written on MISSING plan input")
+      const prereq = readFileSync(join(dir, "PREREQUISITES.md"), "utf8")
+      assert.match(prereq, /^- Status: MISSING$/m, `plan-input refusal must record MISSING:\n${prereq}`)
     }),
 })
 
@@ -1893,6 +1932,7 @@ process.exit(0);
         const probe = await h.tools.teamwork_lemma_probe.execute({}, { sessionID: "ses_sentinel" })
         assert.equal(probe.ready, true, probe.content)
         assert.equal(existsSync(marker), true, "teamwork_lemma_probe must invoke `leap doctor`")
+        assert.equal(existsSync(join(dir, "PREREQUISITES.md")), false, "a READY probe must not write PREREQUISITES.md")
       })
     }),
 })
@@ -2721,9 +2761,16 @@ addCase({
       const h = await makeHarness(dir)
       const runId = "20261125-120000-a3b5"
       await setupCodingRunToPass(h.tools, dir, runId, { skipInterview: true })
+      // Prove the run is terminal before the append; otherwise "not ALL_PASSED
+      // afterwards" is vacuous.
+      const fv = await h.tools.teamwork_final_verify.execute({ sessionId: runId }, { sessionID: "ses_sentinel" })
+      assert.equal(fv.status, "PASS", `fixture must reach final PASS before the append: ${fv.content}`)
+      const beforeAppend = await h.tools.teamwork_next.execute({ sessionId: runId }, { sessionID: "ses_sentinel" })
+      assert.equal(beforeAppend.status, "ALL_PASSED", `fixture must be ALL_PASSED before the append: ${beforeAppend.content}`)
       await invokeFollowUpAppend(h.tools, runId, "New requirement after victory.", { sessionID: "ses_sentinel" })
       const next = await h.tools.teamwork_next.execute({ sessionId: runId }, { sessionID: "ses_sentinel" })
       assert.notEqual(next.status, "ALL_PASSED", "follow-up append must not keep stale VICTORY CONFIRMED valid")
+      assert.match(String(next.content), /AUTH_STALE|request.?hash/i, `stale victory must cite AUTH_STALE/requestHash drift: ${next.content}`)
     }),
 })
 
@@ -2805,6 +2852,55 @@ addCase({
         { sessionID: "ses_victory" },
       )
       assert.ok(String(third.content).startsWith("refused:"), `3rd victory audit in small-focused should be capped/refused: ${third.content}`)
+
+      // Residual review finding: an unsigned legacy run has no signed manifest.
+      // A re-plan must still not change topology (it would move the 2-audit cap
+      // to an uncapped topology) and must leave plan.dag.json byte-identical.
+      const unsignedRun = "20261125-120000-a4b3u"
+      const firstUnsigned = await h.tools.teamwork_plan.execute(
+        {
+          sessionId: unsignedRun,
+          topology: "small-focused",
+          request: "Unsigned fix",
+          requirements: [{ id: "R1", text: "Fix" }],
+          allowUnsignedLegacy: true,
+          skipInterview: true,
+          tasks: [{ id: "t1" }],
+        },
+        { sessionID: "ses_sentinel" },
+      )
+      assert.ok(!String(firstUnsigned.content).startsWith("refused:"), firstUnsigned.content)
+      const unsignedPlanFile = join(dir, ".opencode", "teamwork", unsignedRun, "plan.dag.json")
+      const beforeUnsignedPlan = readFileSync(unsignedPlanFile)
+      const unsignedReplan = await h.tools.teamwork_plan.execute(
+        { sessionId: unsignedRun, topology: "iterative-coding", allowUnsignedLegacy: true, skipInterview: true, tasks: [{ id: "t1" }] },
+        { sessionID: "ses_sentinel" },
+      )
+      assert.ok(String(unsignedReplan.content).startsWith("refused:"), `unsigned topology change must be refused: ${unsignedReplan.content}`)
+      assert.match(String(unsignedReplan.content), /AUTH_STALE|re-plan/i, unsignedReplan.content)
+      assert.deepEqual(readFileSync(unsignedPlanFile), beforeUnsignedPlan, "a refused unsigned re-plan must not rewrite plan.dag.json")
+      for (const n of [1, 2]) {
+        const rejected = await h.tools.teamwork_victory_audit.execute(
+          {
+            sessionId: unsignedRun,
+            verdict: "VICTORY REJECTED",
+            requirements: [{ id: "R1", met: false, evidence: `Unsigned reject ${n}` }],
+            summary: makeThreePhaseVictorySummary("VICTORY REJECTED"),
+          },
+          { sessionID: "ses_victory" },
+        )
+        assert.ok(!String(rejected.content).startsWith("refused:"), rejected.content)
+      }
+      const unsignedThird = await h.tools.teamwork_victory_audit.execute(
+        {
+          sessionId: unsignedRun,
+          verdict: "VICTORY REJECTED",
+          requirements: [{ id: "R1", met: false, evidence: "Unsigned reject 3" }],
+          summary: makeThreePhaseVictorySummary("VICTORY REJECTED"),
+        },
+        { sessionID: "ses_victory" },
+      )
+      assert.ok(String(unsignedThird.content).startsWith("refused:"), `unsigned small-focused run must keep the 2-audit cap: ${unsignedThird.content}`)
     }),
 })
 
@@ -3119,6 +3215,11 @@ console.log("leap 1.0.0"); process.exit(0);
         const probe = await h.tools.teamwork_lemma_probe.execute({}, { sessionID: "ses_sentinel" })
         assert.equal(probe.ready, false, "failing leap doctor must make probe not ready")
         assert.equal(probe.status, "OUTAGE", `expected OUTAGE when leap doctor fails, got ${probe.status}`)
+        assert.doesNotMatch(String(probe.content), /Nothing was written/i, "PREREQUISITES.md is written, so the refusal must not claim nothing was written")
+        assert.match(String(probe.content), /No run directory or plan artifact was created/)
+        const prereq = readFileSync(join(dir, "PREREQUISITES.md"), "utf8")
+        assert.match(prereq, /^- Status: OUTAGE$/m, `a leap doctor failure is OUTAGE, not MISSING:\n${prereq}`)
+        assert.doesNotMatch(prereq, /^- Status: MISSING$/m)
       })
     }),
 })
@@ -3141,6 +3242,7 @@ addCase({
       )
       assert.ok(String(res.content).startsWith("refused:") || String(res.content).includes("MISSING"))
       assert.equal(readFileSync(victim, "utf8"), "SAFE", "symlinked PREREQUISITES.md must never be overwritten")
+      assert.equal(lstatSync(join(dir, "PREREQUISITES.md")).isSymbolicLink(), true, "a planted PREREQUISITES.md symlink must be refused, not replaced")
     }),
 })
 
@@ -3888,7 +3990,15 @@ addCase({
 
           const cli = spawnSync(
             process.execPath,
-            [CLI_PATH, "verify", "--session", runId, "--root", dir, "--public-key", pubB64, "--json"],
+            [
+              CLI_PATH,
+              "verify",
+              "--run-dir",
+              join(dir, ".opencode", "teamwork", runId),
+              "--public-key",
+              pubB64,
+              "--json",
+            ],
             { encoding: "utf8" },
           )
           assert.equal(cli.status, 0, cli.stderr || cli.stdout)

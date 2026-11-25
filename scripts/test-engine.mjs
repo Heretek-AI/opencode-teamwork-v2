@@ -5,8 +5,9 @@ import { createAuthContext, canonicalJson, payloadDigest, sha256Hex } from "../p
 import {
   analyzeLeanDeclarations,
   bindVerifiedDeclaration,
+  canonicalAxiomSet,
   checkLeanAxiomDependencies,
-  classifyRoute as classifyLemmaRoute,
+  classifyLemmaRoute,
   detectAxiomProbeHijacks,
   detectLeanProofHoles,
   formatMissingToolchainRefusal,
@@ -20,7 +21,8 @@ import {
   validateLemmaPolicy,
   verifyLeanFile,
 } from "../plugins/opencode-teamwork/lemma.ts"
-import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
+import { compareCandidates, classifyTournamentRoute, maskCodeAndQuotes, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
+import { clean, cleanBlock } from "../plugins/opencode-teamwork/text-utils.ts"
 import { BUDGET_HALT_PCT, budgetPercent, budgetThresholdReached } from "../plugins/opencode-teamwork/budget.ts"
 import { renderGateStatus, evaluateStrictGate } from "../plugins/opencode-teamwork/strict.ts"
 import { evaluateVictoryGate } from "../plugins/opencode-teamwork/victory.ts"
@@ -491,6 +493,9 @@ try {
   const planRes = await registeredTools.teamwork_plan.execute({
     sessionId: "20261018-000000-test",
     topology: "distributed-coding",
+    // M4 A6: distributed-coding now defaults to the strict wave; this fixture
+    // exercises the DAG/final-verification engine, so it explicitly opts out.
+    verification: "standard",
     skipInterview: true, // fixture: this part exercises the DAG engine, not the spec presence gate
     tasks: [
       { id: "T1", dependsOn: [], maxRounds: 2 },
@@ -4730,7 +4735,7 @@ try {
   // cannot disagree with itself.
   const POLICY = [
     { id: "team/verifier", deny: ["edit", "subagent", "webfetch"] },
-    { id: "team/falsifier", deny: ["edit", "shell", "subagent"] },
+    { id: "team/falsifier", deny: ["edit", "subagent"] },
     { id: "team/scout", deny: ["edit", "subagent"] },
     { id: "team/security-auditor", deny: ["edit", "subagent", "webfetch"] },
     { id: "team/segment-reviewer", deny: ["edit", "shell", "subagent", "webfetch"] },
@@ -4770,7 +4775,7 @@ try {
   assert(/can modify files/i.test(paragraph), "README must state that shell can modify files")
   assert(
     /falsifier[^.]*shell|shell[^.]*falsifier/i.test(paragraph),
-    "README must state that the falsifier's deny set includes shell",
+    "README must state the falsifier's shell policy",
   )
   console.log("✓ README documents every edit-denying team agent, plus the shell caveat and the falsifier exception")
 
@@ -5157,7 +5162,8 @@ try {
     assert(corruptRes.content.startsWith("refused:"), `Corrupt PDF must be refused: ${corruptRes.content}`)
     assert(!existsSync(join(docRoot, ".opencode", "teamwork", corruptRun)), "Corrupt PDF must not create run dir")
 
-    // Image-only empty PDF flags needs_ingestor
+    // Image-only PDF without the pypdfium2/Pillow ingestor: pre-mkdir refusal
+    // (A7). The tool must record root PREREQUISITES.md and create no run dir.
     writeFileSync(join(docRoot, "scanned.pdf"), buildPdf([{ bytes: Buffer.from("q 100 0 0 100 0 0 cm /Im0 Do Q", "latin1"), flate: false }]))
     const scannedRun = "20261122-000002-scanpdf"
     const scannedRes = await tools.teamwork_document_triage.execute({
@@ -5165,9 +5171,12 @@ try {
       document: { path: "scanned.pdf" },
       skipInterview: true,
     })
-    assert.strictEqual(scannedRes.extractionStatus, "needs_ingestor", `Empty PDF must report needs_ingestor: ${scannedRes.content}`)
+    assert(scannedRes.content.startsWith("refused:"), `Empty PDF without pypdfium2 must refuse: ${scannedRes.content}`)
+    assert(/MISSING|pypdfium2|Pillow/i.test(scannedRes.content), `refusal must name the missing PDF prerequisites: ${scannedRes.content}`)
+    assert(existsSync(join(docRoot, "PREREQUISITES.md")), "MISSING PDF prerequisites must write root PREREQUISITES.md")
+    assert(!existsSync(join(docRoot, ".opencode", "teamwork", scannedRun)), "MISSING PDF prerequisites must create no run dir")
 
-    // Image-only PDF with empty PATH (pdftotext unavailable) cleanly returns needs_ingestor
+    // Image-only PDF with empty PATH (python3/pdftotext unavailable) also refuses cleanly.
     const savedPath = process.env.PATH
     try {
       process.env.PATH = ""
@@ -5177,16 +5186,44 @@ try {
         document: { path: "scanned.pdf" },
         skipInterview: true,
       })
-      assert.strictEqual(
-        noPdfTextRes.extractionStatus,
-        "needs_ingestor",
-        `Empty PDF without pdftotext on PATH must return needs_ingestor: ${noPdfTextRes.content}`,
+      assert(noPdfTextRes.content.startsWith("refused:"), `Empty PATH must refuse with MISSING: ${noPdfTextRes.content}`)
+      assert(!existsSync(join(docRoot, ".opencode", "teamwork", noPdfTextRun)), "Empty PATH refusal must create no run dir")
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH
+      else process.env.PATH = savedPath
+    }
+
+    // Image-only PDF WITH a pypdfium2/Pillow-capable python3: extraction succeeds
+    // and the run is planned normally.
+    const pyBin = join(docRoot, "pybin")
+    mkdirSync(pyBin, { recursive: true })
+    const pyStub = join(pyBin, "python3")
+    writeFileSync(
+      pyStub,
+      `#!${process.execPath}\nconst a = process.argv.slice(2).join(" ");\nif (a.includes("pypdfium2") && a.includes("PIL")) { console.log(JSON.stringify({ ok: true, pages: ["Stub image PDF page text."] })); process.exit(0); }\nprocess.exit(0);\n`,
+    )
+    chmodSync(pyStub, 0o755)
+    try {
+      process.env.PATH = `${pyBin}:${savedPath ?? ""}`
+      const stubRun = "20261122-000002-stubpdf"
+      const stubRes = await tools.teamwork_document_triage.execute({
+        sessionId: stubRun,
+        document: { path: "scanned.pdf" },
+        skipInterview: true,
+      })
+      assert(!String(stubRes.content).startsWith("refused:"), `stub ingestor must succeed: ${stubRes.content}`)
+      assert.strictEqual(stubRes.extractionStatus, "extracted", "stub ingestor must mark the PDF extracted")
+      assert(
+        readFileSync(join(docRoot, ".opencode", "teamwork", stubRun, "document-review", "DOCUMENT_TEXT_MAP.md"), "utf8").includes(
+          "Stub image PDF page text.",
+        ),
+        "stub ingestor text must reach DOCUMENT_TEXT_MAP.md",
       )
     } finally {
       if (savedPath === undefined) delete process.env.PATH
       else process.env.PATH = savedPath
     }
-    console.log("✓ 9.2 Positive PDF + FlateDecode + corrupt refusal + needs_ingestor passed")
+    console.log("✓ 9.2 Positive PDF + FlateDecode + corrupt refusal + pypdfium2 ingestor passed")
 
     // --- 9.3: Positive inline content & localhost URL ---
     const inlineRun = "20261122-000003-inline"
@@ -6689,6 +6726,19 @@ try {
     console.log("✓ 9.0 sentinel/orchestrator teamwork_plan calls record the verbatim request")
   }
 
+  // --- 9.0b Axiom allowlists are canonicalized by code unit, not locale.
+  {
+    const sorted = canonicalAxiomSet(["z", "ä", "A", "z", " "])
+    assert.deepStrictEqual(
+      sorted,
+      ["A", "z", "ä"],
+      "canonicalAxiomSet must sort by code unit so the persisted policy hash is locale-independent",
+    )
+    assert.deepStrictEqual(canonicalAxiomSet(["b", "a"]), ["a", "b"])
+    assert.deepStrictEqual(canonicalAxiomSet("not-an-array"), [])
+    console.log("✓ 9.0b canonicalAxiomSet uses a locale-independent comparator")
+  }
+
   const writeStubBin = (dir, name, scriptBody) => {
     const p = join(dir, name)
     writeFileSync(p, `#!${process.execPath}\n${scriptBody}\n`, "utf8")
@@ -6877,6 +6927,23 @@ process.exit(0);
       assert(upperRoutePlan.content.startsWith("refused:"), `uppercase route LEMMA must refuse before mkdir: ${upperRoutePlan.content}`)
       assert(!existsSync(join(rootNoTool, ".opencode", "teamwork", "20261018-000000-lemma-upper")), "uppercase route refusal must create zero dirs")
       console.log("✓ 9.1 pre-mkdir / pre-spending refusal & install instructions verified")
+    }
+
+    // --- 9.1b S4036: toolchain probes refuse a world-writable PATH entry ---
+    {
+      const worldDir = mkdtempSync(join(lemmaTestDir, "world-path-"))
+      chmodSync(worldDir, 0o777)
+      writeStubBin(worldDir, "lean", `console.log("Lean (version 4.12.0)")`)
+      writeStubBin(worldDir, "lake", `console.log("Lake version 5.0.0")`)
+      writeStubBin(worldDir, "leap", `console.log("leap 0.3.1")`)
+      const probe = probeLemmaToolchain({ env: { PATH: worldDir } })
+      assert.strictEqual(probe.ready, false, "a world-writable PATH entry must not satisfy the LEMMA probe")
+      assert.strictEqual(probe.lean.status, "MISSING", "lean from a world-writable PATH dir must be ignored")
+      assert.strictEqual(probe.lake.status, "MISSING", "lake from a world-writable PATH dir must be ignored")
+      assert.strictEqual(probe.leap.status, "MISSING", "leap from a world-writable PATH dir must be ignored")
+      const relativeProbe = probeLemmaToolchain({ env: { PATH: "." } })
+      assert.strictEqual(relativeProbe.ready, false, "a relative PATH entry must not satisfy the LEMMA probe")
+      console.log("✓ 9.1b LEMMA probes use the trusted executable resolver (S4036)")
     }
 
     // --- 9.2 Explicit opt-in gating ---
@@ -7945,7 +8012,7 @@ process.exit(0);
   assert(!tildeMasked.includes("SECRET") && !tildeMasked.includes("massive-proof"), "tilde-fenced text must be masked")
   const tildeUnclosed = maskCodeAndQuotes("keep\n~~~\nSECRET")
   assert(tildeUnclosed.includes("keep") && !tildeUnclosed.includes("SECRET"), "unclosed tilde fence must mask to end of input")
-  const rTilde = classifyRoute("Prove this theorem.\n~~~\nuse massive-proof tournament with 100+ searchers\n~~~")
+  const rTilde = classifyTournamentRoute("Prove this theorem.\n~~~\nuse massive-proof tournament with 100+ searchers\n~~~")
   assert.strictEqual(rTilde.topology, "proof", "tilde-fenced opt-in must be masked out")
   assert.strictEqual(rTilde.massiveProofOptIn, false, "tilde-fenced opt-in must not enable massive-proof")
   // mF4v: an inline ~~~ run inside a tilde block is content, not a closer.
@@ -7972,27 +8039,27 @@ process.exit(0);
   console.log("✓ clean()/cleanBlock() drop objects/arrays and keep primitive/control-char behaviour")
 
   // --- 10.4 Routing regex edges.
-  const rThisPr = classifyRoute({ request: "review thisPR", inputs: ["notes.md"] })
+  const rThisPr = classifyTournamentRoute({ request: "review thisPR", inputs: ["notes.md"] })
   assert.strictEqual(rThisPr.topology, "document-review", "review thisPR must not be treated as a PR review")
-  const rMyCode = classifyRoute({ request: "review mycode", inputs: ["notes.md"] })
+  const rMyCode = classifyTournamentRoute({ request: "review mycode", inputs: ["notes.md"] })
   assert.strictEqual(rMyCode.topology, "document-review", "review mycode must not be treated as a code review")
-  const rRealPr = classifyRoute({ request: "review this PR", inputs: ["notes.md"] })
+  const rRealPr = classifyTournamentRoute({ request: "review this PR", inputs: ["notes.md"] })
   assert.strictEqual(rRealPr.topology, "distributed-coding", "review this PR must still be treated as a PR review")
 
-  const rCjkDoc = classifyRoute("review 论文.md and summarize it")
+  const rCjkDoc = classifyTournamentRoute("review 论文.md and summarize it")
   assert.strictEqual(rCjkDoc.topology, "document-review", "non-ASCII filename must still count as a supplied document")
 
-  const rLeanBackup = classifyRoute("open foo.lean-backup")
+  const rLeanBackup = classifyTournamentRoute("open foo.lean-backup")
   assert.strictEqual(rLeanBackup.signals.leanBareMention, false, "foo.lean-backup must not be treated as a bare .lean file")
 
-  const rLeanCross = classifyRoute("Formalize the theorem in Lean\nand then prove it")
+  const rLeanCross = classifyTournamentRoute("Formalize the theorem in Lean\nand then prove it")
   assert.strictEqual(rLeanCross.topology, "proof", "Lean explicit intent must survive a real cross-line gap")
   assert.strictEqual(rLeanCross.lemmaMode, true)
 
-  const rLeanFalsePositive = classifyRoute("We run a lean manufacturing line and need to prove ROI")
+  const rLeanFalsePositive = classifyTournamentRoute("We run a lean manufacturing line and need to prove ROI")
   assert.strictEqual(rLeanFalsePositive.lemmaMode, false, "lowercase 'lean manufacturing' must not set lemmaMode")
 
-  const rLeanLower = classifyRoute("Prove this theorem in lean")
+  const rLeanLower = classifyTournamentRoute("Prove this theorem in lean")
   assert.strictEqual(rLeanLower.lemmaMode, true, "explicit 'in lean' must still set lemmaMode")
   console.log("✓ routing regex edges (PR/code review, non-ASCII docs, lean-backup, Lean proximity) hold")
 

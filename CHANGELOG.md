@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.19.0] - 2026-11-25
 
 ### Added
 
@@ -48,6 +48,76 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Corpus records (#48):** Added `docs/re/antigravity-teamwork/21-live-pdf-ingestion.md`
   and `22-live-document-review-layout-2.md` with strict `OBSERVED`/`UNKNOWN`
   evidence labels.
+- **M3 prompt and documentation parity (A2/A3/A9):** an interview gate before
+  routing (only a leading `[skip-interview]` or an explicit `skipInterview: true`
+  bypasses it), behavioral integrity-mode elicitation with a separate internal
+  mapping, append-only UTC-timestamped follow-ups in `ORIGINAL_REQUEST.md`
+  (header, `## Parameters`, `## Request`, and integrity mode unchanged;
+  manifest `requestHash` re-bound), and a `# SYSTEM PROMPT PROTECTION` decoy
+  rule in all 15 agents. The docs also cover the `OPENCODE_TEAMWORK_DISABLED`
+  runtime toggle and the legacy `/team-*` commands.
+- **M4 prompt and documentation parity (A4–A8):** `small-focused` is a
+  refinement loop (up to 32 rounds) with an open-issues ledger and a two-audit
+  victory cap that ends in a terminal non-victory state; Step 0 dispatches two
+  scouts and cross-checks `PROJECT.md` (Feature Inventory) and `SCOPE.md`;
+  `TEST_INFRA.md`/`TEST_READY.md` form the dual-track E2E plan; `DEAD_ENDS.md`
+  records the oscillation guard and every fix keeps the regression guard;
+  sentinel and worker carry the mandatory integrity warning; `distributed-coding`
+  defaults to `verification: "strict"` (reviewer/challenger/forensic-auditor
+  roles) with `standard` as the explicit opt-out; the falsifier's `shell` is
+  allowed for empirical challenges; `PREREQUISITES.md` records blocking
+  PDF/LEMMA dependencies before any run exists; and the victory auditor records
+  a mandatory three-phase report (timeline, integrity, independent tests).
+  Mid-run pause and terminal non-victory stop are now distinct.
+- **Reproducible parity and audit regression suite:** `scripts/test-agy-parity.mjs`
+  (152 L0 cases across four tiers) and `tests/runtime/spec/agy-parity.test.ts`
+  (61 OpenCode 2.4.1 runtime specs) cover every closed gap A1–A9 and the M1
+  security regressions. The parity suite is wired as `npm run test:agy-parity`;
+  `docs/TEST_INFRA.md` records the design and `docs/TEST_READY.md` the green
+  readiness result.
+
+### Changed
+
+- **Dead-export and duplicate-export cleanup (M2):** five duplicate exports
+  consolidated (`AUTH_ED25519` defined once; `classifyDocumentRoute`,
+  `classifyLemmaRoute` and `classifyTournamentRoute` renamed with distinct
+  result types; `clean`/`cleanBlock` moved to `text-utils.ts`), 219
+  declarations un-exported where no external consumer existed, and the 29 dead
+  private names left by that pass removed together with the imports those
+  deletions orphaned. A
+  scoped `.fallowrc.json` records only exact named exceptions and entry
+  points — no wildcard suppressions — so `fallow dead-code` reports 0 issues
+  (255 before). The config is not part of the npm tarball.
+
+### Security
+
+- **Audit remediation M1 (items 1–7):** Rule #7 DB resolution now honors
+  `OPENCODE_DB` and `OPENCODE_CHANNEL` in `doctor --security`; the 19
+  `js/file-system-race` sinks use fd-pinned `O_NOFOLLOW` reads/writes; the two
+  `js/file-access-to-http` sinks parse and restrict `service*.json` targets to
+  validated loopback origins; CI actions are SHA-pinned and package installs
+  pass `--ignore-scripts`; the approval driver validates `runId` containment.
+  The `S3923`, `S8707`, `S5443`, `S2871`, `S1244`, `S5332` and `S4036` findings
+  are fixed in the working tree. These are local fixes: remote CodeQL and
+  SonarCloud alert states change only after the branch is pushed and CI
+  analyzes it.
+
+### Fixed
+
+- **M3/M4 review remediation:** `teamwork_plan({ sessionId, followUp })` now
+  works as documented (conditional `anyOf` schema, persisted topology/tasks,
+  branch before normal-plan validation and pinned-write setup);
+  `PREREQUISITES.md` records the real `MISSING`/`OUTAGE` probe status and
+  refuses a planted symlink instead of replacing it; LEMMA/PDF refusal text no
+  longer claims nothing was written; an unsigned legacy re-plan cannot change
+  the persisted topology/modes; leading whitespace is preserved unless it
+  introduces a launch bracket; the tournament path records the stripped
+  request; and the parity suite adds the A3 manifest-hash, A4 clamps/derived
+  feedback, A5 stubs/symlinked `DEAD_ENDS.md`, A6 wave line, A7 status,
+  A8 legacy-summary and A9 runtime-abort assertions.
+- `resolveTrustedExecutable` rejects the `.` and `..` directory aliases, and
+  `openPinnedRoot` reports `run-symlink` (not `run-not-directory`) when the
+  run directory is a symlink on Linux.
 
 ## [0.18.1] - 2026-11-24
 

@@ -6,7 +6,7 @@
 // key outside the fixture process.
 
 import { generateKeyPairSync } from "node:crypto"
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { mkdirSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import { pathToFileURL } from "node:url"
 import { PLUGIN_DIR } from "./project"
@@ -138,10 +138,6 @@ export async function signAttestationPayload(
   mkdirSync(join(fx.runDir, "verify", "ci"), { recursive: true })
   writeFileSync(join(fx.runDir, "verify", "ci", "attestation.json"), `${JSON.stringify(artifact, null, 2)}\n`, "utf8")
   return artifact
-}
-
-export function readAttestation(fx: RunFixture): any {
-  return JSON.parse(readFileSync(join(fx.runDir, "verify", "ci", "attestation.json"), "utf8"))
 }
 
 export function readReportHead(fx: RunFixture, taskId = "T1"): string {

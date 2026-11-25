@@ -11,7 +11,7 @@ Every run writes under one root:
 ```
 .opencode/teamwork/<session-id>/
 ├── prompt_draft.md          # spec (from the crafter, or inlined by the sentinel); required by teamwork_plan unless bypassed
-├── ORIGINAL_REQUEST.md      # verbatim routed request + integrity mode (write-once; absent on legacy runs)
+├── ORIGINAL_REQUEST.md      # verbatim request + launch parameters + UTC follow-ups (header write-once; absent on legacy runs)
 ├── requirements.json        # plan-time requirements baseline (caller or request-derived; absent when neither exists)
 ├── run.manifest.json        # signed baseline: modes + request/requirements/plan/policy hashes (_auth)
 ├── plan.dag.json            # task DAG (+ preflight gate result + verification/victoryAudit/requireHandoffs modes)
@@ -19,6 +19,11 @@ Every run writes under one root:
 ├── state.json               # resumable coordinator state
 ├── costs.json               # coordinator-maintained budget tracker
 ├── BRIEFING.md              # shared run briefing: mission, identity, constraints, status, artifacts, succession
+├── PROJECT.md               # survey: architecture, code layout, Feature Inventory (cross-checked with plan tasks)
+├── SCOPE.md                 # survey: milestones, deliverables, out-of-scope items
+├── TEST_INFRA.md            # test philosophy + 13-feature / 4-tier plan (written before implementation)
+├── TEST_READY.md            # only after the E2E suite is green; required for final milestone completion
+├── DEAD_ENDS.md             # oscillation guard: repeated failure signatures and the approach change
 ├── handoffs/                # canonical agent handoffs: <taskId|_run>-<agent>.md + index.json
 ├── agents/                  # per-agent briefings: <agentSlug>-<sha256(sessionID)[0:32]>/BRIEFING.md
 ├── handoff.md               # legacy unqualified handoff (read-only; new writes go through teamwork_handoff)
@@ -63,8 +68,12 @@ Every run writes under one root:
 ├── TOURNAMENT_REPORT.md       # deterministic tournament summary (COMPLETED, FAILED, or PARTIAL)
 ├── final.md                 # presented result
 ├── report.html / report.md  # optional export output (`opencode-teamwork export`)
-└── interrupted.md           # present when the user stops a run
+└── interrupted.md           # mid-run pause or terminal non-victory stop (never a victory record)
 ```
+
+`PREREQUISITES.md` is written at the **repository root**, not inside the run
+directory, because a blocking dependency is discovered before any run exists
+(see [`PREREQUISITES.md`](#prerequisitesmd-repo-root--blocking-dependency-report)).
 
 `<session-id>` = `YYYYMMDD-HHMMSS-<4 hex>`.
 
@@ -76,7 +85,7 @@ the repo are a footgun). Default root: `$TEAMWORK_WORKTREES_DIR` or
 
 | Topology | Shape |
 | --- | --- |
-| `small-focused` | 1 worker + 1 verifier loop |
+| `small-focused` | 1 worker + 1 verifier refinement loop (up to 32 rounds; open-issues ledger) |
 | `iterative-coding` | 1 worker, test-driven tight loop on one module |
 | `distributed-coding` | N workers fan-out + merge |
 | `proof` | 1 strategist + 3-5 searchers + 1 formal checker (plus explicit opt-in LEMMA / Lean 4 mode via `lemmaMode: true`) |
@@ -130,21 +139,144 @@ refused before anything is written.
 to prove a rule was broken; it takes the auditor's report at face value and
 makes a reported violation binding on the gate.
 
+## `PREREQUISITES.md` (repo root) — blocking dependency report
+
+Some routes need tools that are not part of this package. When a blocking
+dependency is `MISSING` or in `OUTAGE`, the plugin writes `PREREQUISITES.md` at
+the **repository root**, before any run directory is created, and refuses to
+plan or spend until it is resolved. The file is only written on failure: its
+`- Status:` line is `MISSING` or `OUTAGE`. A successful probe writes nothing
+(`READY` is not an artifact state).
+
+| Route | Required | Probe |
+| --- | --- | --- |
+| PDF `document-review` | Python 3 with `pypdfium2` **and** `Pillow` | imports both modules and extracts one page |
+| LEMMA (`lemmaMode: true`) | `lean`, `lake`, and the LEAP CLI (`leap`) | `leap doctor`, plus the individual tool probes |
+
+Each probe records one verdict:
+
+| Verdict | Meaning |
+| --- | --- |
+| `READY` | found and usable; clears the route and writes no `PREREQUISITES.md` |
+| `MISSING` | not installed or not on `PATH`; blocks the route |
+| `OUTAGE` | installed but unusable (non-zero probe, corrupt toolchain, fetch/network failure) |
+
+`READY` clears that route; `MISSING`/`OUTAGE` block it and the file records the
+exact install commands plus the probe output. The file is written atomically,
+refuses to replace a planted symlink, and is never silently deleted; deleting
+it does not install anything. It is a diagnostic record, not proof that the
+toolchain will succeed on every input.
+
+## Verification modes
+
+`verification` is recorded in `plan.dag.json`, `state.json`, and the signed
+manifest; a re-plan may repeat it but not change it.
+
+| Mode | Shape |
+| --- | --- |
+| `standard` | one `team/verifier` report per task. An explicit opt-out from strict. |
+| `strict` | the verifier report, plus one `team/falsifier` challenge (`PASS`) and one `team/security-auditor` audit (`CLEAN`) per task. |
+
+**`distributed-coding` defaults to `strict`.** `standard` is an explicit opt-out
+the caller passes and the plan records — never an assumed default. The strict
+wave reuses existing roles: reviewer=`team/verifier`,
+challenger=`team/falsifier`, forensic auditor=`team/security-auditor`. Every
+wave verdict is sha256-bound to the verifier report by `teamwork_wave_record`,
+and the final gate writes `GATE_STATUS.md` with worker/verifier/challenger/auditor
+rows and a `## Continuity` handoff table.
+
+## Command entrypoint and runtime toggle
+
+`/teamwork` is the supported entrypoint. `/team-orchestrate`, `/team-propose`,
+`/team-falsify`, `/team-synthesize`, and `/team-review` are legacy v1 commands:
+they still run the propose/falsify/synthesize/verify loop through
+`team/orchestrator`, but new work should use `/teamwork`. `/teamwork-craft`
+remains the crafter wizard.
+
+`OPENCODE_TEAMWORK_DISABLED=1` (or `true`, case-insensitive) makes the plugin's
+`setup` register nothing: no `teamwork_*` tools, no commands, and no permission
+hook. `0`, `false`, or an empty value leaves the plugin enabled. The variable is
+read once at setup, so it is a process-level toggle, not a per-run switch.
+
+## Survey and tracking artifacts
+
+Step 0 of a run produces the survey, then tracks the work against it. These
+files live in the run root. `teamwork_plan` seeds create-only stubs for
+`PROJECT.md`, `SCOPE.md`, `TEST_INFRA.md`, and `DEAD_ENDS.md` in
+`distributed-coding`; never `TEST_READY.md`. For other topologies the Sentinel
+writes them from the survey. Either way they exist before dispatch.
+
+| File | When | Contents |
+| --- | --- | --- |
+| `PROJECT.md` | after the two-scout survey, before dispatch | architecture, code layout, and a **Feature Inventory** (`feature \| path \| test \| status`). Cross-checked against the plan tasks: every in-scope feature has a task (or an explicit out-of-scope line), and every task names the rows it changes. |
+| `SCOPE.md` | same as `PROJECT.md` | milestones, deliverables, and out-of-scope items with the reason. |
+| `TEST_INFRA.md` | before implementation | test philosophy and the **13-feature / 4-tier** plan (unit → integration → E2E → regression), with exact commands. |
+| `TEST_READY.md` | **only** after the E2E suite is green | the recorded green E2E result. Final milestone completion requires this file; writing it early is a false claim. |
+| `DEAD_ENDS.md` | on the second consecutive identical failure signature | oscillation guard: task id, signature, what was tried, and the approach change. A third identical retry is a process failure, not persistence. |
+
+The **Regression Guard** is the complementary rule: every fix must keep
+previously passing checks green, and a full re-run is required before a fix is
+claimed.
+
+## Run ends: `interrupted.md` and terminal states
+
+`interrupted.md` is written by the Sentinel for a pause or terminal non-victory
+stop; the engine itself writes it only for a non-tournament `AbortSignal`
+(`teamwork_next` returns `CANCELLED`). It is never a victory record.
+
+- **Mid-run pause** (user interruption, context limit, budget pause): save
+  state, write `interrupted.md` with the current status and every open issue,
+  and stop. The victory auditor is not invoked; resume later with
+  `teamwork_resume` / `teamwork_next`.
+- **Terminal non-victory stop** (max rounds, `DEADLOCK`, two rejected victory
+  audits, or a budget stop that is not resumed): write `interrupted.md` (or
+  `final.md` when a partial result is presentable), report the partial results
+  and every open issue. `VICTORY CONFIRMED` is never written for such a run.
+
 ## Schemas
 
-### `ORIGINAL_REQUEST.md` — verbatim routed request (write-once)
+### `ORIGINAL_REQUEST.md` — verbatim request, launch parameters, follow-ups
 
 `teamwork_plan` writes this file once, **before** `plan.dag.json` and
 `state.json`, when its optional `request` input is provided. It is the artifact
 the auditor reads the integrity mode from, and the path to hand any auditor that
 checks the work against the original request.
 
-- **Write-once.** If the file already exists with non-empty content, a second
-  plan into the same run is refused ("write-once ... use a new session") and
-  writes nothing else.
-- **Verbatim.** The request text is preserved exactly — no reflow, no trimming
-  of interior whitespace — and capped at 20,000 characters. A longer request is
-  refused, never silently truncated.
+- **Header write-once.** The header, `## Parameters`, and `## Request` are
+  written once. If the file already exists with non-empty content, a second plan
+  that tries to write a different initial request into the same run is refused
+  ("write-once ... use a new session") and writes nothing else. Only
+  `followUp` appends are allowed after creation.
+- **Verbatim request.** The request text is preserved exactly — no reflow, no
+  trimming of interior whitespace — and capped at 20,000 characters. A longer
+  request is refused, never silently truncated. An empty or whitespace-only
+  request is refused before any file is created.
+- **Launch parameters.** A `## Parameters` section records how the run was
+  launched. `[skip-interview]` is recorded there whenever the bypass is
+  effective; a leading `[skip-interview]` bracket is removed from `## Request`
+  before the task text is recorded. The first other leading bracket is left in
+  the task text and reported, because it is part of the task. Leading spaces or
+  tabs are consumed only when they introduce a bracketed token; a request with
+  no leading bracket is preserved byte-for-byte, including meaningful leading
+  whitespace. The marker line
+  `How this run was launched; not part of the task.` separates launch metadata
+  from the task text.
+- **Follow-ups.** `teamwork_plan({ sessionId, followUp: "<text>" })` appends a
+  UTC-timestamped section to an existing run (the normal-plan `topology` and
+  `tasks` inputs are not required for a follow-up; the persisted plan supplies
+  them):
+  `\n## <YYYY-MM-DDTHH:MM:SSZ>\n\n<text>\n`. It never mutates the header,
+  `## Request`, `## Parameters`, or the recorded integrity mode. An empty or
+  whitespace-only follow-up is refused, as is one over 20,000 characters.
+  Repeating the exact last follow-up is a no-op (duplicate-last skip), so a
+  retried call does not append twice. A follow-up against a run with no
+  `ORIGINAL_REQUEST.md` is refused rather than creating a request artifact.
+- **Hash re-binding.** The signed `run.manifest.json` `requestHash` is the
+  sha256 of the whole file, so every append re-signs the manifest with the new
+  `requestHash`. A victory verdict or final verification computed before the
+  append is stale by design (`AUTH_STALE`); re-run the gates after a follow-up.
+  The append and re-sign are separate writes, so a crash between them leaves an
+  unsigned/new-bytes mismatch rather than a falsely valid manifest.
 - **Legacy tolerance.** When `request` is omitted, no file is created; the run
   still plans and the mode defaults to `development`.
 
@@ -157,9 +289,19 @@ Format:
 - Recorded: 2026-01-12T10:15:00.000Z
 - Session: 20260112-101500-a1b2
 
+## Parameters
+
+How this run was launched; not part of the task.
+- skipInterview: true
+- [skip-interview]
+
 ## Request
 
-<verbatim request>
+<verbatim request, with one leading [skip-interview] bracket removed>
+
+## 2026-01-12T10:20:00Z
+
+<follow-up message text>
 ~~~
 
 ### `requirements.json` — plan-time requirements baseline
@@ -798,9 +940,18 @@ carry `feedbackLog`, an ordered array of per-round entries:
 
 Every `teamwork_task_update` call carrying a non-empty `feedback` appends one
 entry with `resolved: false`; existing entries are preserved, never overwritten.
-The array is capped at **20 entries**: when a 21st would be added, the oldest is
-dropped, so state stays bounded. A task that has never failed has no
-`feedbackLog` field at all.
+When the call carries no explicit `feedback` but the verifier report exists, the
+FAIL entry is derived from `verify/report-<taskId>.json` (summary/fatal
+findings), so a FAIL cannot pass unrecorded. The array is capped at **20
+entries**: when a 21st would be added, the oldest is dropped, so state stays
+bounded. A task that has never failed has no `feedbackLog` field at all.
+
+This ledger is the **open-issues ledger**. Every verifier FAIL adds one open
+entry; the next round must address every open entry; a `PASS` resolves them; an
+entry is never silently dropped. `small-focused` runs are a refinement loop, not
+one shot: they may set `maxRounds` up to **32** and stop only when the ledger is
+empty, the verifier reports 0 open issues, the last round made 0 edits, and an
+independent re-run of the tests passes.
 
 `verified_pass` marks **every** existing entry `resolved: true` in the same write
 that records the transition, so no second tool call is needed. `verified_fail`
@@ -1078,7 +1229,7 @@ mapping. An unresolvable mapping keeps the legacy newest-run behaviour.
 ### Engine Tools
 
 The plugin provides deterministic orchestration tools for the Sentinel coordinator:
-- `teamwork_plan`: Creates the run directory and writes `plan.dag.json`, `state.json` and `costs.json`. It is gated on a spec by default (`requireSpec`, see below). `skipInterview` is the explicit, recorded bypass. `verification` selects `standard` (default, unchanged) or `strict` (per-task falsifier challenge + security-auditor audit); it is persisted in both artifacts and a re-plan cannot change it.
+- `teamwork_plan`: Creates the run directory and writes `plan.dag.json`, `state.json` and `costs.json`. It is gated on a spec by default (`requireSpec`, see below). `skipInterview` is the explicit, recorded bypass. `verification` selects `strict` (the default for `distributed-coding`: per-task falsifier challenge + security-auditor audit) or `standard` (the explicit opt-out); it is persisted in both artifacts and a re-plan cannot change it. `followUp` appends a UTC-timestamped message to an existing `ORIGINAL_REQUEST.md` and re-signs the manifest's `requestHash`.
 - `teamwork_route`: Deterministic read-only route classifier checking `document-review` FIRST (before Math/Proof) when a supplied document has critique intent while rejecting PR/code reviews, bare filenames without supplied docs, and problem-solving/coding tasks.
 - `teamwork_document_triage`: Validates bounds (`maxSegments <= 8`, `reviewTreeShape <= [4,2,1]`, `synthTreeShape <= [4,1]`), path containment (`realpathSync` + `O_NOFOLLOW`), URL/inline limits, and PDF headers **before** creating any directory, ingests and partitions the document into `seg-01`..`seg-0K` + `doc-synthesis`, and writes `document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}`. A `document.url` is fetched only through the SSRF guard: http/https only, public addresses only, pinned DNS, no automatic redirects, 3 s timeout, 16 MiB cap (see “URL network policy” below).
 - `teamwork_document_record`: Persists bounded RSA node outputs (`level-<L>-node-<I>.json`), `unit-report.md`, `synthesis/candidate-<I>.md`, and `DOCUMENT_REVIEW_REPORT.md` with `SEGMENT_ID` allowlist, manifest bounds, symlink refusal, and `clean()`/`cleanBlock()` sanitisation.
@@ -1122,8 +1273,9 @@ not bypass that binding (the approval is refused with
 | Input | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `request` | string | omitted | The verbatim text the run was routed on (≤20,000 chars). Recorded once in `ORIGINAL_REQUEST.md` before any plan file; omitting it creates no artifact. |
+| `followUp` | string | omitted | Appends a UTC-timestamped section to an existing run's `ORIGINAL_REQUEST.md` (non-empty, ≤20,000 chars) without changing the header, `## Request`, `## Parameters`, or integrity mode. The manifest `requestHash` is re-bound to the new bytes; repeating the exact last follow-up is a no-op. |
 | `integrityMode` | `development \| demo \| benchmark` | `development` | Recorded in `ORIGINAL_REQUEST.md`, `state.json` and `plan.dag.json`. Any other value refuses the plan before anything is written. |
-| `verification` | `standard \| strict` | `standard` | Recorded in `plan.dag.json` and `state.json`. `strict` adds exactly one `team/falsifier` challenge (`PASS`) and one `team/security-auditor` audit (`CLEAN`) per task. Any other value refuses the plan before anything is written; a re-plan may omit or repeat the persisted mode but not change it. |
+| `verification` | `standard \| strict` | `strict` for `distributed-coding`; `standard` elsewhere | Recorded in `plan.dag.json` and `state.json`. `strict` adds exactly one `team/falsifier` challenge (`PASS`) and one `team/security-auditor` audit (`CLEAN`) per task. Any other value refuses the plan before anything is written; a re-plan may omit or repeat the persisted mode but not change it. `standard` is an explicit, recorded opt-out. |
 | `requirements` | `Array<{id, text}>` | omitted | Up to 50 plan-time requirements. `id` matches `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$` and must be unique; `text` is non-empty and ≤2,000 chars. Persisted to `requirements.json` (source `caller`). Invalid/duplicate items refuse the plan before anything is written. |
 | `victoryAudit` | `required \| skip` | `required` when a request/requirements baseline exists | Recorded in `plan.dag.json`, `state.json` and the signed `run.manifest.json`. A run with no request and no requirements records the legacy default `skip`; `required` without a baseline is refused. An explicit `skip` requires `victorySkipReason` (non-empty, trimmed, ≤500 chars, sanitized) and makes `final_verify` record `victory: "SKIPPED (explicit): <reason>"`. A re-plan may repeat but not change the mode or reason; `benchmark` refuses skip. |
 | `requireHandoffs` | `required \| skip` | `required` for a new run with a request/requirements baseline; `skip` for legacy/unsigned runs | Recorded in `plan.dag.json`, `state.json`, and the signed `run.manifest.json`. `required` makes `final_verify` and `next` demand the continuity matrix. An explicit `skip` is recorded (surface in `verify/final.json` as `handoffs: "SKIPPED (explicit)"`). A re-plan may repeat but not change the mode. `benchmark` refuses `skip`; a run that cannot be signed records `skip` under `allowUnsignedLegacy`. |
@@ -1995,6 +2147,13 @@ with `AUTH_MISSING` (no envelope), `AUTH_INVALID` (edited field), `AUTH_UNKNOWN_
 `AUTH_INDEX_MISSING` (copied from another run), or `AUTH_STALE` (requirements
 baseline changed) rather than trusting it.
 
+`summary` carries the auditor's `=== VICTORY AUDIT REPORT ===` block with
+`VERDICT: VICTORY CONFIRMED | VICTORY REJECTED` and the three phases
+(`PHASE A — TIMELINE`, `PHASE B — INTEGRITY CHECK`,
+`PHASE C — INDEPENDENT TEST EXECUTION`); the handoff quotes the same block. The
+structured `requirements`/`findings` fields remain the machine-checked record —
+the summary is prose, not a second verdict.
+
 **Reviewed evidence (0.12.0).** The tool also records `evidenceDigests`
 computed from disk: the sha256 of every `verify/report-<taskId>.json` present,
 the security audit, and a pre-existing `PASS` final. `CONFIRMED` with an empty
@@ -2247,7 +2406,9 @@ Gate Result: **PASS**
 
 On FAIL it adds a `## Reasons` list and ends with `Gate Result: **FAIL**`. A
 task adds one worker/verifier/challenger/auditor group; the wave scales by tasks
-and rounds, not by a fixed row count. A stale or invalid challenge/audit is
+and rounds, not by a fixed row count. `distributed-coding` defaults to strict;
+the row roles are reviewer=`team/verifier`, challenger=`team/falsifier`,
+forensic auditor=`team/security-auditor`. A stale or invalid challenge/audit is
 rendered as `FAIL` in its verdict cell. The `## Continuity` section cites each
 required handoff path and sha256 (or says `SKIPPED (explicit)`); handoff prose
 never appears in a Verdict cell. If `GATE_STATUS.md` cannot be written

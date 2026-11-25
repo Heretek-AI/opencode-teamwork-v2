@@ -76,7 +76,7 @@ const pathText = (path) =>
  * each keyword has the shape the validator expects. Throws on the first
  * unsupported construct so a registration failure is loud and locatable.
  */
-export function assertSupportedSchema(schema, path = []) {
+function assertSupportedSchema(schema, path = []) {
   if (!isRecord(schema)) throw new Error(`strictInput: schema at ${pathText(path)} must be an object`)
   for (const key of Object.keys(schema)) {
     if (!SUPPORTED_KEYWORDS.includes(key)) {
@@ -195,10 +195,19 @@ function validateValue(schema, value, path, issues) {
       validateValue(child, value, path, nested)
       if (nested.length === 0) return true
       const label = child.title || child.type || `branch[${index}]`
-      const first = nested[0]
-      const relPath = first.path.slice(path.length)
-      const loc = relPath.length > 0 ? `${pathText(relPath)}: ` : ""
-      branchFailures.push(`branch ${index} (${label}): ${loc}${first.message}`)
+      // Name every failing field in the branch (up to 4), not just the first:
+      // a conditional schema such as teamwork_plan's plan/follow-up pair must
+      // tell the caller that BOTH topology and tasks are missing.
+      const detail = nested
+        .slice(0, 4)
+        .map((issue) => {
+          const relPath = issue.path.slice(path.length)
+          const loc = relPath.length > 0 ? `${pathText(relPath)}: ` : ""
+          return `${loc}${issue.message}`
+        })
+        .join(", ")
+      const more = nested.length > 4 ? `, ...and ${nested.length - 4} more` : ""
+      branchFailures.push(`branch ${index} (${label}): ${detail}${more}`)
       return false
     })
     if (!matches) {

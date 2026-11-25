@@ -591,6 +591,19 @@ try {
     assert.strictEqual(grpCheck.status, "fail", grpCheck.message)
     assert(grpCheck.message.includes("docker") && grpCheck.message.includes("wheel"), grpCheck.message)
 
+    // 5h. An unreadable group file must fail closed as UNKNOWN, not PASS.
+    // A directory is unreadable as a file even for root, so this stays
+    // discriminating on any runner.
+    const unreadableReport = collectSecurityReport(
+      allPassOptions({
+        groupFile: dbRoot,
+        groups: [998],
+      }),
+    )
+    const unreadableCheck = unreadableReport.checks.find((c) => c.name === "privileged_groups")
+    assert.strictEqual(unreadableCheck.status, "unknown", unreadableCheck.message)
+    assert.match(unreadableCheck.message, /unreadable|cannot be verified/)
+
     console.log("✓ Rule #7 DB resolution (OPENCODE_DB, :memory:, channels, precedence) and S3923 group normalization pass")
   }
 

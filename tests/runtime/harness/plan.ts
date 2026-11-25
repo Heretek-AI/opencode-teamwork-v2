@@ -7,7 +7,7 @@
 
 import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { closeSync, constants as fsConstants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
+import { closeSync, constants as fsConstants, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname, join, relative } from "node:path"
 import { resolveTrustedExecutable } from "../../../plugins/opencode-teamwork/safe-fs.mjs"
 import type { LoadedHost } from "./load"
@@ -15,8 +15,8 @@ import { importTeamwork, loadHost } from "./load"
 import { createProject, type Project } from "./project"
 import { createSession, execute, type RunSession, type ToolResult } from "./run"
 
-export const DEFAULT_RUN_ID = "20261124-000000-l2"
-export const DEFAULT_REQUEST = "Ship a deterministic two-task change with tests."
+const DEFAULT_RUN_ID = "20261124-000000-l2"
+const DEFAULT_REQUEST = "Ship a deterministic two-task change with tests."
 
 export interface PlanOptions {
   readonly sessionId?: string
@@ -200,7 +200,7 @@ export function runFile(project: Project, runId: string, relativePath: string): 
   return join(runDir(project, runId), relativePath)
 }
 
-export function readJson<T = any>(path: string): T | undefined {
+function readJson<T = any>(path: string): T | undefined {
   try {
     return JSON.parse(readFileSync(path, "utf8")) as T
   } catch {
@@ -255,16 +255,8 @@ export function writeSpec(project: Project, runId: string, text: string): string
   return file
 }
 
-export function sha256(data: string | Buffer): string {
+function sha256(data: string | Buffer): string {
   return createHash("sha256").update(data).digest("hex")
-}
-
-export function fileSha256(path: string): string | undefined {
-  try {
-    return sha256(readFileSync(path))
-  } catch {
-    return undefined
-  }
 }
 
 /** Sorted relative path -> sha256 for every regular file under `dir`. */
@@ -350,8 +342,8 @@ export function gitCommitCount(cwd: string): number {
   return Number(git(cwd, ["rev-list", "--count", "HEAD"]))
 }
 
-export const baseBranch = (runId: string) => `teamwork/base-${runId}`
-export const taskBranch = (runId: string, taskId: string) => `teamwork/${runId}-${taskId}`
+const baseBranch = (runId: string) => `teamwork/base-${runId}`
+const taskBranch = (runId: string, taskId: string) => `teamwork/${runId}-${taskId}`
 
 /**
  * Create the run's base branch and one clean worktree for `taskId` at the
@@ -384,8 +376,4 @@ export function commitInWorktree(
   git(worktree, ["add", "--", relativePath])
   git(worktree, ["commit", "-qm", message])
   return gitHead(worktree)
-}
-
-export function worktreeExists(path: string): boolean {
-  return existsSync(path)
 }

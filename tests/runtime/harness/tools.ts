@@ -20,6 +20,10 @@ export interface ToolTarget {
   readonly agent?: string
   readonly messageID?: string
   readonly id?: string
+  /** Propagated to `Tool.Context.signal` so abort specs can cancel mid-run. */
+  readonly signal?: AbortSignal
+  /** The host's cancellation Effect; the Promise adapter turns it into `signal`. */
+  readonly cancel?: unknown
 }
 
 const context = (target: ToolTarget) => ({
@@ -27,6 +31,8 @@ const context = (target: ToolTarget) => ({
   agent: target.agent ?? "build",
   messageID: target.messageID ?? "msg_l1_harness",
   id: target.id ?? "call_l1_harness",
+  ...(target.signal ? { signal: target.signal } : {}),
+  ...(target.cancel !== undefined ? { cancel: target.cancel } : {}),
 })
 
 export interface LocationTools {

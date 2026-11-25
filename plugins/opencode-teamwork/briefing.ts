@@ -24,23 +24,23 @@ import { createHash } from "node:crypto"
 import { lstatSync, readdirSync, rmSync } from "node:fs"
 import { basename, join } from "node:path"
 import {
-  clean,
   ensureSafeRunSubpath,
   readBoundedRunFile,
   readBoundedRunJson,
   writeSafeRunFile,
 } from "./tournament.ts"
+import { clean } from "./text-utils.ts"
 import { evaluateStrictGate, normalizeVerificationMode } from "./strict.ts"
 import { evaluateVictoryGate, readVictoryVerdict, recordedVictorySkipReason, resolveVictoryAuditMode } from "./victory.ts"
 
-export const BRIEFING_FILE = "BRIEFING.md"
+const BRIEFING_FILE = "BRIEFING.md"
 /** Hard cap for the on-disk briefing, in UTF-8 bytes. */
 export const MAX_BRIEFING_BYTES = 16 * 1024
 /** How much of the briefing is injected into <run>/context. */
-export const BRIEFING_EXCERPT_BYTES = 4 * 1024
+const BRIEFING_EXCERPT_BYTES = 4 * 1024
 
 /** Per-agent briefings live under `<run>/agents/<slug>-<hash32>/BRIEFING.md`. */
-export const AGENT_BRIEFING_DIR = "agents"
+const AGENT_BRIEFING_DIR = "agents"
 export const MAX_AGENT_BRIEFING_DIRS = 64
 const AGENT_BRIEFING_DIR_RE = /^[a-z][a-z0-9-]{0,31}-[0-9a-f]{32}$/
 const AGENT_SLUG_RE = /^[a-z][a-z0-9-]{0,31}$/
@@ -74,7 +74,7 @@ function primitiveText(value: unknown): string {
  * Sanitise multi-line briefing text while keeping "\n". Caps by characters and
  * marks a truncation. Never returns a raw control character.
  */
-export function sanitizeBriefingText(value: unknown, max = MAX_MISSION_CHARS): string {
+function sanitizeBriefingText(value: unknown, max = MAX_MISSION_CHARS): string {
   const raw = primitiveText(value).replace(BLOCK_CONTROL, " ")
   const collapsed = raw.replace(/\n{3,}/g, "\n\n").trim()
   const capped =
@@ -87,7 +87,7 @@ export function sanitizeBriefingText(value: unknown, max = MAX_MISSION_CHARS): s
  * Unlike sanitizeBriefingText it must NOT defuse headings or collapse lines:
  * the briefing's own `## Section` markers are content here.
  */
-export function sanitizeBriefingOutput(value: unknown, max = MAX_BRIEFING_BYTES): string {
+function sanitizeBriefingOutput(value: unknown, max = MAX_BRIEFING_BYTES): string {
   const raw = primitiveText(value).replace(BLOCK_CONTROL, " ")
   return raw.length > max ? raw.slice(0, Math.max(0, max - 1)) + "…" : raw
 }
@@ -270,7 +270,7 @@ function constraintsFor(verification: string, victoryMode: string): string[] {
  * Build the full briefing text. Reads only run-local artifacts through the
  * bounded, no-follow helpers, and sanitises every value it interpolates.
  */
-export function buildBriefing(
+function buildBriefing(
   run: string,
   timestamp = new Date().toISOString(),
   extraIdentity: string[] = [],
@@ -388,20 +388,20 @@ export function readBriefingExcerpt(
 // ---------------------------------------------------------------------------
 
 /** `team/worker` → `worker`; undefined for any other shape. */
-export function agentBriefingSlug(agent: unknown): string | undefined {
+function agentBriefingSlug(agent: unknown): string | undefined {
   const raw = typeof agent === "string" ? agent.trim() : ""
   const m = /^team\/([a-z][a-z0-9-]{0,31})$/.exec(raw)
   return m && AGENT_SLUG_RE.test(m[1]) ? m[1] : undefined
 }
 
 /** Plain sha256 of the OpenCode session id, first 32 hex chars. */
-export function agentBriefingSessionHash(sessionID: unknown): string | undefined {
+function agentBriefingSessionHash(sessionID: unknown): string | undefined {
   if (typeof sessionID !== "string" || !sessionID.trim()) return undefined
   return createHash("sha256").update(sessionID, "utf8").digest("hex").slice(0, 32)
 }
 
 /** `<slug>-<hash32>`; the only directory name this feature writes. */
-export function agentBriefingDirName(agent: unknown, sessionID: unknown): string | undefined {
+function agentBriefingDirName(agent: unknown, sessionID: unknown): string | undefined {
   const slug = agentBriefingSlug(agent)
   const hash = agentBriefingSessionHash(sessionID)
   if (!slug || !hash) return undefined
@@ -415,7 +415,7 @@ export function agentBriefingRelativePath(agent: unknown, sessionID: unknown): s
 }
 
 /** Build the per-agent text from the shared briefing data + identity extras. */
-export function buildAgentBriefing(
+function buildAgentBriefing(
   run: string,
   agent: string,
   sessionID: string,

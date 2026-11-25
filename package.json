@@ -1,6 +1,6 @@
 {
   "name": "@heretek-ai/opencode-teamwork-v2",
-  "version": "0.18.1",
+  "version": "0.19.0",
   "description": "Antigravity-style multi-agent orchestration for OpenCode V2 — 15 agents, 7 commands, interactive model assignment on install.",
   "keywords": [
     "opencode",
@@ -38,6 +38,7 @@
     "docs",
     "!docs/re/**",
     "scripts",
+    "!scripts/test-agy-parity.mjs",
     "postinstall.mjs",
     "README.md",
     "SECURITY.md",
@@ -70,7 +71,8 @@
     "runs": "node ./bin/opencode-teamwork.mjs runs",
     "inspect": "node ./bin/opencode-teamwork.mjs inspect",
     "prune": "node ./bin/opencode-teamwork.mjs prune",
-    "export": "node ./bin/opencode-teamwork.mjs export"
+    "export": "node ./bin/opencode-teamwork.mjs export",
+    "test:agy-parity": "node ./scripts/test-agy-parity.mjs"
   },
   "peerDependencies": {
     "@opencode/plugin": "^2.4"

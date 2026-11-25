@@ -6,12 +6,11 @@
 // tool's own refusal text, so a broken precondition fails the spec loudly
 // instead of being papered over.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname, join } from "node:path"
 import type { Project } from "./project"
 import {
   commitInWorktree,
-  gitHead,
   readRunJson,
   readState,
   runFile,
@@ -19,11 +18,11 @@ import {
 } from "./plan"
 import { execute, type ToolResult } from "./run"
 
-export const WORKER_ACTIVE = "worker_active"
-export const WORKER_DONE = "worker_done"
-export const VERIFIER_ACTIVE = "verifier_active"
+const WORKER_ACTIVE = "worker_active"
+const WORKER_DONE = "worker_done"
+const VERIFIER_ACTIVE = "verifier_active"
 
-export function failure(result: ToolResult, label: string): Error {
+function failure(result: ToolResult, label: string): Error {
   return new Error(`${label}: ${result.status ?? "ERROR"} ${result.content || result.error || ""}`.trim())
 }
 
@@ -75,7 +74,7 @@ export async function setupWorktree(
   return { path, result }
 }
 
-export function taskWorktree(project: Project, runId: string, taskId: string): string {
+function taskWorktree(project: Project, runId: string, taskId: string): string {
   return join(project.worktreesDir, runId, taskId)
 }
 
@@ -220,7 +219,7 @@ export async function victory(fx: RunFixture, options: VictoryOptions = {}): Pro
   return ok(result, `victory_audit ${verdict}`, `VICTORY AUDIT RECORDED: ${verdict}`)
 }
 
-export function readRequirements(fx: RunFixture): Array<{ id: string; text: string }> {
+function readRequirements(fx: RunFixture): Array<{ id: string; text: string }> {
   const file = readRunJson<{ items: Array<{ id: string; text: string }> }>(fx.project, fx.runId, "requirements.json")
   return file?.items ?? []
 }
@@ -240,7 +239,7 @@ export function state(fx: RunFixture): any {
   return readState(fx.project, fx.runId)
 }
 
-export function runPath(fx: RunFixture, relativePath: string): string {
+function runPath(fx: RunFixture, relativePath: string): string {
   return runFile(fx.project, fx.runId, relativePath)
 }
 
@@ -282,5 +281,3 @@ export async function completeStandardRun(
   await victory(fx, { verdict: "VICTORY CONFIRMED" })
   return finalVerify(fx)
 }
-
-export { existsSync, gitHead }

@@ -57,7 +57,7 @@ function readPackageVersion(name: string) {
 }
 
 /** The exact versions under test, read from the installed tree. */
-export function installedVersions(): Versions {
+function installedVersions(): Versions {
   return {
     core: readPackageVersion("@opencode/core"),
     sdk: readPackageVersion("@opencode/sdk"),
@@ -67,7 +67,7 @@ export function installedVersions(): Versions {
   }
 }
 
-export const teamPluginUrl = (project: Project) => pathToFileURL(join(project.pluginDir, "index.ts")).href
+const teamPluginUrl = (project: Project) => pathToFileURL(join(project.pluginDir, "index.ts")).href
 
 /** Import the plugin module directly (only for static export checks). */
 export async function importTeamwork(project: Project) {

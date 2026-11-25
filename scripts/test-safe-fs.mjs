@@ -337,6 +337,8 @@ if (!supportsFdContainment()) {
     assert.strictEqual(resolveTrustedExecutable("../sh"), null)
     assert.strictEqual(resolveTrustedExecutable("a/b"), null)
     assert.strictEqual(resolveTrustedExecutable(""), null)
+    assert.strictEqual(resolveTrustedExecutable("."), null)
+    assert.strictEqual(resolveTrustedExecutable(".."), null)
 
     if (process.platform !== "win32") {
       const binRoot = mkdtempSync(join(testDir, "bin-trust-"))

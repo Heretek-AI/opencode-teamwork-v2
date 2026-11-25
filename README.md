@@ -125,13 +125,14 @@ Hooks: `permission.evaluate` enforces the per-agent read-only policy **in code**
 `team/falsifier`, `team/scout`, `team/security-auditor`,
 `team/segment-reviewer`, `team/formalization-reviewer`, `team/referee`,
 `team/victory-auditor`) all deny the `edit` tool, so none of them can write
-through it. `shell` is still available to the verifier, scout, security auditor
-and victory auditor, and it can modify files; the falsifier, segment reviewer,
-formalization reviewer, and referee also have `shell` denied, and the segment,
-formalization, referee, and victory-auditor roles deny `webfetch` and
+through it. `shell` is still available to the verifier, falsifier, scout,
+security auditor and victory auditor, and it can modify files; the segment
+reviewer, formalization reviewer, and referee also have `shell` denied, and the
+segment, formalization, referee, and victory-auditor roles deny `webfetch` and
 `subagent` as well (the verifier and security auditor deny `webfetch`). In
-short: no writes through `edit` for all eight, and no `shell` writes for the
-falsifier, segment reviewer, formalization reviewer, or referee. The
+short: no writes through `edit` for all eight, and no `shell` for the segment
+reviewer, formalization reviewer, or referee; the falsifier uses `shell` only
+to run empirical tests and must not edit through it. The
 `team/victory-auditor` keeps `shell` (it can modify files) and is denied `edit`,
 `webfetch`, and `subagent`; its independence comes from a fresh session that
 inspects the delivered artifacts and runs tests itself, not from capability
@@ -147,7 +148,13 @@ prompt.
 All run artifacts live under `.opencode/teamwork/<session-id>/`; see
 [`docs/ARTIFACTS.md`](docs/ARTIFACTS.md) for the layout, the canonical
 topologies, and the JSON schemas (`spec.json`, `plan.dag.json`, `state.json`,
-`verification_report.json`). The installer copies that reference to
+`verification_report.json`). The Step 0 survey writes `PROJECT.md` (architecture
+and Feature Inventory) and `SCOPE.md`; the dual-track suite writes
+`TEST_INFRA.md` and, only after the E2E suite is green, `TEST_READY.md`;
+`DEAD_ENDS.md` records repeated dead ends. Open verifier issues live in the
+`state.json` `feedbackLog` ledger. A blocking dependency probe writes
+`PREREQUISITES.md` at the repository root before any run directory exists. The
+installer copies that reference to
 `<config-dir>/teamwork/ARTIFACTS.md` next to your agents.
 
 ### Completion guarantees
@@ -158,8 +165,9 @@ topologies, and the JSON schemas (`spec.json`, `plan.dag.json`, `state.json`,
 - A run completes only with a `PASS` `verify/final.json` stamped by `teamwork_final_verify`; an unstamped report needs the recorded `allowUnstamped` bypass. An unsigned legacy run returns `AUTH_LEGACY` until the recorded `allowUnsignedLegacy` bypass is passed at the completion gate; `benchmark` refuses that bypass, `victoryAudit: "skip"`, and `requireHandoffs: "skip"`.
 - `teamwork_victory_audit`, `teamwork_wave_record`, and `teamwork_report` require the caller session to descend from the plan-time `rootSessionId`, so a top-level `opencode run --agent team/victory-auditor` cannot self-authorize.
 - That PASS also needs a `verify/victory.json` from the independent `team/victory-auditor` reporting `VICTORY CONFIRMED` for every requirement and the current `ORIGINAL_REQUEST.md` hash, unless the plan explicitly recorded `victoryAudit: "skip"` with a non-empty `victorySkipReason` (then `final_verify` records `victory: "SKIPPED (explicit): <reason>"`). A skip without a reason is refused; the legacy no-baseline default is labelled `SKIPPED (legacy default: no requirements baseline)`.
+- `small-focused` is a refinement loop (up to **32** rounds), not one shot. Every verifier FAIL adds an open issue to the `state.json` `feedbackLog` ledger; the next round must address every open entry; a PASS resolves them; an entry is never silently dropped. The loop stops only at 0 open issues, 0 edits, an empty ledger, and an independent re-run of the tests. A small-focused run gets at most **2** victory audits: after a second `VICTORY REJECTED` (or a block/deadlock/budget stop) the Sentinel enters the terminal non-victory state and records `interrupted.md` (the engine writes it on an AbortSignal); the engine refuses a third audit. The Sentinel reports the open issues and never records `VICTORY CONFIRMED`.
 - The security audit fails on integrity-rule violations for the run's mode, and that blocks the merge.
-- Opt-in `verification: "strict"` adds exactly one `team/falsifier` challenge (`PASS`) and one `team/security-auditor` audit (`CLEAN`) per task after its verifier report. Missing, stale, or non-PASS/CLEAN verdicts block `teamwork_next` (`NEEDS_STRICT_WAVE`) and `teamwork_final_verify`; a strict PASS writes `GATE_STATUS.md` with worker/verifier/challenger/auditor rows and a `## Continuity` handoff table. The default `standard` mode is unchanged, and the wave reuses the existing agents rather than adding roles.
+- **`distributed-coding` defaults to `verification: "strict"`**: one `team/verifier` reviewer report, plus one `team/falsifier` challenger (`PASS`) and one `team/security-auditor` forensic auditor (`CLEAN`) per task. Passing `verification: "standard"` is an explicit, recorded opt-out. Missing, stale, or non-PASS/CLEAN verdicts block `teamwork_next` (`NEEDS_STRICT_WAVE`) and `teamwork_final_verify`; a strict PASS writes `GATE_STATUS.md` with worker/verifier/challenger/auditor rows and a `## Continuity` handoff table. The wave reuses the existing agents rather than adding roles.
 - `requireHandoffs: "required"` (the default for a new run with a request or requirements baseline) makes `final_verify` and `next` demand continuity handoffs derived from the plan: the assigned worker and `team/verifier` per task, `team/falsifier` + `team/security-auditor` per task in strict mode, one `team/sentinel`/`team/orchestrator` run-level handoff, and the `team/victory-auditor` run-level handoff after a confirmed victory audit. Each entry must match `handoffs/index.json` (regular non-symlink file, sha256/byte length) and cite the current report/wave/audit/victory; a changed cited artifact makes it stale. Missing pairs return `NEEDS_HANDOFFS`, stale/duplicate/unknown/tampered evidence returns `BLOCKED_BY_HANDOFFS`, and a passing gate records `handoffs` plus `evidence.handoffs` in `verify/final.json`. An explicit `requireHandoffs: "skip"` is recorded as `handoffs: "SKIPPED (explicit)"` and never reads the index; handoff prose is never a verdict.
 - Planning refuses to start when blocking inputs are missing or unreachable unless `allowMissingInputs` is recorded.
 - Run-artifact writes are contained on Linux by a pinned directory descriptor ([ADR 0010](docs/adr/0010-pinned-fd-write-containment.md)): the target parent is opened once and every create, mkdir, rename, lstat and append is relative to `/proc/self/fd/<dirfd>`, so a directory swapped for a symlink cannot redirect bytes outside the run. Each write uses a random `O_EXCL` temp, `fsync`, a rename under the pin, and a post-rename inode check; appends refuse `nlink !== 1` (a hard link at `events.jsonl` cannot modify outside bytes); the lock file is created inside the same pinned directory. Linux without `/proc/self/fd` fails closed for writes. **macOS and Windows are detective-only** (path-based atomic write plus a post-write check; a transient reverted swap can be missed): 0.13.0 pins the run root and every existing ancestor `(dev, ino)`, re-checks them before the mutation and in the post-check (`identity-changed`), and records the run-root identity in the signed manifest. A detected write is a report about an event that already happened, not a prevented one, and it is not rolled back. `OPENCODE_TEAMWORK_REQUIRE_PINNED_WRITES=1` (or plan `requirePinnedWrites`) refuses control-plane writes on a non-pinned host (`containment-mode`). The run-root `mkdir` is still path-based, and a same-UID ptrace is outside the boundary. See [ADR 0013](docs/adr/0013-containment-parity-and-the-detective-boundary.md).
@@ -603,6 +611,10 @@ built-ins.
 | `/team-synthesize` | `team/orchestrator` | Run only the synthesizer step |
 | `/team-review` | `team/orchestrator` | Run the verifier on the current artifact |
 
+`/team-orchestrate`, `/team-propose`, `/team-falsify`, `/team-synthesize`, and
+`/team-review` are legacy v1 commands kept for compatibility; `/teamwork` is the
+supported entrypoint for new runs.
+
 ## Agents
 
 The 15 shipped agents are installed as markdown files under `~/.config/opencode/agents/team/`. Specialised roles are added strictly alongside the route that exercises them (never a 49-file flat roster or unused roles):
@@ -616,7 +628,7 @@ The 15 shipped agents are installed as markdown files under `~/.config/opencode/
 | `team/worker` | `worker.md` | `deepseek/deepseek-flash` | `small-focused`, `iterative-coding`, `distributed-coding` | — (`webfetch` denied when `network: denied`) | Implementation worker operating in an isolated git worktree |
 | `team/proof-worker` | `proof-worker.md` | `deepseek/deepseek-v4-pro` | `proof` (including LEMMA `lemmaMode: true`) & `massive-proof` | — | Formal and mathematical proof searcher / Lean 4 prover |
 | `team/proposer` | `proposer.md` | `deepseek/deepseek-flash` | `proof`, `massive-proof`, `/team-propose` | — | Parallel candidate generator with distinct proof/coding strategies |
-| `team/falsifier` | `falsifier.md` | `deepseek/deepseek-v4-pro` | `proof`, `massive-proof` (`FALSIFY_PRUNE`), `/team-falsify` | `edit`, `shell`, `subagent` | Read-only adversarial critic and tournament falser |
+| `team/falsifier` | `falsifier.md` | `deepseek/deepseek-v4-pro` | `proof`, `massive-proof` (`FALSIFY_PRUNE`), `distributed-coding` (strict wave), `/team-falsify` | `edit`, `subagent` (`shell` available, can modify files) | Adversarial critic and empirical challenger |
 | `team/synthesizer` | `synthesizer.md` | `deepseek/deepseek-v4-pro` | `distributed-coding` (merge conflict), `document-review` (`doc-synthesis`), `massive-proof` (`MERGE`), `/team-synthesize` | — | Candidate merger, tournament level aggregator, and cross-segment document synthesizer |
 | `team/verifier` | `verifier.md` | `deepseek/deepseek-v4-pro` | All routes (`readyForVerifier`, `teamwork_final_verify`, `/team-review`) | `edit`, `webfetch`, `subagent` (`shell` available, can modify files) | Independent verification forcing function |
 | `team/security-auditor` | `security-auditor.md` | `deepseek/deepseek-v4-pro` | All routes (`READY_FOR_SECURITY_AUDIT`, `teamwork_security_audit`) | `edit`, `webfetch`, `subagent` (`shell` available, can modify files) | Mandatory pre-merge security and integrity-mode auditor |
@@ -647,11 +659,50 @@ to the shared `BRIEFING.md` (see `docs/ARTIFACTS.md`).
 LEMMA is an explicit opt-in capability-gated route (`topology: "proof"`, `lemmaMode: true`) for Lean 4 proving and verification:
 
 - **Explicit opt-in only:** `teamwork_route` checks `document-review` first, requires an explicit Lean 4 prove/formalize/verify/check request in prose, ignores instructions inside fenced code blocks, and routes unrequested `.lean` or Lean-syntax tasks to `distributed-coding` (never `proof`).
-- **Pre-spending toolchain gate:** Requires user-installed **Lean 4** (`lean` and `lake` via `elan`) and the **LEAP CLI** (`leap`) on `PATH`; the legacy `leap-tools` name is also accepted. If any is missing, `teamwork_plan` refuses **before `mkdir`** (zero run files created, zero budget spent) and prints install instructions for both.
+- **Pre-spending toolchain gate:** Requires user-installed **Lean 4** (`lean` and `lake` via `elan`) and the **LEAP CLI** (`leap`) on `PATH`; the legacy `leap-tools` name is also accepted. If any is missing or unusable, `teamwork_plan` refuses **before `mkdir`** (zero run files created, zero budget spent), writes `PREREQUISITES.md` at the repository root recording the `MISSING`/`OUTAGE` probe verdict (the file is only written on failure; `READY` is not written), and prints install instructions for both; `leap doctor` reports the same verdicts.
   - Install the pinned CLI with `pipx install git+https://github.com/billkunghappy/LEAP-CLI@afc016d23579d8236050a157fe6cac8f17b13096` (the `leap-tools` PyPI package does not exist). `leap lean` is the optional full Mathlib setup (~11 GB, 10–20 minutes); LEMMA verification needs only core Lean, no Mathlib.
 - **Bounded verification:** Phase 0 formalization (`problem_draft.lean` → `team/formalization-reviewer` `APPROVE` → `problem.lean`), bounded lemma tree (`maxDepth <= 3`, `maxWidth <= 4`, `maxNodes <= 24`, `maxRetries <= 4`), real `lean`/`lake` execution via `teamwork_lemma_verify` rejecting `sorry`/`admit`/unauthorized `axiom` even on exit `0`, and final `FAITHFUL` check before `teamwork_final_verify`.
 - **Declaration and axiom binding:** each node records its Lean `declaration` and `statement`. Before a node becomes `proved`/`disproved`, the attempt must declare that name and type (comments, strings, and syntax quotations are masked; duplicate/namespaced/`private`/`protected` declarations fail closed). The verifier then runs `#print axioms <declaration>` and records `declaration`, `declarationType`, `axiomDependencies`, and `unauthorizedAxioms`, accepting only `Classical.choice`, `propext`, `Quot.sound`, plus axioms approved once at plan time via `lemmaPolicy.allowedAxioms` (persisted in `lemma/manifest.json`). `sorryAx` is always rejected, and `#`/`logInfo`/`dbg_trace`/`trace`/`run_cmd`/`println`/`IO.`/`set_option trace` probe-hijacking attempts fail closed. Node statement/declaration metadata is immutable after a PASS; `teamwork_final_verify` re-checks stamped metadata before accepting a run.
 - **Known limits:** binding compares the elaborated type text lexically (binder/negation spellings normalized), not semantic equality; the transitive-axiom allowlist is approved at plan time (`lemmaPolicy.allowedAxioms`) and persisted in `lemma/manifest.json`, never caller-supplied at verify time; and the live Lean path is not exercised on hosts without `lean`/`lake`/`leap` (the E2E test skips loudly, while stub tests cover the control flow). CI installs core Lean + the LEAP CLI (no Mathlib) so the live E2E runs on every relevant pull request.
+
+## Prerequisites and troubleshooting
+
+Both capability-gated routes check their tools **before** creating a run and, on
+failure, write `PREREQUISITES.md` at the repository root recording the probe
+verdict (`MISSING` or `OUTAGE`) instead of spending budget. The artifact is only
+written when the probe fails; `READY` is not written.
+
+**PDF document review.** PDF ingestion needs Python 3 with `pypdfium2` and
+`Pillow` on `PATH`:
+
+```sh
+python3 -m pip install pypdfium2 Pillow
+python3 -c "import pypdfium2, PIL; print('ok')"
+```
+
+A failed probe is `MISSING` (not installed) or `OUTAGE` (installed but
+unusable). Plain-text and Markdown review need neither. `READY` means the probe
+ran, not that every page was extracted: check `extractionStatus` in
+`document-review/manifest.json` and the gap report in `DOCUMENT_TEXT_MAP.md`
+rather than assuming missing text is absent from the source.
+
+**LEMMA (Lean 4).** Requires `lean` and `lake` (via `elan`) plus the LEAP CLI
+(`leap`; legacy `leap-tools` is accepted):
+
+```sh
+elan toolchain install stable
+pipx install git+https://github.com/billkunghappy/LEAP-CLI@afc016d23579d8236050a157fe6cac8f17b13096
+leap doctor
+```
+
+A missing tool refuses the plan before `mkdir`; install it and re-run.
+`leap doctor` reports `READY`, `MISSING`, or `OUTAGE` (`OUTAGE` means installed
+but not usable). `leap lean` (Mathlib, ~11 GB) is optional and not needed for
+LEMMA verification.
+
+`PREREQUISITES.md` is a diagnostic record: deleting or editing it does not
+install anything, and `READY` does not prove the toolchain will succeed on
+every input.
 
 ## High-assurance deployment
 

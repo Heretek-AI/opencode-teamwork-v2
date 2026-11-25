@@ -37,7 +37,6 @@ import {
 } from "node:crypto"
 import {
   attestationSignatureInput,
-  canonicalJson,
   contentSha256Hex,
   isApprovalNonce,
   payloadDigest,
@@ -46,13 +45,11 @@ import {
 } from "./approval-format.mjs"
 
 export const ATTESTATION_PATH = "verify/ci/attestation.json"
-export const ATTESTATION_VERSION = 1
-export const ATTESTATION_ALG = "ed25519"
-export const ATTESTATION_PROVIDER_GITHUB = "github-actions"
-export const ATTESTATION_MAX_BYTES = 512 * 1024
-export const ATTESTATION_MAX_COMMANDS = 64
-export const ATTESTATION_MAX_ARGV = 32
-export const ATTESTATION_MAX_ARG_BYTES = 4096
+const ATTESTATION_VERSION = 1
+const ATTESTATION_ALG = "ed25519"
+const ATTESTATION_MAX_COMMANDS = 64
+const ATTESTATION_MAX_ARGV = 32
+const ATTESTATION_MAX_ARG_BYTES = 4096
 
 /**
  * Manifest `attestationPolicy`. `off` is the default and ignores any artifact;
@@ -60,15 +57,11 @@ export const ATTESTATION_MAX_ARG_BYTES = 4096
  * missing/invalid attestation a named refusal. The order is the downgrade
  * ladder: a re-plan may move right (upgrade) but never left.
  */
-export const ATTESTATION_POLICY_MODES = ["off", "optional", "required"]
+const ATTESTATION_POLICY_MODES = ["off", "optional", "required"]
 
 export const ENV_ATTESTATION_PUBLIC_KEY = "OPENCODE_TEAMWORK_ATTESTATION_PUBLIC_KEY"
 export const ENV_ATTESTATION_KEY_ID = "OPENCODE_TEAMWORK_ATTESTATION_KEY_ID"
 export const ENV_ATTESTATION_ISSUER = "OPENCODE_TEAMWORK_ATTESTATION_ISSUER"
-export const ENV_ATTESTATION_OIDC_JWKS = "OPENCODE_TEAMWORK_OIDC_JWKS"
-export const ENV_ATTESTATION_AUDIENCE = "OPENCODE_TEAMWORK_ATTESTATION_AUDIENCE"
-export const ENV_ATTESTATION_REPOSITORY = "OPENCODE_TEAMWORK_ATTESTATION_REPOSITORY"
-export const ENV_ATTESTATION_REF = "OPENCODE_TEAMWORK_ATTESTATION_REF"
 
 const OIDC_SUPPORTED_ALGS = new Set(["RS256", "ES256", "EdDSA"])
 const DEFAULT_OIDC_CLOCK_SKEW_MS = 60_000
@@ -213,7 +206,7 @@ function isoTimestamp(value) {
  * Validate the unsigned attestation payload shape. Returns [] for a valid
  * document; every string names a field, never echoes attacker-controlled data.
  */
-export function attestationPayloadProblems(payload) {
+function attestationPayloadProblems(payload) {
   const problems = []
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return ["attestation is not an object"]
@@ -315,7 +308,7 @@ export function signAttestation(payload, { privateKey, keyId, nonce, at = new Da
  * Verify only the envelope (path/digest/nonce/key/signature). Used by callers
  * that need to distinguish an untrusted signature from a binding failure.
  */
-export function verifyAttestationEnvelope(artifact, { publicKey, expectedKeyId, requireNonce } = {}) {
+function verifyAttestationEnvelope(artifact, { publicKey, expectedKeyId, requireNonce } = {}) {
   if (!artifact || typeof artifact !== "object" || Array.isArray(artifact)) {
     return fail(ATTESTATION_CODES.missing, "attestation is not an object")
   }
@@ -374,7 +367,7 @@ export function verifyAttestationEnvelope(artifact, { publicKey, expectedKeyId, 
  * Parse a JWKS JSON string or object `{ keys: [...] }` into an array of JWKs.
  * Returns `undefined` when absent or malformed.
  */
-export function parseOidcJwks(input) {
+function parseOidcJwks(input) {
   if (!input) return undefined
   let parsed = input
   if (typeof input === "string") {
@@ -407,7 +400,7 @@ function jwkMatchesAlg(jwk, alg) {
  * Strictly offline: never performs network requests. Returns status "UNKNOWN"
  * when no JWKS trust material is supplied.
  */
-export function verifyOidcToken(
+function verifyOidcToken(
   token,
   {
     jwks,
@@ -772,11 +765,3 @@ function withoutAuthSafe(value) {
     return value
   }
 }
-
-/** Exact digest of the canonical payload, exposed for producers/tests. */
-export function attestationPayloadDigest(artifact) {
-  return payloadDigest(artifact)
-}
-
-/** Canonical JSON helper re-exported so producers do not import two leaves. */
-export { canonicalJson }

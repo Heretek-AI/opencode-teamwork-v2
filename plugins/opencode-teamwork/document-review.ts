@@ -18,23 +18,24 @@ import { execFileSync } from "node:child_process"
 import { homedir } from "node:os"
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { inflateRawSync, inflateSync } from "node:zlib"
+import { resolveTrustedExecutable } from "./safe-fs.mjs"
 import { assertSafeUrl, safeFetch } from "./url-guard.ts"
 
-export const MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
-export const MAX_INLINE_BYTES = 512 * 1024
-export const MAX_SEGMENTS = 8
-export const DEFAULT_MAX_SEGMENTS = 6
-export const MAX_RSA_DEPTH = 3
-export const MAX_RSA_WIDTH = 4
-export const DEFAULT_REVIEW_TREE_SHAPE = [4, 2, 1] as const
-export const MAX_SYNTH_DEPTH = 2
-export const MAX_SYNTH_WIDTH = 4
-export const DEFAULT_SYNTH_TREE_SHAPE = [4, 1] as const
+const MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
+const MAX_INLINE_BYTES = 512 * 1024
+const MAX_SEGMENTS = 8
+const DEFAULT_MAX_SEGMENTS = 6
+const MAX_RSA_DEPTH = 3
+const MAX_RSA_WIDTH = 4
+const DEFAULT_REVIEW_TREE_SHAPE = [4, 2, 1] as const
+const MAX_SYNTH_DEPTH = 2
+const MAX_SYNTH_WIDTH = 4
+const DEFAULT_SYNTH_TREE_SHAPE = [4, 1] as const
 export const MAX_SEGMENT_CHARS = 32_000
 export const MAX_TEXT_MAP_CHARS = 200_000
 export const MAX_FINDINGS = 50
-export const URL_FETCH_TIMEOUT_MS = 3000
-export const MAX_PDF_INFLATE_BYTES = 4 * 1024 * 1024
+const URL_FETCH_TIMEOUT_MS = 3000
+const MAX_PDF_INFLATE_BYTES = 4 * 1024 * 1024
 
 export const SEGMENT_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/
 
@@ -55,7 +56,7 @@ export interface RouteClassifyInput {
   checkPaths?: boolean
 }
 
-export interface RouteClassification {
+export interface DocumentRouteClassification {
   topology: string
   routingReason: string
   documentDetected: boolean
@@ -102,13 +103,13 @@ export interface DocumentSegment {
   content: string
 }
 
-export function cleanDocText(value: unknown, max = 64): string {
+function cleanDocText(value: unknown, max = 64): string {
   return String(value ?? "")
     .replace(/[\r\n\t\x00-\x1f\x7f-\x9f\u0085\u2028\u2029]/g, " ")
     .slice(0, max)
 }
 
-export function cleanDocBlock(value: unknown, max = 2000): string {
+function cleanDocBlock(value: unknown, max = 2000): string {
   const s = String(value ?? "").replace(/[\r\x00-\x09\x0b-\x1f\x7f-\x9f\u0085\u2028\u2029]/g, " ")
   return s.length > max ? s.slice(0, Math.max(0, max - 1)) + "…" : s
 }
@@ -842,7 +843,7 @@ function hasExplicitLeanAction(routeEvalText: string): boolean {
 }
 
 function selectRouteDecision(
-  signals: RouteClassification["signals"],
+  signals: DocumentRouteClassification["signals"],
   hasSuppliedDocument: boolean,
 ): { topology: string; routingReason: string; documentDetected: boolean } {
   if (
@@ -899,7 +900,7 @@ function selectRouteDecision(
   }
 }
 
-export function classifyRoute(rawInput: RouteClassifyInput | string, root: string): RouteClassification {
+export function classifyDocumentRoute(rawInput: RouteClassifyInput | string, root: string): DocumentRouteClassification {
   const input: RouteClassifyInput = typeof rawInput === "string" ? { request: rawInput } : rawInput || {}
   const request = typeof input.request === "string" ? input.request : ""
   const doc = input.document && typeof input.document === "object" ? input.document : undefined
@@ -1642,6 +1643,114 @@ function tryPdftotextFallback(buf: Buffer): string {
     }
   }
   return ""
+}
+
+// A7 PDF pre-flight: image-only PDFs need a real renderer. pypdfium2 renders
+// each page; Pillow is the raster dependency the extractor is allowed to use.
+// The script is a constant and reads the document bytes from stdin, so no path
+// or caller text is ever interpolated into Python source.
+const PYTHON_PDF_SCRIPT = [
+  "import sys, json",
+  "try:",
+  "    import pypdfium2 as pdfium",
+  "    from PIL import Image  # noqa: F401",
+  "except Exception as exc:",
+  '    print(json.dumps({"ok": False, "status": "MISSING", "detail": "pypdfium2/Pillow import failed: %s" % (exc,)}))',
+  "    raise SystemExit(0)",
+  "try:",
+  "    payload = sys.stdin.buffer.read()",
+  "    document = pdfium.PdfDocument(payload)",
+  "except Exception as exc:",
+  '    print(json.dumps({"ok": False, "status": "OUTAGE", "detail": "PDF open failed: %s" % (exc,)}))',
+  "    raise SystemExit(0)",
+  "pages = []",
+  "for index in range(len(document)):",
+  "    text = ''",
+  "    try:",
+  "        page = document[index]",
+  "        text_page = page.get_textpage()",
+  "        text = text_page.get_text_range()",
+  "    except Exception:",
+  "        text = ''",
+  "    pages.append(text or '')",
+  'print(json.dumps({"ok": True, "pages": pages}))',
+].join("\n")
+
+export type PdfPythonIngestResult =
+  | { ok: true; text: string }
+  | { ok: false; status: "MISSING" | "OUTAGE"; detail: string }
+
+/**
+ * Ingest an image-only PDF with `python3` + pypdfium2 + Pillow. The executable
+ * is resolved through the trusted-directory resolver (never a raw PATH join);
+ * the PDF bytes go in on stdin and a single JSON line comes back on stdout.
+ * Any failure is classified: an import failure is MISSING, an engine/runtime
+ * failure or empty extraction is OUTAGE. The caller records PREREQUISITES.md.
+ */
+export function ingestPdfWithPython(
+  buf: Buffer,
+  options?: { env?: NodeJS.ProcessEnv; timeoutMs?: number },
+): PdfPythonIngestResult {
+  const env = options?.env ?? process.env
+  // A probe must reflect the PATH the caller narrowed (tests and hardened
+  // hosts), so no silent fallback to /usr/bin when that PATH lacks python3.
+  const python = resolveTrustedExecutable("python3", {
+    env: { PATH: env.PATH, PATHEXT: env.PATHEXT },
+    fallbackToStandard: false,
+  })
+  if (!python) {
+    return { ok: false, status: "MISSING", detail: "python3 was not found on a trusted PATH entry" }
+  }
+  let stdout = ""
+  let stderr = ""
+  try {
+    stdout = execFileSync(python, ["-c", PYTHON_PDF_SCRIPT], {
+      input: buf,
+      encoding: "utf8",
+      timeout: Math.max(1000, Math.min(30000, Number(options?.timeoutMs) || 10000)),
+      maxBuffer: 4 * 1024 * 1024,
+      stdio: ["pipe", "pipe", "pipe"],
+      env,
+    })
+  } catch (err: any) {
+    stderr = String(err?.stderr ?? "")
+    stdout = String(err?.stdout ?? "")
+    const detail = stderr.split(/\r?\n/).map((l) => l.trim()).find(Boolean) || cleanPdfDetail(err?.message) || "python3 PDF extraction failed"
+    if (err?.code === "ETIMEDOUT") {
+      return { ok: false, status: "OUTAGE", detail: "python3 PDF extraction timed out" }
+    }
+    const missingDep = /ModuleNotFoundError|No module named|ImportError/i.test(`${stderr}\n${stdout}`)
+    return { ok: false, status: missingDep ? "MISSING" : "OUTAGE", detail }
+  }
+  const jsonLine = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .pop()
+  let parsed: any
+  try {
+    parsed = JSON.parse(jsonLine ?? "")
+  } catch {
+    return { ok: false, status: "OUTAGE", detail: "python3 returned an unrecognised PDF extraction payload" }
+  }
+  if (parsed?.ok !== true || !Array.isArray(parsed?.pages)) {
+    const status = parsed?.status === "MISSING" ? "MISSING" : "OUTAGE"
+    return { ok: false, status, detail: cleanPdfDetail(parsed?.detail) || "pypdfium2 could not extract text from the PDF" }
+  }
+  const text = parsed.pages
+    .filter((page: unknown): page is string => typeof page === "string")
+    .join("\n\n")
+    .replaceAll("\r\n", "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+  if (!text) {
+    return { ok: false, status: "OUTAGE", detail: "pypdfium2 extracted no text from any page" }
+  }
+  return { ok: true, text: cleanDocBlock(text, MAX_TEXT_MAP_CHARS) }
+}
+
+function cleanPdfDetail(value: unknown): string {
+  return String(value ?? "").replace(/[\x00-\x1f\x7f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 500)
 }
 
 export function ingestDocument(

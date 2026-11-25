@@ -41,8 +41,9 @@ import {
   MAX_SEGMENT_CHARS,
   MAX_TEXT_MAP_CHARS,
   SEGMENT_ID,
-  classifyRoute as classifyDocumentRoute,
+  classifyDocumentRoute,
   ingestDocument,
+  ingestPdfWithPython,
   isSafeSegmentId,
   resolveAndReadDocument,
   segmentDocument,
@@ -53,7 +54,8 @@ import { authorizeToolCall } from "./authorize.ts"
 import { BUDGET_HALT_PCT, budgetPercent, budgetThresholdReached } from "./budget.ts"
 import { assertSafeUrl, parseLoopbackServiceUrl, safeFetch } from "./url-guard.ts"
 import {
-  classifyRoute as classifyLemmaRoute,
+  LEAP_REQUIREMENT,
+  classifyLemmaRoute,
   evaluateLemmaFinalEvidence,
   formatMissingToolchainRefusal,
   initLemmaArtifacts,
@@ -79,7 +81,7 @@ import {
   MAX_VERIFIER_REPORT_BYTES,
   assertRunRootIdentity,
   auditTournament,
-  classifyRoute as classifyTournamentRoute,
+  classifyTournamentRoute,
   ensureSafeRunSubpath as ensureSafeTournamentSubpath,
   estimateTournamentBudget,
   falsifyCandidate,
@@ -100,7 +102,6 @@ import {
   scoreCandidates,
   tournamentConfigsEqual,
   tournamentDir,
-  validateTournamentConfig,
   writeSafeRunFile,
 } from "./tournament.ts"
 import type { BudgetEstimate, TournamentConfig, TournamentManifest } from "./tournament.ts"
@@ -870,6 +871,44 @@ type IntegrityMode = (typeof INTEGRITY_MODES)[number]
 const DEFAULT_INTEGRITY_MODE: IntegrityMode = "development"
 const REQUEST_MAX = 20000
 
+/**
+ * Parse the launch prefix of a `/teamwork` task (or a verbatim `request`).
+ *
+ * Only a leading `[skip-interview]` is a parameter: it is case-insensitive,
+ * may be followed by spaces/tabs, and is removed from the task text. Any other
+ * leading `[...]` token (1..64 chars, no `]`) is reported as `ignoredBracket`
+ * but left in the text because it is part of the task. Brackets anywhere else
+ * are literal. Leading spaces/tabs are consumed only when they precede a
+ * leading bracketed token; a request with no leading bracket is returned
+ * byte-for-byte, so meaningful leading whitespace is preserved. Interior
+ * whitespace is kept byte-for-byte.
+ */
+export function parseTeamworkLaunch(raw: unknown): {
+  text: string
+  skipInterview: boolean
+  ignoredBracket?: string
+} {
+  if (typeof raw !== "string") return { text: "", skipInterview: false }
+  let text = raw
+  // A1: only consume indentation that introduces a bracket token. `[^[]` is
+  // not the test here: the lookahead checks the very next character after the
+  // run of spaces/tabs, so `  Fix bug` stays byte-identical.
+  const indented = /^[ \t]+(?=\[)/.exec(text)
+  if (indented) text = text.slice(indented[0].length)
+  let skipInterview = false
+  const skip = /^\[skip-interview\][ \t]*/i.exec(text)
+  if (skip) {
+    skipInterview = true
+    text = text.slice(skip[0].length)
+  }
+  const ignored = /^\[([^\]\n]{1,64})\]/.exec(text)
+  return {
+    text,
+    skipInterview,
+    ...(ignored ? { ignoredBracket: ignored[0] } : {}),
+  }
+}
+
 // Artifact trust levels (ADR 0008). `local-hmac` is the Phase A default; the
 // stronger levels are enforced by final_verify and can only be chosen at plan
 // time (a re-plan cannot weaken them).
@@ -937,24 +976,18 @@ function forbiddenIntegrityRules(mode: IntegrityMode): IntegrityRule[] {
   return INTEGRITY_RULE_IDS.filter((rule) => isIntegrityRuleForbidden(rule, mode))
 }
 
-export interface SecurityAuditRuleCheck {
-  rule: string
-  result: "clean" | "violation"
-  where?: string
-}
-
 /**
  * 0.12.0: named contradictions between artifacts that can each pass their own
  * check. The engine never fixes these; it refuses and asks for a re-record.
  */
-export const CONTRADICTION_CODES = [
+const CONTRADICTION_CODES = [
   "INCONSISTENT_VICTORY_TASK",
   "INCONSISTENT_REPORT_BRANCH",
   "INCONSISTENT_AUDIT_HIGH",
   "INCONSISTENT_WAVE_REPORT",
 ] as const
-export type ContradictionCode = (typeof CONTRADICTION_CODES)[number]
-export interface EvidenceContradiction {
+type ContradictionCode = (typeof CONTRADICTION_CODES)[number]
+interface EvidenceContradiction {
   code: ContradictionCode
   detail: string
 }
@@ -1346,10 +1379,29 @@ function readRecordedRequest(run: string): string | undefined {
  * The open with `wx` (O_CREAT|O_EXCL) makes "once" true even across two
  * concurrent planners and refuses an existing file/symlink: there is deliberately
  * no exists/read pre-check, which would be a redundant check-then-use race.
+ *
+ * `launch` is the parsed launch metadata (`parseTeamworkLaunch`). It is written
+ * to a `## Parameters` section between the header and `## Request`, so the
+ * bypass/reporting state is recorded without contaminating the verbatim task.
  */
-function writeOriginalRequest(run: string, request: string, mode: IntegrityMode, sessionId: string): string | undefined {
+function writeOriginalRequest(
+  run: string,
+  request: string,
+  mode: IntegrityMode,
+  sessionId: string,
+  launch: { skipInterview: boolean; ignoredBracket?: string },
+): string | undefined {
   const file = join(run, "ORIGINAL_REQUEST.md")
-  const body = `# Original Request\n\n- Integrity mode: ${mode}\n- Recorded: ${new Date().toISOString()}\n- Session: ${sessionId}\n\n## Request\n\n${request}`
+  const parameters = [
+    "## Parameters",
+    "",
+    "How this run was launched; not part of the task.",
+    `- skipInterview: ${launch.skipInterview ? "true" : "false"}`,
+    ...(launch.skipInterview ? ["- [skip-interview]"] : []),
+    ...(launch.ignoredBracket ? [`- Ignored leading bracket: ${launch.ignoredBracket}`] : []),
+    "",
+  ].join("\n")
+  const body = `# Original Request\n\n- Integrity mode: ${mode}\n- Recorded: ${new Date().toISOString()}\n- Session: ${sessionId}\n\n${parameters}\n## Request\n\n${request}`
   try {
     // ADR 0010: create-once inside the pinned run directory. O_CREAT|O_EXCL
     // makes "once" true across concurrent planners and refuses an existing
@@ -1385,7 +1437,10 @@ const READ_ONLY_ACTIONS: Record<string, Set<string>> = {
   // Real OpenCode permission actions only (see the V2 docs): edit covers the
   // write tool too, so "write"/"task" are intentionally not listed.
   "team/verifier": new Set(["edit", "webfetch", "subagent"]),
-  "team/falsifier": new Set(["edit", "shell", "subagent"]),
+  // The falsifier is the empirical challenger: shell is allowed so it can run
+  // the project's tests itself. It can modify files through shell, so the
+  // prompt forbids using it for edits; `edit` stays denied in code.
+  "team/falsifier": new Set(["edit", "subagent"]),
   "team/scout": new Set(["edit", "subagent"]),
   "team/security-auditor": new Set(["edit", "webfetch", "subagent"]),
   "team/segment-reviewer": new Set(["edit", "shell", "subagent", "webfetch"]),
@@ -3914,6 +3969,289 @@ async function refreshBriefingSafe(run: string): Promise<string | undefined> {
   }
 }
 
+/**
+ * Record `<run>/interrupted.md` for a mid-run abort. Best-effort: the caller
+ * still returns CANCELLED. `writeTextSafe` refuses a symlinked or non-regular
+ * target, so a planted link is never followed and the write failure is swallowed.
+ */
+function writeInterruptedSafe(run: string, phase: unknown, reason: string): void {
+  try {
+    const phaseText = clean(phase, 64) || "UNKNOWN"
+    const body = `# Interrupted\n\n- Session: ${basename(run)}\n- Phase: ${phaseText}\n- At: ${new Date().toISOString()}\n- Reason: ${clean(reason, 200)}\n`
+    writeTextSafe(run, join(run, "interrupted.md"), body)
+  } catch {}
+}
+
+/**
+ * Write `PREREQUISITES.md` at the project root (never inside a run). The
+ * pinned writer creates through a directory fd with `O_NOFOLLOW`, so a planted
+ * `PREREQUISITES.md` symlink is replaced/refused rather than followed, and a
+ * write failure (read-only root, hostile path) never fails the refusal itself.
+ */
+function writePrerequisitesSafe(root: string, body: string): boolean {
+  try {
+    const target = join(root, "PREREQUISITES.md")
+    // A7: refuse to replace a planted symlink. The pinned atomic writer would
+    // never follow the link, but silently replacing it hides the operator's
+    // signal and makes "symlinked PREREQUISITES.md is refused" false. A TOCTOU
+    // race after this check can still only reach the safe rename.
+    try {
+      if (lstatSync(target).isSymbolicLink()) return false
+    } catch {}
+    writeFileAtomicWithin(root, "PREREQUISITES.md", body)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Shared preflight body: explicit status, blocker, required items and hints. */
+function prerequisitesBody(
+  status: "MISSING" | "OUTAGE",
+  title: string,
+  required: string[],
+  hints: string[],
+  detail?: string,
+): string {
+  const lines = [
+    "# Prerequisites",
+    "",
+    `- Status: ${status}`,
+    `- Checked: ${new Date().toISOString()}`,
+    `- Blocker: ${clean(title, 200)}`,
+    ...(detail ? [`- Detail: ${cleanBlock(detail, 1000).trim()}`] : []),
+    "",
+    "## Required",
+    "",
+    ...(required.length ? required.map((r) => `- ${r}`) : ["- (none recorded)"]),
+    "",
+    "## Install hints",
+    "",
+    ...(hints.length ? hints.map((h) => `- ${h}`) : ["- (none recorded)"]),
+    "",
+    "Fix the prerequisites above, then re-run the same command. No run directory was created.",
+  ]
+  return lines.join("\n") + "\n"
+}
+
+/** PDF extraction prerequisites (A7). */
+function pdfPrerequisitesBody(status: "MISSING" | "OUTAGE", detail: string): string {
+  return prerequisitesBody(
+    status,
+    "PDF text extraction requires the Python `pypdfium2` and `Pillow` packages (with python3 on PATH)",
+    ["`pypdfium2` (PDF page renderer used for image-only PDFs)", "`Pillow` (Python imaging library required by pypdfium2)"],
+    [
+      "`python3 -m pip install --user pypdfium2 Pillow`",
+      "or install them inside the interpreter that provides `python3` (virtualenv, pipx inject, distro package)",
+      "verify with `python3 -c \"import pypdfium2, PIL; print('ok')\"`",
+    ],
+    detail,
+  )
+}
+
+/** LEMMA / Lean 4 toolchain prerequisites (A7). */
+function lemmaPrerequisitesBody(probe: LemmaProbeResult): string {
+  const doctor = probe.leap.doctor
+  return prerequisitesBody(
+    probe.status,
+    "LEMMA route requires Lean 4 (`lean`, `lake`) and a healthy LEAP CLI (`leap` or legacy `leap-tools`)",
+    [
+      `lean: ${probe.lean.available ? "READY" : `${probe.lean.status}${probe.lean.error ? ` (${probe.lean.error})` : ""}`}`,
+      `lake: ${probe.lake.available ? "READY" : `${probe.lake.status}${probe.lake.error ? ` (${probe.lake.error})` : ""}`}`,
+      `${LEAP_REQUIREMENT}: ${probe.leap.available ? "READY" : `${probe.leap.status}${probe.leap.error ? ` (${probe.leap.error})` : ""}`}`,
+      ...(doctor ? [`leap doctor: ${doctor.status}${doctor.error ? ` (${doctor.error})` : ""}`] : []),
+    ],
+    probe.installInstructions.split("\n"),
+    `probe status: ${probe.status}; missing/unusable: ${probe.missing.join(", ")}`,
+  )
+}
+
+/**
+ * A5 survey stubs. `distributed-coding` starts with the planning survey
+ * artifacts as create-only placeholders: the Sentinel's 2-Scout Survey fills
+ * them in later. `TEST_READY.md` is deliberately NOT created — it is the
+ * Dual-Track E2E gate and must be produced by the team, not pre-seeded.
+ */
+function surveyStubBodies(tasks: Array<{ id?: unknown; agent?: unknown }>): Array<{ name: string; body: string }> {
+  const cell = (v: unknown, max = 64) => clean(v, max).replace(/\|/g, "\\|")
+  const inventory = tasks.length
+    ? tasks.map((t) => `| ${cell(t.id)} | ${cell(t.agent || "team/worker")} | pending |`)
+    : ["| (none) | team/worker | pending |"]
+  const milestoneRows = tasks.length
+    ? tasks.map((t, i) => `| ${i + 1} | ${cell(t.id)} | ${cell(t.agent || "team/worker")} | pending |`)
+    : ["| 1 | (none) | team/worker | pending |"]
+  const project = [
+    "# Project",
+    "",
+    "## Architecture",
+    "",
+    "Planning survey stub: the Sentinel's 2-Scout Survey records the verified architecture here before the first milestone.",
+    "",
+    "## Code Layout",
+    "",
+    "Planning survey stub: record the repository layout (entry points, modules, test dirs) discovered by the survey.",
+    "",
+    "## Feature Inventory",
+    "",
+    "| Task | Agent | Status |",
+    "| --- | --- | --- |",
+    ...inventory,
+    "",
+    "## Milestones",
+    "",
+    "| Milestone | Task | Agent | Status |",
+    "| --- | --- | --- | --- |",
+    ...milestoneRows,
+    "",
+  ].join("\n")
+  const scope = [
+    "# Scope",
+    "",
+    "## Milestones",
+    "",
+    "| Task | Agent | Status |",
+    "| --- | --- | --- |",
+    ...inventory,
+    "",
+    "## Out of Scope",
+    "",
+    "- Anything not traced to a requirement in `requirements.json`.",
+    "- Unrelated refactors, dependency upgrades, and formatting-only churn.",
+    "",
+  ].join("\n")
+  const infra = [
+    "# E2E Test Infra",
+    "",
+    "## Test Philosophy",
+    "",
+    "Tests are evidence, not assertions from the implementer. Every milestone cites a re-runnable command and its observed output.",
+    "",
+    "## Feature Inventory",
+    "",
+    "| Task | Agent | Status |",
+    "| --- | --- | --- |",
+    ...inventory,
+    "",
+    "## Test Architecture",
+    "",
+    "Dual-Track E2E testing: author the test intent and expectations up front (`TEST_INFRA.md`), then require the executed build to satisfy them (`TEST_READY.md`).",
+    "",
+    "1. Tier 1 — unit / pure function checks.",
+    "2. Tier 2 — module and contract integration checks.",
+    "3. Tier 3 — cross-component workflow checks.",
+    "4. Tier 4 — full end-to-end scenario checks against the delivered artifact.",
+    "",
+    "## Coverage Thresholds",
+    "",
+    "- New behaviour needs at least one Tier 1 check plus the narrowest integration tier that exercises it.",
+    "- Every requirement needs a Tier 3 or Tier 4 command that a fresh verifier can re-run.",
+    "- A milestone is not complete until `TEST_READY.md` records the executed commands and their observed results.",
+    "",
+  ].join("\n")
+  return [
+    { name: "PROJECT.md", body: project },
+    { name: "SCOPE.md", body: scope },
+    { name: "TEST_INFRA.md", body: infra },
+  ]
+}
+
+/** Create the A5 survey stubs create-only; a planted symlink is never followed. */
+function writeSurveyStubsSafe(run: string, tasks: Array<{ id?: unknown; agent?: unknown }>): void {
+  for (const stub of surveyStubBodies(tasks)) {
+    try {
+      touchWithin(run, stub.name, stub.body)
+    } catch {}
+  }
+}
+
+/**
+ * A5 failure-signature canonicalisation. Whitespace, line endings and case do
+ * not distinguish two failures; the report summary, the fatal findings and the
+ * worker feedback do. The round number is deliberately excluded, so the same
+ * failure reproduced in round 2 hashes identically to round 1.
+ */
+function normalizeFailureSignatureText(value: unknown): string {
+  return cleanBlock(value, 4000).replace(/\s+/g, " ").trim().toLowerCase()
+}
+
+function failureSignatureOf(args: { report?: any; summary?: unknown; feedback?: unknown }): {
+  signature: string
+  summary: string
+  findingsText: string
+  feedbackText: string
+} {
+  const report = args.report && typeof args.report === "object" ? args.report : undefined
+  const fatalFindings = Array.isArray(report?.fatalFindings)
+    ? report.fatalFindings.slice(0, 50).map((f: any) => ({
+        where: normalizeFailureSignatureText(f?.where),
+        why: normalizeFailureSignatureText(f?.why),
+        fix: normalizeFailureSignatureText(f?.fix),
+      }))
+    : []
+  const summary = normalizeFailureSignatureText(report?.summary ?? args.summary ?? args.feedback ?? "")
+  const feedbackForWorker = normalizeFailureSignatureText(report?.feedbackForWorker ?? args.feedback ?? "")
+  const signature = sha256Hex(canonicalJson({ summary, fatalFindings, feedbackForWorker }))
+  const findingsText = fatalFindings
+    .map((f: any) => [f.where, f.why, f.fix].filter(Boolean).join(": "))
+    .filter(Boolean)
+    .join("\n")
+  return { signature, summary, findingsText, feedbackText: feedbackForWorker }
+}
+
+/**
+ * A5 Oscillation/Regression Guard. Appends one section per distinct failure
+ * signature; a repeated call with the same signature is a no-op. Best-effort:
+ * a symlinked/read-only `DEAD_ENDS.md` must never fail the task transition.
+ */
+function writeDeadEndsSafe(run: string, entry: {
+  taskId: string
+  round: number
+  signature: string
+  count: number
+  feedback: string
+  summary: string
+  findings: string
+}): void {
+  try {
+    const marker = `signature: ${entry.signature}`
+    const deadEndsFile = join(run, "DEAD_ENDS.md")
+    const existingRes = readBoundedRunFile(run, deadEndsFile, MAX_RUN_FILE_BYTES)
+    const existing = existingRes.status === "ok" ? existingRes.text : ""
+    if (existing.includes(marker)) return
+    const observed = [entry.feedback, entry.summary && entry.summary !== entry.feedback ? entry.summary : "", entry.findings]
+      .filter(Boolean)
+      .join("\n")
+    const section = [
+      `## ${entry.taskId} — Oscillation Guard`,
+      "",
+      `- Task: ${clean(entry.taskId, 64)}`,
+      `- Round: ${entry.round}`,
+      `- Identical failures: ${entry.count}`,
+      `- At: ${new Date().toISOString()}`,
+      `- ${marker}`,
+      "",
+      "### Regression Guard",
+      "",
+      "The previous approach reproduced the same failure. Record the checks that already pass and re-run them before claiming a fix; a fix must not regress an earlier passing check.",
+      "",
+      "### Observed failure",
+      "",
+      "```text",
+      observed || "(no verifier feedback was recorded)",
+      "```",
+      "",
+      "### Change approach",
+      "",
+      "Stop retrying the same edit. Reproduce the failure deterministically (minimal test or log), identify the root cause, and change the implementation strategy or ask the Sentinel for a new decomposition before spending another round.",
+      "",
+    ].join("\n")
+    const body = existing.trim()
+      ? `${existing.trimEnd()}\n\n${section}`
+      : `# Dead Ends\n\nFailures that repeated identically are recorded here so the team changes approach instead of oscillating.\n\n${section}`
+    writeTextSafe(run, deadEndsFile, body)
+  } catch {}
+}
+
 function ensureSafeRunSubpath(run: string, targetFile: string) {
   const absRun = resolve(run)
   const absTarget = resolve(targetFile)
@@ -5491,7 +5829,11 @@ async function authorizeToolAction(
     ctx,
     skipSessionTree: opts.skipSessionTree,
   })
-  if (!decision.ok) return { ok: false, content: decision.error }
+  if (!decision.ok) {
+    // Keep the human-readable refusal first (callers and tests match on it) and
+    // append the machine-readable authorization code the decision already carries.
+    return { ok: false, content: `${decision.error} [${decision.code}]` }
+  }
   return { ok: true, caller, sessionID }
 }
 
@@ -5539,6 +5881,128 @@ async function createPlanRun(
       refused: "AUTH_LEGACY",
     }
   }
+  const persistedPlan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
+  const persistedState = readJson<any>(run, join(run, "state.json"), undefined)
+  // A3: a follow-up appends to an existing run's request record; it is not a
+  // re-plan. This branch runs before topology normalisation, the pinned-write
+  // policy and every normal-plan validation, and it reads the persisted
+  // plan/state itself, so the documented minimal call
+  // (`{ sessionId, followUp }`) is sufficient. It returns before
+  // integrity/verification/mode validation so it cannot change tasks, modes,
+  // requirements, or the write-once header. Only ORIGINAL_REQUEST.md and the
+  // signed manifest's whole-file requestHash move. A sign failure after the
+  // append is reported as a refusal (the append is already durable) rather
+  // than claiming success.
+  if (typeof input.followUp === "string") {
+    const originalRequestFile = join(run, "ORIGINAL_REQUEST.md")
+    const noRun = "refused: followUp requires an existing run with ORIGINAL_REQUEST.md; nothing was written."
+    if (!existsSync(join(run, "plan.dag.json"))) return { ok: false, content: noRun }
+    if (!persistedPlan || typeof persistedPlan !== "object" || Array.isArray(persistedPlan)) {
+      return {
+        ok: false,
+        content: `refused: followUp requires a readable ${join(run, "plan.dag.json")}; nothing was written.`,
+      }
+    }
+    const followUpRaw = input.followUp
+    if (!followUpRaw.trim()) {
+      return { ok: false, content: "refused: followUp must be non-empty; nothing was written." }
+    }
+    if (followUpRaw.length > REQUEST_MAX) {
+      return {
+        ok: false,
+        content: `refused: followUp is ${followUpRaw.length} chars, over the ${REQUEST_MAX}-char limit; it must be appended verbatim. Shorten it or record it separately. Nothing was written.`,
+        refused: "followup_too_long",
+      }
+    }
+    const currentRes = readBoundedRunFile(run, originalRequestFile, MAX_RUN_FILE_BYTES)
+    if (currentRes.status !== "ok") return { ok: false, content: noRun }
+    const followUpText = followUpRaw.trim()
+    const lastSection = /\n## (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)\n\n([\s\S]*)$/.exec(currentRes.text)
+    const persistedTopology = normalizeTopology(persistedPlan.topology) ?? ""
+    const persistedIntegrityMode = (normalizeIntegrityMode(persistedPlan.integrityMode) ??
+      normalizeIntegrityMode(persistedState?.integrityMode) ??
+      DEFAULT_INTEGRITY_MODE) as IntegrityMode
+    const followUpResult = () => ({
+      ok: true as const,
+      sessionId,
+      run,
+      tasks: Array.isArray(persistedPlan.tasks) ? persistedPlan.tasks : [],
+      topology: persistedTopology,
+      integrityMode: persistedIntegrityMode,
+    })
+    if (lastSection && lastSection[2].trim() === followUpText) {
+      // Exact duplicate of the last follow-up: leave the file byte-identical so
+      // a retried call is idempotent.
+      return {
+        ...followUpResult(),
+        content: "Recorded follow-up: identical to the last follow-up section; nothing was appended (idempotent no-op).",
+      }
+    }
+    const stamp = new Date().toISOString().replace(/\.\d{3}Z$/, "Z")
+    const section = `\n## ${stamp}\n\n${followUpText}\n`
+    try {
+      appendLineWithin(run, "ORIGINAL_REQUEST.md", () => section, { run })
+    } catch (err: any) {
+      const message = String(err?.message ?? err)
+      return {
+        ok: false,
+        content: `refused: could not append the follow-up to ${originalRequestFile} (${clean(message, 160)}); nothing was changed.`,
+        ...(isUnsafePathError(message) ? { refused: "unsafe_path" } : {}),
+      }
+    }
+    const afterRes = readBoundedRunFile(run, originalRequestFile, MAX_RUN_FILE_BYTES)
+    if (afterRes.status !== "ok") {
+      return {
+        ok: false,
+        content: `refused: appended the follow-up to ${originalRequestFile} (the append is durable), but could not re-read it (${clean(afterRes.error, 160)}); the manifest was not re-bound.`,
+      }
+    }
+    let rebound = false
+    let signFailure: AuthFailure | undefined
+    let signMessage = ""
+    if (existingManifest && auth && authReady.ok) {
+      try {
+        const { _auth: _ignored, ...manifestPayload } = existingManifest as any
+        manifestPayload.requestHash = sha256Hex(afterRes.text)
+        const signed = await auth.signRunArtifact(sessionId, RUN_MANIFEST, manifestPayload)
+        writeJsonSafe(run, runManifestFile(run), signed)
+        rebound = true
+      } catch (err: any) {
+        signFailure = err?.failure as AuthFailure | undefined
+        signMessage = clean(err?.message, 160)
+      }
+    }
+    if (signFailure || signMessage !== "") {
+      return {
+        ok: false,
+        content: `refused: recorded the follow-up in ${originalRequestFile} (the append is durable), but could not re-sign ${RUN_MANIFEST} (${signFailure ? signFailure.code : "signing failed"}: ${signMessage}); the manifest requestHash no longer matches. Repair the signer and re-plan before final verification.`,
+        refused: signFailure?.code ?? "AUTH_UNAVAILABLE",
+      }
+    }
+    await refreshBriefingSafe(run)
+    return {
+      ...followUpResult(),
+      content: `Recorded follow-up in ${originalRequestFile} (## ${stamp}); ${
+        rebound ? "run.manifest.json requestHash re-bound to the new file bytes." : "no signed manifest was re-bound."
+      }`,
+    }
+  }
+  // A normal plan (schema `anyOf` branch 1) still requires both fields. This
+  // explicit check puts a direct `execute` — which bypasses the Standard
+  // Schema — under the same contract with a clear refusal instead of the old
+  // `invalid topology ""` symptom.
+  if (typeof input.topology !== "string" || input.topology.trim() === "") {
+    return {
+      ok: false,
+      content: `refused: topology must be a non-empty string when followUp is not provided (accepted: ${TOPOLOGIES.join(", ")}). Nothing was written.`,
+    }
+  }
+  if (!Array.isArray(input.tasks) || input.tasks.length === 0) {
+    return {
+      ok: false,
+      content: "refused: tasks must be a non-empty array when followUp is not provided. Nothing was written.",
+    }
+  }
   // Refuse an unknown topology before anything is written, so a typo can
   // never become the run's permanent label.
   const topology = normalizeTopology(input.topology)
@@ -5556,7 +6020,6 @@ async function createPlanRun(
   if (input.requirePinnedWrites !== undefined && typeof input.requirePinnedWrites !== "boolean") {
     return { ok: false, content: "refused: requirePinnedWrites must be a boolean; nothing was written." }
   }
-  const persistedPlan = readJson<any>(run, join(run, "plan.dag.json"), undefined)
   const persistedRequirePinnedWrites = persistedPlan?.requirePinnedWrites === true
   if (persistedRequirePinnedWrites && input.requirePinnedWrites === false) {
     return {
@@ -5777,11 +6240,14 @@ async function createPlanRun(
     // Capability probe runs BEFORE mkdirSync; allowMissingInputs MUST NOT bypass.
     lemmaProbe = probeLemmaToolchain()
     if (!lemmaProbe.ready) {
+      // A7: record the toolchain prerequisites at the project root before the
+      // refusal, so the operator gets an actionable checklist. Best-effort.
+      const prereqWritten = writePrerequisitesSafe(root, lemmaPrerequisitesBody(lemmaProbe))
       return {
         // Preserve the probe payload for the route/tool caller; the plan tool
         // only returns content, but tests inspect the refusal text.
         ok: false,
-        content: formatMissingToolchainRefusal(lemmaProbe),
+        content: `${formatMissingToolchainRefusal(lemmaProbe)}${prereqWritten ? `\nPrerequisites recorded at ${join(root, "PREREQUISITES.md")}.` : ""}`,
       }
     }
   }
@@ -5797,8 +6263,9 @@ async function createPlanRun(
       content: `refused: invalid integrityMode "${clean(input.integrityMode, 32)}" (accepted: ${INTEGRITY_MODES.join(", ")}; default: ${DEFAULT_INTEGRITY_MODE})`,
     }
   }
-  // Verification mode: standard (default, unchanged) or strict (one falsifier
-  // challenge + one security-auditor audit per task). It is part of the run's
+  // Verification mode: strict (the distributed-coding default; one falsifier
+  // challenge + one security-auditor audit per task) or standard (the explicit
+  // opt-out, and the default for every other topology). It is part of the run's
   // contract, so an invalid value refuses before anything is written and a
   // re-plan may keep or repeat the persisted mode but never change it.
   const requestedVerification =
@@ -5808,7 +6275,7 @@ async function createPlanRun(
   if (input.verification !== undefined && input.verification !== null && !requestedVerification) {
     return {
       ok: false,
-      content: `refused: invalid verification "${clean(input.verification, 32)}" (accepted: standard | strict; default: ${DEFAULT_VERIFICATION_MODE}); nothing was written.`,
+      content: `refused: invalid verification "${clean(input.verification, 32)}" (accepted: standard | strict; default: ${topology === "distributed-coding" ? "strict" : DEFAULT_VERIFICATION_MODE}); nothing was written.`,
     }
   }
   let persistedVerification: VerificationMode | undefined
@@ -5969,8 +6436,13 @@ async function createPlanRun(
       content: `refused: verification is already persisted as "${persistedVerification}" for this run and cannot be changed by a re-plan; omit it to keep the mode or start a new session. Nothing was written.`,
     }
   }
+  // A6: distributed-coding defaults to the strict wave (reviewer + falsifier
+  // challenger + security-auditor forensic auditor). An explicit "standard" is
+  // a recorded opt-out; every other topology keeps the historical default.
+  const defaultVerification: VerificationMode =
+    topology === "distributed-coding" ? "strict" : DEFAULT_VERIFICATION_MODE
   const verificationMode: VerificationMode =
-    persistedVerification ?? requestedVerification ?? DEFAULT_VERIFICATION_MODE
+    persistedVerification ?? requestedVerification ?? defaultVerification
   // Artifact trust level: chosen once at plan time, persisted in plan/state and
   // the signed manifest, and enforced by final_verify. A re-plan may repeat it
   // but never change it.
@@ -6047,8 +6519,12 @@ async function createPlanRun(
     }
   }
   // The request record is verbatim, so refuse rather than truncate. The
-  // length check runs before anything is written.
-  const request = typeof input.request === "string" ? input.request : undefined
+  // length check runs before anything is written. A leading `[skip-interview]`
+  // is a launch parameter: it is stripped from the recorded body and acts as an
+  // explicit spec-gate bypass.
+  const launch = parseTeamworkLaunch(input.request)
+  const request = typeof input.request === "string" ? launch.text : undefined
+  const effectiveSkipInterview = input.skipInterview === true || launch.skipInterview
   if (request !== undefined && !request.trim()) {
     return {
       ok: false,
@@ -6241,6 +6717,60 @@ async function createPlanRun(
         refused: "AUTH_STALE",
       }
     }
+  } else if (runHasPlan && persistedPlan) {
+    // Residual review finding: an unsigned legacy run has no signed manifest,
+    // so there is no drift baseline above. Compare the persisted plan contract
+    // directly instead of letting a re-plan move topology (and with it the
+    // small-focused 2-audit cap) or a verification/trust mode. Only fields the
+    // baseline actually records are compared, so a same-mode re-plan and a
+    // pre-0.10 legacy plan stay legal.
+    const baselineTopology = normalizeTopology(persistedPlan.topology)
+    const baselineIntegrity =
+      persistedPlan.integrityMode === undefined || persistedPlan.integrityMode === null
+        ? undefined
+        : normalizeIntegrityMode(persistedPlan.integrityMode)
+    const baselineVerification =
+      persistedPlan.verification === undefined || persistedPlan.verification === null
+        ? undefined
+        : normalizeVerificationMode(persistedPlan.verification)
+    const baselineVictory =
+      persistedPlan.victoryAudit === undefined || persistedPlan.victoryAudit === null
+        ? undefined
+        : normalizeVictoryAuditMode(persistedPlan.victoryAudit)
+    const baselineHandoffs =
+      persistedPlan.requireHandoffs === undefined || persistedPlan.requireHandoffs === null
+        ? undefined
+        : normalizeHandoffMode(persistedPlan.requireHandoffs)
+    const baselineTrust =
+      persistedPlan.trustLevel === undefined || persistedPlan.trustLevel === null
+        ? undefined
+        : normalizeTrustLevel(persistedPlan.trustLevel)
+    const modeDrift: string[] = []
+    if (baselineTopology && baselineTopology !== topology) {
+      modeDrift.push(`topology (${baselineTopology} -> ${topology})`)
+    }
+    if (baselineIntegrity && baselineIntegrity !== integrityMode) {
+      modeDrift.push(`integrityMode (${baselineIntegrity} -> ${integrityMode})`)
+    }
+    if (baselineVerification && baselineVerification !== verificationMode) {
+      modeDrift.push(`verification (${baselineVerification} -> ${verificationMode})`)
+    }
+    if (baselineVictory && baselineVictory !== victoryAuditMode) {
+      modeDrift.push(`victoryAudit (${baselineVictory} -> ${victoryAuditMode})`)
+    }
+    if (baselineHandoffs && baselineHandoffs !== requireHandoffsMode) {
+      modeDrift.push(`requireHandoffs (${baselineHandoffs} -> ${requireHandoffsMode})`)
+    }
+    if (baselineTrust && baselineTrust !== trustLevel) {
+      modeDrift.push(`trustLevel (${baselineTrust} -> ${trustLevel})`)
+    }
+    if (modeDrift.length > 0) {
+      return {
+        ok: false,
+        content: `refused: [AUTH_STALE] an unsigned legacy re-plan cannot change the persisted plan baseline (${modeDrift.join(", ")}); omit the mode to keep it or start a new session. Nothing was written.`,
+        refused: "AUTH_STALE",
+      }
+    }
   }
   // SEC-1: task ids become keys of state/costs maps and path/branch segments.
   // Refuse the whole plan (before anything is written) on any unsafe id.
@@ -6349,7 +6879,7 @@ async function createPlanRun(
   const specText = specRead.status === "ok" ? specRead.text.trim() : ""
   const hasSpec = specText.length > 0
   const specGate: "satisfied" | "bypassed" | "not_required" | undefined =
-    input.requireSpec === false ? "not_required" : hasSpec ? "satisfied" : input.skipInterview === true ? "bypassed" : undefined
+    input.requireSpec === false ? "not_required" : hasSpec ? "satisfied" : effectiveSkipInterview ? "bypassed" : undefined
   if (!specGate) {
     return {
       ok: false,
@@ -6401,12 +6931,32 @@ async function createPlanRun(
       (i) => i.blocking && (i.status === "MISSING" || i.status === "OUTAGE"),
     )
     if (blockingProblems.length > 0 && input.allowMissingInputs !== true) {
+      // A7: the refusal is recorded as a root PREREQUISITES.md so the operator
+      // has an actionable checklist. The status is the worst blocking verdict:
+      // OUTAGE means an installed dependency is unusable; MISSING means absent.
+      const preflightStatus: "MISSING" | "OUTAGE" = blockingProblems.some((i) => i.status === "OUTAGE")
+        ? "OUTAGE"
+        : "MISSING"
+      const prereqWritten = writePrerequisitesSafe(
+        root,
+        prerequisitesBody(
+          preflightStatus,
+          `${blockingProblems.length} required input(s) are missing or unreachable`,
+          blockingProblems.map((i) => `- ${i.status} \`${clean(i.value, 300)}\`${i.detail ? ` (${clean(i.detail, 300)})` : ""}`),
+          [
+            "Create or restore the missing path(s) and re-run teamwork_plan",
+            "Or re-call with allowMissingInputs: true to proceed and record the bypass",
+          ],
+          blockingProblems.map((i) => `${i.status} ${i.value}`).join("; "),
+        ),
+      )
       return {
         ok: false,
         content: [
-          `refused: ${blockingProblems.length} required input(s) are missing or unreachable; nothing was written.`,
+          `refused: ${blockingProblems.length} required input(s) are missing or unreachable; no run directory or plan artifact was created.`,
           ...blockingProblems.map((i) => `  ${i.status} ${i.value}${i.detail ? ` (${i.detail})` : ""}`),
           "Fix the paths/URLs, or re-call with allowMissingInputs: true to proceed and record the bypass.",
+          ...(prereqWritten ? [`Prerequisites recorded at ${join(root, "PREREQUISITES.md")}.`] : []),
         ].join("\n"),
       }
     }
@@ -6455,7 +7005,10 @@ async function createPlanRun(
   // The request record goes first: it is the artifact the auditor and the
   // final gate read the integrity mode from.
   if (request !== undefined) {
-    const refused = writeOriginalRequest(run, request, integrityMode, sessionId)
+    const refused = writeOriginalRequest(run, request, integrityMode, sessionId, {
+      skipInterview: effectiveSkipInterview,
+      ...(launch.ignoredBracket ? { ignoredBracket: launch.ignoredBracket } : {}),
+    })
     if (refused) return { ok: false, content: refused }
   }
   if (requirementsBaseline) {
@@ -6471,6 +7024,14 @@ async function createPlanRun(
   // later caller cannot rewrite the recorded plan-time identity.
   const planCaller = await deriveCallerAgent(ctx, run, callSession, context)
   const planAgent = existingManifest?.planAgent ?? planCaller?.agent ?? null
+  // A4: maxRounds is a bounded integer. small-focused is a refinement loop (up
+  // to 32 rounds), not a one-shot; any topology may lower it, but nothing may
+  // raise it above 32 or sneak in a fractional/negative value.
+  const clampMaxRounds = (value: unknown, fallback = 4): number => {
+    const raw = Number(value)
+    if (!Number.isFinite(raw)) return fallback
+    return Math.min(32, Math.max(1, Math.trunc(raw)))
+  }
   const tasks = (input.tasks || []).map((t: any) => ({
     id: clean(t.id, 64),
     dependsOn: Array.isArray(t.dependsOn) ? t.dependsOn.map((d: any) => clean(d, 64)) : [],
@@ -6478,7 +7039,7 @@ async function createPlanRun(
     agent: clean(t.agent || "team/worker", 64),
     status: "pending",
     round: 0,
-    maxRounds: Number.isFinite(t.maxRounds) ? t.maxRounds : 4,
+    maxRounds: clampMaxRounds(t.maxRounds, 4),
   }))
   const routingReason = typeof input.routingReason === "string" ? clean(input.routingReason, 200).trim() : ""
   // Claim protocol baseline (0.10.0). A brand-new run records protocol 2, its
@@ -6547,6 +7108,59 @@ async function createPlanRun(
     ...(routingReason ? { routingReason } : {}),
     ...(allowUnsignedLegacy ? { allowUnsignedLegacy: true } : {}),
   }
+  // The signed-baseline drift check runs BEFORE the approval nonce is consumed
+  // and before any run file is created. A refused re-plan must not rewrite
+  // plan.dag.json (a changed topology would otherwise move the 2-audit cap or
+  // the verification mode after the caller was told "nothing was written").
+  const driftRequestHash = originalRequestHash(run)
+  const driftRequirementsHash = requirementsBaseline
+    ? sha256Hex(canonicalJson(requirementsBaseline))
+    : currentRequirementsHash(run)
+  const driftPlanHash = planHashOf(planObject)
+  const driftLemmaPolicyHash = lemmaPolicyHashOf(run)
+  if (existingManifest) {
+    const drift = manifestDrift(existingManifest, {
+      integrityMode,
+      verification: verificationMode,
+      victoryAudit: victoryAuditMode,
+      victorySkipReason,
+      requireHandoffs: requireHandoffsMode,
+      trustLevel,
+      requireWitness,
+      approvalPolicy: approvalPrereq.approvalPolicy,
+      approvalKeyId:
+        manifestVersion < APPROVAL_EXTERNAL_MIN_VERSION
+          ? existingManifest?.approvalKeyId ?? null
+          : approvalPrereq.approvalKeyId,
+      handoffAuth: allowUnsignedLegacy ? "legacy" : "signed",
+      requiredProvenance,
+      attestationPolicy: manifestVersion >= ATTESTATION_MIN_VERSION ? attestationPolicy : "off",
+      attestationKeyId: manifestVersion >= ATTESTATION_MIN_VERSION ? attestationKeyId : null,
+      attestationIssuer: manifestVersion >= ATTESTATION_MIN_VERSION ? attestationIssuer : null,
+      requestHash: driftRequestHash,
+      requirementsHash: driftRequirementsHash,
+      planHash: driftPlanHash,
+      lemmaPolicyHash: driftLemmaPolicyHash,
+      ...(manifestVersion >= APPROVAL_PROMPT_MIN_VERSION
+        ? {
+            specHash: planApproval?.specHash ?? baselineSpecHash,
+            specBytes: planApproval?.specBytes ?? baselineSpecBytes,
+            approvalDigest: planApproval?.approvalDigest ?? null,
+            approvalNonce: planApproval?.approvalNonce ?? null,
+            approvalBinding: planApproval ? ("prompt" as const) : undefined,
+            approvedBy: planApproval?.approver ?? null,
+            approvedAt: planApproval?.approvedAt ?? null,
+          }
+        : {}),
+    })
+    if (drift.length > 0) {
+      return {
+        ok: false,
+        content: `refused: [AUTH_STALE] a re-plan must preserve the signed baseline; ${drift.join("; ")}. Nothing was written.`,
+        refused: "AUTH_STALE",
+      }
+    }
+  }
   if (planApproval) {
     // Record the consumed nonce's plan hash now that the plan baseline exists.
     await consumeApprovalNonce(ctx, sessionId, {
@@ -6561,6 +7175,9 @@ async function createPlanRun(
     run,
     tasks.map((t: any) => t.id),
   )
+  // A5: a distributed-coding run starts with the survey artifacts as
+  // create-only stubs (never TEST_READY.md — that is the Dual-Track gate).
+  if (topology === "distributed-coding") writeSurveyStubsSafe(run, tasks)
   writeJson(run, join(run, "plan.dag.json"), planObject)
   const planStateFile = join(run, "state.json")
   if (!existsSync(planStateFile)) {
@@ -6674,49 +7291,6 @@ async function createPlanRun(
   const baselineRequirementsHash = currentRequirementsHash(run)
   const baselinePlanHash = planHashOf(planObject)
   const baselineLemmaPolicyHash = lemmaPolicyHashOf(run)
-  if (existingManifest) {
-    const drift = manifestDrift(existingManifest, {
-      integrityMode,
-      verification: verificationMode,
-      victoryAudit: victoryAuditMode,
-      victorySkipReason,
-      requireHandoffs: requireHandoffsMode,
-      trustLevel,
-      requireWitness,
-      approvalPolicy: approvalPrereq.approvalPolicy,
-      approvalKeyId:
-        manifestVersion < APPROVAL_EXTERNAL_MIN_VERSION
-          ? existingManifest?.approvalKeyId ?? null
-          : approvalPrereq.approvalKeyId,
-      handoffAuth: allowUnsignedLegacy ? "legacy" : "signed",
-      requiredProvenance,
-      attestationPolicy: manifestVersion >= ATTESTATION_MIN_VERSION ? attestationPolicy : "off",
-      attestationKeyId: manifestVersion >= ATTESTATION_MIN_VERSION ? attestationKeyId : null,
-      attestationIssuer: manifestVersion >= ATTESTATION_MIN_VERSION ? attestationIssuer : null,
-      requestHash: baselineRequestHash,
-      requirementsHash: baselineRequirementsHash,
-      planHash: baselinePlanHash,
-      lemmaPolicyHash: baselineLemmaPolicyHash,
-      ...(manifestVersion >= APPROVAL_PROMPT_MIN_VERSION
-        ? {
-            specHash: planApproval?.specHash ?? baselineSpecHash,
-            specBytes: planApproval?.specBytes ?? baselineSpecBytes,
-            approvalDigest: planApproval?.approvalDigest ?? null,
-            approvalNonce: planApproval?.approvalNonce ?? null,
-            approvalBinding: planApproval ? ("prompt" as const) : undefined,
-            approvedBy: planApproval?.approver ?? null,
-            approvedAt: planApproval?.approvedAt ?? null,
-          }
-        : {}),
-    })
-    if (drift.length > 0) {
-      return {
-        ok: false,
-        content: `refused: [AUTH_STALE] a re-plan must preserve the signed baseline; ${drift.join("; ")}. Nothing was written.`,
-        refused: "AUTH_STALE",
-      }
-    }
-  }
   const signedRun = !!existingManifest || !allowUnsignedLegacy
   if (signedRun) {
     if (!auth || !authReady.ok) {
@@ -6955,11 +7529,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           topology: { type: "string", description: "small-focused | iterative-coding | distributed-coding | proof | massive-proof | document-review. Legacy aliases accepted and normalised: large-swarm → distributed-coding, doc-review → document-review, long-proof → proof, massive-proof-swarm → massive-proof." },
           routingReason: { type: "string", description: "Optional. Why this topology was chosen; persisted in plan.dag.json when provided." },
           request: { type: "string", description: "The verbatim text this run was routed on (max 20000 chars); recorded once in ORIGINAL_REQUEST.md. Sentinel must always pass this for LEMMA and general runs; a second plan into the same run with a non-empty request file is refused." },
+          followUp: { type: "string", description: "Append a UTC-timestamped user/parent message to an existing run's ORIGINAL_REQUEST.md. Non-empty, <=20000 chars; repeating the exact last follow-up is a no-op. The signed manifest requestHash is re-bound." },
           integrityMode: { type: "string", description: "development | demo | benchmark. Default development. Recorded in ORIGINAL_REQUEST.md, state.json and plan.dag.json; the security auditor and final gate read it from ORIGINAL_REQUEST.md." },
           verification: {
             type: "string",
             description:
-              "standard | strict. Default standard (unchanged verifier-only completion). Strict adds exactly one team/falsifier challenge and one team/security-auditor audit per task; both must be recorded with teamwork_wave_record before final verification can PASS. Persisted in plan.dag.json and state.json; a re-plan may not change it.",
+              "standard | strict. Default: strict for distributed-coding (reviewer + falsifier challenger + security-auditor forensic auditor per task), standard for every other topology (unchanged verifier-only completion). Pass standard explicitly to opt a distributed-coding run out of the strict wave. Strict adds exactly one team/falsifier challenge and one team/security-auditor audit per task; both must be recorded with teamwork_wave_record before final verification can PASS. Persisted in plan.dag.json and state.json; a re-plan may not change it.",
           },
           requirements: {
             type: "array",
@@ -7118,7 +7693,25 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             },
           },
         },
-        required: ["topology", "tasks"],
+        // A3: a follow-up append is a legal minimal call
+        // (`{ sessionId, followUp }`); a normal plan still requires topology
+        // and tasks. `anyOf` keeps both contracts visible to the model instead
+        // of weakening `createPlanRun`, which re-checks the pair explicitly
+        // for direct executes that bypass the Standard Schema.
+        anyOf: [
+          {
+            title: "plan",
+            type: "object",
+            required: ["topology", "tasks"],
+            additionalProperties: true,
+          },
+          {
+            title: "follow-up",
+            type: "object",
+            required: ["followUp"],
+            additionalProperties: true,
+          },
+        ],
         additionalProperties: false,
       }),
       execute: async (input: any, context: any) => {
@@ -7126,7 +7719,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const authz = await authorizeToolAction(ctx, planRun, "plan", undefined, context)
         if (!authz.ok) return { content: authz.content, refused: "unauthorized" }
         const res = await createPlanRun(ctx, root, input, context, undefined, auth)
-        return { content: res.content, ...(res.ok ? {} : { ...(res.refused ? { refused: res.refused } : {}), ...(res.aborted ? { aborted: true } : {}) }) }
+        return {
+          content: res.content,
+          ...(res.ok
+            ? { sessionId: res.sessionId, run: res.run, tasks: res.tasks, topology: res.topology, integrityMode: res.integrityMode }
+            : { ...(res.refused ? { refused: res.refused } : {}), ...(res.aborted ? { aborted: true } : {}) }),
+        }
       },
     })
 
@@ -7159,8 +7757,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         // explicit Lean 4 gate for Priority 2; the tournament classifier owns
         // the explicit massive-proof opt-in for Priority 3. All three features
         // return route/topology/lemmaMode so any caller's tests can assert.
-        const doc = classifyDocumentRoute(input || {}, root)
-        const request = String(input?.request ?? "")
+        // A leading [skip-interview] is a launch parameter, never task text.
+        const request = parseTeamworkLaunch(input?.request).text
+        const doc = classifyDocumentRoute({ ...(input || {}), request }, root)
         const lemma = classifyLemmaRoute(
           {
             request,
@@ -7318,8 +7917,34 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         })
         if (!readRes.ok) return { content: readRes.error }
 
-        const ingested = ingestDocument(readRes.doc.bufferOrText, readRes.doc.format)
+        let ingested = ingestDocument(readRes.doc.bufferOrText, readRes.doc.format)
         if (!ingested.ok) return { content: ingested.error }
+        // A7: an image-only PDF needs the pypdfium2 + Pillow ingestor. It runs
+        // BEFORE createPlanRun, so a MISSING toolchain refuses without creating
+        // a run directory, and a readable extraction replaces the empty text.
+        if (ingested.extractionStatus === "needs_ingestor") {
+          const pdfBuffer = Buffer.isBuffer(readRes.doc.bufferOrText)
+            ? readRes.doc.bufferOrText
+            : Buffer.from(String(readRes.doc.bufferOrText), "latin1")
+          const pythonIngest = ingestPdfWithPython(pdfBuffer)
+          if (!pythonIngest.ok) {
+            const prereqWritten = writePrerequisitesSafe(
+              root,
+              pdfPrerequisitesBody(pythonIngest.status, pythonIngest.detail),
+            )
+            return {
+              content: `refused: ${pythonIngest.status} PDF text extraction prerequisites: pypdfium2 and Pillow are required for this image-only PDF. ${pythonIngest.detail}${prereqWritten ? `\nPrerequisites recorded at ${join(root, "PREREQUISITES.md")}.` : ""} No run directory was created.`,
+              extractionStatus: "needs_ingestor",
+              missing: ["pypdfium2", "Pillow"],
+            }
+          }
+          ingested = {
+            ok: true,
+            format: "pdf",
+            text: pythonIngest.text,
+            extractionStatus: "extracted",
+          }
+        }
 
         const segments = segmentDocument(ingested.text, bounds.maxSegments)
         const perSegBudget = Math.max(
@@ -7349,11 +7974,15 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         }
 
         const rawRequest = typeof input?.request === "string" ? input.request : undefined
-        const splitReq = rawRequest !== undefined ? splitInstructionAndInlineDoc(rawRequest) : undefined
+        // A leading [skip-interview] is launch metadata, not document-review task
+        // text; it also bypasses the spec gate for this triage run.
+        const launch = parseTeamworkLaunch(rawRequest)
+        const launchRequest = rawRequest !== undefined ? launch.text : undefined
+        const splitReq = launchRequest !== undefined ? splitInstructionAndInlineDoc(launchRequest) : undefined
         const recordedRequest =
-          rawRequest !== undefined && rawRequest.length > REQUEST_MAX && splitReq?.hasInlineDoc
-            ? splitReq.instructionText || rawRequest.slice(0, REQUEST_MAX)
-            : rawRequest
+          launchRequest !== undefined && launchRequest.length > REQUEST_MAX && splitReq?.hasInlineDoc
+            ? splitReq.instructionText || launchRequest.slice(0, REQUEST_MAX)
+            : launchRequest
         const preflightRequest =
           splitReq?.hasInlineDoc || typeof input?.document?.content === "string"
             ? splitReq?.instructionText ?? ""
@@ -7377,7 +8006,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             budgetUsd: input?.budgetUsd,
             budgetSource: input?.budgetSource,
             requireSpec: input?.requireSpec,
-            skipInterview: input?.skipInterview,
+            skipInterview: input?.skipInterview === true || launch.skipInterview,
             inputs: input?.inputs,
             checkUrls: input?.checkUrls,
             allowMissingInputs: input?.allowMissingInputs,
@@ -8410,7 +9039,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             mkdirSync(run, { recursive: true })
             precreateRunDirs(run)
             if (request !== undefined && !existsSync(join(run, "ORIGINAL_REQUEST.md"))) {
-              const refused = writeOriginalRequest(run, request, DEFAULT_INTEGRITY_MODE, sessionId)
+              const tournamentLaunch = parseTeamworkLaunch(request)
+              const refused = writeOriginalRequest(run, tournamentLaunch.text, DEFAULT_INTEGRITY_MODE, sessionId, {
+                skipInterview: tournamentLaunch.skipInterview,
+                ...(tournamentLaunch.ignoredBracket ? { ignoredBracket: tournamentLaunch.ignoredBracket } : {}),
+              })
               if (refused) return { content: refused }
             }
             if (!existingPlan) {
@@ -8909,6 +9542,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         additionalProperties: false,
       }),
       execute: async (input: any, context: any) => {
+        // Bind the cancellation signal at entry. The host's Promise adapter
+        // starts listening to `context.cancel` the first time the tool reads
+        // `signal`, so an entry read lets a cancel that arrives while `next`
+        // is working be observed at the completion check below.
+        const cancelSignal = context?.signal
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
@@ -9008,7 +9646,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               const manifest = mRes.manifest
               const caller = await deriveCallerAgent(ctx, run, callSession, context)
 
-              if (TOURNAMENT_ACTIVE_PHASES.has(manifest.phase) && context?.signal?.aborted) {
+              if (TOURNAMENT_ACTIVE_PHASES.has(manifest.phase) && cancelSignal?.aborted) {
                 const partial = finalizeTournamentPartial(run, manifest, {
                   trigger: "signal",
                   reason: "Aborted via AbortSignal",
@@ -9160,7 +9798,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             throw err
           }
           if (tOutcome) return tOutcome
-        } else if (context?.signal?.aborted) {
+        } else if (cancelSignal?.aborted) {
+          writeInterruptedSafe(run, state?.phase, "request aborted via AbortSignal")
           return { content: "refused: request aborted via AbortSignal.", status: "CANCELLED", aborted: true }
         }
 
@@ -9870,10 +10509,21 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
         }
 
+        // A5: surface the oscillation guard to the coordinator. The artifact is
+        // authoritative, but a coordinator that only reads the DAG status must
+        // still see that the same failure signature has repeated.
+        const oscillationTasks = Object.values(state?.tasks || {})
+          .filter((task: any) => Number(task?.failureSignatureCount) >= 2)
+          .map((task: any) => String(task?.id ?? "task"))
+        const oscillationNote = oscillationTasks.length
+          ? `\nOscillation Guard: ${oscillationTasks.join(", ")} repeated the same failure signature; see DEAD_ENDS.md and change approach.`
+          : ""
         if (!readyForWorker.length && !readyForVerifier.length && !inProgress.length) {
           return {
-            content: `DEADLOCK_OR_BLOCKED: No tasks can proceed.\nBlocked tasks (${blockedTasks.length}):\n` +
-              blockedTasks.map((t) => `  - ${t.id}: ${t.reason}`).join("\n"),
+            content:
+              `DEADLOCK_OR_BLOCKED: No tasks can proceed.\nBlocked tasks (${blockedTasks.length}):\n` +
+              blockedTasks.map((t) => `  - ${t.id}: ${t.reason}`).join("\n") +
+              oscillationNote,
             status: "DEADLOCK",
             blocked: blockedTasks,
           }
@@ -9913,7 +10563,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         lines.push(`\nProgress: ${passedTasks.length}/${taskDefs.size} passed, ${blockedTasks.length} blocked.`)
 
         return {
-          content: lines.join("\n"),
+          content: lines.join("\n") + oscillationNote,
           readyForWorker,
           readyForVerifier,
           inProgress,
@@ -10054,6 +10704,10 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           if (status === "pass") status = "verified_pass"
           else if (status === "fail") status = "verified_fail"
           else if (status === "running") status = "worker_active"
+          // Captured before the maxRounds coercion: a verifier FAIL that hits
+          // the round cap is recorded as `blocked`, but it is still a failure
+          // for the ledger, the derived feedback and the oscillation guard.
+          const failureRequested = status === "verified_fail"
 
           const VALID_STATUSES = new Set([
             "pending",
@@ -10368,6 +11022,36 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           // (sanitised) instead of replacing the previous round; verified_pass
           // resolves all entries in the same write, verified_fail leaves them open.
           // The array is capped at 20 entries, oldest dropped first.
+          //
+          // A4: a verifier FAIL often arrives with no `feedback` argument (the
+          // evidence is the report). Derive the open issue from the report's
+          // feedbackForWorker, then the first fatal finding, then the summary,
+          // so round 2 always sees what round 1 failed on. A missing report is
+          // not an error.
+          let failureReport: any
+          if (failureRequested && isSafeTaskId(taskId)) {
+            const reportRes = readBoundedRunJson<any>(
+              run,
+              join(run, "verify", `report-${taskId}.json`),
+              MAX_VERIFIER_REPORT_BYTES,
+            )
+            if (reportRes.status === "ok") failureReport = reportRes.value
+          }
+          const reportFeedback =
+            typeof failureReport?.feedbackForWorker === "string" ? failureReport.feedbackForWorker : ""
+          const firstFatal =
+            Array.isArray(failureReport?.fatalFindings) && failureReport.fatalFindings.length > 0
+              ? failureReport.fatalFindings[0]
+              : undefined
+          const fatalFeedback = firstFatal
+            ? [clean(firstFatal.where, 200).trim(), clean(firstFatal.why, 300).trim()].filter(Boolean).join(": ")
+            : ""
+          const derivedFeedback =
+            failureRequested && !input.feedback
+              ? clean(reportFeedback, 500).trim() ||
+                clean(fatalFeedback, 500).trim() ||
+                clean(failureReport?.summary, 500).trim()
+              : ""
           const priorLog: any[] = Array.isArray(current.feedbackLog)
             ? current.feedbackLog
                 .filter((e: any) => e && typeof e === "object")
@@ -10378,19 +11062,57 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                   resolved: e.resolved === true,
                 }))
             : []
-          const feedbackText = input.feedback ? clean(input.feedback, 500) : ""
+          const feedbackText = typeof input.feedback === "string" ? clean(input.feedback, 500).trim() : ""
           if (feedbackText) {
             priorLog.push({ round, at: new Date().toISOString(), text: feedbackText, resolved: false })
+          } else if (derivedFeedback) {
+            priorLog.push({ round, at: new Date().toISOString(), text: derivedFeedback, resolved: false })
           }
           if (status === "verified_pass") {
             for (const e of priorLog) e.resolved = true
           }
           const feedbackLog = priorLog.slice(-20)
 
+          // A5: canonical failure signature. Two consecutive failures with the
+          // same signature are an oscillation: record DEAD_ENDS.md (once per
+          // signature) so the next round changes approach instead of retrying.
+          // A failure with no report/feedback/summary carries no evidence and
+          // clears the counter rather than inventing an identical failure.
+          let failureSignature: string | undefined
+          let failureSignatureCount = 0
+          if (failureRequested) {
+            const sig = failureSignatureOf({
+              report: failureReport,
+              summary: input.summary,
+              feedback: input.feedback,
+            })
+            if (sig.summary || sig.findingsText || sig.feedbackText) {
+              const prevSignature =
+                typeof current.failureSignature === "string" ? current.failureSignature : ""
+              const prevCount = Number(current.failureSignatureCount) || 0
+              failureSignature = sig.signature
+              failureSignatureCount = prevSignature === sig.signature ? prevCount + 1 : 1
+              if (failureSignatureCount >= 2) {
+                writeDeadEndsSafe(run, {
+                  taskId,
+                  round,
+                  signature: sig.signature,
+                  count: failureSignatureCount,
+                  feedback: feedbackText || derivedFeedback,
+                  summary: sig.summary,
+                  findings: sig.findingsText,
+                })
+              }
+            }
+          }
+
           const nextTask: any = {
             ...current,
             status,
             round,
+            ...(failureRequested
+              ? { failureSignature: failureSignature, failureSignatureCount }
+              : {}),
             ...(input.branch ? { branch: clean(input.branch, 120) } : {}),
             ...(input.worktree ? { worktree: clean(input.worktree, 200) } : {}),
             ...(input.summary ? { summary: clean(input.summary, 300) } : {}),
@@ -13363,13 +14085,19 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (!authz.ok) return { content: authz.content }
         const probe = probeLemmaToolchain({ timeoutMs: input?.timeoutMs })
         if (!probe.ready) {
+          // A7: give the operator an actionable PREREQUISITES.md at the repo root.
+          const prereqWritten = writePrerequisitesSafe(root, lemmaPrerequisitesBody(probe))
           return {
-            content: formatMissingToolchainRefusal(probe),
+            content: `${formatMissingToolchainRefusal(probe)}${prereqWritten ? `\nPrerequisites recorded at ${join(root, "PREREQUISITES.md")}.` : ""}`,
             ...probe,
           }
         }
+        const doctor = probe.leap.doctor
+        const doctorText = doctor
+          ? `; leap doctor ${doctor.status}${doctor.output ? ` (${cleanBlock(doctor.output, 200).trim()})` : ""}`
+          : ""
         return {
-          content: `LEMMA toolchain READY: lean (${probe.lean.version}), lake (${probe.lake.version}), ${probe.leap.name} (${probe.leap.version}).`,
+          content: `LEMMA toolchain READY: lean (${probe.lean.version}), lake (${probe.lake.version}), ${probe.leap.name} (${probe.leap.version})${doctorText}.`,
           ...probe,
         }
       },

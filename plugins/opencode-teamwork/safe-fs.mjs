@@ -379,7 +379,7 @@ function boundMap(map, max) {
 }
 
 /** Every identity key that names this run (lexical path, realpath, dev:ino). */
-export function runPolicyKeys(run) {
+function runPolicyKeys(run) {
   const keys = []
   const add = (key) => {
     if (key && !keys.includes(key)) keys.push(key)
@@ -501,11 +501,6 @@ export function setRunRequirePinnedWrites(run, enabled) {
   boundMap(pinnedPolicyCleared, MAX_PINNED_REQUIRED_RUNS)
 }
 
-/** True when this run's writes must be pinned. */
-export function runRequiresPinnedWrites(run) {
-  return resolveRunPolicy(run).required
-}
-
 /**
  * The one refusal used by both the writer and the lock layer, so the message
  * (including the run id) and the machine-readable reason are identical.
@@ -545,7 +540,7 @@ export function assertPinnedWritePolicy(run, options = {}) {
 const MAX_MODE_DIAGNOSTIC_RUNS = 512
 const modeDiagnosticRuns = new Set()
 
-export function noteTraversalModeForRun(run) {
+function noteTraversalModeForRun(run) {
   const mode = currentTraversalMode()
   if (mode === "pinned") return
   let key
@@ -619,7 +614,7 @@ function configDirForAudit(env) {
 }
 
 /** The durable anomaly audit path (overridable for hermetic tests). */
-export function writeAnomalyAuditPath(env = process.env) {
+function writeAnomalyAuditPath(env = process.env) {
   if (anomalyAuditPathOverride) return anomalyAuditPathOverride
   if (env?.[AUDIT_PATH_ENV]) return resolve(String(env[AUDIT_PATH_ENV]))
   return join(configDirForAudit(env), "teamwork", "write-anomalies.jsonl")
@@ -635,7 +630,7 @@ export function setWriteAnomalyAuditPathForTest(path) {
  * When the audit path is overridden for hermetic tests, defaults beside it so
  * tests never touch the operator's real config directory.
  */
-export function writeIncidentDir(env = process.env) {
+function writeIncidentDir(env = process.env) {
   if (incidentDirOverride) return incidentDirOverride
   if (env?.[INCIDENTS_DIR_ENV]) return resolve(String(env[INCIDENTS_DIR_ENV]))
   if (anomalyAuditPathOverride) return join(dirname(anomalyAuditPathOverride), "incidents")
@@ -914,7 +909,11 @@ export function writeAnomaliesForRun(run, options = {}) {
     seen.add(key)
     out.push({ ...record, acknowledged: acknowledgedAt(record) })
   }
-  out.sort((a, b) => String(a.at).localeCompare(String(b.at)))
+  out.sort((a, b) => {
+    const left = String(a.at)
+    const right = String(b.at)
+    return left < right ? -1 : left > right ? 1 : 0
+  })
   return out
 }
 
@@ -1028,7 +1027,7 @@ export function assertSingleSegment(name) {
 }
 
 /** The real path of an open descriptor (Linux /proc/self/fd only). Throws. */
-export function fdPath(fd) {
+function fdPath(fd) {
   return realpathSync(`${PROC_SELF_FD}/${fd}`)
 }
 
@@ -1037,7 +1036,7 @@ export function fdPath(fd) {
  * The run root itself is accepted; " (deleted)" and every non-exact realpath are
  * refused. False when the mode is not "pinned" or the fd cannot be resolved.
  */
-export function fdExactly(real, fd) {
+function fdExactly(real, fd) {
   if (currentTraversalMode() !== "pinned") return false
   let path
   try {
@@ -1077,7 +1076,17 @@ export function openPinnedRoot(run) {
     const code = err?.code
     if (code === "ENOENT") return refused("run-missing", "refused: run directory does not exist")
     if (code === "ELOOP" || code === "EMLINK") return refused("run-symlink", "refused: run directory is a symlink")
-    if (code === "ENOTDIR") return refused("run-not-directory", "refused: run path is not a directory")
+    if (code === "ENOTDIR") {
+      // Linux returns ENOTDIR (not ELOOP) when O_DIRECTORY|O_NOFOLLOW meets a
+      // symlink, so classify from lstat. This only sharpens the diagnostic; the
+      // refusal itself already happened in open(2) above.
+      let isSymlink = false
+      try {
+        isSymlink = lstatSync(run).isSymbolicLink()
+      } catch {}
+      if (isSymlink) return refused("run-symlink", "refused: run directory is a symlink")
+      return refused("run-not-directory", "refused: run path is not a directory")
+    }
     return refused("unreadable", `refused: cannot open run directory (${sanitize(code || err?.message)})`)
   }
   let st
@@ -1114,7 +1123,7 @@ export function openPinnedRoot(run) {
 }
 
 /** Open one child directory relative to a pinned parent (never follows a link). */
-export function openChildDir(parentFd, name) {
+function openChildDir(parentFd, name) {
   assertSingleSegment(name)
   return openSync(
     `${PROC_SELF_FD}/${parentFd}/${name}`,
@@ -1123,7 +1132,7 @@ export function openChildDir(parentFd, name) {
 }
 
 /** Open a child directory, creating exactly that one segment when absent. */
-export function openOrCreateDir(parentFd, name) {
+function openOrCreateDir(parentFd, name) {
   assertSingleSegment(name)
   const path = `${PROC_SELF_FD}/${parentFd}/${name}`
   const flags = fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY || 0) | (fsConstants.O_NOFOLLOW || 0)
@@ -1360,7 +1369,7 @@ export function writeFileAtomicAt(dirFd, name, content, options = {}) {
 }
 
 /** Create `name` once (O_CREAT|O_EXCL|O_NOFOLLOW). `EEXIST` is propagated. */
-export function writeOnceAt(dirFd, name, content, options = {}) {
+function writeOnceAt(dirFd, name, content, options = {}) {
   assertSingleSegment(name)
   const data = toBuffer(content)
   const destPath = `${PROC_SELF_FD}/${dirFd}/${name}`
@@ -1403,7 +1412,7 @@ export function writeOnceAt(dirFd, name, content, options = {}) {
 }
 
 /** Create `name` with `content` only if it does not exist; EEXIST is a no-op. */
-export function touchAt(dirFd, name, content, options = {}) {
+function touchAt(dirFd, name, content, options = {}) {
   try {
     return writeOnceAt(dirFd, name, content, options)
   } catch (err) {
@@ -1418,7 +1427,7 @@ export function touchAt(dirFd, name, content, options = {}) {
  * is built from *that* descriptor (so a sequence number cannot be computed from
  * a different inode), written with one non-positional write, and fsync'ed.
  */
-export function appendLineAt(dirFd, name, buildLineFromFd, options = {}) {
+function appendLineAt(dirFd, name, buildLineFromFd, options = {}) {
   assertSingleSegment(name)
   const destPath = `${PROC_SELF_FD}/${dirFd}/${name}`
   let fd = null
@@ -1460,7 +1469,7 @@ export function appendLineAt(dirFd, name, buildLineFromFd, options = {}) {
 }
 
 /** Unlink `name` inside a pinned directory (cleanup helper). */
-export function unlinkAt(dirFd, name) {
+function unlinkAt(dirFd, name) {
   assertSingleSegment(name)
   try {
     unlinkSync(`${PROC_SELF_FD}/${dirFd}/${name}`)
@@ -2346,6 +2355,9 @@ function resolveExecutableInDir(dir, binName, pathext) {
  */
 export function resolveTrustedExecutable(binName, options = {}) {
   if (typeof binName !== "string" || !TRUSTED_BIN_NAME.test(binName)) return null
+  // "." and ".." match the character class but are directory aliases, never
+  // executable names. Reject them before any join() can traverse a directory.
+  if (binName === "." || binName === "..") return null
   const env = options?.env ?? process.env
   const currentUid = typeof process.getuid === "function" ? process.getuid() : null
   const pathext =
@@ -2370,7 +2382,7 @@ export function resolveTrustedExecutable(binName, options = {}) {
       addDir(entry)
     }
   }
-  if (process.platform !== "win32") {
+  if (process.platform !== "win32" && options?.fallbackToStandard !== false) {
     for (const dir of STANDARD_POSIX_BIN_DIRS) addDir(dir)
   }
 

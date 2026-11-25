@@ -8,7 +8,7 @@
 // buildApprovalRequest -> signApprovalArtifact -> writeApprovalAtomically.
 
 import { createHmac, generateKeyPairSync, randomBytes } from "node:crypto"
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs"
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs"
 import { basename, dirname, join } from "node:path"
 import { pathToFileURL } from "node:url"
 import type { LoadedHost } from "./load"
@@ -75,7 +75,7 @@ export async function readStorageKeyRing(source: LoadedHost | { get: (key: strin
   return value as any
 }
 
-export function isBase64UrlBytes(value: unknown, bytes?: number): boolean {
+function isBase64UrlBytes(value: unknown, bytes?: number): boolean {
   if (typeof value !== "string" || !BASE64URL.test(value)) return false
   const decoded = Buffer.from(value, "base64url")
   return bytes === undefined ? decoded.length > 0 : decoded.length === bytes
@@ -295,15 +295,6 @@ export async function signHmacApproval(
   const path = join(dir, `${runId}.json`)
   writeFileSync(path, `${JSON.stringify(artifact, null, 2)}\n`, { mode: 0o600 })
   return { artifact, path, payload, dir }
-}
-
-export function approvalExists(dir: string, runId: string): boolean {
-  return existsSync(join(dir, `${runId}.json`))
-}
-
-/** Read a run's `_auth`-wrapped artifact (e.g. handoffs/index.json). */
-export function readSignedJson(path: string): any {
-  return JSON.parse(readFileSync(path, "utf8"))
 }
 
 /**

@@ -1,0 +1,41 @@
+{
+  "ignorePatterns": ["docs/re/**"],
+  "entry": [
+    "scripts/approval-driver.mjs",
+    "scripts/test-nfs.mjs",
+    "postinstall.mjs"
+  ],
+  "supportEntry": [
+    "tests/runtime/harness/preload.ts",
+    "tests/runtime/harness/race-child.ts",
+    "scripts/test-agy-parity.mjs"
+  ],
+  "ignoreUnresolvedImports": ["/preload.js"],
+  "ignoreDependencies": ["@opencode/client"],
+  "ignoreExports": [
+    {
+      "file": "lib/approve.mjs",
+      "exports": ["readDraftDigest", "buildApprovalRequest", "writeApprovalAtomically"]
+    },
+    {
+      "file": "plugins/opencode-teamwork/auth.ts",
+      "exports": ["KEY_RING_STORAGE_KEY", "ENV_KEY", "ENV_KEY_ID", "ENV_ED25519_KEY_ID"]
+    },
+    {
+      "file": "plugins/opencode-teamwork/lemma.ts",
+      "exports": ["LEMMA_ID"]
+    },
+    {
+      "file": "plugins/opencode-teamwork/safe-fs.mjs",
+      "exports": ["setRequirePinnedWritesForTest"]
+    },
+    {
+      "file": "plugins/opencode-teamwork/tools.ts",
+      "exports": ["nextEventSeqFromFd"]
+    },
+    {
+      "file": "plugins/opencode-teamwork/url-guard.ts",
+      "exports": ["ALLOW_LOCALHOST_ENV"]
+    }
+  ]
+}

@@ -18,7 +18,7 @@
 //
 // Zero runtime dependencies. Erasable TypeScript only.
 
-export const INSTALLED_TEAM_ROLES = new Set([
+const INSTALLED_TEAM_ROLES = new Set([
   "team/crafter",
   "team/sentinel",
   "team/orchestrator",
@@ -252,7 +252,7 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
  * permits it) or a strict descendant of it. Fails closed when ancestry cannot
  * be resolved.
  */
-export async function requireDescendantSession(
+async function requireDescendantSession(
   ctx: any,
   rootSessionId: string | undefined,
   sessionID: string | undefined,

@@ -9,7 +9,7 @@
 // first import. `load.ts` imports the SDK dynamically for the same reason.
 
 import { execFileSync } from "node:child_process"
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { cpSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -184,8 +184,4 @@ export function cleanupProjects() {
     } catch {}
   }
   roots.clear()
-}
-
-export function projectExists(project: Project, path: string) {
-  return existsSync(join(project.root, path))
 }

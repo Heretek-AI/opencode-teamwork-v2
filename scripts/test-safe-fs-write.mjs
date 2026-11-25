@@ -189,6 +189,20 @@ check("static intermediate symlink: pinned write refuses, outside gains nothing"
   assert.strictEqual(existsSync(join(outside, "report.json")), false)
 })
 
+check("openPinnedRoot classifies a symlinked run directory as run-symlink, not run-not-directory", () => {
+  if (!PINNED) {
+    console.log(`SKIP: pinned writes unavailable (mode=${fdTraversalMode()}) — root symlink reason not asserted`)
+    return
+  }
+  const target = join(testDir, "outside-root")
+  mkdirSync(target, { recursive: true })
+  if (!makeTestLink(target, join(testDir, "run-link"), "dir")) return
+  const root = openPinnedRoot(join(testDir, "run-link"))
+  assert.strictEqual(root.status, "refused")
+  assert.strictEqual(root.reason, "run-symlink")
+  assert.match(root.message, /symlink/)
+})
+
 check("negative control: the old path-based mkdir+write DOES escape through the symlink", () => {
   const { run, outside } = makeFixture()
   if (!makeTestLink(outside, join(run, "verify"), "dir")) return

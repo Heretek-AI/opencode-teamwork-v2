@@ -66,7 +66,7 @@ export interface SafeFetchSuccess {
 
 export type SafeFetchResult = SafeFetchSuccess | UrlGuardFailure
 
-export function localhostOptInEnabled(): boolean {
+function localhostOptInEnabled(): boolean {
   return process.env[ALLOW_LOCALHOST_ENV] === "1"
 }
 

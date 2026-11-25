@@ -14,11 +14,13 @@
 //   - on-disk run artifacts, snapshotTree/treeDiff, real node:http servers, CLI
 
 import { describe, expect, test } from "bun:test"
+import { Effect } from "effect"
 import { spawnSync } from "node:child_process"
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   rmSync,
@@ -38,7 +40,6 @@ import {
   readVictory,
   runDir,
   runFile,
-  sha256,
   snapshotTree,
   treeDiff,
   withHost,
@@ -74,6 +75,7 @@ import {
   withApprovalOwner,
   withEnv,
 } from "../harness/sign"
+import { sha256Hex as keyedSha256Hex } from "../../../plugins/opencode-teamwork/approval-format.mjs"
 import { HANDOFF } from "./helpers"
 
 const EMPTY_DIFF = { added: [], removed: [], changed: [] }
@@ -173,8 +175,22 @@ function runCli(args: string[], envOverrides: Record<string, string | undefined>
   return { code: res.status, stdout: res.stdout, stderr: res.stderr, json }
 }
 
-function threePhaseVictorySummary(verdict: "VICTORY CONFIRMED" | "VICTORY REJECTED"): string {
-  return [
+// The host's Promise plugin adapter implements `context.cancel` as an Effect
+// and exposes it to the tool as `context.signal`. This Effect resolves when the
+// test's AbortController fires, so a real AbortController drives cancellation
+// through the host boundary (the caller-supplied `signal` property itself is
+// replaced by the adapter).
+function cancelWhenAborted(ac: AbortController): Effect.Effect<void> {
+  return Effect.promise(
+    () =>
+      new Promise<void>((resolve) => {
+        if (ac.signal.aborted) resolve()
+        else ac.signal.addEventListener("abort", () => resolve(), { once: true })
+      }),
+  )
+}
+
+function threePhaseVictorySummary(verdict: "VICTORY CONFIRMED" | "VICTORY REJECTED"): string {  return [
     "=== VICTORY AUDIT REPORT ===",
     `VERDICT: ${verdict}`,
     "",
@@ -453,10 +469,6 @@ describe("Tier 1: Feature Coverage [M1, M3, M4]", () => {
         const beforeText = readRunText(fx, "ORIGINAL_REQUEST.md")
         const appendRes = await execute(fx.loaded, fx.root, "plan", {
           sessionId: fx.runId,
-          topology: "iterative-coding",
-          integrityMode: "demo",
-          skipInterview: true,
-          tasks: [{ id: "T1" }],
           followUp: "Also preserve backward compatibility for v1 configs.",
         })
         expect(appendRes.status).not.toBe("ERROR")
@@ -528,6 +540,13 @@ describe("Tier 1: Feature Coverage [M1, M3, M4]", () => {
         tasks: [{ id: "T1", maxRounds: 4 }],
       },
       async (fx) => {
+        // A5: distributed-coding starts with the planning survey stubs. They
+        // are create-only placeholders; TEST_READY.md is the Dual-Track gate
+        // and must be produced by the team, never pre-seeded.
+        for (const stub of ["PROJECT.md", "SCOPE.md", "TEST_INFRA.md"]) {
+          expect(existsSync(runFile(fx.project, fx.runId, stub))).toBe(true)
+        }
+        expect(existsSync(runFile(fx.project, fx.runId, "TEST_READY.md"))).toBe(false)
         await next(fx)
         for (const roundNum of [1, 2]) {
           await transition(fx, "T1", "worker_active")
@@ -618,6 +637,7 @@ describe("Tier 1: Feature Coverage [M1, M3, M4]", () => {
           expect(probe.ready).toBe(true)
           expect(String(probe.content)).toContain("READY")
           expect(JSON.stringify(probe)).toMatch(/doctor/i)
+          expect(existsSync(join(project.root, "PREREQUISITES.md"))).toBe(false)
         })
       } finally {
         rmSync(binDir, { recursive: true, force: true })
@@ -939,55 +959,25 @@ describe("Tier 2: Boundary & Corner Cases [M1, M3, M4]", () => {
       },
       async (fx) => {
         const msg = "Clarification: use strict JSON."
-        const first = await execute(fx.loaded, fx.root, "plan", {
-          sessionId: fx.runId,
-          topology: "iterative-coding",
-          skipInterview: true,
-          tasks: [{ id: "T1" }],
-          followUp: msg,
-        })
+        const first = await execute(fx.loaded, fx.root, "plan", { sessionId: fx.runId, followUp: msg })
         expect(String(first.content)).not.toContain("refused:")
         const afterFirst = readRunText(fx, "ORIGINAL_REQUEST.md")
 
         // Duplicate-last must skip idempotently without duplicating the section.
-        const dup = await execute(fx.loaded, fx.root, "plan", {
-          sessionId: fx.runId,
-          topology: "iterative-coding",
-          skipInterview: true,
-          tasks: [{ id: "T1" }],
-          followUp: msg,
-        })
+        const dup = await execute(fx.loaded, fx.root, "plan", { sessionId: fx.runId, followUp: msg })
         expect(String(dup.content)).not.toContain("refused:")
         expect(readRunText(fx, "ORIGINAL_REQUEST.md")).toBe(afterFirst)
 
         // Empty / oversize refused.
-        const empty = await execute(fx.loaded, fx.root, "plan", {
-          sessionId: fx.runId,
-          topology: "iterative-coding",
-          skipInterview: true,
-          tasks: [{ id: "T1" }],
-          followUp: "   ",
-        })
+        const empty = await execute(fx.loaded, fx.root, "plan", { sessionId: fx.runId, followUp: "   " })
         expect(String(empty.content)).toContain("refused:")
-        const oversize = await execute(fx.loaded, fx.root, "plan", {
-          sessionId: fx.runId,
-          topology: "iterative-coding",
-          skipInterview: true,
-          tasks: [{ id: "T1" }],
-          followUp: "y".repeat(20_001),
-        })
+        const oversize = await execute(fx.loaded, fx.root, "plan", { sessionId: fx.runId, followUp: "y".repeat(20_001) })
         expect(String(oversize.content)).toContain("refused:")
 
         // Unrelated root session refused by authorize.ts.
         const stranger = await fx.loaded.host.sessions.create({ location: { directory: fx.project.root } })
         const strangerSession = { id: stranger.id, agent: "team/sentinel", parentID: null, info: stranger }
-        const denied = await execute(fx.loaded, strangerSession, "plan", {
-          sessionId: fx.runId,
-          topology: "iterative-coding",
-          skipInterview: true,
-          tasks: [{ id: "T1" }],
-          followUp: "Hijack attempt.",
-        })
+        const denied = await execute(fx.loaded, strangerSession, "plan", { sessionId: fx.runId, followUp: "Hijack attempt." })
         expect(String(denied.content)).toContain("AUTHZ_SESSION_TREE")
         expect(readRunText(fx, "ORIGINAL_REQUEST.md")).toBe(afterFirst)
       },
@@ -1008,6 +998,23 @@ describe("Tier 2: Boundary & Corner Cases [M1, M3, M4]", () => {
       },
       async (fx) => {
         expect(readPlan(fx.project, fx.runId)?.tasks?.[0]?.maxRounds).toBe(32)
+        // A4 clamp boundaries: 0 -> 1, 33 -> 32.
+        const zero = await planRun(fx.loaded, fx.root, {
+          sessionId: "20261125-000002-a4b0",
+          topology: "small-focused",
+          request: "Fix typo with zero rounds.",
+          tasks: [{ id: "T1", maxRounds: 0 }],
+        })
+        expect(zero.content.startsWith("Planned ")).toBe(true)
+        expect(readPlan(fx.project, "20261125-000002-a4b0")?.tasks?.[0]?.maxRounds).toBe(1)
+        const over = await planRun(fx.loaded, fx.root, {
+          sessionId: "20261125-000002-a4b33",
+          topology: "small-focused",
+          request: "Fix typo with too many rounds.",
+          tasks: [{ id: "T1", maxRounds: 33 }],
+        })
+        expect(over.content.startsWith("Planned ")).toBe(true)
+        expect(readPlan(fx.project, "20261125-000002-a4b33")?.tasks?.[0]?.maxRounds).toBe(32)
         await next(fx)
         await transition(fx, "T1", "worker_active")
         await transition(fx, "T1", "worker_done")
@@ -1019,6 +1026,9 @@ describe("Tier 2: Boundary & Corner Cases [M1, M3, M4]", () => {
         await transition(fx, "T1", "verified_fail")
         expect(Array.isArray(state(fx).tasks.T1.feedbackLog)).toBe(true)
         expect(state(fx).tasks.T1.feedbackLog.length).toBeGreaterThanOrEqual(1)
+        // Report-derived feedback: no input.feedback was passed to task_update,
+        // so the ledger text comes from the verifier report's feedbackForWorker.
+        expect(state(fx).tasks.T1.feedbackLog.some((e: any) => e.text === "Open issue #1 remains" && e.resolved === false)).toBe(true)
 
         // Complete round 2 to reach victory audits
         await transition(fx, "T1", "worker_active")
@@ -1050,7 +1060,7 @@ describe("Tier 2: Boundary & Corner Cases [M1, M3, M4]", () => {
         verification: "standard",
         request: "Verify non-identical failures do not trigger oscillation guard.",
         requireHandoffs: "skip",
-        tasks: [{ id: "T1", maxRounds: 4 }],
+        tasks: [{ id: "T1", maxRounds: 5 }],
       },
       async (fx) => {
         await next(fx)
@@ -1073,6 +1083,27 @@ describe("Tier 2: Boundary & Corner Cases [M1, M3, M4]", () => {
         })
         await transition(fx, "T1", "verified_fail")
         expect(existsSync(runFile(fx.project, fx.runId, "DEAD_ENDS.md"))).toBe(false)
+
+        // Plant a symlink before two identical failures. The writer must never
+        // follow it and must not replace the link with a regular file.
+        const outside = join(fx.project.root, "outside-dead-ends.md")
+        writeFileSync(outside, "outside untouched", "utf8")
+        const deadEnds = runFile(fx.project, fx.runId, "DEAD_ENDS.md")
+        symlinkSync(outside, deadEnds)
+        for (const roundNum of [3, 4]) {
+          await transition(fx, "T1", "worker_active")
+          await transition(fx, "T1", "worker_done")
+          await transition(fx, "T1", "verifier_active")
+          await verifierReport(fx, "T1", "FAIL", {
+            summary: "Identical symlink failure signature",
+            fatalFindings: [{ where: "src/index.ts:1", why: "Missing export foo", fix: "Export foo" }],
+            feedbackForWorker: "Export foo in src/index.ts",
+          })
+          await transition(fx, "T1", "verified_fail")
+          expect(state(fx).tasks.T1.round).toBe(roundNum)
+        }
+        expect(readFileSync(outside, "utf8")).toBe("outside untouched")
+        expect(lstatSync(deadEnds).isSymbolicLink()).toBe(true)
       },
     )
   })
@@ -1126,6 +1157,10 @@ describe("Tier 2: Boundary & Corner Cases [M1, M3, M4]", () => {
         const staleFinal = await finalVerify(fx)
         expect(staleFinal.status).toBe("FAIL")
         expect(JSON.stringify(staleFinal.reasons).toLowerCase()).toContain("stale")
+        const gateStatus = readRunText(fx, "GATE_STATUS.md")
+        expect(gateStatus).toContain(
+          "- Wave: reviewer (team/verifier) + challenger (team/falsifier) + forensic auditor (team/security-auditor)",
+        )
       },
     )
   })
@@ -1153,6 +1188,7 @@ describe("Tier 2: Boundary & Corner Cases [M1, M3, M4]", () => {
           const prereq = readFileSync(join(project.root, "PREREQUISITES.md"), "utf8")
           expect(prereq).toContain("pypdfium2")
           expect(prereq).toContain("Pillow")
+          expect(prereq).toMatch(/^- Status: MISSING$/m)
         })
       } finally {
         rmSync(stubBin, { recursive: true, force: true })
@@ -1190,11 +1226,15 @@ describe("Tier 2: Boundary & Corner Cases [M1, M3, M4]", () => {
           const missing = await execute(loaded, root, "lemma_probe", {})
           expect(missing.ready).toBe(false)
           expect(String(missing.content)).toMatch(/MISSING|missing/)
+          expect(readFileSync(join(project.root, "PREREQUISITES.md"), "utf8")).toMatch(/^- Status: MISSING$/m)
         })
         await withEnv({ PATH: brokenDoctorBin }, async () => {
           const badDoc = await execute(loaded, root, "lemma_probe", {})
           expect(badDoc.ready).toBe(false)
           expect(String(badDoc.content)).toMatch(/doctor|OUTAGE|MISSING/i)
+          const prereq = readFileSync(join(project.root, "PREREQUISITES.md"), "utf8")
+          expect(prereq).toMatch(/^- Status: OUTAGE$/m)
+          expect(prereq).not.toMatch(/^- Status: MISSING$/m)
         })
       } finally {
         rmSync(emptyBin, { recursive: true, force: true })
@@ -1242,6 +1282,21 @@ describe("Tier 2: Boundary & Corner Cases [M1, M3, M4]", () => {
           ],
         })
         expect(String(unknown.content)).toContain("refused:")
+
+        // A8 residual: the engine does not enforce the 3-phase format; a legacy
+        // (non-3-phase) summary is accepted and stored verbatim. The prompt is
+        // the mandate, not a code check.
+        const legacySummary = "Legacy acceptance note without phase headings."
+        const legacy = await call(fx, fx.victoryAuditor, "victory_audit", {
+          verdict: "VICTORY CONFIRMED",
+          requirements: [
+            { id: "R1", met: true, evidence: "First req observed." },
+            { id: "R2", met: true, evidence: "Second req observed." },
+          ],
+          summary: legacySummary,
+        })
+        expect(String(legacy.content)).toContain("VICTORY AUDIT RECORDED: VICTORY CONFIRMED")
+        expect(readVictory(fx.project, fx.runId)?.summary).toBe(legacySummary)
       },
     )
   })
@@ -1263,7 +1318,21 @@ describe("Tier 2: Boundary & Corner Cases [M1, M3, M4]", () => {
     await withEnv({ OPENCODE_TEAMWORK_DISABLED: "0" }, async () => {
       const loaded = await loadHost(projZero, { mode: "memory" })
       try {
-        expect((await loaded.capture.listCommands()).data).toHaveLength(7)
+        // The host also exposes its own built-in commands, so count only the
+        // seven the plugin registers, by name.
+        const names = (await loaded.capture.listCommands()).data.map((c: any) => String(c.name))
+        for (const expected of [
+          "teamwork",
+          "teamwork-craft",
+          "team-orchestrate",
+          "team-propose",
+          "team-falsify",
+          "team-synthesize",
+          "team-review",
+        ]) {
+          expect(names).toContain(expected)
+        }
+        expect(names.filter((name) => name.startsWith("teamwork") || name.startsWith("team-"))).toHaveLength(7)
         const { list } = await openLocationTools(loaded, projZero.root)
         expect(list.filter((t: any) => String(t.id).startsWith("teamwork_"))).toHaveLength(26)
       } finally {
@@ -1273,26 +1342,47 @@ describe("Tier 2: Boundary & Corner Cases [M1, M3, M4]", () => {
     })
   })
 
-  test("[M3 A9] interrupted.md contract alignment (absent stale ref or valid artifact) and symlink refusal", async () => {
-    await withRun(
-      "a9-interrupted-symlink",
-      {
-        sessionId: "20261125-000002-a9s",
-        request: "Verify interrupted.md alignment and symlink safety.",
+  test("[M3 A9] abort writes interrupted.md and never follows a planted interrupted.md symlink", async () => {
+    await withHost("a9-interrupted-abort", async ({ project, loaded, root }) => {
+      // 1) A planted symlink is refused by writeTextSafe: the outside target is
+      // untouched, the link is not replaced, and the phase stays CANCELLED.
+      const symlinkRunId = "20261125-000002-a9s"
+      const plannedSymlink = await planRun(loaded, root, {
+        sessionId: symlinkRunId,
+        request: "Verify interrupted.md symlink safety.",
         tasks: [{ id: "T1" }],
-      },
-      async (fx) => {
-        const outside = join(fx.project.root, "outside-interrupted.md")
-        writeFileSync(outside, "evil", "utf8")
-        symlinkSync(outside, runFile(fx.project, fx.runId, "interrupted.md"))
-        // Verify runtime strictness: blocked/interrupted run cannot stamp VICTORY CONFIRMED or PASS
-        await next(fx)
-        await transition(fx, "T1", "blocked")
-        expect(state(fx).phase).toBe("PRESENT_PARTIAL")
-        const fv = await finalVerify(fx)
-        expect(fv.status).toBe("FAIL")
-      },
-    )
+      })
+      expect(plannedSymlink.content.startsWith("Planned ")).toBe(true)
+      const outside = join(project.root, "outside-interrupted.md")
+      writeFileSync(outside, "evil", "utf8")
+      const symlinkTarget = runFile(project, symlinkRunId, "interrupted.md")
+      symlinkSync(outside, symlinkTarget)
+      const acSymlink = new AbortController()
+      const symlinkPending = execute(loaded, root, "next", { sessionId: symlinkRunId }, { signal: acSymlink.signal, cancel: cancelWhenAborted(acSymlink) })
+      acSymlink.abort()
+      const cancelledSymlink = await symlinkPending
+      expect(cancelledSymlink.status).toBe("CANCELLED")
+      expect(readFileSync(outside, "utf8")).toBe("evil")
+      expect(lstatSync(symlinkTarget).isSymbolicLink()).toBe(true)
+
+      // 2) A normal abort writes a real interrupted.md with the CANCELLED phase.
+      const abortRunId = "20261125-000002-a9a"
+      const plannedAbort = await planRun(loaded, root, {
+        sessionId: abortRunId,
+        request: "Verify abort-time interrupted.md.",
+        tasks: [{ id: "T1" }],
+      })
+      expect(plannedAbort.content.startsWith("Planned ")).toBe(true)
+      const ac = new AbortController()
+      const pending = execute(loaded, root, "next", { sessionId: abortRunId }, { signal: ac.signal, cancel: cancelWhenAborted(ac) })
+      ac.abort()
+      const cancelled = await pending
+      expect(cancelled.status).toBe("CANCELLED")
+      const interrupted = readFileSync(runFile(project, abortRunId, "interrupted.md"), "utf8")
+      expect(interrupted).toContain("# Interrupted")
+      expect(interrupted).toContain("request aborted via AbortSignal")
+      expect(interrupted).toContain(abortRunId)
+    })
   })
 
   test("[M1/A1-A8 Runtime Boundary] executeViaRuntime enforces strictInput on route/plan/document_triage/victory_audit", async () => {
@@ -1353,7 +1443,9 @@ describe("Tier 3: Cross-Feature Pairwise Interactions [M1, M3, M4]", () => {
         const reqBytes = readRunText(fx, "ORIGINAL_REQUEST.md")
         expect(reqBytes).toContain("## Parameters")
         const manifest = readManifest(fx.project, fx.runId)
-        expect(manifest?.requestHash).toBe(sha256(reqBytes))
+        // The manifest binds the request with the keyed digest (ADR 0015), not
+        // a plain sha256. b-plan.test.ts B4 asserts the same contract.
+        expect(manifest?.requestHash).toBe(keyedSha256Hex(reqBytes))
       },
     )
   })
@@ -1407,12 +1499,13 @@ describe("Tier 3: Cross-Feature Pairwise Interactions [M1, M3, M4]", () => {
         await next(fx)
         await execute(fx.loaded, fx.root, "plan", {
           sessionId: fx.runId,
-          topology: "iterative-coding",
-          skipInterview: true,
-          tasks: [{ id: "T1" }],
           followUp: "Add strict null check.",
         })
         expect(readRunText(fx, "ORIGINAL_REQUEST.md")).toContain("Add strict null check.")
+        // A3 residual: the follow-up must re-bind the signed manifest to the
+        // current whole-file bytes, not leave the pre-append hash in place.
+        const requestBytes = readRunText(fx, "ORIGINAL_REQUEST.md")
+        expect(readManifest(fx.project, fx.runId)?.requestHash).toBe(keyedSha256Hex(requestBytes))
         await taskCycle(fx, "T1")
         await securityAudit(fx, "PASS")
         await victory(fx, { verdict: "VICTORY CONFIRMED" })
@@ -1434,8 +1527,6 @@ describe("Tier 3: Cross-Feature Pairwise Interactions [M1, M3, M4]", () => {
       async (fx) => {
         await execute(fx.loaded, fx.root, "plan", {
           sessionId: fx.runId,
-          topology: "iterative-coding",
-          tasks: [{ id: "T1" }],
           followUp: "Follow-up note.",
         })
         const text = readRunText(fx, "ORIGINAL_REQUEST.md")
@@ -1507,7 +1598,7 @@ describe("Tier 3: Cross-Feature Pairwise Interactions [M1, M3, M4]", () => {
       },
       async (fx) => {
         const res = await next(fx)
-        expect((res.readyForWorker as any[]).map((t) => t.id).sort()).toEqual(["T1", "T2"])
+        expect((res.readyForWorker as any[]).map((t) => String(t.id)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))).toEqual(["T1", "T2"])
         for (const item of res.readyForWorker as any[]) {
           expect(typeof item.fence).toBe("number")
         }
