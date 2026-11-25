@@ -222,6 +222,13 @@ async function writeSignedFixture(root, runId, relPath, payload) {
   return signed
 }
 
+/** Sign an artifact a route writer already produced as plain JSON. */
+async function signExistingFixture(root, runId, relPath) {
+  const file = join(root, ".opencode", "teamwork", runId, relPath)
+  const payload = JSON.parse(readFileSync(file, "utf8"))
+  return writeSignedFixture(root, runId, relPath, payload)
+}
+
 // Compare URLs by parsed origin/path instead of substring containment
 // (CodeQL js/incomplete-url-substring-sanitization).
 function mentionsExactUrl(text, expected) {
@@ -5130,17 +5137,85 @@ try {
       },
       workers: false,
     })
-    const fvPass = await tools.teamwork_final_verify.execute({ sessionId: mdRun, summary: "Verified all segments." })
-    assert.strictEqual(fvPass.status, "PASS", `final_verify must PASS: ${fvPass.content}`)
+    // document-review.ts writes a plain JSON manifest and plain-text reports.
+    // A signed run must fail closed rather than sign PASS from evidence a
+    // run-directory writer could forge.
+    const fvUnsignedDoc = await tools.teamwork_final_verify.execute({ sessionId: mdRun, summary: "Verified all segments." })
+    assert.strictEqual(
+      fvUnsignedDoc.status,
+      "FAIL",
+      `unsigned document-review evidence on a signed run must FAIL final_verify: ${fvUnsignedDoc.content}`,
+    )
+    assert(
+      fvUnsignedDoc.reasons.some(
+        (r) => r.includes("DOCUMENT_REVIEW_EVIDENCE_UNSIGNED") && r.includes("document-review/manifest.json"),
+      ),
+      `final_verify must name the unsigned manifest: ${JSON.stringify(fvUnsignedDoc.reasons)}`,
+    )
+    assert(
+      fvUnsignedDoc.reasons.some((r) => r.includes("DOCUMENT_REVIEW_EVIDENCE_UNSIGNED") && r.includes("unit-report.md")),
+      `final_verify must name the unsigned unit reports: ${JSON.stringify(fvUnsignedDoc.reasons)}`,
+    )
+    assert(
+      fvUnsignedDoc.reasons.some(
+        (r) => r.includes("DOCUMENT_REVIEW_EVIDENCE_UNSIGNED") && r.includes("DOCUMENT_REVIEW_REPORT.md"),
+      ),
+      `final_verify must name the unsigned final report: ${JSON.stringify(fvUnsignedDoc.reasons)}`,
+    )
+
+    // Signing only the manifest does not authenticate the plain-text reports
+    // it points at, so the gate still refuses this evidence.
+    await signExistingFixture(docRoot, mdRun, "document-review/manifest.json")
+    const fvSignedManifestOnly = await tools.teamwork_final_verify.execute({ sessionId: mdRun })
+    assert.strictEqual(fvSignedManifestOnly.status, "FAIL", "a signed manifest alone must not authenticate unit reports")
+    assert(
+      fvSignedManifestOnly.reasons.some(
+        (r) => r.includes("DOCUMENT_REVIEW_EVIDENCE_UNSIGNED") && r.includes("unit-report.md"),
+      ),
+      `final_verify must still name the unsigned unit reports: ${JSON.stringify(fvSignedManifestOnly.reasons)}`,
+    )
+    assert(
+      !fvSignedManifestOnly.reasons.some(
+        (r) => r.includes("DOCUMENT_REVIEW_EVIDENCE_UNSIGNED") && r.includes("document-review/manifest.json"),
+      ),
+      "the signed manifest itself must not be reported unsigned again",
+    )
+
+    // An edit after signing is forged evidence, not merely unsigned.
+    {
+      const docManifestFile = join(mdRunDir, "document-review", "manifest.json")
+      const signedDocManifest = readFileSync(docManifestFile, "utf8")
+      const forgedDocManifest = JSON.parse(signedDocManifest)
+      forgedDocManifest.sourceLabel = "edited after signing"
+      writeFileSync(docManifestFile, JSON.stringify(forgedDocManifest, null, 2) + "\n")
+      const fvForgedDoc = await tools.teamwork_final_verify.execute({ sessionId: mdRun })
+      assert.strictEqual(fvForgedDoc.status, "FAIL", "an edited signed document-review manifest must FAIL final_verify")
+      assert(
+        fvForgedDoc.reasons.some(
+          (r) => r.includes("DOCUMENT_REVIEW_EVIDENCE_UNSIGNED") && r.includes("document-review/manifest.json"),
+        ),
+        `final_verify must name the forged document-review manifest: ${JSON.stringify(fvForgedDoc.reasons)}`,
+      )
+      writeFileSync(docManifestFile, signedDocManifest)
+    }
+    const fvRestoredDoc = await tools.teamwork_final_verify.execute({ sessionId: mdRun })
+    assert.strictEqual(fvRestoredDoc.status, "FAIL", "the plain-text reports remain unauthenticated after the restore")
+
+    // A signed run that cannot authenticate its evidence must never complete.
     const finalJson = JSON.parse(readFileSync(join(mdRunDir, "verify", "final.json"), "utf8"))
-    assert.deepStrictEqual(finalJson.evidence.documentReview, {
-      checked: true,
-      segmentReportsComplete: true,
-      finalReportPresent: true,
-    })
+    assert.strictEqual(finalJson.status, "FAIL", "verify/final.json must be stamped FAIL")
+    assert.deepStrictEqual(
+      finalJson.evidence.documentReview,
+      { checked: true, segmentReportsComplete: true, finalReportPresent: true },
+      "the evidence summary still records completeness; authenticity is the failing gate",
+    )
     nextMd = await tools.teamwork_next.execute({ sessionId: mdRun })
-    assert.strictEqual(nextMd.status, "ALL_PASSED")
-    console.log("✓ 9.1 Positive Markdown E2E passed")
+    assert.strictEqual(
+      nextMd.status,
+      "BLOCKED_BY_FINAL_VERIFICATION",
+      `unsigned document-review evidence must block completion: ${nextMd.content}`,
+    )
+    console.log("✓ 9.1 Positive Markdown E2E exercises document-review evidence; signed final_verify fails closed on unsigned evidence")
 
     // --- 9.2: Positive PDF ingestion + validation ---
     const buildPdf = (streams) => {
@@ -6217,12 +6292,50 @@ try {
       // The tournament has its own victory audit; the independent final
       // acceptance audit is separate and still required for completion.
       await stampVictoryFor(tools9, ctx9, testDir9, sid)
+
+      // tournament.ts writes plain JSON. On a signed run final_verify must
+      // refuse to sign PASS until that exact evidence carries verified _auth.
+      const fvUnsignedTournament = await tools9.teamwork_final_verify.execute({ sessionId: sid })
+      assert.strictEqual(
+        fvUnsignedTournament.status,
+        "FAIL",
+        `unsigned tournament evidence on a signed run must FAIL final_verify: ${fvUnsignedTournament.content}`,
+      )
+      for (const relPath of ["tournament/manifest.json", "tournament/verdict.json"]) {
+        assert(
+          fvUnsignedTournament.reasons.some((r) => r.includes("TOURNAMENT_EVIDENCE_UNSIGNED") && r.includes(relPath)),
+          `final_verify must name ${relPath}: ${JSON.stringify(fvUnsignedTournament.reasons)}`,
+        )
+      }
+
+      await signExistingFixture(testDir9, sid, "tournament/manifest.json")
+      await signExistingFixture(testDir9, sid, "tournament/verdict.json")
       const fvDone = await tools9.teamwork_final_verify.execute({ sessionId: sid })
       assert.strictEqual(fvDone.status, "PASS")
       const finalObj = JSON.parse(readFileSync(join(runPath, "verify", "final.json"), "utf8"))
       assert.strictEqual(finalObj.evidence.tournament.phase, "COMPLETED")
       assert.strictEqual(finalObj.evidence.tournament.winnerId, "merge-ab")
       assert.strictEqual(finalObj.evidence.tournament.refereeAgent, "team/referee")
+
+      // An edit after signing is forged evidence, not merely unsigned.
+      {
+        const verdictFile = join(runPath, "tournament", "verdict.json")
+        const signedVerdict = readFileSync(verdictFile, "utf8")
+        const forgedVerdict = JSON.parse(signedVerdict)
+        forgedVerdict.summary = "edited after signing"
+        writeFileSync(verdictFile, JSON.stringify(forgedVerdict, null, 2) + "\n")
+        const fvForgedTournament = await tools9.teamwork_final_verify.execute({ sessionId: sid })
+        assert.strictEqual(fvForgedTournament.status, "FAIL", "an edited signed tournament verdict must FAIL final_verify")
+        assert(
+          fvForgedTournament.reasons.some(
+            (r) => r.includes("TOURNAMENT_EVIDENCE_UNSIGNED") && r.includes("tournament/verdict.json"),
+          ),
+          `final_verify must name the forged tournament verdict: ${JSON.stringify(fvForgedTournament.reasons)}`,
+        )
+        writeFileSync(verdictFile, signedVerdict)
+        const fvRestoredTournament = await tools9.teamwork_final_verify.execute({ sessionId: sid })
+        assert.strictEqual(fvRestoredTournament.status, "PASS", "restored signed tournament evidence must PASS")
+      }
 
       const nextDone = await tools9.teamwork_next.execute({ sessionId: sid })
       assert.strictEqual(nextDone.status, "ALL_PASSED", `tournament completion must reach ALL_PASSED: ${nextDone.content}`)
@@ -7462,7 +7575,7 @@ if (args.includes("doctor")) {
 
       // (e) Tampering verify-4.json to executed: false -> final_verify FAIL
       const verify4File = join(rootV, ".opencode", "teamwork", RUN, "lemma", "nodes", "root", "verify-4.json")
-      const savedVerify4 = readFileSync(verify4File, "utf8")
+      let savedVerify4 = readFileSync(verify4File, "utf8")
       const tampered = JSON.parse(savedVerify4)
       tampered.executed = false
       writeFileSync(verify4File, JSON.stringify(tampered, null, 2) + "\n")
@@ -7475,21 +7588,66 @@ if (args.includes("doctor")) {
 
       // V3.15: manifest.phase === "BLOCKED" must FAIL final_verify even when nodes & verify reports look clean
       const manifestFile = join(rootV, ".opencode", "teamwork", RUN, "lemma", "manifest.json")
-      const savedManifest = readFileSync(manifestFile, "utf8")
+      let savedManifest = readFileSync(manifestFile, "utf8")
       const blockedManifest = JSON.parse(savedManifest)
       blockedManifest.phase = "BLOCKED"
       writeFileSync(manifestFile, JSON.stringify(blockedManifest, null, 2) + "\n")
       const fvBlocked = await tools.teamwork_final_verify.execute({ sessionId: RUN })
       assert.strictEqual(fvBlocked.status, "FAIL", "manifest.phase=BLOCKED must FAIL final_verify")
 
-      // Restore valid manifest -> final_verify PASS with evidence.lemma
+      // Restore valid LEMMA evidence. The route writer emitted plain JSON, so a
+      // signed run must fail closed instead of stamping PASS from it.
       writeFileSync(manifestFile, savedManifest)
       writeFileSync(verify4File, savedVerify4)
+      const fvUnsignedLemma = await tools.teamwork_final_verify.execute({ sessionId: RUN })
+      assert.strictEqual(
+        fvUnsignedLemma.status,
+        "FAIL",
+        `unsigned LEMMA evidence on a signed run must FAIL final_verify: ${fvUnsignedLemma.content}`,
+      )
+      for (const relPath of [
+        "lemma/manifest.json",
+        "lemma/formalization-review.json",
+        "lemma/nodes/root/verify-4.json",
+      ]) {
+        assert(
+          fvUnsignedLemma.reasons.some((r) => r.includes("LEMMA_EVIDENCE_UNSIGNED") && r.includes(relPath)),
+          `final_verify must name ${relPath}: ${JSON.stringify(fvUnsignedLemma.reasons)}`,
+        )
+      }
+
+      // Sign the exact evidence final_verify reads, then the same evidence can PASS.
+      for (const relPath of ["lemma/manifest.json", "lemma/formalization-review.json", "lemma/nodes/root/verify-4.json"]) {
+        await signExistingFixture(rootV, RUN, relPath)
+      }
+      savedManifest = readFileSync(manifestFile, "utf8")
+      savedVerify4 = readFileSync(verify4File, "utf8")
       const fvOk = await tools.teamwork_final_verify.execute({ sessionId: RUN })
       assert.strictEqual(fvOk.status, "PASS", `valid LEMMA run must PASS final_verify: ${fvOk.content}`)
       const finalJson = JSON.parse(readFileSync(join(rootV, ".opencode", "teamwork", RUN, "verify", "final.json"), "utf8"))
       assert(finalJson.evidence?.lemma?.active === true, "verify/final.json must stamp evidence.lemma")
       assert.strictEqual(finalJson.evidence.lemma.finalVerdict, "FAITHFUL")
+
+      // An edit after signing is forged evidence, not merely unsigned: the
+      // signature check must name the route evidence failure.
+      {
+        const reviewFile = join(rootV, ".opencode", "teamwork", RUN, "lemma", "formalization-review.json")
+        const signedReview = readFileSync(reviewFile, "utf8")
+        const forgedReview = JSON.parse(signedReview)
+        forgedReview.preSearch.notes = "edited after signing"
+        writeFileSync(reviewFile, JSON.stringify(forgedReview, null, 2) + "\n")
+        const fvForgedLemma = await tools.teamwork_final_verify.execute({ sessionId: RUN })
+        assert.strictEqual(fvForgedLemma.status, "FAIL", "an edited signed formalization review must FAIL final_verify")
+        assert(
+          fvForgedLemma.reasons.some(
+            (r) => r.includes("LEMMA_EVIDENCE_UNSIGNED") && r.includes("lemma/formalization-review.json"),
+          ),
+          `final_verify must name the forged formalization review: ${JSON.stringify(fvForgedLemma.reasons)}`,
+        )
+        writeFileSync(reviewFile, signedReview)
+        const fvRestoredReview = await tools.teamwork_final_verify.execute({ sessionId: RUN })
+        assert.strictEqual(fvRestoredReview.status, "PASS", "restored signed formalization review must PASS")
+      }
 
       // S6: final evidence must re-check stamped metadata against current nodes.
       const metaManifest = JSON.parse(savedManifest)
@@ -7979,6 +8137,9 @@ if (args.includes("doctor")) {
       assert.strictEqual(policyPassUpdate.status, "verified_pass", `policy fixture verified_pass must accept the signed report: ${policyPassUpdate.content}`)
       await tools.teamwork_security_audit.execute({ sessionId: RUN_FINAL, status: "PASS", findings: [] })
       await tools.teamwork_lemma_formalize.execute({ sessionId: RUN_FINAL, action: "review_final", verdict: "FAITHFUL", notes: "matches" })
+      for (const relPath of ["lemma/manifest.json", "lemma/formalization-review.json", "lemma/nodes/root/verify-1.json"]) {
+        await signExistingFixture(rootP, RUN_FINAL, relPath)
+      }
       const fvPolicyOk = await tools.teamwork_final_verify.execute({ sessionId: RUN_FINAL })
       assert.strictEqual(fvPolicyOk.status, "PASS", `approved policy run must PASS final_verify: ${fvPolicyOk.content}`)
 
