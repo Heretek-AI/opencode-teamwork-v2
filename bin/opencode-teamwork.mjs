@@ -92,12 +92,15 @@ Options:
       --hmac-key <k>     HMAC-SHA256 secret (base64url, 32 bytes) for verify
       --hmac-key-id <id> Expected HMAC key id
       --repo <path>      Repository for optional branch head/diff checks, and the clean checkout for --rerun
-      --rerun            Re-execute verify/rerun.json commands in a disposable worktree (exit 2 = unverifiable)
+      --rerun            Re-execute verify/rerun.json commands in a disposable worktree
+                         (requires an authenticated manifest, rerun record and reports;
+                         exit 2 = unverifiable)
       --timeout <s>      Cap each re-executed command's recorded timeout
       --require-git      Fail as UNKNOWN when git/branch data is unavailable
       --require-index <snapshot>
                          Detect a whole-run rollback against a file snapshot
-      --allow-unsigned   Analyse an unsigned legacy run (never upgrades to PASS)
+      --allow-unsigned   Analyse a legacy run that has no run.manifest.json
+                         (never upgrades to PASS; cannot be combined with --rerun)
       --fail-on-warning  Promote a warning to a failing exit code
       --witness-public-key <k>  Optional Ed25519 witness key for a receipt
       --witness-key-id <id>     Expected witness key id

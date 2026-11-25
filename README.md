@@ -450,12 +450,21 @@ an untruncated output digest and a `headSha`; the engine writes a signed
 `provenance: claimed` and returns `UNKNOWN` (exit 2) — never `PASS`.
 `--rerun` creates a detached worktree at the report's commit, runs the argv with
 no shell and a minimal environment, enforces the recorded timeout, and compares
-the exit code and stdout+stderr digest. A changed digest is
+the exit code and stdout+stderr digest. Before any worktree is created it
+requires the manifest, `verify/rerun.json` and every report the record names to
+authenticate, and the rerun record to match the report projection; otherwise it
+emits `RERUN_UNTRUSTED` and executes nothing. A changed digest is
 `output-digest-mismatch`, a non-zero exit is `command-failed`, a missing binary
 is exit 2 `command-unavailable`, a timeout is `command-timeout`, and a shell line
 or escaping `cwd` is `command-refused`. The source checkout is hashed before and
 after; the worktree is removed unless `--keep-worktree`. `declared` runs keep the
 0.15 behaviour.
+
+A manifest `trustLevel` of `human-approved` or `ci-attested` is reported as
+`trust:approval` / `AUTH_APPROVAL_UNVERIFIED` (`UNKNOWN`), because offline
+verification has no approval enforcement. `requireWitness` without a usable
+receipt is `trust:witness` / `AUTH_WITNESS_UNVERIFIED` (`UNKNOWN`). The JSON
+`trust` object carries `runTrustLevel`, `approval.status` and `witness.status`.
 
 Since 0.18.0 a plan can set `attestationPolicy: "optional" | "required"`. A CI
 job runs `.github/workflows/attest.yml` (or `scripts/attest-sign.mjs`) under a
@@ -479,8 +488,9 @@ verdict's report/audit/requirements digests. It also names the four
 Exit codes: `0` verified, `1` fail, `2` unverifiable (no key, unsigned legacy,
 HMAC without a secret, required git/index unavailable), `3` usage.
 `--fail-on-warning` promotes a warning to exit 1, and `--allow-unsigned`
-analyses a legacy run without ever upgrading it to `PASS`. `--json` is the
-stable machine report; the human table is rendered from it.
+analyses a legacy run that has no `run.manifest.json` without ever upgrading it
+to `PASS`; it is refused with `--rerun`. `--json` is the stable machine report;
+the human table is rendered from it.
 
 **Honest limit.** A verifier holding only the public key and a read-only copy can
 recompute every byte digest, citation, branch binding and cross-artifact

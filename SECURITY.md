@@ -335,7 +335,10 @@ signer's policy is outside the plugin.
   `requiredProvenance: "command"` (0.16.0) a `PASS` must now survive
   `opencode-teamwork verify --rerun --repo <clean-checkout>`: the signed
   `verify/rerun.json` commands are re-executed at the report's commit in a
-  disposable worktree and their exit code and output digest must match. The
+  disposable worktree and their exit code and output digest must match. Before
+  creating that worktree, `verify` requires the signed manifest,
+  `verify/rerun.json` and every report the record names to authenticate; an
+  untrusted record is `RERUN_UNTRUSTED` and nothing is executed. The
   engine itself never runs the command (`teamwork_report` records the
   observation; `final_verify` only checks the record shape), so a compromised
   verifier can still author a consistent claim that the deployed environment

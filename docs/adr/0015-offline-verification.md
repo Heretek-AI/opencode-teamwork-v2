@@ -112,9 +112,20 @@ signed false observation still passes (see §4).
 
 A failed signature is `FAIL`, not `UNKNOWN`: a key was supplied and it did not
 verify the bytes. `UNKNOWN` is never promoted to `PASS`. `--allow-unsigned`
-permits relation analysis of an unsigned legacy run but the verdict stays
-`UNKNOWN`, because the missing signatures are exactly what the tool was asked to
-establish.
+permits relation analysis of a legacy run with no `run.manifest.json`, but the
+verdict stays `UNKNOWN`, because the missing signatures are exactly what the tool
+was asked to establish. When a manifest is present, signed or not,
+`--allow-unsigned` has no effect: a missing artifact envelope is `FAIL`, as is a
+missing handoff-index envelope on a run whose manifest requires signed handoffs.
+It cannot be combined with `--rerun`.
+
+`run.manifest.json` also carries a `trustLevel`. Offline `verify` has no
+approval enforcement, so `human-approved` and `ci-attested` emit
+`trust:approval` / `AUTH_APPROVAL_UNVERIFIED` (`UNKNOWN`), never `PASS`. A
+manifest with `requireWitness: true` and no usable witness receipt emits
+`trust:witness` / `AUTH_WITNESS_UNVERIFIED` (`UNKNOWN`). The `trust` object
+reports `runTrustLevel`, `approval.status` and `witness.status` so a consumer
+can distinguish "not required" from "not verified".
 
 ### 2.5 Stable JSON
 
@@ -126,7 +137,14 @@ establish.
   "toolVersion": "0.15.0",
   "runId": "20261124-120000-abcd",
   "runPath": "/abs/path/.opencode/teamwork/20261124-120000-abcd",
-  "trust": { "alg": "ed25519", "keyId": "ed_...", "source": "public-key" },
+  "trust": {
+    "alg": "ed25519",
+    "keyId": "ed_...",
+    "source": "public-key",
+    "runTrustLevel": "external-signer",
+    "approval": { "status": "NOT_REQUIRED" },
+    "witness": { "status": "NOT_REQUIRED" }
+  },
   "verdict": "PASS|FAIL|UNKNOWN",
   "counts": { "pass": 0, "warn": 0, "fail": 0, "skip": 0, "unknown": 0, "total": 0 },
   "checks": [

@@ -2573,7 +2573,12 @@ opencode-teamwork verify --run-dir <path> --public-key ... \
 The manifest is the trust anchor. Its `_auth` is verified first; `runNonce`,
 `runKeyId` and the algorithm are read from the signed payload (not from
 storage), then every artifact is pinned to those values. A copied envelope
-fails on path, nonce, key id or digest.
+fails on path, nonce, key id or digest. A manifest `trustLevel` of
+`human-approved` or `ci-attested` is `trust:approval` /
+`AUTH_APPROVAL_UNVERIFIED` (`UNKNOWN`) because offline verification has no
+approval enforcement; `requireWitness` without a usable receipt is
+`trust:witness` / `AUTH_WITNESS_UNVERIFIED` (`UNKNOWN`). The JSON `trust` object
+carries `runTrustLevel`, `approval.status` and `witness.status`.
 
 ### What the verifier recomputes
 
@@ -2599,6 +2604,11 @@ mixed.
 ### Re-execution (`--rerun`, 0.16.0)
 
 `--rerun` needs `--repo <clean-checkout>` and a recorded `verify/rerun.json`.
+Before any worktree is created or command spawned it requires the signed
+manifest, `verify/rerun.json` and every report the record names to authenticate,
+and the rerun record to match the report projection. A failure is
+`rerun:trust` / `RERUN_UNTRUSTED` (or the underlying `AUTH_*`), and nothing is
+executed. `--allow-unsigned` cannot be combined with `--rerun`.
 For each check it creates a detached worktree at the report's `headSha`, runs
 the recorded argv with `spawnSync` (no shell, a minimal environment, `cwd`
 inside the worktree), enforces `timeoutMs` (capped by `--timeout <s>`), and
@@ -2626,8 +2636,12 @@ claim as `provenance: claimed` and returns `UNKNOWN`, never `PASS`. Under
 `0` verified (`PASS`), `1` fail (`FAIL`), `2` unverifiable (`UNKNOWN`), `3`
 usage. `--fail-on-warning` promotes a warning to exit 1. `--json` prints the
 stable object described in ADR 0015; the human table is rendered from it.
-`--allow-unsigned` analyses an unsigned legacy run but the verdict stays
-`UNKNOWN`: a missing signature is exactly what the verifier cannot supply.
+`--allow-unsigned` analyses a legacy run with no `run.manifest.json` but the
+verdict stays `UNKNOWN`: a missing signature is exactly what the verifier cannot
+supply. When a manifest is present, signed or not, `--allow-unsigned` has no
+effect: a missing artifact envelope is `FAIL`, as is a missing handoff-index
+envelope on a run whose manifest requires signed handoffs. It cannot be combined
+with `--rerun`.
 
 Since 0.18.0 `--json` also carries `attestation: {status, commitSha, keyId,
 issuer}` and `attested: boolean`. Without `--attestation-public-key` a present
