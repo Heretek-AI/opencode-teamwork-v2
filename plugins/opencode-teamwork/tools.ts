@@ -4052,6 +4052,9 @@ function pdfPrerequisitesBody(status: "MISSING" | "OUTAGE", detail: string): str
 /** LEMMA / Lean 4 toolchain prerequisites (A7). */
 function lemmaPrerequisitesBody(probe: LemmaProbeResult): string {
   const doctor = probe.leap.doctor
+  const doctorLine = doctor
+    ? `leap doctor: ${doctor.status}${doctor.failedChecks?.length ? ` [failed: ${doctor.failedChecks.slice(0, 8).join(", ")}]` : ""}${doctor.warning ? ` — warning: ${clean(doctor.warning, 240)}` : ""}${doctor.error ? ` (${clean(doctor.error, 180)})` : ""}${doctor.output ? ` — ${cleanBlock(doctor.output, 400).trim().replace(/\s+/g, " ")}` : ""}`
+    : ""
   return prerequisitesBody(
     probe.status,
     "LEMMA route requires Lean 4 (`lean`, `lake`) and a healthy LEAP CLI (`leap` or legacy `leap-tools`)",
@@ -4059,7 +4062,7 @@ function lemmaPrerequisitesBody(probe: LemmaProbeResult): string {
       `lean: ${probe.lean.available ? "READY" : `${probe.lean.status}${probe.lean.error ? ` (${probe.lean.error})` : ""}`}`,
       `lake: ${probe.lake.available ? "READY" : `${probe.lake.status}${probe.lake.error ? ` (${probe.lake.error})` : ""}`}`,
       `${LEAP_REQUIREMENT}: ${probe.leap.available ? "READY" : `${probe.leap.status}${probe.leap.error ? ` (${probe.leap.error})` : ""}`}`,
-      ...(doctor ? [`leap doctor: ${doctor.status}${doctor.error ? ` (${doctor.error})` : ""}`] : []),
+      ...(doctor ? [doctorLine] : []),
     ],
     probe.installInstructions.split("\n"),
     `probe status: ${probe.status}; missing/unusable: ${probe.missing.join(", ")}`,
@@ -14072,7 +14075,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       name: "lemma_probe",
       options: { namespace: "teamwork", codemode: false },
       description:
-        "Read-only probe for the external LEMMA toolchain (`lean`, `lake`, and the LEAP CLI `leap`, or legacy `leap-tools`) on PATH. Never touches disk and never installs packages.",
+        "Read-only probe for the external LEMMA toolchain (`lean`, `lake`, and the LEAP CLI `leap`, or legacy `leap-tools`) on PATH. Runs `leap doctor --offline`; a `LEAN_PROJECT_DIR`-only failure is a WARN (core Lean + LEAP CLI usable, Mathlib optional). Never touches disk and never installs packages.",
       input: strictInput({
         type: "object",
         properties: {
@@ -14094,7 +14097,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         }
         const doctor = probe.leap.doctor
         const doctorText = doctor
-          ? `; leap doctor ${doctor.status}${doctor.output ? ` (${cleanBlock(doctor.output, 200).trim()})` : ""}`
+          ? `; leap doctor ${doctor.status}${doctor.failedChecks?.length ? ` [failed: ${doctor.failedChecks.slice(0, 8).join(", ")}]` : ""}${doctor.warning ? ` — ${clean(doctor.warning, 240)}` : ""}${doctor.output ? ` (${cleanBlock(doctor.output, 240).trim().replace(/\s+/g, " ")})` : ""}`
           : ""
         return {
           content: `LEMMA toolchain READY: lean (${probe.lean.version}), lake (${probe.lake.version}), ${probe.leap.name} (${probe.leap.version})${doctorText}.`,

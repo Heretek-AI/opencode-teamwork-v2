@@ -60,15 +60,28 @@ export interface LemmaPolicy {
 }
 
 export type ProbeStatus = "READY" | "MISSING" | "OUTAGE"
+/**
+ * `leap doctor --offline` verdict. `WARN` means the only failed check was
+ * `LEAN_PROJECT_DIR`: the host has core Lean and a usable LEAP CLI but no local
+ * Lake project, which LEMMA does not require (Mathlib and `leap lean` are
+ * optional). Every other non-zero exit stays `OUTAGE`.
+ */
+export type LeapDoctorStatus = ProbeStatus | "WARN"
 export type LemmaBinaryName = "lean" | "lake" | "leap" | "leap-tools"
 /** The real LEAP requirement: the `leap` console script, with the legacy `leap-tools` alias. */
 export const LEAP_REQUIREMENT = "leap (LEAP CLI) or legacy leap-tools"
 export type LemmaRequirement = "lean" | "lake" | typeof LEAP_REQUIREMENT
+/** The only `leap doctor` check whose failure is advisory for LEMMA. */
+export const LEAP_DOCTOR_PROJECT_CHECK = "LEAN_PROJECT_DIR"
 
 export interface LeapDoctorResult {
-  status: ProbeStatus
+  status: LeapDoctorStatus
   output: string
   error?: string
+  /** Bounded, de-duplicated check names that printed a `[FAIL]` line. */
+  failedChecks?: string[]
+  /** `WARN` only: why the doctor verdict is advisory rather than blocking. */
+  warning?: string
 }
 
 export interface BinaryProbeResult {
@@ -397,8 +410,12 @@ function runLeapDoctor(
   env: NodeJS.ProcessEnv,
   timeoutMs: number,
 ): LeapDoctorResult {
+  // `--offline` keeps the doctor check local: the full check probes/updates
+  // Mathlib state over the network, which LEMMA does not require (Mathlib and
+  // `leap lean` are optional). `--offline` still exits non-zero when no local
+  // Lean project exists, so the FAIL set below decides WARN vs OUTAGE.
   try {
-    const out = execFileSync(resolved, ["doctor"], {
+    const out = execFileSync(resolved, ["doctor", "--offline"], {
       env,
       timeout: timeoutMs,
       maxBuffer: 256 * 1024,
@@ -409,14 +426,58 @@ function runLeapDoctor(
   } catch (err: any) {
     const stderr = String(err?.stderr ?? "")
     const stdout = String(err?.stdout ?? "")
+    const combined = [stdout, stderr].filter(Boolean).join("\n")
+    const failedChecks = parseLeapDoctorFailures(combined)
+    const output = cleanBlock(combined, 2000).trim()
     const detail =
       firstNonEmptyLine(stderr) || firstNonEmptyLine(stdout) || err?.code || err?.message || "leap doctor failed"
+    // WARN requires a real non-zero exit: a timeout, spawn failure (ENOENT), or
+    // output overflow is never downgraded, even when partial output mentions
+    // LEAN_PROJECT_DIR.
+    const doctorExit = typeof err?.status === "number" ? err.status : null
+    if (
+      doctorExit !== null &&
+      doctorExit !== 0 &&
+      failedChecks.length > 0 &&
+      failedChecks.every((c) => c === LEAP_DOCTOR_PROJECT_CHECK)
+    ) {
+      return {
+        status: "WARN",
+        output,
+        failedChecks,
+        warning:
+          "only LEAN_PROJECT_DIR failed: no local Lean project; core Lean and the LEAP CLI are usable and Mathlib/`leap lean` is optional",
+      }
+    }
     return {
       status: "OUTAGE",
-      output: cleanBlock(stdout || stderr, 2000).trim(),
+      output,
+      failedChecks,
       error: err?.code === "ETIMEDOUT" ? `leap doctor timed out after ${timeoutMs}ms` : clean(detail, 180),
     }
   }
+}
+
+/**
+ * Parse the check names from `[FAIL] <check>` lines in stdout/stderr. The
+ * verdict only needs the set, but bounding the names keeps the probe result
+ * small even when a hostile binary floods the pipe.
+ */
+function parseLeapDoctorFailures(text: string): string[] {
+  const failures = new Set<string>()
+  const plain = text.replace(/\x1b\[[0-9;]*m/g, "")
+  const re = /^\[FAIL\]\s+(\S+)/gm
+  let match: RegExpExecArray | null
+  while ((match = re.exec(plain)) !== null) {
+    if (failures.size >= 64) {
+      // Overflow is treated as "not project-only" so the verdict fails closed.
+      failures.add("…")
+      break
+    }
+    const name = clean(match[1], 64)
+    if (name) failures.add(name)
+  }
+  return [...failures].sort()
 }
 
 function probeLeapCli(env: NodeJS.ProcessEnv, timeoutMs: number): BinaryProbeResult {
@@ -439,11 +500,12 @@ function probeLeapCli(env: NodeJS.ProcessEnv, timeoutMs: number): BinaryProbeRes
       doctor: { status: "OUTAGE", output: "", error: "leap doctor not run: the CLI probe failed" },
     }
   }
-  // A5/A7: `leap --help` only proves the console script starts. `leap doctor`
-  // is the CLI's own environment check (toolchain, cache, Mathlib state), so a
-  // failing doctor makes the CLI unusable for LEMMA even though `--help` works.
+  // A5/A7: `leap --help` only proves the console script starts. `leap doctor
+  // --offline` is the CLI's own local environment check (toolchain, cache,
+  // project state), so a failing doctor blocks the CLI for LEMMA unless the only
+  // failed check is `LEAN_PROJECT_DIR` (no Lake project; Mathlib is optional).
   const doctor = runLeapDoctor(chosen.path, env, timeoutMs)
-  if (doctor.status !== "READY") {
+  if (doctor.status === "OUTAGE") {
     return {
       ...chosen,
       available: false,
@@ -452,6 +514,7 @@ function probeLeapCli(env: NodeJS.ProcessEnv, timeoutMs: number): BinaryProbeRes
       doctor,
     }
   }
+  // READY or WARN: the binary is usable and neither flips `available` to false.
   return { ...chosen, doctor }
 }
 
@@ -468,6 +531,8 @@ export function probeLemmaToolchain(options?: { env?: NodeJS.ProcessEnv; timeout
   if (!lake.available) missing.push("lake")
   if (!leap.available) missing.push(LEAP_REQUIREMENT)
 
+  // A doctor WARN (project-only) keeps `leap.available` true, so a core-only
+  // host reports READY/ready here; only MISSING/OUTAGE verdicts block.
   const failedResults = [lean, lake, leap].filter((r) => !r.available)
   let status: ProbeStatus = "READY"
   if (failedResults.length > 0) {
@@ -492,7 +557,7 @@ export function formatMissingToolchainRefusal(probe: LemmaProbeResult): string {
     `  - ${LEAP_REQUIREMENT}: ${describeProbe(probe.leap)}`,
     ...(probe.leap.doctor
       ? [
-          `  - leap doctor: ${probe.leap.doctor.status}${probe.leap.doctor.output ? ` (${cleanBlock(probe.leap.doctor.output, 300).trim()})` : ""}${probe.leap.doctor.error ? ` — ${probe.leap.doctor.error}` : ""}`,
+          `  - leap doctor: ${probe.leap.doctor.status}${probe.leap.doctor.output ? ` (${cleanBlock(probe.leap.doctor.output, 300).trim()})` : ""}${probe.leap.doctor.warning ? ` — warning: ${probe.leap.doctor.warning}` : ""}${probe.leap.doctor.error ? ` — ${probe.leap.doctor.error}` : ""}`,
         ]
       : []),
   ]

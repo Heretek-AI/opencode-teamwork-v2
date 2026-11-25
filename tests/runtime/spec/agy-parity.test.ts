@@ -624,19 +624,44 @@ describe("Tier 1: Feature Coverage [M1, M3, M4]", () => {
     })
   })
 
-  test("[M4 A7] teamwork_lemma_probe executes leap doctor when lean, lake, leap exist on PATH", async () => {
+  test("[M4 A7] teamwork_lemma_probe executes leap doctor --offline when lean, lake, leap exist on PATH", async () => {
     await withHost("a7-lemma-probe-doctor", async ({ project, loaded, root }) => {
       const binDir = makeMockBinDir(project, "lemma-ok", {
         lean: 'echo "Lean (version 4.12.0, commit abc)"',
         lake: 'echo "Lake version 5.0.0"',
-        leap: 'if [ "$1" = "doctor" ]; then echo "leap doctor: OK"; exit 0; fi; echo "leap 0.3.1"',
+        leap: 'if [ "$1" = "doctor" ]; then [ "$2" = "--offline" ] || { echo "expected --offline, got $2" >&2; exit 9; }; echo "leap doctor: OK"; exit 0; fi; echo "leap 0.3.1"',
       })
       try {
         await withEnv({ PATH: binDir }, async () => {
           const probe = await execute(loaded, root, "lemma_probe", {})
           expect(probe.ready).toBe(true)
+          expect(probe.leap.doctor.status).toBe("READY")
           expect(String(probe.content)).toContain("READY")
           expect(JSON.stringify(probe)).toMatch(/doctor/i)
+          expect(existsSync(join(project.root, "PREREQUISITES.md"))).toBe(false)
+        })
+      } finally {
+        rmSync(binDir, { recursive: true, force: true })
+      }
+    })
+  })
+
+  test("[M4 A7] teamwork_lemma_probe treats a LEAN_PROJECT_DIR-only leap doctor failure as READY/WARN", async () => {
+    await withHost("a7-lemma-project-warn", async ({ project, loaded, root }) => {
+      const binDir = makeMockBinDir(project, "lemma-project-warn", {
+        lean: 'echo "Lean (version 4.12.0, commit abc)"',
+        lake: 'echo "Lake version 5.0.0"',
+        leap: 'if [ "$1" = "doctor" ]; then [ "$2" = "--offline" ] || { echo "expected --offline, got $2" >&2; exit 9; }; echo "[FAIL] LEAN_PROJECT_DIR -- no local Lean project found"; exit 1; fi; echo "leap 0.3.1"',
+      })
+      try {
+        await withEnv({ PATH: binDir }, async () => {
+          const probe = await execute(loaded, root, "lemma_probe", {})
+          expect(probe.ready).toBe(true)
+          expect(probe.status).toBe("READY")
+          expect(probe.leap.available).toBe(true)
+          expect(probe.leap.doctor.status).toBe("WARN")
+          expect(String(probe.content)).toMatch(/WARN/)
+          expect(String(probe.content)).toContain("LEAN_PROJECT_DIR")
           expect(existsSync(join(project.root, "PREREQUISITES.md"))).toBe(false)
         })
       } finally {
@@ -1219,7 +1244,7 @@ describe("Tier 2: Boundary & Corner Cases [M1, M3, M4]", () => {
       const brokenDoctorBin = makeMockBinDir(project, "bad-doc", {
         lean: 'echo "Lean (version 4.12.0)"',
         lake: 'echo "Lake version 5.0.0"',
-        leap: 'if [ "$1" = "doctor" ]; then echo "missing mathlib cache" >&2; exit 1; fi; echo "leap 0.3.1"',
+        leap: 'if [ "$1" = "doctor" ]; then [ "$2" = "--offline" ] || { echo "expected --offline" >&2; exit 9; }; echo "missing mathlib cache" >&2; exit 1; fi; echo "leap 0.3.1"',
       })
       try {
         await withEnv({ PATH: emptyBin }, async () => {
