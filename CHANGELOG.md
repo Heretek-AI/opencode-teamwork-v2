@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **CI trust boundaries:** `attest.yml` no longer accepts `manifest_path`; the
+  path is derived from the validated run id, checked as a regular file under
+  `.opencode/teamwork/<run_id>/`, and passed as a step output rather than
+  written to `$GITHUB_ENV`. Testing and signing now run in separate jobs: the
+  test job has `contents: read` and no OIDC token, while the signing job starts
+  from a clean checkout and verifies the uploaded record with
+  `scripts/check-attest-input.mjs` before loading the key.
+- **Release publishing:** `publish.yml` no longer holds `id-token: write` in
+  the job that runs `npm test`/T4. A separate publish job starts from a clean
+  checkout, verifies the uploaded tarball's sha256, re-packs the clean checkout
+  and requires a byte-identical digest, then publishes that tarball.
+- **Action pinning:** all `actions/*` uses are pinned to full commit SHAs with
+  the version in a comment (`checkout`, `setup-node`, `setup-python`, `cache`,
+  `upload-artifact`, `download-artifact`, `github-script`).
+
+### Fixed
+
+- **Nightly host-drift probe:** the isolated copy now contains the whole
+  repository tree (minus `.git`/`node_modules`) instead of only
+  `tests/runtime`, so the harness `REPO_ROOT` can import `plugins/` and
+  `agents/`. A preflight checks `plugins/opencode-teamwork/index.ts` and a
+  one-spec smoke run precedes the full suite. Install/preflight failures are
+  reported as infrastructure failures, not as host drift.
+
 ## [0.19.1] - 2026-11-25
 
 ### Fixed

@@ -8,6 +8,14 @@ name: Nightly OpenCode host drift
 # The install/test job runs untrusted package code. It has contents:read only,
 # no persisted checkout credentials, and no issue-write token. A separate
 # report job downloads the captured diagnostics and holds issues:write.
+#
+# The harness computes REPO_ROOT from its own location (`tests/runtime/harness`
+# -> repository root), so the probe copies the whole repository tree into the
+# isolated directory, not just `tests/runtime`. Otherwise the suite imports
+# `plugins/` and `agents/` from outside the copy and cannot start. A preflight
+# asserts those paths exist, and a one-spec smoke run happens before the full
+# suite. Failures before/while resolving packages are reported as
+# infrastructure failures, never as host drift.
 
 on:
   schedule:
@@ -24,9 +32,13 @@ jobs:
     permissions:
       contents: read
     outputs:
-      exit_code: ${{ steps.suite.outputs.exit_code }}
+      # If the full suite was skipped because the smoke spec failed, the smoke
+      # exit code is the result to report.
+      exit_code: ${{ steps.suite.outputs.exit_code || steps.smoke.outputs.exit_code }}
+      infra_failure: ${{ steps.install.outputs.infra_failure || steps.prepare.outputs.infra_failure }}
+      infra_reason: ${{ steps.install.outputs.infra_reason || steps.prepare.outputs.infra_reason }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
@@ -34,7 +46,7 @@ jobs:
         with:
           bun-version: 1.4.4
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "24"
           package-manager-cache: false
@@ -42,24 +54,68 @@ jobs:
       - name: Capture pinned catalog snapshot
         run: node scripts/diff-host-catalog.mjs --out "$RUNNER_TEMP/catalog-pinned.json"
 
+      # Copy the full repository so `REPO_ROOT` (computed from the harness
+      # location) still has plugins/, agents/, lib/, bin/ and scripts/ after
+      # tests/runtime/package.json is rewritten to `latest`.
+      - name: Create isolated full-tree copy
+        id: prepare
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/repo-latest"
+          rm -rf "$dest"
+          mkdir -p "$dest"
+          rsync -a --exclude '.git' --exclude 'node_modules' ./ "$dest/"
+          missing=""
+          test -f "$dest/plugins/opencode-teamwork/index.ts" || missing="plugins/opencode-teamwork/index.ts"
+          if [ -z "$missing" ] && [ ! -d "$dest/agents/team" ]; then missing="agents/team"; fi
+          if [ -z "$missing" ] && [ ! -f "$dest/tests/runtime/harness/project.ts" ]; then missing="tests/runtime/harness/project.ts"; fi
+          if [ -n "$missing" ]; then
+            echo "infra_failure=true" >> "$GITHUB_OUTPUT"
+            echo "infra_reason=isolated copy is missing $missing" >> "$GITHUB_OUTPUT"
+            echo "::error::isolated copy is missing $missing; the harness cannot resolve REPO_ROOT" >&2
+            exit 1
+          fi
+          echo "prepared $dest"
+
       - name: Resolve latest @opencode/* packages in isolated copy
         id: resolve
+        if: steps.prepare.outcome == 'success'
         run: |
-          cp -r tests/runtime "$RUNNER_TEMP/runtime-latest"
           node -e '
             const fs = require("fs");
-            const p = process.env.RUNNER_TEMP + "/runtime-latest/package.json";
+            const p = process.env.RUNNER_TEMP + "/repo-latest/tests/runtime/package.json";
             const pkg = JSON.parse(fs.readFileSync(p, "utf8"));
             for (const dep of ["@opencode/ai", "@opencode/core", "@opencode/plugin", "@opencode/sdk"]) {
               if (pkg.devDependencies[dep]) pkg.devDependencies[dep] = "latest";
             }
             fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + "\n");
           '
-          rm -f "$RUNNER_TEMP/runtime-latest/bun.lock"
-          (cd "$RUNNER_TEMP/runtime-latest" && bun install --ignore-scripts) # NOSONAR (S8543): intentional @opencode/*@latest resolution in an isolated copy; this probe job has contents:read, no persisted checkout credential, and --ignore-scripts; reporting runs in a separate issues:write job
+          rm -f "$RUNNER_TEMP/repo-latest/tests/runtime/bun.lock"
+
+      - name: Install resolved packages
+        id: install
+        if: steps.prepare.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set +e
+          (cd "$RUNNER_TEMP/repo-latest/tests/runtime" && bun install --ignore-scripts) > "$RUNNER_TEMP/drift-install.txt" 2>&1 # NOSONAR (S8543): intentional @opencode/*@latest resolution in an isolated copy; this probe job has contents:read, no persisted checkout credential, and --ignore-scripts; reporting runs in a separate issues:write job
+          code=$?
+          set -e
+          cat "$RUNNER_TEMP/drift-install.txt"
+          if [ "$code" -ne 0 ]; then
+            echo "infra_failure=true" >> "$GITHUB_OUTPUT"
+            echo "infra_reason=bun install of @opencode/*@latest failed (exit $code)" >> "$GITHUB_OUTPUT"
+            echo "::error::could not install @opencode/*@latest; this is infrastructure, not host drift" >&2
+            exit "$code"
+          fi
+
+      - name: Capture resolved host versions
+        if: steps.install.outcome == 'success'
+        run: |
           node -e '
             const fs = require("fs");
-            const base = process.env.RUNNER_TEMP + "/runtime-latest/node_modules";
+            const base = process.env.RUNNER_TEMP + "/repo-latest/tests/runtime/node_modules";
             const versions = {};
             for (const dep of ["@opencode/ai", "@opencode/core", "@opencode/plugin", "@opencode/sdk", "effect"]) {
               try {
@@ -70,32 +126,53 @@ jobs:
             console.log("Resolved versions:", JSON.stringify(versions));
           '
 
-      - name: Run L1-L3 runtime suite against @opencode/*@latest
-        id: suite
+      # Smoke before the full suite: catches a broken copy, preload or import
+      # path while the report still has the short log. A failure here is a
+      # runtime-suite failure against the resolved host, not an infrastructure
+      # failure, because install already succeeded.
+      - name: Smoke-test the harness (one spec)
+        id: smoke
+        if: steps.install.outcome == 'success'
         continue-on-error: true
         run: |
           set +e
-          (cd "$RUNNER_TEMP/runtime-latest" && bun test --timeout 30000) > "$RUNNER_TEMP/drift-output.txt" 2>&1
+          (cd "$RUNNER_TEMP/repo-latest/tests/runtime" && bun test --timeout 30000 spec/a1-load.test.ts) > "$RUNNER_TEMP/drift-smoke.txt" 2>&1
           code=$?
+          set -e
+          cat "$RUNNER_TEMP/drift-smoke.txt"
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      - name: Run L1-L3 runtime suite against @opencode/*@latest
+        id: suite
+        if: steps.smoke.outputs.exit_code == '0'
+        continue-on-error: true
+        run: |
+          set +e
+          (cd "$RUNNER_TEMP/repo-latest/tests/runtime" && bun test --timeout 30000) > "$RUNNER_TEMP/drift-output.txt" 2>&1
+          code=$?
+          set -e
           cat "$RUNNER_TEMP/drift-output.txt"
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-          exit $code
+          exit "$code"
 
       - name: Upload drift diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: opencode-host-drift
           path: |
             ${{ runner.temp }}/host-versions.json
             ${{ runner.temp }}/catalog-pinned.json
+            ${{ runner.temp }}/drift-install.txt
+            ${{ runner.temp }}/drift-smoke.txt
             ${{ runner.temp }}/drift-output.txt
           if-no-files-found: warn
           retention-days: 30
 
       - name: Upload resolved host versions on success
         if: steps.suite.outputs.exit_code == '0'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: opencode-host-versions
           path: |
@@ -106,7 +183,7 @@ jobs:
   report:
     name: Report OpenCode host drift
     needs: probe
-    if: always() && (needs.probe.result != 'success' || needs.probe.outputs.exit_code != '0')
+    if: always() && (needs.probe.result != 'success' || needs.probe.outputs.infra_failure == 'true' || needs.probe.outputs.exit_code != '0')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -114,13 +191,18 @@ jobs:
     steps:
       - name: Download drift diagnostics
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: opencode-host-drift
           path: ${{ runner.temp }}/host-drift
 
       - name: Report drift in deduplicated GitHub issue
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PROBE_RESULT: ${{ needs.probe.result }}
+          INFRA_FAILURE: ${{ needs.probe.outputs.infra_failure }}
+          INFRA_REASON: ${{ needs.probe.outputs.infra_reason }}
+          PROBE_EXIT: ${{ needs.probe.outputs.exit_code }}
         with:
           script: |
             const fs = require("fs");
@@ -133,24 +215,56 @@ jobs:
                 return "";
               }
             };
+
+            const probeResult = process.env.PROBE_RESULT || "unknown";
+            const probeExit = process.env.PROBE_EXIT || "";
+            const infra = process.env.INFRA_FAILURE === "true" || probeResult !== "success" || probeExit === "";
+            const reason = (process.env.INFRA_REASON || "").trim();
             const versions = read("host-versions.json").trim() || "{}";
-            const output = read("drift-output.txt").slice(-6000).trim() || "(no output captured)";
-            const title = "OpenCode host drift";
-            const body = [
-              "Nightly runtime suite failed against `@opencode/*@latest`.",
+            const smoke = read("drift-smoke.txt").slice(-4000).trim();
+            const install = read("drift-install.txt").slice(-4000).trim();
+            const suite = read("drift-output.txt").slice(-6000).trim();
+
+            const title = infra
+              ? "OpenCode host drift probe infrastructure failure"
+              : "OpenCode host drift";
+
+            const intro = infra
+              ? "The nightly host-drift probe did not produce a runtime-suite result. **This is an infrastructure failure, not host drift.**"
+              : "Nightly runtime suite failed against `@opencode/*@latest`.";
+
+            const sections = [
+              intro,
               "",
+              ...(infra
+                ? [
+                    `Probe result: \`${probeResult}\``,
+                    `Reason: ${reason || "not captured (check the workflow log)"}`,
+                    "",
+                  ]
+                : []),
               "### Resolved versions",
               "```json",
               versions,
               "```",
               "",
               `Workflow run: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            ];
+
+            if (install) {
+              sections.push("", "### Install log tail", "```text", install, "```");
+            }
+            if (smoke) {
+              sections.push("", "### Harness smoke tail", "```text", smoke, "```");
+            }
+            sections.push(
               "",
-              "### Failure tail",
+              infra ? "### Probe log tail" : "### Failure tail",
               "```text",
-              output,
+              suite || smoke || "(no output captured)",
               "```",
-            ].join("\n");
+            );
+            const body = sections.join("\n");
 
             const issues = await github.rest.issues.listForRepo({
               owner: context.repo.owner,

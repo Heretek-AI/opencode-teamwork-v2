@@ -12,6 +12,19 @@ name: Publish Package
 # Release flow:
 #   npm version patch        # or edit "version" in package.json
 #   git push --follow-tags   # pushes the vX.Y.Z tag -> this workflow publishes
+#
+# PRIVILEGE BOUNDARY
+# ------------------
+# `verify` runs `npm test`, the packaging guard, the tag guard and T4 with
+# `contents: read` only. It has no OIDC token and no registry credential, so a
+# test-writable script cannot mint a trusted-publishing token.
+#
+# `publish` is the only job with `id-token: write`. It starts from a fresh
+# checkout of the same commit, downloads the tarball produced by `verify`,
+# verifies its sha256, and re-packs the clean checkout (`--ignore-scripts`) to
+# prove the artifact still matches the repository. Only then does it invoke
+# `npm publish` on the tarball, which — unlike a directory publish — runs no
+# repository lifecycle scripts either.
 
 on:
   push:
@@ -20,22 +33,24 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write # Required for OIDC trusted publishing
   contents: read
 
 jobs:
-  publish:
+  verify:
+    name: Test and pack
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0 # full history: the release-tag guard needs origin/main
           fetch-tags: true
+          persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
           package-manager-cache: false # never cache in release builds
 
       - name: Test
@@ -61,6 +76,7 @@ jobs:
 
       # Trusted publishing (OIDC) needs npm >= 11.5.1. Prefer the latest npm but
       # fall back to the newest 11.x if the latest requires a newer Node.
+      # Both jobs pin the same npm version so `npm pack` is byte-identical.
       - name: Ensure recent npm
         run: |
           npm install -g --ignore-scripts npm@11.21.3
@@ -98,8 +114,159 @@ jobs:
       - name: Packed-tarball install test (T4)
         run: node scripts/test-packed-tarball.mjs
 
+      # Build the exact artifact the privileged job will publish. The tests
+      # above can modify the worktree; `publish` re-packs a clean checkout with
+      # --ignore-scripts and refuses to publish if the digest differs.
+      - name: Build the release tarball
+        id: release
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          npm pack --json --pack-destination "$RUNNER_TEMP/release" > "$RUNNER_TEMP/pack-release.json"
+          node -e '
+          const fs = require("fs");
+          const path = require("path");
+          const crypto = require("crypto");
+          const dir = process.env.RUNNER_TEMP + "/release";
+          const meta = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/pack-release.json", "utf8"))[0];
+          if (!meta || !/^[A-Za-z0-9._-]+\.tgz$/.test(String(meta.filename ?? ""))) {
+            console.error("npm pack returned an unsafe tarball filename");
+            process.exit(1);
+          }
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          if (meta.name !== pkg.name || meta.version !== pkg.version) {
+            console.error(`packed ${meta.name}@${meta.version} does not match package.json ${pkg.name}@${pkg.version}`);
+            process.exit(1);
+          }
+          const tarball = path.join(dir, meta.filename);
+          const sha256 = crypto.createHash("sha256").update(fs.readFileSync(tarball)).digest("hex");
+          fs.writeFileSync(path.join(dir, "release.json"), JSON.stringify({
+            filename: meta.filename,
+            name: meta.name,
+            version: meta.version,
+            sha256,
+          }, null, 2) + "\n");
+          fs.writeFileSync(path.join(dir, "tarball.sha256"), `${sha256}  ${meta.filename}\n`);
+          console.log(`release tarball: ${meta.filename}`);
+          console.log(`sha256:          ${sha256}`);
+          '
+          test -s "$RUNNER_TEMP/release/tarball.sha256"
+
+      - name: Upload the release tarball
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-release-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish verified tarball
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Required for OIDC trusted publishing
+    steps:
+      # Fresh checkout at the same commit. Nothing from the test job's writable
+      # workspace is reused; only its tarball artifact is consumed below.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false # never cache in release builds
+
+      - name: Ensure recent npm
+        run: |
+          npm install -g --ignore-scripts npm@11.21.3
+          npm --version
+
+      - name: Download the release tarball
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-release-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release
+
+      # Verify before the OIDC token can be used: the artifact hash must match
+      # its manifest, the version must match this checkout, and a fresh
+      # `npm pack` of the clean checkout must be byte-identical. A test-mutated
+      # worktree in `verify` therefore cannot smuggle a different tarball here.
+      - name: Verify the tarball against the clean checkout
+        id: verify
+        # --ignore-scripts means this privileged job executes no repository
+        # lifecycle code. A package that needs a `prepare`/`prepack` step will
+        # not match the tested tarball and publishing stops (fail closed).
+        run: |
+          mkdir -p "$RUNNER_TEMP/repack"
+          npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP/repack" > "$RUNNER_TEMP/repack.json"
+          node -e '
+          const fs = require("fs");
+          const path = require("path");
+          const crypto = require("crypto");
+          const fail = (message) => { console.error(`verify-release: ${message}`); process.exit(1); };
+          const dir = process.env.RUNNER_TEMP + "/release";
+          let meta;
+          try {
+            meta = JSON.parse(fs.readFileSync(path.join(dir, "release.json"), "utf8"));
+          } catch (err) {
+            fail(`release.json is unreadable (${err?.message ?? err})`);
+          }
+          if (!/^[A-Za-z0-9._-]+\.tgz$/.test(String(meta.filename ?? ""))) fail("unsafe tarball filename");
+          const tarball = path.join(dir, meta.filename);
+          let bytes;
+          try {
+            bytes = fs.readFileSync(tarball);
+          } catch (err) {
+            fail(`tarball is unreadable (${err?.message ?? err})`);
+          }
+          const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+          if (sha256 !== meta.sha256) fail("tarball sha256 does not match release.json");
+          let recorded;
+          try {
+            recorded = fs.readFileSync(path.join(dir, "tarball.sha256"), "utf8").trim().split(/\s+/)[0];
+          } catch (err) {
+            fail(`tarball.sha256 is unreadable (${err?.message ?? err})`);
+          }
+          if (recorded !== sha256) fail("tarball.sha256 does not match the downloaded tarball");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          if (meta.name !== pkg.name || meta.version !== pkg.version) {
+            fail(`artifact ${meta.name}@${meta.version} does not match package.json ${pkg.name}@${pkg.version}`);
+          }
+          let repacked;
+          try {
+            repacked = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/repack.json", "utf8"))[0];
+          } catch (err) {
+            fail(`npm pack --json is unreadable (${err?.message ?? err})`);
+          }
+          if (!repacked || !/^[A-Za-z0-9._-]+\.tgz$/.test(String(repacked.filename ?? ""))) {
+            fail("npm pack returned an unsafe tarball filename");
+          }
+          const repackPath = path.join(process.env.RUNNER_TEMP, "repack", repacked.filename);
+          const repackSha = crypto.createHash("sha256").update(fs.readFileSync(repackPath)).digest("hex");
+          if (repackSha !== sha256) {
+            fail("downloaded tarball does not match a fresh pack of the clean checkout");
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `tarball_path=${tarball}\n`);
+          console.log(`verified ${meta.filename} (sha256 ${sha256}) against the clean checkout`);
+          '
+
+      # Re-run the guard in the privileged checkout. The tag guard only reads
+      # git refs; it never executes repository test code.
+      - name: Release tag provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        run: node scripts/check-release-tag.mjs
+
       # `repository.url` in package.json must exactly match this GitHub repo or
       # provenance/OIDC verification fails. npm generates provenance
       # automatically under trusted publishing — no --provenance flag needed.
+      # Publishing a tarball runs no repository lifecycle scripts.
       - name: Publish
-        run: npm publish --access public
+        env:
+          TARBALL: ${{ steps.verify.outputs.tarball_path }}
+        run: npm publish --access public "$TARBALL"

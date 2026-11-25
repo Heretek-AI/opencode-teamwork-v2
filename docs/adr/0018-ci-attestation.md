@@ -168,11 +168,22 @@ dispatcher cannot invent a binding.
 `run_id` and `manifest_digest` as required inputs. It is gated on
 `github.ref_protected` and the default branch, uses a literal test command from
 that protected checkout, passes inputs through environment variables (never a
-shell line), and signs with an environment secret. A dispatch cannot select
-arbitrary code, a ref, or a command; the run manifest must already be present
-in the protected checkout. The workflow comments state the residual: a
-compromised runner, a key readable by the agent, a weak suite, or a test edited
-in the same commit still produces a valid attestation.
+shell line), and never accepts a caller-supplied path: the manifest is read from
+the fixed `.opencode/teamwork/<run_id>/run.manifest.json` and must be a regular
+file at that location. A dispatch cannot select arbitrary code, a ref, or a
+command.
+
+Testing and signing are separate jobs with separate privileges. The test job
+has `contents: read`, no OIDC token and no signing key; it validates the inputs,
+snapshots the manifest before running `npm test`, and uploads the command,
+output digest and manifest snapshot. The signing job checks out the same commit
+fresh, has `id-token: write` and the `ci-attestation` environment secret,
+verifies the uploaded record with `scripts/check-attest-input.mjs`, and runs
+only the checked-in `scripts/attest-sign.mjs`; it does not run repository test
+code. The workflow comments state the residual: a compromised runner, a key
+readable by the agent, a weak suite, or a test edited in the same commit still
+produces a valid attestation, and the test job's uploaded observation is not
+proof that the suite is meaningful.
 
 ## 3. What this establishes and what it does not
 
