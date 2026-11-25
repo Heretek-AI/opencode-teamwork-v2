@@ -72,7 +72,7 @@ export type LemmaBinaryName = "lean" | "lake" | "leap" | "leap-tools"
 export const LEAP_REQUIREMENT = "leap (LEAP CLI) or legacy leap-tools"
 export type LemmaRequirement = "lean" | "lake" | typeof LEAP_REQUIREMENT
 /** The only `leap doctor` check whose failure is advisory for LEMMA. */
-export const LEAP_DOCTOR_PROJECT_CHECK = "LEAN_PROJECT_DIR"
+const LEAP_DOCTOR_PROJECT_CHECK = "LEAN_PROJECT_DIR"
 
 export interface LeapDoctorResult {
   status: LeapDoctorStatus

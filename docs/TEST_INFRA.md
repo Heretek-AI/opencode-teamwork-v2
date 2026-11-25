@@ -42,14 +42,14 @@ remediation (M1, M2) and the behavioural parity gaps A1–A9 against the observe
 
 ## Layers
 
-1. **L0 — `scripts/test-agy-parity.mjs` (152 cases).**
+1. **L0 — `scripts/test-agy-parity.mjs` (153 cases).**
    Zero-dependency Node ESM. Exercises the CLI, plugin registration, tool
    contracts, prompt text, artifact shapes, filesystem containment and the
    security regressions. Run with `npm run test:agy-parity`; filter with
    `--milestone=M1|M3|M4` and `--tier=T1|T2|T3|T4`.
-   Tiers: T1 feature coverage (65), T2 boundary/corner (65), T3 pairwise (15),
+   Tiers: T1 feature coverage (66), T2 boundary/corner (65), T3 pairwise (15),
    T4 real-world scenarios (7).
-2. **L1–L3 — `tests/runtime/spec/agy-parity.test.ts` (61 specs).**
+2. **L1–L3 — `tests/runtime/spec/agy-parity.test.ts` (62 specs).**
    Runs the plugin inside the real OpenCode 2.4.1 runtime with real git
    worktrees, SQLite KV, command dispatch and permission hooks. Run with:
    `cd tests/runtime && bun test --timeout 30000 spec/agy-parity.test.ts`.
@@ -59,19 +59,19 @@ remediation (M1, M2) and the behavioural parity gaps A1–A9 against the observe
 
 ## Coverage thresholds
 
-- T1 ≥ 5 cases per feature unit (65 total).
+- T1 ≥ 5 cases per feature unit (66 total).
 - T2 ≥ 5 cases per feature unit (65 total).
 - T3 ≥ 13 pairwise interactions (15 total).
 - T4 ≥ 7 end-to-end scenarios (7 total).
-- Total L0 ≥ 152 cases; runtime parity = 61 specs.
+- Total L0 ≥ 153 cases; runtime parity = 62 specs.
 
 ## Commands
 
 ```sh
 npm test                     # the 15 repository L0 suites
-npm run test:agy-parity      # the 152-case parity/regression suite
+npm run test:agy-parity      # the 153-case parity/regression suite
 cd tests/runtime
-bun test --timeout 30000     # L1-L3 including the 61 parity specs
+bun test --timeout 30000     # L1-L3 including the 62 parity specs
 ```
 
 ## Scope boundary
