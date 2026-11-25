@@ -65,6 +65,13 @@ export const ATTESTATION_POLICY_MODES = ["off", "optional", "required"]
 export const ENV_ATTESTATION_PUBLIC_KEY = "OPENCODE_TEAMWORK_ATTESTATION_PUBLIC_KEY"
 export const ENV_ATTESTATION_KEY_ID = "OPENCODE_TEAMWORK_ATTESTATION_KEY_ID"
 export const ENV_ATTESTATION_ISSUER = "OPENCODE_TEAMWORK_ATTESTATION_ISSUER"
+export const ENV_ATTESTATION_OIDC_JWKS = "OPENCODE_TEAMWORK_OIDC_JWKS"
+export const ENV_ATTESTATION_AUDIENCE = "OPENCODE_TEAMWORK_ATTESTATION_AUDIENCE"
+export const ENV_ATTESTATION_REPOSITORY = "OPENCODE_TEAMWORK_ATTESTATION_REPOSITORY"
+export const ENV_ATTESTATION_REF = "OPENCODE_TEAMWORK_ATTESTATION_REF"
+
+const OIDC_SUPPORTED_ALGS = new Set(["RS256", "ES256", "EdDSA"])
+const DEFAULT_OIDC_CLOCK_SKEW_MS = 60_000
 
 const SHA256_HEX = /^[0-9a-f]{64}$/
 const GIT_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
@@ -257,6 +264,12 @@ export function attestationPayloadProblems(payload) {
         problems.push(`oidc.${field} is missing`)
       }
     }
+    if (payload.oidc.token !== undefined && (typeof payload.oidc.token !== "string" || payload.oidc.token.trim() === "")) {
+      problems.push("oidc.token must be a non-empty string when present")
+    }
+    if (payload.oidc.ref !== undefined && (typeof payload.oidc.ref !== "string" || payload.oidc.ref.trim() === "")) {
+      problems.push("oidc.ref must be a non-empty string when present")
+    }
   }
   if (isoTimestamp(payload.issuedAt) === undefined) problems.push("issuedAt is not an ISO timestamp")
   if (isoTimestamp(payload.expiresAt) === undefined) problems.push("expiresAt is not an ISO timestamp")
@@ -358,8 +371,183 @@ export function verifyAttestationEnvelope(artifact, { publicKey, expectedKeyId, 
 }
 
 /**
- * Full policy evaluation: envelope, expiry, run binding, commit binding, and
- * command/output binding against the verifier reports.
+ * Parse a JWKS JSON string or object `{ keys: [...] }` into an array of JWKs.
+ * Returns `undefined` when absent or malformed.
+ */
+export function parseOidcJwks(input) {
+  if (!input) return undefined
+  let parsed = input
+  if (typeof input === "string") {
+    const trimmed = input.trim()
+    if (!trimmed) return undefined
+    try {
+      parsed = JSON.parse(trimmed)
+    } catch {
+      return undefined
+    }
+  }
+  const keys = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.keys) ? parsed.keys : undefined
+  if (!keys || keys.length === 0) return undefined
+  return keys.filter((k) => k && typeof k === "object" && typeof k.kty === "string")
+}
+
+function jwkMatchesAlg(jwk, alg) {
+  if (jwk.alg && jwk.alg !== alg) return false
+  if (alg === "RS256") return jwk.kty === "RSA"
+  if (alg === "ES256") return jwk.kty === "EC" && (!jwk.crv || jwk.crv === "P-256")
+  if (alg === "EdDSA") return jwk.kty === "OKP" && (!jwk.crv || jwk.crv === "Ed25519")
+  return false
+}
+
+/**
+ * Cryptographically verify a compact OIDC JWT (RS256 / ES256 / EdDSA) against
+ * pinned JWKS trust material and bind issuer, audience, subject, repository,
+ * ref, commit SHA, and expiry/nbf to the attestation and policy.
+ *
+ * Strictly offline: never performs network requests. Returns status "UNKNOWN"
+ * when no JWKS trust material is supplied.
+ */
+export function verifyOidcToken(
+  token,
+  {
+    jwks,
+    expectedIssuer,
+    expectedAudience,
+    expectedSubject,
+    expectedRepository,
+    expectedRef,
+    expectedCommitSha,
+    now = Date.now(),
+    clockSkewMs = DEFAULT_OIDC_CLOCK_SKEW_MS,
+  } = {},
+) {
+  if (typeof token !== "string" || token.trim() === "") {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.untrusted, message: "OIDC token is missing; a claimed issuer string alone is not sufficient" }
+  }
+  const parts = token.trim().split(".")
+  if (parts.length !== 3) {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.untrusted, message: "OIDC token is not a 3-part compact JWS" }
+  }
+  const [headerB64, payloadB64, sigB64] = parts
+  const headerBuf = safeDecodeBase64Url(headerB64)
+  const payloadBuf = safeDecodeBase64Url(payloadB64)
+  const sigBuf = safeDecodeBase64Url(sigB64)
+  if (!headerBuf || !payloadBuf || !sigBuf) {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.untrusted, message: "OIDC token contains invalid base64url encoding" }
+  }
+  let header
+  let claims
+  try {
+    header = JSON.parse(headerBuf.toString("utf8"))
+    claims = JSON.parse(payloadBuf.toString("utf8"))
+  } catch {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.untrusted, message: "OIDC token header or payload is not valid JSON" }
+  }
+  if (!header || typeof header !== "object" || !claims || typeof claims !== "object") {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.untrusted, message: "OIDC token header/payload must be JSON objects" }
+  }
+  const alg = header.alg
+  if (typeof alg !== "string" || !OIDC_SUPPORTED_ALGS.has(alg)) {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.untrusted, message: `OIDC token alg ${JSON.stringify(alg ?? null)} is not supported (expected RS256, ES256, or EdDSA)` }
+  }
+
+  const keys = parseOidcJwks(jwks)
+  if (!keys || keys.length === 0) {
+    return { ok: false, status: "UNKNOWN", code: ATTESTATION_CODES.untrusted, message: "no OIDC issuer trust material (JWKS) is configured; cannot verify OIDC token" }
+  }
+
+  const candidates = keys.filter((k) => {
+    if (!jwkMatchesAlg(k, alg)) return false
+    if (header.kid !== undefined && k.kid !== undefined && k.kid !== header.kid) return false
+    return true
+  })
+  if (candidates.length === 0) {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.untrusted, message: `no matching key in OIDC JWKS for alg=${alg} kid=${JSON.stringify(header.kid ?? null)}` }
+  }
+
+  const signingInput = Buffer.from(`${headerB64}.${payloadB64}`, "utf8")
+  let verified = false
+  for (const jwk of candidates) {
+    try {
+      const pubKey = createPublicKey({ key: jwk, format: "jwk" })
+      if (alg === "RS256") {
+        verified = cryptoVerify("sha256", signingInput, pubKey, sigBuf)
+      } else if (alg === "ES256") {
+        verified = cryptoVerify("sha256", signingInput, { key: pubKey, dsaEncoding: "ieee-p1363" }, sigBuf)
+      } else if (alg === "EdDSA") {
+        verified = cryptoVerify(null, signingInput, pubKey, sigBuf)
+      }
+      if (verified) break
+    } catch {
+      // Try next candidate key.
+    }
+  }
+  if (!verified) {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.untrusted, message: "OIDC token signature failed cryptographic verification against pinned JWKS" }
+  }
+
+  if (typeof claims.iss !== "string" || claims.iss.trim() === "") {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.untrusted, message: "OIDC token is missing iss claim" }
+  }
+  if (expectedIssuer && claims.iss !== expectedIssuer) {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.untrusted, message: `OIDC token iss ${JSON.stringify(claims.iss)} does not match ${JSON.stringify(expectedIssuer)}` }
+  }
+
+  const audList = Array.isArray(claims.aud) ? claims.aud : typeof claims.aud === "string" ? [claims.aud] : []
+  if (audList.length === 0) {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.untrusted, message: "OIDC token is missing aud claim" }
+  }
+  if (expectedAudience && !audList.includes(expectedAudience)) {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.untrusted, message: `OIDC token aud does not include ${JSON.stringify(expectedAudience)}` }
+  }
+
+  if (typeof claims.sub !== "string" || claims.sub.trim() === "") {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.untrusted, message: "OIDC token is missing sub claim" }
+  }
+  if (expectedSubject && claims.sub !== expectedSubject) {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.replay, message: `OIDC token sub ${JSON.stringify(claims.sub)} does not match ${JSON.stringify(expectedSubject)}` }
+  }
+
+  if (!Number.isFinite(claims.exp) || claims.exp * 1000 + clockSkewMs <= now) {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.stale, message: "OIDC token is expired or missing exp" }
+  }
+  if (claims.nbf !== undefined && (!Number.isFinite(claims.nbf) || claims.nbf * 1000 - clockSkewMs > now)) {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.stale, message: "OIDC token is not yet valid (nbf)" }
+  }
+
+  if (expectedRepository) {
+    const tokenRepo = typeof claims.repository === "string" ? claims.repository : undefined
+    const subRepoMatch = claims.sub.startsWith(`repo:${expectedRepository}:`)
+    if (tokenRepo !== undefined && tokenRepo !== expectedRepository) {
+      return { ok: false, status: "INVALID", code: ATTESTATION_CODES.replay, message: `OIDC token repository ${JSON.stringify(tokenRepo)} does not match ${JSON.stringify(expectedRepository)}` }
+    }
+    if (tokenRepo === undefined && !subRepoMatch) {
+      return { ok: false, status: "INVALID", code: ATTESTATION_CODES.replay, message: `OIDC token does not bind repository ${JSON.stringify(expectedRepository)}` }
+    }
+  }
+
+  if (expectedRef) {
+    const tokenRef = typeof claims.ref === "string" ? claims.ref : undefined
+    const subRefMatch = claims.sub.includes(`:ref:${expectedRef}`)
+    if (tokenRef !== undefined && tokenRef !== expectedRef) {
+      return { ok: false, status: "INVALID", code: ATTESTATION_CODES.replay, message: `OIDC token ref ${JSON.stringify(tokenRef)} does not match ${JSON.stringify(expectedRef)}` }
+    }
+    if (tokenRef === undefined && !subRefMatch) {
+      return { ok: false, status: "INVALID", code: ATTESTATION_CODES.replay, message: `OIDC token does not bind ref ${JSON.stringify(expectedRef)}` }
+    }
+  }
+
+  if (expectedCommitSha && typeof claims.sha === "string" && claims.sha !== expectedCommitSha) {
+    return { ok: false, status: "INVALID", code: ATTESTATION_CODES.commitMismatch, message: `OIDC token sha does not match attestation commitSha` }
+  }
+
+  return { ok: true, claims }
+}
+
+/**
+ * Full policy evaluation: envelope, expiry, run binding, commit binding,
+ * OIDC claim verification (when enabled or token present), and command/output
+ * binding against the verifier reports.
  *
  * Returns:
  *   { status: "OFF" | "MISSING" | "UNKNOWN" | "ATTESTED" | "INVALID",
@@ -374,6 +562,11 @@ export function evaluateAttestation({
   publicKey,
   expectedKeyId,
   expectedIssuer,
+  expectedAudience,
+  expectedRepository,
+  expectedRef,
+  oidcJwks,
+  requireOidcToken = false,
   runId,
   runNonce,
   runKeyId,
@@ -466,6 +659,43 @@ export function evaluateAttestation({
       status: "INVALID",
       code: ATTESTATION_CODES.untrusted,
       message: `attestation issuer ${JSON.stringify(issuer ?? null)} does not match ${JSON.stringify(expectedIssuer)}`,
+    }
+  }
+  const hasOidcToken = typeof artifact.oidc?.token === "string" && artifact.oidc.token.trim() !== ""
+  if (requireOidcToken || hasOidcToken || oidcJwks !== undefined) {
+    const oidcCheck = verifyOidcToken(artifact.oidc?.token, {
+      jwks: oidcJwks,
+      expectedIssuer: expectedIssuer ?? issuer,
+      expectedAudience: expectedAudience ?? artifact.oidc?.audience,
+      expectedSubject: artifact.oidc?.subject,
+      expectedRepository: expectedRepository ?? (artifact.repository && artifact.repository !== "unknown/unknown" ? artifact.repository : undefined),
+      expectedRef: expectedRef ?? artifact.oidc?.ref,
+      expectedCommitSha: artifact.commitSha,
+      now,
+    })
+    if (!oidcCheck.ok) {
+      return {
+        ...reported,
+        status: oidcCheck.status,
+        code: oidcCheck.code,
+        message: oidcCheck.message,
+      }
+    }
+    if (oidcCheck.claims.iss !== artifact.oidc.issuer) {
+      return {
+        ...reported,
+        status: "INVALID",
+        code: ATTESTATION_CODES.untrusted,
+        message: "OIDC token iss does not match attestation oidc.issuer",
+      }
+    }
+    if (expectedRepository && artifact.repository !== expectedRepository) {
+      return {
+        ...reported,
+        status: "INVALID",
+        code: ATTESTATION_CODES.replay,
+        message: `attestation repository ${JSON.stringify(artifact.repository)} does not match ${JSON.stringify(expectedRepository)}`,
+      }
     }
   }
   const expiresAt = isoTimestamp(artifact.expiresAt)

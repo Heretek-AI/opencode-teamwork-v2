@@ -1910,6 +1910,150 @@ async function main() {
     ok("T35 attest-sign.mjs produces a verifiable artifact and refuses a mismatched manifest digest")
   }
 
+  // T36: real OIDC JWT validation, forged issuer refusal, cross-repo/ref replay, UNKNOWN without JWKS (#44)
+  {
+    const { generateKeyPairSync, sign: cryptoSign } = await import("node:crypto")
+    const { evaluateAttestation, signAttestation, ATTESTATION_CODES } = await import("../plugins/opencode-teamwork/attestation.mjs")
+    const attKeys = generateKeyPairSync("ed25519")
+    const oidcKeys = generateKeyPairSync("ed25519")
+    const oidcJwk = { ...oidcKeys.publicKey.export({ format: "jwk" }), kid: "oidc-k1", alg: "EdDSA" }
+    const jwks = { keys: [oidcJwk] }
+
+    function makeJwt(claims, privKey = oidcKeys.privateKey, kid = "oidc-k1") {
+      const h = Buffer.from(JSON.stringify({ alg: "EdDSA", typ: "JWT", kid })).toString("base64url")
+      const p = Buffer.from(JSON.stringify(claims)).toString("base64url")
+      const sig = cryptoSign(null, Buffer.from(`${h}.${p}`, "utf8"), privKey).toString("base64url")
+      return `${h}.${p}.${sig}`
+    }
+
+    const nowSec = Math.floor(Date.now() / 1000)
+    const runNonce = "A".repeat(24)
+    const sha = "a".repeat(40)
+    const planHash = "b".repeat(64)
+    const promptHash = "c".repeat(64)
+    const basePayload = {
+      v: 1,
+      provider: "github-actions",
+      workflow: "ci-attestation",
+      runId: "r-oidc-1",
+      runAttempt: 1,
+      repository: "Heretek-AI/opencode-teamwork-v2",
+      commitSha: sha,
+      promptHash,
+      planHash,
+      commands: [],
+      oidc: {
+        issuer: "https://token.actions.githubusercontent.com",
+        subject: "repo:Heretek-AI/opencode-teamwork-v2:ref:refs/heads/main",
+        audience: "opencode-teamwork",
+        ref: "refs/heads/main",
+      },
+      issuedAt: new Date(nowSec * 1000).toISOString(),
+      expiresAt: new Date((nowSec + 3600) * 1000).toISOString(),
+    }
+
+    // 1. Forged issuer string without token fails when requireOidcToken is true.
+    const noTokenArt = signAttestation(basePayload, { privateKey: attKeys.privateKey, keyId: "att-1", nonce: runNonce })
+    const forged = evaluateAttestation({
+      artifact: noTokenArt,
+      policy: "required",
+      publicKey: attKeys.publicKey,
+      expectedKeyId: "att-1",
+      expectedIssuer: "https://token.actions.githubusercontent.com",
+      oidcJwks: jwks,
+      requireOidcToken: true,
+      runId: "r-oidc-1",
+      runNonce,
+      planHash,
+      promptHash,
+    })
+    assert.strictEqual(forged.status, "INVALID")
+    assert.strictEqual(forged.code, ATTESTATION_CODES.untrusted)
+
+    // 2. Valid signed OIDC token passes.
+    const validToken = makeJwt({
+      iss: "https://token.actions.githubusercontent.com",
+      aud: "opencode-teamwork",
+      sub: "repo:Heretek-AI/opencode-teamwork-v2:ref:refs/heads/main",
+      repository: "Heretek-AI/opencode-teamwork-v2",
+      ref: "refs/heads/main",
+      sha,
+      exp: nowSec + 600,
+    })
+    const validArt = signAttestation(
+      { ...basePayload, oidc: { ...basePayload.oidc, token: validToken } },
+      { privateKey: attKeys.privateKey, keyId: "att-1", nonce: runNonce },
+    )
+    const validRes = evaluateAttestation({
+      artifact: validArt,
+      policy: "required",
+      publicKey: attKeys.publicKey,
+      expectedKeyId: "att-1",
+      expectedIssuer: "https://token.actions.githubusercontent.com",
+      expectedAudience: "opencode-teamwork",
+      expectedRepository: "Heretek-AI/opencode-teamwork-v2",
+      expectedRef: "refs/heads/main",
+      oidcJwks: jwks,
+      requireOidcToken: true,
+      runId: "r-oidc-1",
+      runNonce,
+      planHash,
+      promptHash,
+    })
+    assert.strictEqual(validRes.status, "ATTESTED")
+
+    // 3. Missing JWKS trust material reports UNKNOWN.
+    const unknownRes = evaluateAttestation({
+      artifact: validArt,
+      policy: "required",
+      publicKey: attKeys.publicKey,
+      expectedKeyId: "att-1",
+      expectedIssuer: "https://token.actions.githubusercontent.com",
+      requireOidcToken: true,
+      runId: "r-oidc-1",
+      runNonce,
+      planHash,
+      promptHash,
+    })
+    assert.strictEqual(unknownRes.status, "UNKNOWN")
+
+    // 4. Cross-repository and cross-ref replay fail with AUTH_ATTESTATION_REPLAY.
+    const wrongRepo = evaluateAttestation({
+      artifact: validArt,
+      policy: "required",
+      publicKey: attKeys.publicKey,
+      expectedKeyId: "att-1",
+      expectedIssuer: "https://token.actions.githubusercontent.com",
+      expectedRepository: "OtherOrg/other-repo",
+      oidcJwks: jwks,
+      requireOidcToken: true,
+      runId: "r-oidc-1",
+      runNonce,
+      planHash,
+      promptHash,
+    })
+    assert.strictEqual(wrongRepo.status, "INVALID")
+    assert.strictEqual(wrongRepo.code, ATTESTATION_CODES.replay)
+
+    const wrongRef = evaluateAttestation({
+      artifact: validArt,
+      policy: "required",
+      publicKey: attKeys.publicKey,
+      expectedKeyId: "att-1",
+      expectedIssuer: "https://token.actions.githubusercontent.com",
+      expectedRef: "refs/heads/feature",
+      oidcJwks: jwks,
+      requireOidcToken: true,
+      runId: "r-oidc-1",
+      runNonce,
+      planHash,
+      promptHash,
+    })
+    assert.strictEqual(wrongRef.status, "INVALID")
+    assert.strictEqual(wrongRef.code, ATTESTATION_CODES.replay)
+    ok("T36 OIDC real-token verification, forged-issuer refusal, replay checks, and UNKNOWN without JWKS")
+  }
+
   rmSync(TEST_ROOT, { recursive: true, force: true })
   console.log(`\n${passed} verify tests passed`)
 }

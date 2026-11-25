@@ -245,6 +245,24 @@ function parseArgs(argv) {
       case "--attestation-issuer":
         options.attestationIssuer = rest.shift() ?? ""
         break
+      case "--oidc-jwks":
+        options.oidcJwks = rest.shift() ?? ""
+        break
+      case "--fetch-jwks":
+        options.fetchJwks = rest.shift() ?? ""
+        break
+      case "--require-oidc":
+        options.requireOidcToken = true
+        break
+      case "--expected-repo":
+        options.attestationRepository = rest.shift() ?? ""
+        break
+      case "--expected-ref":
+        options.attestationRef = rest.shift() ?? ""
+        break
+      case "--expected-audience":
+        options.attestationAudience = rest.shift() ?? ""
+        break
       case "--html":
         options.markdown = false
         break
@@ -620,8 +638,49 @@ function runPlanRequirePinnedWrites(runDir) {
   }
 }
 
+/**
+ * Opt-in CLI-only OIDC JWKS fetcher (`verify --fetch-jwks <issuer-url>`).
+ * Strictly HTTPS-only (no redirects to HTTP), bounded response size, never
+ * invoked unless the operator explicitly passes `--fetch-jwks`.
+ */
+async function fetchOidcJwks(issuerUrl) {
+  const base = String(issuerUrl || "").trim().replace(/\/+$/, "")
+  let parsed
+  try {
+    parsed = new URL(base)
+  } catch {
+    throw new Error(`--fetch-jwks issuer "${base}" is not a valid URL`)
+  }
+  if (parsed.protocol !== "https:") {
+    throw new Error(`--fetch-jwks requires an https:// issuer URL (got ${parsed.protocol})`)
+  }
+  const wellKnownUrl = `${base}/.well-known/openid-configuration`
+  const discoRes = await fetch(wellKnownUrl, { signal: AbortSignal.timeout(10_000) })
+  if (!discoRes.ok) throw new Error(`OIDC discovery ${wellKnownUrl} failed with HTTP ${discoRes.status}`)
+  const disco = await discoRes.json()
+  if (typeof disco?.jwks_uri !== "string" || !disco.jwks_uri.startsWith("https://")) {
+    throw new Error(`OIDC discovery at ${wellKnownUrl} returned no valid https:// jwks_uri`)
+  }
+  const jwksRes = await fetch(disco.jwks_uri, { signal: AbortSignal.timeout(10_000) })
+  if (!jwksRes.ok) throw new Error(`JWKS fetch ${disco.jwks_uri} failed with HTTP ${jwksRes.status}`)
+  const text = await jwksRes.text()
+  if (Buffer.byteLength(text, "utf8") > 512 * 1024) throw new Error("JWKS response exceeds 512 KiB bound")
+  const jwks = JSON.parse(text)
+  if (!Array.isArray(jwks?.keys)) throw new Error("JWKS response has no keys array")
+  return jwks
+}
+
 async function verifyCommand(options) {
   try {
+    let oidcJwks
+    if (options.fetchJwks) {
+      oidcJwks = await fetchOidcJwks(options.fetchJwks)
+    } else if (options.oidcJwks) {
+      oidcJwks = JSON.parse(readFileSync(resolve(options.oidcJwks), "utf8"))
+    } else if (process.env.OPENCODE_TEAMWORK_OIDC_JWKS) {
+      const raw = process.env.OPENCODE_TEAMWORK_OIDC_JWKS.trim()
+      oidcJwks = raw.startsWith("@") ? JSON.parse(readFileSync(resolve(raw.slice(1)), "utf8")) : JSON.parse(raw)
+    }
     const result = await verifyRun({
       cwd: process.cwd(),
       session: options.session,
@@ -644,6 +703,11 @@ async function verifyCommand(options) {
       attestationPublicKey: options.attestationPublicKey || undefined,
       attestationKeyId: options.attestationKeyId || undefined,
       attestationIssuer: options.attestationIssuer || undefined,
+      attestationAudience: options.attestationAudience || undefined,
+      attestationRepository: options.attestationRepository || undefined,
+      attestationRef: options.attestationRef || undefined,
+      oidcJwks,
+      requireOidcToken: options.requireOidcToken === true,
     })
     if (options.json) {
       // JSON.stringify escapes C0 only; escape DEL and C1 (incl. 0x9b CSI) too

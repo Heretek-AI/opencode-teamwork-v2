@@ -47,6 +47,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   group: ci-attestation-${{ inputs.run_id }}
@@ -154,6 +155,21 @@ jobs:
           fi
           mkdir -p verify/ci
           base="$(git rev-parse HEAD^ 2>/dev/null || true)"
+          oidc_args=()
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            oidc_json="$RUNNER_TEMP/oidc.json"
+            if curl -fsSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=opencode-teamwork" > "$oidc_json"; then
+              node -e '
+                const fs = require("fs");
+                const j = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/oidc.json", "utf8"));
+                if (typeof j.value === "string" && j.value) fs.writeFileSync(process.env.RUNNER_TEMP + "/oidc.jwt", j.value, { mode: 0o600 });
+              '
+              if [ -s "$RUNNER_TEMP/oidc.jwt" ]; then
+                oidc_args=(--oidc-token "@$RUNNER_TEMP/oidc.jwt" --oidc-ref "$GITHUB_REF")
+              fi
+            fi
+          fi
           node scripts/attest-sign.mjs \
             --run-id "$RUN_ID" \
             --manifest-digest "$MANIFEST_DIGEST" \
@@ -166,8 +182,10 @@ jobs:
             --repository "$GITHUB_REPOSITORY" \
             --oidc-subject "repo:$GITHUB_REPOSITORY:ref:$GITHUB_REF" \
             --oidc-issuer "https://token.actions.githubusercontent.com" \
+            --oidc-audience "opencode-teamwork" \
+            "${oidc_args[@]}" \
             --out verify/ci/attestation.json
-          rm -f "$key"
+          rm -f "$key" "$RUNNER_TEMP/oidc.json" "$RUNNER_TEMP/oidc.jwt"
 
       - name: Upload the attestation
         uses: actions/upload-artifact@v4
