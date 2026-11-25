@@ -30,14 +30,14 @@ symbol, and the tool output or observed `agy` behaviour that produced it.
 | Source | Baseline | After remediation (local) | Remote state |
 | --- | ---: | ---: | --- |
 | fallow dead-code | **255** issues: 18 unused files, 214 unused exports, 15 unused types, 5 duplicate exports, 1 unresolved import, 2 unlisted deps | **0** issues (exit 0) | n/a (local tool) |
-| SonarCloud open issues | **1,234** total; **1,050** outside `docs/re` (55 bugs, 45 vulnerabilities, 950 code smells) | Target bugs/vulnerabilities and the dead-code/duplication findings are fixed; the secrets scan is clean. After the merge, `main` @ `34cc451` reports **1,289** open (8 bugs, 16 vulnerabilities, 1,265 smells); 15 of the 24 bugs/vulns are in `docs/re`, 9 outside (tracked in #49) | Re-analyzed on `main` after the merge; the remaining 9 non-`docs/re` findings are logged in #49 |
-| GitHub code scanning | **44** alerts: 22 open, 14 fixed, 8 dismissed. Open: 19 `js/file-system-race`, 2 `js/file-access-to-http`, 1 `actions/unpinned-tag` | All 22 are fixed, plus the 3 new alerts introduced by the merge (`#66-68`) | **47 alerts: 0 open, 39 fixed, 8 dismissed** after the `c770dd8` CodeQL run |
-| Runtime gates | 52 pass, 1 skip (L4 live), 0 fail | 113 pass, 1 skip (L4 live), 0 fail | local |
+| SonarCloud open issues | **1,234** total; **1,050** outside `docs/re` (55 bugs, 45 vulnerabilities, 950 code smells) | Target bugs/vulnerabilities and the dead-code/duplication findings are fixed; the secrets scan is clean. The 0.19.1 PR analysis is gate-OK with **0 new bugs/vulnerabilities** | `main` @ `7e0de63` (0.19.1): **1,292 open** (7 bugs, 5 vulnerabilities, 1,280 smells); **all 12 bugs/vulnerabilities are in `docs/re/`**, **0 outside**. The nine #49 findings are fixed or line-suppressed |
+| GitHub code scanning | **44** alerts: 22 open, 14 fixed, 8 dismissed. Open: 19 `js/file-system-race`, 2 `js/file-access-to-http`, 1 `actions/unpinned-tag` | All 22 are fixed, plus the 3 new alerts introduced by the merge (`#66-68`); 0 new alerts in 0.19.1 | **52 alerts: 0 open, 43 fixed, 9 dismissed** after the 0.19.1 analysis. The 0.19.1 addition is a deterministic test-fixture nonce in `signer/tests/spec_28.rs`, dismissed as used in tests |
+| Runtime gates | 52 pass, 1 skip (L4 live), 0 fail | 114 pass, 1 skip (L4 live), 0 fail | local |
 | Rust signer | 5/5 | 5/5 | local |
-| Packaging | 103 files, 0 deps | 108 files, 0 deps (`text-utils.ts` added; the parity script now ships with the other test scripts); no `tests/`, `docs/re/`, or `signer/` | local |
+| Packaging | 103 files, 0 deps | 109 files, 0 deps (the parity script and `url-guard.mjs` + `.d.mts` ship); no `tests/`, `docs/re/`, or `signer/` | local |
 
-The local-vs-remote distinction is deliberate. Nothing in this report claims
-that a remote scanner has already accepted the local fixes.
+The local-vs-remote distinction is deliberate: local gates and the actual
+remote `main` analyses are recorded separately.
 
 ## 3. Findings by source
 
@@ -101,6 +101,10 @@ code smells).
 | `S1244` (float equality) | tests | tolerance-based assertions |
 | `S5332` (http URLs) | test fixtures | https fixtures or documented localhost exceptions |
 | `S4036` (PATH lookup) | shipped code | one `resolveTrustedExecutable` resolver; 0777/relative/foreign-owner PATH entries refused; `lemma.ts` toolchain probes now use it with `fallbackToStandard: false` |
+
+After 0.19.1, `main` @ `7e0de63` reports **1,292** open issues (7 bugs, 5
+vulnerabilities, 1,280 code smells); all 12 bugs/vulnerabilities are in the
+never-shipped `docs/re/` corpus, 0 outside.
 
 **Code smells.** The dead-code and duplicate findings above are the targeted
 M2 smells. The remaining large family is cognitive complexity (`S3776`, 106
@@ -205,13 +209,13 @@ All commands below were run from the repo root unless noted.
 
 ```sh
 npm test                                   # exit 0; 15 L0 suites
-npm run test:agy-parity                    # 152/152 parity
+npm run test:agy-parity                    # 153/153 parity
 node scripts/lint-security-claims.mjs      # 31 files clean
 npm run lint:prompts                       # 15 agents, 6 topologies
-npm pack --dry-run                         # 108 files, 0 deps, no tests/docs/re/signer
+npm pack --dry-run                         # 109 files, 0 deps, no tests/docs/re/signer
 cargo test --manifest-path signer/Cargo.toml  # 5/5
 fallow dead-code --no-cache                # 0 issues, exit 0
-cd tests/runtime && bun test --timeout 30000  # 113 pass, 1 skip (L4 live), 0 fail
+cd tests/runtime && bun test --timeout 30000  # 114 pass, 1 skip (L4 live), 0 fail
 ```
 
 The full audit and test evidence is in the fresh run recorded with this report.
@@ -232,11 +236,13 @@ secrets**.
 
 ## 7. Unresolved items and residual risks
 
-1. **Remote scanner state.** CodeQL is clean on `main` (`c770dd8`: 0 open,
-   39 fixed, 8 dismissed). SonarCloud re-analyzed `main` at `34cc451`: 1,289
-   open (8 bugs, 16 vulnerabilities, 1,265 smells); 9 bugs/vulnerabilities
-   remain outside `docs/re` and are tracked in #49. The larger smell count is
-   new code, not a regression in the shipped behaviour.
+1. **Remote scanner state.** CodeQL is clean on `main` (`7e0de63`: 0 open,
+   43 fixed, 9 dismissed; the 0.19.1 addition is a deterministic test-fixture
+   nonce in `signer/tests/spec_28.rs`, dismissed as used in tests). SonarCloud
+   analyzed `main` @ `7e0de63` (0.19.1): 1,292 open (7 bugs, 5 vulnerabilities,
+   1,280 smells); all 12 bugs/vulnerabilities are in the never-shipped
+   `docs/re/` corpus, 0 outside. #49 is closed. The larger smell count is new
+   code, not a regression in the shipped behaviour.
 2. **Sonar code smells remain.** The targeted bug/vulnerability/dead-code set is
    fixed; the large `S3776` cognitive-complexity family (and other style rules)
    was not mass-refactored. Reducing it safely is a separate change.
@@ -312,8 +318,8 @@ below is the recorded run in `docs/TEST_READY.md`.
 wrote none of the implementation. Comparison: survey matrix features 1-17, each
 tagged with one of the five surfaces above. Local: source, L0, and direct CLI
 probes. `tests/runtime` was deliberately not run here; its rows cite the
-recorded `docs/TEST_READY.md` run (61/61 parity; 113 pass, 1 skip, 0 fail
-overall).
+recorded `docs/TEST_READY.md` run for 0.19.0 (61/61 parity; 113 pass, 1 skip,
+0 fail overall). The 0.19.1 counts are in §§2 and 5.
 
 **Commands run for this rubric.**
 
@@ -344,7 +350,7 @@ overall).
   denies it for three (`segment-reviewer`, `formalization-reviewer`,
   `referee`). The code and the permission test agree; the matrix sentence is
   imprecise.
-- Report counts: `npm pack --dry-run` is 108 files and the claim lint sees 31
+- Report counts: `npm pack --dry-run` is 109 files and the claim lint sees 31
   files because this report, `TEST_INFRA.md` and `TEST_READY.md` were added;
   §§2 and 5 were refreshed to match.
 - `state.json` is unsigned coordinator state. No signature is claimed for the
