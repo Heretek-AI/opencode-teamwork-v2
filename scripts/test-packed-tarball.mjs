@@ -20,9 +20,22 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 const RUNTIME_DIR = join(ROOT, "tests", "runtime")
 
 const npmBin = resolveTrustedExecutable("npm")
-if (!npmBin) {
-  console.error("test-packed-tarball: no trusted npm executable found on PATH")
-  process.exit(1)
+// Hosted setup-node exposes `npm` as a symlink to a non-executable npm-cli.js,
+// so the trusted executable resolver can reject it even though npm is the
+// toolchain's own bin. Fall back to the npm CLI beside process.execPath; this is
+// an absolute path, never a PATH lookup.
+const npmShim = join(dirname(process.execPath), process.platform === "win32" ? "npm.cmd" : "npm")
+const npmCli =
+  process.platform === "win32"
+    ? join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js")
+    : join(dirname(process.execPath), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js")
+function runNpm(args, options = {}) {
+  if (npmBin) return execFileSync(npmBin, args, options)
+  // The toolchain's own shim is an absolute path; the trusted-directory
+  // resolver rejects it only because it follows to a non-executable JS file.
+  if (existsSync(npmShim)) return execFileSync(npmShim, args, options)
+  if (existsSync(npmCli)) return execFileSync(process.execPath, [npmCli, ...args], options)
+  throw new Error("test-packed-tarball: no trusted npm executable or npm shim beside process.execPath")
 }
 const bunBin = resolveTrustedExecutable("bun")
 if (!bunBin) {
@@ -32,7 +45,7 @@ if (!bunBin) {
 
 const work = mkdtempSync(join(tmpdir(), "teamwork-t4-pack-"))
 try {
-  const packOut = execFileSync(npmBin, ["pack", "--json", "--pack-destination", work], {
+  const packOut = runNpm(["pack", "--json", "--pack-destination", work], {
     cwd: ROOT,
     encoding: "utf8",
   })
@@ -68,7 +81,7 @@ try {
   const consumer = join(work, "consumer")
   mkdirSync(consumer, { recursive: true })
   writeFileSync(join(consumer, "package.json"), JSON.stringify({ name: "t4-consumer", private: true }) + "\n")
-  execFileSync(npmBin, ["install", "--no-audit", "--no-fund", tarballPath], {
+  runNpm(["install", "--no-audit", "--no-fund", tarballPath], {
     cwd: consumer,
     stdio: "inherit",
   })
