@@ -37,8 +37,8 @@ symbol, and the tool output or observed `agy` behaviour that produced it.
 | Source | Baseline | After remediation (local) | Remote state |
 | --- | ---: | ---: | --- |
 | fallow dead-code | **255** issues: 18 unused files, 214 unused exports, 15 unused types, 5 duplicate exports, 1 unresolved import, 2 unlisted deps | **0** issues (exit 0) | n/a (local tool) |
-| SonarCloud open issues | **1,234** total; **1,050** outside `docs/re` (55 bugs, 45 vulnerabilities, 950 code smells) | Target bugs/vulnerabilities and the dead-code/duplication findings are fixed; the secrets scan is clean. The 0.19.1 PR analysis is gate-OK with **0 new bugs/vulnerabilities** | `main` @ `7e0de63` (0.19.1): **1,292 open** (7 bugs, 5 vulnerabilities, 1,280 smells); **all 12 bugs/vulnerabilities are in `docs/re/`**, **0 outside**. The nine #49 findings are fixed or line-suppressed |
-| GitHub code scanning | **44** alerts: 22 open, 14 fixed, 8 dismissed. Open: 19 `js/file-system-race`, 2 `js/file-access-to-http`, 1 `actions/unpinned-tag` | All 22 are fixed, plus the 3 new alerts introduced by the merge (`#66-68`); 0 new alerts in 0.19.1 | **52 alerts: 0 open, 43 fixed, 9 dismissed** after the 0.19.1 analysis. The 0.19.1 addition is a deterministic test-fixture nonce in `signer/tests/spec_28.rs`, dismissed as used in tests |
+| SonarCloud open issues | **1,234** total; **1,050** outside `docs/re` (55 bugs, 45 vulnerabilities, 950 code smells) | Target bugs/vulnerabilities and the dead-code/duplication findings are fixed; the secrets scan is clean. The 0.19.2 PR analysis is gate-OK with **0 new bugs/vulnerabilities** | `main` @ `52ef2b6` (0.19.2): **1,316 open** (7 bugs, 5 vulnerabilities, 1,304 smells); **all 12 bugs/vulnerabilities are in `docs/re/`**, **0 outside**. #49 is closed |
+| GitHub code scanning | **44** alerts: 22 open, 14 fixed, 8 dismissed. Open: 19 `js/file-system-race`, 2 `js/file-access-to-http`, 1 `actions/unpinned-tag` | All 22 are fixed, plus the 3 new alerts introduced by the merge (`#66-68`); 0 new alerts in 0.19.2 | **52 alerts: 0 open, 43 fixed, 9 dismissed** after the 0.19.2 analysis. The 0.19.1 addition is a deterministic test-fixture nonce in `signer/tests/spec_28.rs`, dismissed as used in tests |
 | Runtime gates | 52 pass, 1 skip (L4 live), 0 fail | Local host with `opencode`: 118 pass, 1 skip (L4 live), 0 fail. The `runtime-l1` CI gate installs `@opencode/cli@2.4.1` and requires the same 118/1/0; a host-less 117 pass + 2 skip run fails it | local / CI |
 | Rust signer | 5/5 | 5/5 | local |
 | Packaging | 103 files, 0 deps | 115 files on the 0.19.2 release line (`lib/oidc-fetch.mjs` and the two attestation-input scripts add three; the release-consistency check, its self-test and the release runbook add three); 0 deps (the parity script and `url-guard.mjs` + `.d.mts` ship); no `tests/`, `docs/re/`, or `signer/` | local release branch |
@@ -109,13 +109,14 @@ code smells).
 | `S5332` (http URLs) | test fixtures | https fixtures or documented localhost exceptions |
 | `S4036` (PATH lookup) | shipped code | one `resolveTrustedExecutable` resolver; 0777/relative/foreign-owner PATH entries refused; `lemma.ts` toolchain probes now use it with `fallbackToStandard: false` |
 
-After 0.19.1, `main` @ `7e0de63` reports **1,292** open issues (7 bugs, 5
-vulnerabilities, 1,280 code smells); all 12 bugs/vulnerabilities are in the
+After 0.19.2, `main` @ `52ef2b6` reports **1,316** open issues (7 bugs, 5
+vulnerabilities, 1,304 code smells); all 12 bugs/vulnerabilities are in the
 never-shipped `docs/re/` corpus, 0 outside. The checked-in analysis scope is
 [`sonar-project.properties`](../sonar-project.properties); the exclusion policy
-and its two narrow rule-level exceptions are in §3.2.1. `docs/re/**` is out of
-scope, so those 12 findings do not appear in a new analysis. The quality gate is
-server-side and is not set by the properties file.
+and its two narrow rule-level exceptions are in §3.2.1. `docs/re/**` is excluded
+from new analysis; the 12 corpus findings still shown in the dashboard are
+retained from earlier analyses and are not in the shipped package. The quality
+gate is server-side and is not set by the properties file.
 
 **Code smells.** The dead-code and duplicate findings above are the targeted
 M2 smells. The remaining large family is cognitive complexity (`S3776`, 106
@@ -292,11 +293,11 @@ secrets**.
 
 ## 7. Unresolved items and residual risks
 
-1. **Remote scanner state.** CodeQL is clean on `main` (`7e0de63`: 0 open,
+1. **Remote scanner state.** CodeQL is clean on `main` (`52ef2b6`: 0 open,
    43 fixed, 9 dismissed; the 0.19.1 addition is a deterministic test-fixture
    nonce in `signer/tests/spec_28.rs`, dismissed as used in tests). SonarCloud
-   analyzed `main` @ `7e0de63` (0.19.1): 1,292 open (7 bugs, 5 vulnerabilities,
-   1,280 smells); all 12 bugs/vulnerabilities are in the never-shipped
+   analyzed `main` @ `52ef2b6` (0.19.2): 1,316 open (7 bugs, 5 vulnerabilities,
+   1,304 smells); all 12 bugs/vulnerabilities are in the never-shipped
    `docs/re/` corpus, 0 outside. #49 is closed. The larger smell count is new
    code, not a regression in the shipped behaviour.
 2. **Sonar code smells remain.** The targeted bug/vulnerability/dead-code set is
