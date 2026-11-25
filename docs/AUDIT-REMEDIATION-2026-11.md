@@ -39,9 +39,9 @@ symbol, and the tool output or observed `agy` behaviour that produced it.
 | fallow dead-code | **255** issues: 18 unused files, 214 unused exports, 15 unused types, 5 duplicate exports, 1 unresolved import, 2 unlisted deps | **0** issues (exit 0) | n/a (local tool) |
 | SonarCloud open issues | **1,234** total; **1,050** outside `docs/re` (55 bugs, 45 vulnerabilities, 950 code smells) | Target bugs/vulnerabilities and the dead-code/duplication findings are fixed; the secrets scan is clean. The 0.19.1 PR analysis is gate-OK with **0 new bugs/vulnerabilities** | `main` @ `7e0de63` (0.19.1): **1,292 open** (7 bugs, 5 vulnerabilities, 1,280 smells); **all 12 bugs/vulnerabilities are in `docs/re/`**, **0 outside**. The nine #49 findings are fixed or line-suppressed |
 | GitHub code scanning | **44** alerts: 22 open, 14 fixed, 8 dismissed. Open: 19 `js/file-system-race`, 2 `js/file-access-to-http`, 1 `actions/unpinned-tag` | All 22 are fixed, plus the 3 new alerts introduced by the merge (`#66-68`); 0 new alerts in 0.19.1 | **52 alerts: 0 open, 43 fixed, 9 dismissed** after the 0.19.1 analysis. The 0.19.1 addition is a deterministic test-fixture nonce in `signer/tests/spec_28.rs`, dismissed as used in tests |
-| Runtime gates | 52 pass, 1 skip (L4 live), 0 fail | Local host with `opencode`: 114 pass, 1 skip (L4 live), 0 fail. CI (no `opencode` on `PATH`): 113 pass, 2 skip (process E2E, L4 live), 0 fail | local / CI |
+| Runtime gates | 52 pass, 1 skip (L4 live), 0 fail | Local host with `opencode`: 118 pass, 1 skip (L4 live), 0 fail. CI (no `opencode` on `PATH`): 117 pass, 2 skip (process E2E, L4 live), 0 fail | local / CI |
 | Rust signer | 5/5 | 5/5 | local |
-| Packaging | 103 files, 0 deps | 110 files on the 0.19.2 release line (the URL/L4 `lib/oidc-fetch.mjs` adds one); 0 deps (the parity script and `url-guard.mjs` + `.d.mts` ship); no `tests/`, `docs/re/`, or `signer/` | local + URL/L4 branch |
+| Packaging | 103 files, 0 deps | 112 files on the 0.19.2 release line (`lib/oidc-fetch.mjs` and the two attestation-input scripts add three); 0 deps (the parity script and `url-guard.mjs` + `.d.mts` ship); no `tests/`, `docs/re/`, or `signer/` | local release branch |
 
 The local-vs-remote distinction is deliberate: local gates and the actual
 remote `main` analyses are recorded separately.
@@ -266,10 +266,10 @@ npm test                                   # exit 0; all L0 suites (15 at 0.19.1
 npm run test:agy-parity                    # 153/153 parity
 node scripts/lint-security-claims.mjs      # 31 files clean
 npm run lint:prompts                       # 15 agents, 6 topologies
-npm pack --dry-run                         # 110 files on the 0.19.2 release line, 0 deps, no tests/docs/re/signer
+npm pack --dry-run                         # 112 files on the 0.19.2 release line, 0 deps, no tests/docs/re/signer
 cargo test --manifest-path signer/Cargo.toml  # 5/5
 fallow dead-code --no-cache                # 0 issues, exit 0
-cd tests/runtime && bun test --timeout 30000  # local 114 pass, 1 skip (L4 live); CI 113 pass, 2 skip
+cd tests/runtime && bun test --timeout 30000  # local 118 pass, 1 skip (L4 live); CI 117 pass, 2 skip
 ```
 
 The full audit and test evidence is in the fresh run recorded with this report.
@@ -375,7 +375,7 @@ probes. `tests/runtime` was deliberately not run here; its rows cite the
 recorded `docs/TEST_READY.md` run for 0.19.0 (at that review: 61/61 parity;
 113 pass, 1 skip, 0 fail overall). Those are **0.19.0** counts; the current
 0.19.1/0.19.2 record is 153/153 L0 (T1 66), 62 runtime parity specs, and CI
-113 pass + 2 skip (local 114 pass + 1 skip).
+117 pass + 2 skip (local 118 pass + 1 skip).
 
 **Commands run for this rubric.**
 

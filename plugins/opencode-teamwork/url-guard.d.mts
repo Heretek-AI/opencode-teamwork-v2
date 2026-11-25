@@ -2,7 +2,6 @@
 // implementation. Type-only: this file has no runtime effect.
 
 export const ALLOW_LOCALHOST_ENV: string
-export const DEFAULT_TOTAL_TIMEOUT_MS: number
 
 export type UrlGuardCode =
   | "URL_INVALID"

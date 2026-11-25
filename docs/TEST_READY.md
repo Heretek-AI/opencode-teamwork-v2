@@ -13,10 +13,10 @@ and CI runs the same suite without an `opencode` binary on `PATH`.
 | --- | --- | --- |
 | L0 parity/regression | `npm run test:agy-parity` | **153/153** (T1 66, T2 65, T3 15, T4 7) |
 | Runtime parity | `cd tests/runtime && bun test --timeout 30000 spec/agy-parity.test.ts` | **62/62**, 0 fail |
-| Full runtime L1–L3 | `cd tests/runtime && bun test --timeout 30000` | **CI: 113 pass, 2 skip (process E2E when `opencode` is absent, L4 live), 0 fail**; local host with `opencode` on `PATH`: 114 pass, 1 skip (L4 live), 0 fail |
+| Full runtime L1–L3 | `cd tests/runtime && bun test --timeout 30000` | **CI: 117 pass, 2 skip (process E2E when `opencode` is absent, L4 live), 0 fail**; local host with `opencode` on `PATH`: 118 pass, 1 skip (L4 live), 0 fail |
 | L0 repository suite | `npm test` | all L0 suites (15 at 0.19.1; the 0.19.2 attestation-input check adds one), exit 0 |
 | Rust signer | `cargo test --manifest-path signer/Cargo.toml` | 5/5 |
-| Packaging | `npm pack --dry-run` | 110 files on the 0.19.2 release line (the URL/L4 `lib/oidc-fetch.mjs` adds one), 0 dependencies, no `tests/`, `docs/re/`, or `signer/`; the parity script ships with the other test scripts |
+| Packaging | `npm pack --dry-run` | 112 files on the 0.19.2 release line (`lib/oidc-fetch.mjs` and the two attestation-input scripts add three), 0 dependencies, no `tests/`, `docs/re/`, or `signer/`; the parity script ships with the other test scripts |
 
 ## What is covered
 

@@ -30,7 +30,7 @@ export const ALLOW_LOCALHOST_ENV = "OPENCODE_TEAMWORK_ALLOW_LOCALHOST"
 // socket inactivity, so a slow-drip response could otherwise hold a caller
 // open indefinitely. Callers with a tighter budget (document review, preflight,
 // OIDC) pass their own signal instead.
-export const DEFAULT_TOTAL_TIMEOUT_MS = 10_000
+const DEFAULT_TOTAL_TIMEOUT_MS = 10_000
 
 function localhostOptInEnabled() {
   return process.env[ALLOW_LOCALHOST_ENV] === "1"

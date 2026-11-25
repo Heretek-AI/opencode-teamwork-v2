@@ -104,7 +104,14 @@ test("I6 verifier: public-key PASS, byte flip FAIL, read-only run untouched, HMA
           const clean = cliVerify(["--run-dir", fx.runDir, "--public-key", `@${publicKeyFile}`])
           expect({ code: clean.code, stderr: clean.stderr }).toEqual({ code: 0, stderr: "" })
           expect(clean.json?.verdict).toBe("PASS")
-          expect(clean.json?.trust).toEqual({ alg: "ed25519", keyId: keys.keyId, source: "public-key" })
+          expect(clean.json?.trust).toEqual({
+            alg: "ed25519",
+            keyId: keys.keyId,
+            source: "public-key",
+            runTrustLevel: "local-hmac",
+            approval: { status: "NOT_REQUIRED" },
+            witness: { status: "NOT_REQUIRED" },
+          })
           expect(clean.json?.runId).toBe(fx.runId)
           expect(clean.json?.counts.fail).toBe(0)
 
