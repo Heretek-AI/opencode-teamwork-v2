@@ -123,8 +123,9 @@ rather than being treated as local.
   receipt is `AUTH_INVALID`, not a pass. When
   `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` is set the plugin sends a v2 request
   with the derived `approvalRef`, but it does not read the approval: the
-  signer's policy remains outside the plugin, and the signer is not shipped in
-  this repository (see [ADR 0014](adr/0014-verifiable-witness-and-signer-v2.md)).
+  signer's policy remains outside the plugin; the Rust reference signer in
+  [`signer/`](../signer/) is not shipped in the npm package and is not a
+  turnkey service (see [ADR 0014](adr/0014-verifiable-witness-and-signer-v2.md)).
   Free-form inputs that are not control-plane verdicts (`state.json` task
   summaries, `pitfalls.md`, `prompt_draft.md`, spec text) remain untrusted and
   are sanitised before injection, not authenticated. **Handoff prose is in the

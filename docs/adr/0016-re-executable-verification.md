@@ -155,6 +155,14 @@ Exit codes:
 | manifest, rerun record or a named report is unauthenticated | 1 or 2 | `RERUN_UNTRUSTED` |
 | source tree changed | 1 | `source-tree-modified` |
 
+**The worktree is not a sandbox.** `--rerun` executes commands recorded by the
+evidence author. The manifest and `verify/rerun.json` authenticate the record,
+not the safety of the command; the child runs with the caller's UID and can
+reach the rest of the machine. Use it only on evidence you are willing to
+execute. 0.19.2 refuses `--rerun` with `--allow-unsigned` and requires the
+signed manifest, its reports and the rerun links to authenticate before any
+command runs.
+
 Under `command`, `verify` without `--rerun` reports the claim as
 `provenance: claimed` and returns `UNKNOWN` (exit 2): a claimed observation is
 never promoted to `PASS`. Under `declared`, the 0.15 behaviour is unchanged with

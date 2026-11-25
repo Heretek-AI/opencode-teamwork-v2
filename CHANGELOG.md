@@ -4,35 +4,77 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.19.2] - 2026-11-25
 
 ### Security
 
-- **CI trust boundaries:** `attest.yml` no longer accepts `manifest_path`; the
-  path is derived from the validated run id, checked as a regular file under
-  `.opencode/teamwork/<run_id>/`, and passed as a step output rather than
-  written to `$GITHUB_ENV`. Testing and signing now run in separate jobs: the
-  test job has `contents: read` and no OIDC token, while the signing job starts
-  from a clean checkout and verifies the uploaded record with
-  `scripts/check-attest-input.mjs` before loading the key.
+- **`verify --rerun` trust gate:** a re-executed command contributes to a
+  verdict only when the signed manifest, `verify/rerun.json`, the reports it
+  names and the rerun links all authenticate. `--rerun` is refused together
+  with `--allow-unsigned`, because an unsigned run has no trust anchor for the
+  recorded command list. Re-execution still runs operator-recorded code: the
+  disposable worktree is an isolation convenience, not a sandbox.
+- **`--allow-unsigned` narrowed to legacy runs:** the flag is accepted only
+  when `run.manifest.json` is absent. It recomputes relations for an unsigned
+  legacy run but the verdict stays `UNKNOWN`; on a run that has a manifest, a
+  missing envelope is a failure rather than a warning. It cannot be combined
+  with `--rerun`.
+- **Attestation input validation:** `attest.yml` validates the run id and
+  manifest digest as fixed-shape values and accepts no caller-supplied manifest
+  path; the path is derived from the validated run id and must be a regular file
+  under `.opencode/teamwork/<run_id>/`. Testing and signing are separate jobs
+  with separate privileges, and no input is interpolated into a shell command.
+- **Fail-closed trust:** an approval (`AUTH_APPROVAL_UNVERIFIED`) or witness
+  (`AUTH_WITNESS_UNVERIFIED`) that the offline verifier cannot establish is
+  reported as `UNKNOWN`, never treated as satisfied; the JSON `trust` object
+  carries `runTrustLevel`, `approval.status` and `witness.status`.
+- **Fail-closed route evidence (breaking):** on a signed run, `final_verify`
+  now refuses `PASS` for LEMMA (`LEMMA_EVIDENCE_UNSIGNED`), massive-proof
+  tournament (`TOURNAMENT_EVIDENCE_UNSIGNED`) and document-review
+  (`DOCUMENT_REVIEW_EVIDENCE_UNSIGNED`) evidence because those writers still
+  emit plain JSON/plain text without `_auth` envelopes. This is deliberate: the
+  alternative is claiming an authenticated verdict over unauthenticated
+  evidence. Explicit unsigned legacy runs (`allowUnsignedLegacy: true`) keep the
+  old behaviour. Evidence signing is Phase 2; until it lands, those routes on a
+  signed run are blocked at `final_verify`.
+- **OIDC fetch deadlines:** `verify --fetch-jwks` now runs discovery, DNS
+  validation and the JWKS fetch under one total deadline, destroys responses on
+  early refusal, and retries a per-address `URL_TIMEOUT` on the next validated
+  address while the total deadline is live. The fetcher lives in
+  `lib/oidc-fetch.mjs`.
+- **CI action pinning:** every `actions/*` use is pinned to a full commit SHA
+  with the version in a comment.
 - **Release publishing:** `publish.yml` no longer holds `id-token: write` in
   the job that runs `npm test`/T4. A separate publish job is gated to
-  `refs/tags/v*`, so a `workflow_dispatch` on a branch can only run the
-  unprivileged `verify` dry-run. The publish job starts from a clean checkout,
-  verifies the uploaded tarball's sha256, re-packs the clean checkout and
-  requires a byte-identical digest, then publishes that tarball.
-- **Action pinning:** all `actions/*` uses are pinned to full commit SHAs with
-  the version in a comment (`checkout`, `setup-node`, `setup-python`, `cache`,
-  `upload-artifact`, `download-artifact`, `github-script`).
+  `refs/tags/v*`, so a branch dispatch can only run the unprivileged `verify`
+  dry-run. The publish job starts from a clean checkout, verifies the uploaded
+  tarball's sha256, re-packs the clean checkout and requires a byte-identical
+  digest, then publishes that tarball. A `v*` tag is required; there is no
+  branch-dispatch publish path.
 
 ### Fixed
 
+- **L4 live-model budget:** the live suite now reads spend back from session
+  messages, records each turn, and refuses to start another turn once the USD
+  cap is reached; the previous `estimatedUsd` counter never advanced, so the
+  "hard" cap was advisory. The log records `budgetStopped`.
 - **Nightly host-drift probe:** the isolated copy now contains the whole
   repository tree (minus `.git`/`node_modules`) instead of only
   `tests/runtime`, so the harness `REPO_ROOT` can import `plugins/` and
-  `agents/`. A preflight checks `plugins/opencode-teamwork/index.ts` and a
-  one-spec smoke run precedes the full suite. Install/preflight failures are
-  reported as infrastructure failures, not as host drift.
+  `agents/`. A preflight and a one-spec smoke run precede the full suite, and
+  install/preflight failures are reported as infrastructure failures rather
+  than as host drift.
+- **Docs truth pass:** corrected the 0.16.0 compatibility audit to a clearly
+  labelled historical record with a 0.19.2 disposition, refreshed the open-work
+  lists, updated the signer docs to point at the non-shipped `signer/`
+  reference, and corrected the test/runtime/packaging counts and the `--rerun`,
+  `--allow-unsigned`, `attest.yml`, T4 and L4 claims.
+- **SonarCloud configuration:** added `sonar-project.properties` and documented
+  the policy in `docs/AUDIT-REMEDIATION-2026-11.md` §3.2.1; `docs/re/**` is
+  excluded as the never-shipped corpus, and only the two reviewed rule/resource
+  pairs are excluded (`S9382` in `scripts/test-*.mjs`, `S1313` in
+  `url-guard.mjs`). The quality gate is server-side and must be set in the
+  SonarCloud UI.
 
 ## [0.19.1] - 2026-11-25
 
@@ -84,7 +126,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that already happened).
 - **Release packed-tarball T4 test (#46):** `scripts/test-packed-tarball.mjs`
   packs, checks sha256 and `files` exclusions, installs into a clean consumer,
-  and runs L1 specs against the installed package before `npm publish`.
+  and loads the installed package through the A1 directory-mode L1 spec before
+  `npm publish` (the A2/A3 specs in the same run still import the working-tree
+  module).
 - **Nightly OpenCode host-drift CI (#39):** `.github/workflows/host-drift.yml`
   and `scripts/diff-host-catalog.mjs` test `@opencode/*@latest` nightly and
   report drift in a single deduplicated `"OpenCode host drift"` issue.
@@ -109,8 +153,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   SQLite state visibility.
 - **L4 live-model opt-in suite (#38):** `tests/runtime/live/l4-live.test.ts`
   and `.github/workflows/live-l4.yml` (`TEAMWORK_LIVE=1`, default model
-  `magpie/opencode-go/muse-spark-1.3-contributor`, hard USD budget cap; prompt
-  fidelity evidence only).
+  `magpie/opencode-go/muse-spark-1.3-contributor`, a `max_usd` workflow input
+  checked between scenarios as an advisory cap — it cannot interrupt an
+  in-flight model call; prompt fidelity evidence only).
 - **Corpus records (#48):** Added `docs/re/antigravity-teamwork/21-live-pdf-ingestion.md`
   and `22-live-document-review-layout-2.md` with strict `OBSERVED`/`UNKNOWN`
   evidence labels.
@@ -161,7 +206,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `OPENCODE_DB` and `OPENCODE_CHANNEL` in `doctor --security`; the 19
   `js/file-system-race` sinks use fd-pinned `O_NOFOLLOW` reads/writes; the two
   `js/file-access-to-http` sinks parse and restrict `service*.json` targets to
-  validated loopback origins; CI actions are SHA-pinned and package installs
+  validated loopback origins; at that release `oven-sh/setup-bun` was the
+  SHA-pinned action (0.19.2 pins the remaining `actions/*` steps) and package installs
   pass `--ignore-scripts`; the approval driver validates `runId` containment.
   The `S3923`, `S8707`, `S5443`, `S2871`, `S1244`, `S5332` and `S4036` findings
   are fixed in the working tree. These are local fixes: remote CodeQL and

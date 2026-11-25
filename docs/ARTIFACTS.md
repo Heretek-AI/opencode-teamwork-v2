@@ -2568,7 +2568,9 @@ asserted and the mode is not pinned, the check is a failure and
 one run directory plus a public key. It never writes into the run and never
 reads `ctx.storage`. Without `--rerun` it never executes a reported check; with
 `--rerun` it re-executes the signed `verify/rerun.json` commands in a disposable
-worktree (0.16.0). See [ADR 0015](adr/0015-offline-verification.md) and
+worktree (0.16.0; the worktree is not a sandbox — see
+[Re-execution](#re-execution-rerun-0160)). See
+[ADR 0015](adr/0015-offline-verification.md) and
 [ADR 0016](adr/0016-re-executable-verification.md).
 
 ```sh
@@ -2628,6 +2630,15 @@ compares the exit code and the unkeyed sha256 of stdout+stderr to the recorded
 values. `sh -c`/`bash -c` and a `cwd` that escapes the worktree are refused.
 The source checkout is hashed before and after and a change is
 `source-tree-modified`. The worktree is removed unless `--keep-worktree`.
+
+**The worktree is not a sandbox.** `--rerun` executes commands recorded by
+whoever produced the signed evidence. A valid signature proves who recorded the
+command and that the record was not edited; it does not make the command safe.
+The child runs with your UID and can read and write anything your account can
+reach. Use `--rerun` only on evidence you are willing to execute, and use a
+disposable container or VM for untrusted runs. `--rerun` is refused with
+`--allow-unsigned`: re-execution needs an authenticated manifest, reports and
+`verify/rerun.json`.
 
 | Outcome | Exit | Code |
 | --- | --- | --- |

@@ -1,26 +1,36 @@
 # OpenCode compatibility
 
 What this plugin is written against, which host surfaces it uses, where the
-current implementation departs from them, and how the departure will be tested.
+implementation departs from them, and how the departure is tested.
+
+> **Status at 0.19.2 (2026-11-25).** This is the historical audit of plugin
+> **0.16.0**. The host-contract analysis in §1–§3 and the residuals in §7–§8
+> remain the reference. All ten defects in §4 were fixed in 0.17.1–0.18.1
+> (disposition in §4.1), and the harness planned in §5 now exists at
+> `tests/runtime/`. The audit prose keeps its original citations and evidence
+> labels; current-state notes are marked separately so the historical claims
+> are not mistaken for present behaviour.
 
 **Audited host:** OpenCode **2.4.1**, commit `b0cda2010b`, read from the clone at
 `/home/john/Projects/opencode`. Package version and commit are OBSERVED
-(`package.json:5`; `git log -1` in the clone). **Audited plugin:** this checkout
-at `main` `6340f64` (`package.json` version `0.16.0`).
+(`package.json:5`; `git log -1` in the clone). **Audited plugin (historical):**
+this checkout at `main` `6340f64` (`package.json` version `0.16.0`). The
+current tree is version 0.19.2; its runtime evidence is recorded in
+[`TEST_READY.md`](TEST_READY.md).
 
 **Evidence labels.** Every claim below is marked:
 
 - **OBSERVED** — read in the cited source at the cited line.
 - **INFERRED** — reasoned from the source but not directly stated there.
 
-Nothing in this document is a claim that a host or harness was executed. The
-only behavioural statement about our own tree is what its source says it does.
+The 0.16.0 audit made no claim that a host or harness was executed; its
+behavioural statements are what the cited source says. Runtime evidence added
+after the harness existed is labelled as such and recorded in `TEST_READY.md`.
 
-The earlier README statement "Verified against **OpenCode `v2.0.26`**"
-(`README.md:18`) is **stale** (OBSERVED). It describes a host two minor lines
-behind the one this document audits, and it predates the Code Mode default,
-the `Tool.Options` reshaping, and the automation context addition listed in
-§1.2.
+At the 0.16.0 audit the README still said "Verified against **OpenCode
+`v2.0.26`**", two minor lines behind the audited host and predating the Code
+Mode default, the `Tool.Options` reshaping and the automation context addition
+in §1.2. The README now names **OpenCode 2.4.1** (`README.md:18`).
 
 ---
 
@@ -139,8 +149,8 @@ Two traps, both OBSERVED:
    asks for children by `parentID` without following `cursor.next` silently
    loses every child after the first page.
 
-Our implementation currently does not follow fork lineage or the cursor; see
-§4 rows 5-6.
+At the 0.16.0 audit our implementation followed neither fork lineage nor the
+cursor; both were fixed in 0.17.1 (see §4 rows 5-6 and §4.1).
 
 ### 2.3 Identity is optional and partly contextual
 
@@ -158,9 +168,10 @@ OBSERVED:
 INFERRED: any authorization that treats `session.get(...).agent` as an
 authenticated caller identity is trusting host-written metadata that is absent
 for some sessions and mutable for others. It is a useful routing signal, not a
-security boundary. Our code already fails closed when the agent is missing
-(`plugins/opencode-teamwork/authorize.ts:317-331`), which is the right default,
-but it also fails closed for legitimate fork descendants (see §4 row 6).
+security boundary. Our code fails closed when the agent is missing
+(`plugins/opencode-teamwork/authorize.ts:317-331`), which is the right default.
+At 0.16.0 it also failed closed for legitimate fork descendants; since 0.17.1
+the ancestry walk follows `fork.sessionID` (see §4 row 6 and §4.1).
 
 ---
 
@@ -309,10 +320,11 @@ and `Options` at `:127-143`.
 
 ---
 
-## 4. Known defects against this contract
+## 4. Known defects against this contract (historical; all ten fixed)
 
-These are the defects the in-flight `0.17.1` fix targets. "Impact" is INFERRED
-from the cited source; the defect itself is OBSERVED.
+These are the defects the `0.17.1` fix targeted. "Impact" is INFERRED from the
+cited source; the defect itself is OBSERVED. The table is preserved as the
+0.16.0 finding record; §4.1 records the 0.19.2 disposition.
 
 | # | Defect | Evidence | Impact |
 | --- | --- | --- | --- |
@@ -333,6 +345,26 @@ because it keys the tool table by `tool.name` and stubs `namespace` to a no-op
 (`scripts/test-engine.mjs:400-411`). That is the motivation for the harness in
 §5.
 
+### 4.1 Disposition at 0.19.2
+
+All ten rows are fixed in the shipped tree:
+
+| # | Current state | Guard |
+| --- | --- | --- |
+| 1, 2 | Every `editor.add` passes `options: { namespace: "teamwork", codemode: false }`; effective ids are `teamwork_*` and the tools stay direct. | `scripts/test-catalog.mjs` (26 ids, options, `strictInput`, prompt tokens); `tests/runtime/spec/a2-catalog.test.ts` against the real host |
+| 3 | The merge-conflict return carries `content` and `mergeOutput`; it no longer sets an undeclared `output` key (merge-conflict branch in `tools.ts`). | The merge-conflict case in `scripts/test-engine.mjs` |
+| 4 | Database resolution honors `OPENCODE_DB`, then channel-specific `opencode-<channel>.db`, then `opencode.db`; service lookup follows the same channel names (`tools.ts:312-347`). | `scripts/test-cost.mjs` |
+| 5 | The session-tree walk follows `cursor.next` with a bounded loop (`tools.ts:435-465`). | The paginated child-list case in `scripts/test-engine.mjs` |
+| 6 | Ancestry follows `fork.sessionID` / `fork_session_id` when `parentID` is absent (`authorize.ts:289-295`). | The fork-ancestry case in `scripts/test-engine.mjs` |
+| 7 | `setup` only verifies agents and warns; it does not write them. Installation belongs to `init`/postinstall (`index.ts:232-250`). | L1 load specs |
+| 8 | The root and vendored plugin manifests are in lockstep at 0.19.2. | `scripts/test-catalog.mjs` version check |
+| 9 | No literal `AD` lines remain in the sentinel or orchestrator prompts. | Prompt lint; `tests/runtime/spec/a7-agents.test.ts` |
+| 10 | The `/teamwork` template tells the model to pass `topology` and `tasks` (`index.ts:45`). | Prompt lint; `scripts/test-catalog.mjs` token check |
+
+The unit shim's blindness is also addressed: the catalog guard runs without the
+shim's namespace stub, and L1–L3 drive the real 2.4.1 runtime. The recorded
+run counts and skip reasons are in [`TEST_READY.md`](TEST_READY.md).
+
 ---
 
 ## 5. Test strategy
@@ -342,37 +374,43 @@ our own prompts contain. Five layers, cheapest first.
 
 | Layer | What runs | Model | What it proves |
 | --- | --- | --- | --- |
-| **L0** | Existing `node`/`bun` unit suites under `scripts/` | none | Pure logic, artifact schemas, crypto, containment, CLI behaviour |
-| **L1** | Real plugin registered in an embedded host; tools invoked directly | none | Registration, effective names, schema conversion, refusal/auth paths, storage semantics against the real host |
-| **L2** | Embedded host + scripted `TestLLM` multi-turn | scripted | Tool placement, prompt-independent tool reachability, multi-turn artifact flow |
-| **L3** | L2 over a real temp git repository and worktree | scripted | Worktree setup/merge/conflict and the merge-path defect, end to end |
-| **L4** | Real provider, real models | live | Only that a live model can use the catalog; never used as a correctness gate |
+| **L0** | `node`/`bun` unit suites under `scripts/` | none | Pure logic, artifact schemas, crypto, containment, CLI behaviour |
+| **L1** | Real plugin registered in an embedded host; load, catalog, commands, schema, hooks, storage, result shape | none | Registration, effective names, schema conversion, refusal/auth paths, storage semantics against the real host |
+| **L2** | Engine tools driven through real sessions and host storage: plan, claims, evidence, approvals | none | Tool placement, artifact flow, signing and gate behaviour without a model |
+| **L3** | Whole workflows over a real temp git repository and worktree, including a two-process claim race and the verifier CLI | none | Worktree setup/merge/conflict, retries, strict waves, victory refusal/resume, crash recovery |
+| **L4** | Real provider, real models, opt-in via `TEAMWORK_LIVE=1` | live | Only that a live model can use the catalog; never used as a correctness gate |
+
+The original plan used a scripted `TestLLM` for L2/L3. The implemented harness
+chose *no model at all*: it calls the host's real tool executor and the plugin's
+registered tools, which is a stronger and cheaper assertion for the contract.
+Prompt fidelity is the only question left to L4.
 
 ### 5.1 Harness location and dependencies
 
-Planned layout (nothing here exists yet):
+The harness planned here now exists (0.19.x):
 
 ```
 tests/runtime/
-  lib/host.ts          # create(options) wrapper, overrides, tmp dirs
-  lib/probe-plugin.ts  # captures ctx.tool.list() after all transforms
-  lib/script.ts        # TestLLM sequences and request assertions
-  lib/worktree.ts      # throwaway git repo + worktree helpers
-  catalog.golden.json  # the first artifact (see 5.4)
-  l1-registration.test.ts
-  l2-turns.test.ts
-  l3-workflow.test.ts
-  l4-live.test.ts       # skipped unless OPENCODE_LIVE=1
+  harness/load.ts       # embedded host, plugin load (memory or directory), overrides
+  harness/project.ts    # throwaway project, config dir and TMPDIR per spec
+  harness/tools.ts      # direct-call helpers and artifact assertions
+  harness/plan.ts, run.ts, sign.ts, attest.ts, flow.ts
+  spec/a1-load.test.ts … spec/a8-result-shape.test.ts  # contract, catalog, commands, schema, hooks
+  spec/b-plan.test.ts … spec/j-strict-input.test.ts
+  spec/agy-parity.test.ts                    # parity specs
+  e2e/process-e2e.test.ts                    # real `opencode serve`; skips without the CLI
+  live/l4-live.test.ts                       # skipped unless TEAMWORK_LIVE=1
 ```
 
-- Runtime: **bun** (OBSERVED: the host is a bun workspace,
-  `package.json:8` in the clone; `@opencode/plugin` is a bun test target).
-- Dependencies: exact `@opencode/*@2.4.1` **devDependencies only**. They are not
-  runtime dependencies, so the published tarball stays dependency-free.
-- Packaging: `tests/` is not in `package.json` `files` (`package.json:33-45`),
-  so it is excluded from the tarball by omission. A pack dry-run is the guard.
-- No test may import from `/home/john/Projects/opencode` at runtime. The clone is
+- Runtime: **bun**. `tests/runtime/package.json` pins the exact
+  `@opencode/*@2.4.1` packages and `effect@4.1.0` as **devDependencies only**;
+  the root package stays dependency-free.
+- Packaging: `tests/` is not in the root `files` list, so it is excluded from
+  the tarball by omission. `npm pack --dry-run` and
+  `scripts/test-packed-tarball.mjs` are the guards.
+- No test imports from `/home/john/Projects/opencode` at runtime. The clone is
   a reading reference; the harness installs the published packages.
+- The L4 suite is opt-in via `TEAMWORK_LIVE=1`; it is never a correctness gate.
 
 ### 5.2 Embedded host and overrides
 
@@ -391,27 +429,30 @@ OBSERVED:
 - A local directory is loaded through config
   (`packages/core/src/plugin/module.ts:107-120`); entries are
   `string | { package, options }` (`packages/schema/src/config/plugin.ts:6-14`).
-- `TestLLM` is a real `LLMClient` replacement with a response queue, fallback,
-  request log and gates (`packages/ai/src/testing.ts:53-102`); the pattern
-  `llmClient.replace(Layer.succeed(LLMClient.Service, llm))` with
-  `TestLLM.testLayer(...)` is used by the host's own embedded SDK test
-  (`packages/sdk/test/embedded.test.ts:59-81`).
+- `TestLLM` exists as a real `LLMClient` replacement
+  (`packages/ai/src/testing.ts:53-102`), but the implemented L1–L3 harness does
+  not use it: there is no model request to script. It is reserved for a future
+  prompt-level suite; L4 is the live-model layer.
 
-INFERRED harness shape:
+Implemented harness shape (`tests/runtime/harness/load.ts`, OBSERVED):
 
 ```ts
-const llm = yield* TestLLM.Test.pipe(Effect.provide(TestLLM.testLayer({ fallback })))
-const opencode = yield* OpenCode.create(
-  {
-    config: { directory, project: false, content: JSON.stringify({ ... }) },
+const embedded = await Effect.runPromise(
+  EmbeddedHost.create({
+    database: { path: options.databasePath ?? ":memory:" },
+    app: { name: "opencode-l1", version: versions.core },
+    config: { directory: project.configDir, project: false, content: "{}" },
     models: { fetch: false },
     fs: { filewatcher: false },
-  },
-  { overrides: [llmClient.replace(Layer.succeed(LLMClient.Service, llm))] },
+    plugins: promisePlugins.map((plugin) => PluginPromise.fromPromise(plugin)),
+  }),
 )
 ```
 
-The plugin is loaded both ways, because they exercise different paths:
+The public `OpenCode.create()` returns only an HTTP client and discards the
+runtime the L1 assertions need, so the harness uses the SDK's internal
+`EmbeddedHost` entrypoint and documents it. The plugin is loaded both ways,
+because they exercise different paths:
 
 - **from a directory**: `config.plugins: ["/abs/path/to/plugins/opencode-teamwork"]`
   — proves the real module graph, `import.meta.url` agent lookup, and package
@@ -435,22 +476,25 @@ A test may assert that a prompt *contains* a tool name (a cheap regression for
 the §4 row 1 defect), but it must not treat that as proof the tool exists. The
 existence proof is the catalog, not the prompt.
 
-### 5.4 The catalog golden is the first artifact
+### 5.4 The catalog guard is the first artifact
 
-Capture, once, the result of `ctx.tool.list()` after every transform
-(`ToolDomain.list`, `packages/plugin/src/promise/tool.ts:83-88`), plus for each
-entry:
+The plan called for one captured `catalog.golden.json`. It was implemented as
+two guards instead, because an explicit expected list is easier to review than a
+large generated blob:
 
-- `id` (effective name),
-- `options.namespace`,
-- `options.codemode` and the resulting placement (`direct` or `codemode`),
-- the input schema's `required` keys,
-- a digest of the input/output JSON Schema.
+- `scripts/test-catalog.mjs` (L0) registers the real tools through the same
+  effective-name shim and asserts the exact 26 `teamwork_*` ids, the
+  `{ namespace: "teamwork", codemode: false }` options, the `strictInput`
+  wrapper, the supported JSON-Schema keyword set, and that every tool token in
+  the shipped prompts resolves to a registered id.
+- `tests/runtime/spec/a2-catalog.test.ts` (L1) repeats the id/options contract
+  against the real 2.4.1 host, while `a1-load.test.ts` proves both the
+  in-memory and local-directory load paths.
 
-Compare on every run. This is the one artifact that catches the bare-name and
-Code Mode defects even before a model is involved, and its diff is readable in
-review. It is also the artifact that would have caught the `2.3.2 → 2.4.1`
-`Tool.Options` reshaping if the plugin had declared namespaces.
+This catches the bare-name and Code Mode defects before a model is involved,
+and its diff is readable in review. It is also the check that would have caught
+the `2.3.2 → 2.4.1` `Tool.Options` reshaping if the plugin had declared
+namespaces.
 
 ---
 
@@ -458,17 +502,18 @@ review. It is also the artifact that would have caught the `2.3.2 → 2.4.1`
 
 | Tier | Contents | Trigger | Blocking |
 | --- | --- | --- | --- |
-| **T0** | Existing `npm test` (13 scripts) + catalog golden | every push / PR | yes |
+| **T0** | `npm test` (all L0 suites) + `scripts/test-catalog.mjs` | every push / PR | yes |
 | **T1** | L1 + L2 on pinned `@opencode/*@2.4.1` | every push / PR | yes |
 | **T2** | L3 in a real git worktree | every push / PR | yes |
-| **T3** | Full matrix, nightly: Node/bun matrix, `@opencode/*@latest` drift | nightly schedule | no (reports drift) |
-| **T4** | Release tarball: `npm pack`, install into a clean dir, load the plugin | release tag | yes |
+| **T3** | Nightly `@opencode/*@latest` drift, plus the macOS/Windows containment matrix | nightly / push | drift: no (reports); platform: yes |
+| **T4** | Release tarball: `npm pack`, install into a clean dir, load the installed package through the A1 directory-mode L1 spec (A2/A3 in the same run still use the working tree) | release tag | yes |
 
 Notes (INFERRED):
 
 - T3's `@latest` job is deliberately non-blocking: a 2.5 behavioural change
   should be visible in the nightly report, not stop a security release at 02:00.
-  The pinned 2.4.1 jobs remain the contract.
+  The macOS/Windows containment jobs are a separate blocking matrix; they do not
+  run the full engine suite. The pinned 2.4.1 jobs remain the contract.
 - T4 is the only tier that proves the published `files` list is sufficient.
   `tests/` being excluded by omission is verified by the tarball, not by a unit
   test reading `package.json`.
@@ -484,9 +529,9 @@ different principal or of the model, not of the plugin's code path.
 
 | Residual | Why a harness cannot close it |
 | --- | --- |
-| **Prompt injection** | A scripted model follows a script. A live model reading an untrusted document is the attack, and a passing test only shows the injection used in the test did not work. |
+| **Prompt injection** | A test that scripts the model follows a script; the L1–L3 harness calls no model at all. A live model reading an untrusted document is the attack, and a passing test only shows the injection used in the test did not work. |
 | **Same-UID forgery** | The engine and the attacker share a UID in every test we can run. Reading the KV key ring and minting an envelope is not simulated by a test that uses the same key legitimately. |
-| **Model judgment** | Whether `team/verifier` noticed the real defect is not a function of the harness; a passing scripted turn only proves the call was made. |
+| **Model judgment** | Whether `team/verifier` noticed the real defect is not a function of the harness; a passing tool-level assertion only proves the call path, and a live run only proves the model made a call. |
 | **A consistent signed lie under `declared`** | Under `declared` provenance there is nothing to re-execute. A false PASS with a matching signature passes every check by construction; only `command` provenance plus external re-execution narrows it. |
 | **NFS exactly-once** | Locks are `link`/`rename`-based and documented as best-effort off one local filesystem. A test on tmpfs cannot prove a network filesystem's semantics. |
 | **Transient detective swaps** | The post-write `(dev, ino)` check can miss a symlink swapped and restored between syscalls. A test sees one interleaving. |
@@ -500,8 +545,8 @@ different principal or of the model, not of the plugin's code path.
 **Decision:** publish an **optional peer range** and warn at runtime; do not add
 a runtime dependency.
 
-- `package.json` gains:
-  - `peerDependencies: { "@opencode/plugin": "^2.4.0" }`
+- `package.json` declares:
+  - `peerDependencies: { "@opencode/plugin": "^2.4" }`
   - `peerDependenciesMeta: { "@opencode/plugin": { "optional": true } }`
 - `setup` compares `ctx.app.version` (`packages/core/src/app.ts:4-19`) against
   the audited major/minor and logs **one** warning on mismatch, including the
@@ -523,11 +568,20 @@ resolve the peer.
 
 ## 9. What remains unverified
 
-- The host was read, not run. Statements about how 2.4.1 *behaves* at runtime
-  (as opposed to what its source says) are INFERRED.
-- No harness in §5 exists yet; the document records the plan, not a result.
+- The audit in §1–§3 was a source read of 2.4.1, not an execution. Statements
+  about how the host *behaves* there are INFERRED even where the harness now
+  exercises the same path; the runtime evidence is the harness's own assertions
+  (recorded in `TEST_READY.md`), not this document.
+- The harness in §5 exists and runs against the published 2.4.1 packages. Its
+  coverage is the listed specs, not every host surface; the L4 live suite is
+  opt-in and the process-level E2E spec skips when the `opencode` CLI is absent
+  from `PATH` (including the current CI runner).
 - The 2.3.2 → 2.4.1 delta was read for the packages this plugin imports. A
   transitive type change outside them was not audited.
 - npm's optional-peer installation behaviour was not executed in this checkout.
-- Whether later 2.4.x releases change any §3 behaviour is unknown; T3 exists to
-  surface it.
+- Whether later 2.4.x releases change any §3 behaviour is unknown; the nightly
+  host-drift job (`.github/workflows/host-drift.yml`) exists to surface it, and
+  is non-blocking by design.
+- The audit's "no harness can prove" list in §7 is unchanged: passing specs do
+  not prove prompt injection is impossible, model judgment, same-UID containment
+  or provider billing.

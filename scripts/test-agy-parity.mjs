@@ -4,7 +4,7 @@
 // Opaque-box 4-tier test suite covering N = 13 feature units across 5 surfaces:
 //   - M1 regressions: M1.1 (dbPathFor), M1.2 (S3923), M1.3 (approval-driver runId), M1.4 (service*.json URL guard)
 //   - agy parity gaps: A1..A9
-//   - Tiers: T1 (Feature Coverage, 65), T2 (Boundary & Corner, 65), T3 (Pairwise, 15), T4 (E2E Scenarios, 7) => 152 cases
+//   - Tiers: T1 (Feature Coverage, 66), T2 (Boundary & Corner, 65), T3 (Pairwise, 15), T4 (E2E Scenarios, 7) => 153 cases
 //
 // Zero runtime dependencies; no @opencode/* imports.
 // Usage: node scripts/test-agy-parity.mjs [--milestone=M1|M3|M4|all] [--tier=T1|T2|T3|T4|all] [--verbose]
@@ -539,7 +539,8 @@ function addCase(def) {
 }
 
 // =============================================================================
-// TIER 1: FEATURE COVERAGE (65 cases: 5 per feature M1.1..M1.4 + A1..A9)
+// TIER 1: FEATURE COVERAGE (66 cases: 5 per feature M1.1..M1.4 + A1..A9,
+// plus the extra A7 toolchain case)
 // =============================================================================
 
 // --- M1.1 dbPathFor(env) (lib/security.mjs) ---

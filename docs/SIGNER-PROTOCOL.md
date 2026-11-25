@@ -3,8 +3,10 @@
 **Status:** 0.14.0 implements the plugin half. The plugin sends `v: 2` with
 `runId` and `approvalRef` when `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` is set,
 and the exact v1 request when it is unset. This document specifies the contract
-the signer must implement. The signer itself is **not in this repository** and
-must be built (§8). A v2-only signer with an unmodified/0.13 client, or a v1-only
+the signer must implement. A Rust reference implementation is in
+[`signer/`](../signer/); it is **not shipped in the npm package** and is not a
+turnkey hardened service. Review, build and own it (§8), or implement the
+contract yourself. A v2-only signer with an unmodified/0.13 client, or a v1-only
 signer with the directory set, fails closed with `AUTH_SIGNER_UNAVAILABLE`; there
 is no HMAC fallback. Do not deploy the two halves separately.
 
@@ -463,6 +465,12 @@ key custody are deployment properties.
 ---
 
 ## 8. Reference implementation outline
+
+The Rust crate in [`signer/`](../signer/) follows this outline (strict v2
+parser, keyed-digest recomputation, `O_NOFOLLOW` approval reads, Ed25519
+verification, a durable ledger, audit-before-sign, and systemd units). Its tests
+cover the §3.3 vector and the policy refusals, but passing them is not a
+deployment review. The crate is excluded from the npm tarball.
 
 ### 8.1 Language and process model
 

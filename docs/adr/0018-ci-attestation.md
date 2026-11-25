@@ -164,7 +164,7 @@ the CI job runs the command and hands over its output digest. `--manifest`
 cross-checks the nonce, plan hash, prompt hash and manifest digest, so a
 dispatcher cannot invent a binding.
 
-`.github/workflows/attest.yml` is a `workflow_dispatch` template with only
+`.github/workflows/attest.yml` is a `workflow_dispatch` template with
 `run_id` and `manifest_digest` as required inputs. It is gated on
 `github.ref_protected` and the default branch, uses a literal test command from
 that protected checkout, passes inputs through environment variables (never a

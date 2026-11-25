@@ -1,6 +1,6 @@
 {
   "name": "@heretek-ai/opencode-teamwork-v2",
-  "version": "0.19.1",
+  "version": "0.19.2",
   "description": "Antigravity-style multi-agent orchestration for OpenCode V2 — 15 agents, 7 commands, interactive model assignment on install.",
   "keywords": [
     "opencode",
