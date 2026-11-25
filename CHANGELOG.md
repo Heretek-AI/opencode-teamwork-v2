@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.1] - 2026-11-25
+
+### Fixed
+
+- **LEMMA toolchain gate (#50):** `teamwork_lemma_probe` and the pre-spend
+  gate now run `leap doctor --offline`. A `LEAN_PROJECT_DIR`-only failure (no
+  local Lake project) is a `WARN`, not a block: core Lean and the LEAP CLI are
+  usable, and Mathlib/`leap lean` remains optional. Every other doctor failure
+  stays `OUTAGE`. The probe result, `PREREQUISITES.md`, and the live-E2E skip
+  line carry the doctor verdict; the `LEMMA live toolchain E2E` job records
+  tool versions and the doctor transcript and uploads the test log.
+- **Sonar residual bugs/vulnerabilities (#49):** removed the throw in the
+  rerun-cleanup `finally` (`S1143`); added line-targeted, justified
+  suppressions for the approval-driver containment sink (`S8707`), the
+  plain-http negative fixture (`S5332`), and the intentional no-lockfile
+  host-drift install (`S8543`); test helpers now resolve `sqlite3`, `npm`, and
+  `bun` through `resolveTrustedExecutable` (`S4036`); and `verify
+  --fetch-jwks` now routes OIDC discovery and the JWKS through the URL guard
+  (`S8476`/`S5144`) with HTTPS-only, loopback/private/link-local/metadata
+  refusal, no redirects, DNS pinning, and a 512 KiB cap.
+- **Shared URL guard:** `plugins/opencode-teamwork/url-guard.ts` is now
+  `url-guard.mjs` plus `url-guard.d.mts`, so the Node CLI and the plugin use
+  one implementation. Intranet or offline OIDC issuers use
+  `--oidc-jwks <file>` rather than the network fetch path.
+
+### Tests
+
+- L0 parity is now 153 cases (T1 66, T2 65, T3 15, T4 7) and runtime parity is
+  62 specs. The full L1–L3 runtime suite is 114 pass, 1 skip (L4 live), 0 fail.
+  `fallow dead-code` reports 0 issues, and the packed tarball is 109 files.
+
 ## [0.19.0] - 2026-11-25
 
 ### Added

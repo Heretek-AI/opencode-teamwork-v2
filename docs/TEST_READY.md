@@ -3,18 +3,18 @@
 Status: **READY** (2026-11-25)
 
 The dual-track E2E suite described in [`TEST_INFRA.md`](TEST_INFRA.md) is green
-on the branch `feat/remediation-waves-1-4`, on top of OpenCode 2.4.1.
+on the branch `release/0.19.1`, on top of OpenCode 2.4.1.
 
 ## Last recorded run
 
 | Layer | Command | Result |
 | --- | --- | --- |
-| L0 parity/regression | `npm run test:agy-parity` | **152/152** (T1 65, T2 65, T3 15, T4 7) |
-| Runtime parity | `cd tests/runtime && bun test --timeout 30000 spec/agy-parity.test.ts` | **61/61**, 0 fail |
-| Full runtime L1–L3 | `cd tests/runtime && bun test --timeout 30000` | **113 pass, 1 skip (L4 live), 0 fail** |
+| L0 parity/regression | `npm run test:agy-parity` | **153/153** (T1 66, T2 65, T3 15, T4 7) |
+| Runtime parity | `cd tests/runtime && bun test --timeout 30000 spec/agy-parity.test.ts` | **62/62**, 0 fail |
+| Full runtime L1–L3 | `cd tests/runtime && bun test --timeout 30000` | **114 pass, 1 skip (L4 live), 0 fail** |
 | L0 repository suite | `npm test` | 15 suites, exit 0 |
 | Rust signer | `cargo test --manifest-path signer/Cargo.toml` | 5/5 |
-| Packaging | `npm pack --dry-run` | 108 files, 0 dependencies, no `tests/`, `docs/re/`, or `signer/`; the parity script ships with the other test scripts |
+| Packaging | `npm pack --dry-run` | 109 files, 0 dependencies, no `tests/`, `docs/re/`, or `signer/`; the parity script ships with the other test scripts |
 
 ## What is covered
 
