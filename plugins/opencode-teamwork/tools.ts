@@ -1297,7 +1297,11 @@ async function checkInputUrl(value: string, checkUrls: boolean): Promise<{ statu
   if (!checkUrls) return { status: "UNCHECKED", detail: "checkUrls: false" }
   // HEAD only: no body is read. Redirects are not followed, but a Location is
   // validated so a redirect cannot point at a loopback/private/metadata address.
-  const fetched = await safeFetch(value, { method: "HEAD", timeoutMs: PREFLIGHT_URL_TIMEOUT_MS })
+  const fetched = await safeFetch(value, {
+    method: "HEAD",
+    timeoutMs: PREFLIGHT_URL_TIMEOUT_MS,
+    signal: AbortSignal.timeout(PREFLIGHT_URL_TIMEOUT_MS),
+  })
   if (!fetched.ok) {
     if (fetched.code === "URL_TIMEOUT") return { status: "OUTAGE", detail: "timeout" }
     return { status: "OUTAGE", detail: clean(fetched.error, 160) }
@@ -1307,7 +1311,9 @@ async function checkInputUrl(value: string, checkUrls: boolean): Promise<{ statu
     if (location) {
       try {
         const next = new URL(String(location), value)
-        const target = await assertSafeUrl(next.toString())
+        const target = await assertSafeUrl(next.toString(), {
+          signal: AbortSignal.timeout(PREFLIGHT_URL_TIMEOUT_MS),
+        })
         if (!target.ok) return { status: "OUTAGE", detail: clean(`redirect to blocked address: ${target.error}`, 160) }
       } catch {
         return { status: "OUTAGE", detail: "redirect with an invalid Location" }

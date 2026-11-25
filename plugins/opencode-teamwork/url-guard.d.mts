@@ -2,6 +2,7 @@
 // implementation. Type-only: this file has no runtime effect.
 
 export const ALLOW_LOCALHOST_ENV: string
+export const DEFAULT_TOTAL_TIMEOUT_MS: number
 
 export type UrlGuardCode =
   | "URL_INVALID"
@@ -27,14 +28,22 @@ export interface AssertSafeUrlOptions {
   loopbackOnly?: boolean
   /** Test seam; production always uses the system resolver. */
   resolveHost?: (hostname: string) => Promise<Array<{ address: string; family: 4 | 6 }>>
+  /** End-to-end deadline; aborts DNS resolution and is reused by safeFetch. */
+  signal?: AbortSignal
 }
 
 export interface SafeFetchOptions extends AssertSafeUrlOptions {
   method?: "GET" | "HEAD"
+  /** Socket-inactivity timeout per address attempt (default 5000ms). */
   timeoutMs?: number
+  /**
+   * End-to-end deadline covering DNS and every retry. Only used when no
+   * `signal` is supplied; defaults to DEFAULT_TOTAL_TIMEOUT_MS (10000ms).
+   */
+  totalTimeoutMs?: number
   maxBytes?: number
   headers?: Record<string, string>
-  /** Optional end-to-end deadline. The request is destroyed when this aborts. */
+  /** Caller-owned end-to-end deadline. The request is destroyed when this aborts. */
   signal?: AbortSignal
 }
 

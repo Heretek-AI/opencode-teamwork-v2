@@ -2119,6 +2119,62 @@ async function main() {
     ok("T38 --fetch-jwks refuses non-https, loopback, metadata, and IPv6 loopback issuers (exit 2), even with the localhost opt-in")
   }
 
+  // -------------------------------------------------------------------------
+  // T39 — the OIDC path owns one end-to-end deadline across DNS and both
+  // fetches; a slow resolver cannot outlive it, and discovery + JWKS share the
+  // same signal.
+  // -------------------------------------------------------------------------
+  {
+    const { fetchOidcJwks } = await import("../lib/oidc-fetch.mjs")
+
+    const started = Date.now()
+    await assert.rejects(
+      fetchOidcJwks("https://issuer.example", {
+        timeoutMs: 150,
+        resolveHost: () =>
+          new Promise((resolve) =>
+            setTimeout(() => resolve([{ address: "203.0.113.10", family: 4 }]), 500),
+          ),
+      }),
+      /timed out after 150ms/,
+      "a resolver that never settles must be cut off by the OIDC deadline",
+    )
+    assert(Date.now() - started < 2000, "the OIDC deadline must cover DNS resolution")
+
+    const seen = []
+    const jwks = await fetchOidcJwks("https://issuer.example", {
+      timeoutMs: 5000,
+      fetchJson: async (url, label, options) => {
+        seen.push({ url, label, signal: options.signal })
+        if (label === "OIDC discovery") return { jwks_uri: "https://issuer.example/jwks" }
+        return { keys: [{ kty: "oct", kid: "shared-deadline" }] }
+      },
+    })
+    assert.strictEqual(jwks.keys.length, 1)
+    assert.strictEqual(seen.length, 2, "discovery and JWKS must both be fetched")
+    assert.strictEqual(seen[0].url, "https://issuer.example/.well-known/openid-configuration")
+    assert.strictEqual(seen[1].url, "https://issuer.example/jwks")
+    assert.strictEqual(seen[0].signal, seen[1].signal, "both fetches must share one deadline signal")
+
+    let calls = 0
+    const deadlineStarted = Date.now()
+    await assert.rejects(
+      fetchOidcJwks("https://issuer.example", {
+        timeoutMs: 100,
+        fetchJson: async () => {
+          calls++
+          await new Promise((resolve) => setTimeout(resolve, 250))
+          return { jwks_uri: "https://issuer.example/jwks" }
+        },
+      }),
+      /timed out after 100ms/,
+      "a first fetch that consumes the deadline must stop before the JWKS fetch",
+    )
+    assert.strictEqual(calls, 1, "the expired shared deadline must prevent the second fetch")
+    assert(Date.now() - deadlineStarted < 2000)
+    ok("T39 OIDC discovery/JWKS share one deadline that also covers a slow resolver")
+  }
+
   rmSync(TEST_ROOT, { recursive: true, force: true })
   console.log(`\n${passed} verify tests passed`)
 }

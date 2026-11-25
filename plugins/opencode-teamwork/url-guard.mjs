@@ -26,12 +26,53 @@ import { request as httpsRequest } from "node:https"
 
 export const ALLOW_LOCALHOST_ENV = "OPENCODE_TEAMWORK_ALLOW_LOCALHOST"
 
+// End-to-end cap for callers that supply no signal. `timeoutMs` alone is only
+// socket inactivity, so a slow-drip response could otherwise hold a caller
+// open indefinitely. Callers with a tighter budget (document review, preflight,
+// OIDC) pass their own signal instead.
+export const DEFAULT_TOTAL_TIMEOUT_MS = 10_000
+
 function localhostOptInEnabled() {
   return process.env[ALLOW_LOCALHOST_ENV] === "1"
 }
 
 function refuse(code, error) {
   return { ok: false, code, error }
+}
+
+const TIMED_OUT = Symbol("url-guard-timeout")
+
+function timeoutRefusal() {
+  return refuse("URL_TIMEOUT", "URL request timed out")
+}
+
+/** Resolve `promise`, or the TIMED_OUT sentinel as soon as `signal` aborts. */
+function raceSignal(promise, signal) {
+  if (!signal) return promise
+  if (signal.aborted) return Promise.resolve(TIMED_OUT)
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const onAbort = () => {
+      if (settled) return
+      settled = true
+      resolve(TIMED_OUT)
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+    Promise.resolve(promise).then(
+      (value) => {
+        if (settled) return
+        settled = true
+        signal.removeEventListener("abort", onAbort)
+        resolve(value)
+      },
+      (err) => {
+        if (settled) return
+        settled = true
+        signal.removeEventListener("abort", onAbort)
+        reject(err)
+      },
+    )
+  })
 }
 
 function normalizeHost(hostname) {
@@ -202,6 +243,7 @@ export function parseLoopbackServiceUrl(rawUrl) {
  * public; a hostname with one private answer is refused as a whole.
  */
 export async function assertSafeUrl(rawUrl, options = {}) {
+  if (options.signal?.aborted) return timeoutRefusal()
   let parsed
   try {
     parsed = new URL(String(rawUrl || "").trim())
@@ -233,14 +275,18 @@ export async function assertSafeUrl(rawUrl, options = {}) {
       return refuse("URL_BLOCKED_ADDRESS", "URL host is localhost (loopback is blocked; set OPENCODE_TEAMWORK_ALLOW_LOCALHOST=1 only for local tests)")
     }
     try {
+      let lookupPromise
       if (options.resolveHost) {
-        addresses = await options.resolveHost(host)
+        lookupPromise = Promise.resolve(options.resolveHost(host))
       } else {
-        const answers = await dnsLookup(host, { all: true, verbatim: true })
-        addresses = answers
-          .filter((entry) => entry.family === 4 || entry.family === 6)
-          .map((entry) => ({ address: entry.address, family: entry.family }))
+        lookupPromise = dnsLookup(host, { all: true, verbatim: true }).then((answers) =>
+          answers
+            .filter((entry) => entry.family === 4 || entry.family === 6)
+            .map((entry) => ({ address: entry.address, family: entry.family })),
+        )
       }
+      addresses = await raceSignal(lookupPromise, options.signal)
+      if (addresses === TIMED_OUT) return timeoutRefusal()
     } catch (err) {
       return refuse("URL_DNS", `URL host could not be resolved (${String(err?.code || err?.message || "DNS error").slice(0, 120)})`)
     }
@@ -307,13 +353,25 @@ function requestPinned(safe, options, address) {
         (res) => {
           const headers = res.headers || {}
           const contentLength = Number(headers["content-length"] || 0)
+          // Refusals must tear the connection down. Leaving the response to
+          // drain would hold a socket (and keep receiving an unbounded body)
+          // after the tool has already returned its refusal.
+          const destroyEarly = () => {
+            res.on("error", () => {})
+            try {
+              res.destroy()
+            } catch {}
+            try {
+              req.destroy()
+            } catch {}
+          }
           if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-            res.resume()
+            destroyEarly()
             done(refuse("URL_TOO_LARGE", `response exceeds ${maxBytes} byte limit`))
             return
           }
           if (method === "HEAD") {
-            res.resume()
+            destroyEarly()
             done({ ok: true, status: Number(res.statusCode) || 0, headers })
             return
           }
@@ -375,21 +433,53 @@ function requestPinned(safe, options, address) {
  * Fetch a URL through the guard. Redirects are NOT followed (3xx is returned to
  * the caller); callers that choose to follow one must validate the target with
  * `assertSafeUrl` first. The connection is pinned to the validated address.
+ *
+ * `timeoutMs` is per-address socket inactivity, not a total deadline. Supply
+ * `signal` for a caller-owned end-to-end deadline; otherwise an internal
+ * `totalTimeoutMs` (default DEFAULT_TOTAL_TIMEOUT_MS) covers DNS and retries.
  */
 export async function safeFetch(rawUrl, options = {}) {
-  const safe = await assertSafeUrl(rawUrl, {
-    allowLocalhost: options.allowLocalhost,
-    loopbackOnly: options.loopbackOnly,
-    resolveHost: options.resolveHost,
-  })
-  if (!safe.ok) return safe
-  let last
-  for (const address of safe.addresses) {
-    const result = await requestPinned(safe, options, address)
-    if (result.ok) return result
-    last = result
-    // Only try the next address when the connection itself failed.
-    if (result.code !== "URL_NETWORK") return result
+  // `options.signal` is the caller's end-to-end deadline. Without one, create
+  // an internal deadline that spans DNS validation and every address attempt,
+  // so a slow resolver or slow-drip server cannot hold the caller open.
+  const callerSignal = options.signal
+  const totalTimeoutMs =
+    Number.isFinite(options.totalTimeoutMs) && options.totalTimeoutMs > 0
+      ? options.totalTimeoutMs
+      : callerSignal
+        ? undefined
+        : DEFAULT_TOTAL_TIMEOUT_MS
+  let controller
+  let timer
+  let signal = callerSignal
+  if (!signal && totalTimeoutMs !== undefined) {
+    controller = new AbortController()
+    signal = controller.signal
+    timer = setTimeout(() => controller.abort(), totalTimeoutMs)
+    if (typeof timer.unref === "function") timer.unref()
   }
-  return last ?? refuse("URL_NETWORK", "URL request failed")
+  try {
+    const safe = await assertSafeUrl(rawUrl, {
+      allowLocalhost: options.allowLocalhost,
+      loopbackOnly: options.loopbackOnly,
+      resolveHost: options.resolveHost,
+      signal,
+    })
+    if (!safe.ok) return safe
+    let last
+    for (const address of safe.addresses) {
+      if (signal?.aborted) return timeoutRefusal()
+      const result = await requestPinned(safe, { ...options, signal }, address)
+      if (result.ok) return result
+      last = result
+      const callerAborted = signal?.aborted === true
+      // Retry a connection failure on the next validated address, and also a
+      // per-address timeout (an IPv6 blackhole) while the total deadline is
+      // still live. A timeout caused by the deadline itself is final.
+      if (result.code !== "URL_NETWORK" && !(result.code === "URL_TIMEOUT" && !callerAborted)) return result
+    }
+    return last ?? refuse("URL_NETWORK", "URL request failed")
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
 }
