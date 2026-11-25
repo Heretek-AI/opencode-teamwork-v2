@@ -44,7 +44,7 @@ test("I2 strict run: waves gate next, a missing wave blocks, GATE_STATUS.md reco
       const noWaves = await next(fx)
       expect(noWaves.status).toBe("NEEDS_STRICT_WAVE")
       expect(noWaves.content).toContain("NEEDS_STRICT_WAVE")
-      const missing = (noWaves.missing as any[]).map((entry) => `${entry.taskId}:${entry.kind}`).sort()
+      const missing = (noWaves.missing as any[]).map((entry) => `${entry.taskId}:${entry.kind}`).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
       expect(missing).toEqual(["T1:audit", "T1:challenge", "T2:audit", "T2:challenge"])
 
       const t1Evidence = await evidence(fx, "T1-review.txt", "T1 strict review evidence\n")
@@ -54,7 +54,7 @@ test("I2 strict run: waves gate next, a missing wave blocks, GATE_STATUS.md reco
       // T1 is covered; T2 is not, so the run still cannot complete.
       const oneWave = await next(fx)
       expect(oneWave.status).toBe("NEEDS_STRICT_WAVE")
-      const missingOne = (oneWave.missing as any[]).map((entry) => `${entry.taskId}:${entry.kind}`).sort()
+      const missingOne = (oneWave.missing as any[]).map((entry) => `${entry.taskId}:${entry.kind}`).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
       expect(missingOne).toEqual(["T2:audit", "T2:challenge"])
 
       // Directly asking for the final verdict is refused for the same reason.
@@ -135,7 +135,7 @@ test("I2 strict run: waves gate next, a missing wave blocks, GATE_STATUS.md reco
 
       const waves = readEvents(fx.project, fx.runId).filter((entry) => entry.event === "verification_wave")
       expect(waves).toHaveLength(4)
-      expect(waves.map((entry) => entry.note).sort()).toEqual([
+      expect(waves.map((entry) => entry.note).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))).toEqual([
         "audit: CLEAN",
         "audit: CLEAN",
         "challenge: PASS",

@@ -100,7 +100,7 @@ test("I5 two processes race next: no task is claimed twice, events seq stays uni
         claimsByTask.set(task.id, list)
       }
     }
-    expect([...claimsByTask.keys()].sort()).toEqual(["T1", "T2"])
+    expect([...claimsByTask.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))).toEqual(["T1", "T2"])
     for (const taskId of ["T1", "T2"]) {
       expect(claimsByTask.get(taskId)).toHaveLength(1)
     }
@@ -142,7 +142,7 @@ test("I5 two processes race next: no task is claimed twice, events seq stays uni
 
     // Exactly one transition per task, each by the process that claimed it.
     const transitions = events.filter((event) => event.event === "task_transition")
-    expect(transitions.map((event) => event.taskId).sort()).toEqual(["T1", "T2"])
+    expect(transitions.map((event) => event.taskId).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))).toEqual(["T1", "T2"])
     for (const transition of transitions) {
       expect(transition.to).toBe("worker_active")
       expect(transition.agent).toBe("team/sentinel")

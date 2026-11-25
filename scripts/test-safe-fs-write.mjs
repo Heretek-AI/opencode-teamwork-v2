@@ -48,7 +48,9 @@ import {
   listContainmentIncidents,
   openPinnedRoot,
   pinParent,
+  readRegularBounded,
   recentWriteAnomalies,
+  resolveTrustedExecutable,
   setIncidentDirForTest,
   setMaxIncidentFilesForTest,
   setDarwinRootFdCheckForTest,
@@ -125,15 +127,14 @@ function makeFixture() {
 }
 
 function markerIn(dir) {
-  for (const name of readdirSync(dir)) {
-    const p = join(dir, name)
-    const st = lstatSync(p)
-    if (st.isDirectory()) {
+  for (const dirent of readdirSync(dir, { withFileTypes: true })) {
+    if (dirent.isSymbolicLink()) continue
+    const p = join(dir, dirent.name)
+    if (dirent.isDirectory()) {
       if (markerIn(p)) return true
-    } else if (st.isFile()) {
-      try {
-        if (readFileSync(p, "utf8").includes(MARKER)) return true
-      } catch {}
+    } else if (dirent.isFile()) {
+      const read = readRegularBounded(p, 1024 * 1024)
+      if (read.status === "ok" && read.text.includes(MARKER)) return true
     }
   }
   return false
@@ -460,7 +461,7 @@ await checkAsync("write-once: concurrent ORIGINAL_REQUEST writes -> one wins, on
     runChild(WRITE_ONCE_CHILD, { RUN: run, BODY: "REQ-A" }),
     runChild(WRITE_ONCE_CHILD, { RUN: run, BODY: "REQ-B" }),
   ])
-  const outcomes = [a.stdout.trim(), b.stdout.trim()].sort()
+  const outcomes = [a.stdout.trim(), b.stdout.trim()].sort((x, y) => (x < y ? -1 : x > y ? 1 : 0))
   assert.deepStrictEqual(outcomes, ["EEXIST", "OK"], `unexpected outcomes: ${a.stdout}|${b.stdout}|${a.stderr}|${b.stderr}`)
   const body = readFileSync(join(run, "ORIGINAL_REQUEST.md"), "utf8")
   assert(body === "REQ-A" || body === "REQ-B", "the winning bytes must be one complete request")
@@ -505,7 +506,12 @@ check("FIFO at the append target is refused without hanging (child timeout)", ()
   }
   const { run } = makeFixture()
   const fifo = join(run, "events.fifo")
-  const mk = spawnSync("mkfifo", [fifo], { encoding: "utf8" })
+  const mkfifoBin = resolveTrustedExecutable("mkfifo")
+  if (!mkfifoBin) {
+    console.log("SKIP: mkfifo unavailable")
+    return
+  }
+  const mk = spawnSync(mkfifoBin, [fifo], { encoding: "utf8" })
   if (mk.status !== 0) {
     console.log("SKIP: mkfifo unavailable")
     return

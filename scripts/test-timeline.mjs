@@ -12,6 +12,7 @@
 import { buildTimeline, renderTimeline, timelineWarnings } from "../lib/timeline.mjs"
 import { inspectTeamworkRun, listTeamworkRuns } from "../lib/runs.mjs"
 import { registerTeamworkTools } from "../plugins/opencode-teamwork/tools.ts"
+import { resolveTrustedExecutable } from "../plugins/opencode-teamwork/safe-fs.mjs"
 import { registerTool } from "./tool-registry.mjs"
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, utimesSync, symlinkSync, truncateSync, existsSync, lstatSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -163,12 +164,21 @@ const TIMELINE_KEYS = [
 ]
 const TOTALS_KEYS = ["tasks", "passed", "failed", "blocked", "totalRounds", "spentUsd", "tokens"]
 
+const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+
+function assertApprox(actual, expected, msg) {
+  assert(
+    typeof actual === "number" && Math.abs(actual - expected) < 1e-9,
+    msg ?? `expected ${expected} (+/- 1e-9), got ${actual}`,
+  )
+}
+
 function assertShape(t) {
-  assert.deepStrictEqual(Object.keys(t).sort(), [...TIMELINE_KEYS].sort(), "top-level R2 keys")
-  assert.deepStrictEqual(Object.keys(t.totals).sort(), [...TOTALS_KEYS].sort(), "totals keys")
+  assert.deepStrictEqual(Object.keys(t).sort(cmp), [...TIMELINE_KEYS].sort(cmp), "top-level R2 keys")
+  assert.deepStrictEqual(Object.keys(t.totals).sort(cmp), [...TOTALS_KEYS].sort(cmp), "totals keys")
   assert(Array.isArray(t.tasks), "tasks must be an array")
   for (const task of t.tasks) {
-    assert.deepStrictEqual(Object.keys(task).sort(), [...TASK_KEYS].sort(), `task keys for ${task.taskId}`)
+    assert.deepStrictEqual(Object.keys(task).sort(cmp), [...TASK_KEYS].sort(cmp), `task keys for ${task.taskId}`)
   }
   assert(Array.isArray(t.unattributed), "unattributed must be an array")
 }
@@ -194,7 +204,7 @@ await check("events mode: mode and run-level startedAt/endedAt/durationMs are ex
   assert.strictEqual(t.phase, "DONE")
   assert.strictEqual(t.budgetUsd, 5)
   assert.strictEqual(t.budgetSource, "manual")
-  assert.strictEqual(t.spentUsd, 0.21)
+  assertApprox(t.spentUsd, 0.21)
 })
 
 await check("events mode: alpha startedAt/endedAt/durationMs/rounds/passedAtRound/agent are exact", () => {
@@ -395,9 +405,9 @@ await check("default sessionId picks the most recently modified run", () => {
 // ==========================================
 
 await check("cost attribution: task buckets land on the right tasks", () => {
-  assert.strictEqual(taskOf(eventsTimeline, "alpha").costUsd, 0.12)
-  assert.strictEqual(taskOf(eventsTimeline, "beta").costUsd, 0.05)
-  assert.strictEqual(taskOf(derivedTimeline, "alpha").costUsd, 0.12)
+  assertApprox(taskOf(eventsTimeline, "alpha").costUsd, 0.12)
+  assertApprox(taskOf(eventsTimeline, "beta").costUsd, 0.05)
+  assertApprox(taskOf(derivedTimeline, "alpha").costUsd, 0.12)
 })
 
 await check("cost attribution: _sentinel/_unattributed/agent buckets are unattributed and NOT tasks", () => {
@@ -412,8 +422,8 @@ await check("cost attribution: _sentinel/_unattributed/agent buckets are unattri
 
 await check("cost attribution: non-task buckets never leak into per-task costUsd", () => {
   // If _sentinel/_unattributed/team/worker leaked into a task, these values would change.
-  assert.strictEqual(taskOf(eventsTimeline, "alpha").costUsd, 0.12)
-  assert.strictEqual(taskOf(eventsTimeline, "beta").costUsd, 0.05)
+  assertApprox(taskOf(eventsTimeline, "alpha").costUsd, 0.12)
+  assertApprox(taskOf(eventsTimeline, "beta").costUsd, 0.05)
 })
 
 await check("cost attribution: a plan task with no cost bucket gets costUsd null", () => {
@@ -428,7 +438,7 @@ await check("cost attribution: per-task tokens are null; totals carry the run to
   assert.strictEqual(taskOf(eventsTimeline, "alpha").tokens, null)
   assert.strictEqual(taskOf(eventsTimeline, "beta").tokens, null)
   assert.deepStrictEqual(eventsTimeline.totals.tokens, COSTS.tokens)
-  assert.strictEqual(eventsTimeline.totals.spentUsd, 0.21)
+  assertApprox(eventsTimeline.totals.spentUsd, 0.21)
 })
 
 // Populated per-task token buckets (costs.byTaskTokens). The legacy check above
@@ -493,23 +503,23 @@ await check("frozen shape: buildTimeline key sets are exactly the R2 contract, l
   const costs = { ...COSTS, byTaskTokens: { alpha: BT_ALPHA } }
   for (const t of [buildTimeline(makeRun({ events: EVENTS, costs }), SESSION), buildTimeline(makeRun({ events: null, costs }), SESSION)]) {
     assert.deepStrictEqual(
-      Object.keys(t).sort(),
+      Object.keys(t).sort(cmp),
       ["budgetSource", "budgetUsd", "durationMs", "endedAt", "mode", "phase", "sessionId", "spentUsd", "startedAt", "tasks", "topology", "totals", "unattributed"],
     )
     assert.deepStrictEqual(
-      Object.keys(t.totals).sort(),
+      Object.keys(t.totals).sort(cmp),
       ["blocked", "failed", "passed", "spentUsd", "tasks", "tokens", "totalRounds"],
     )
     for (const task of t.tasks) {
       assert.deepStrictEqual(
-        Object.keys(task).sort(),
+        Object.keys(task).sort(cmp),
         ["agent", "agentSource", "approx", "branch", "costUsd", "durationMs", "endedAt", "note", "passedAtRound", "rounds", "seq", "startedAt", "status", "taskId", "tokens"],
         `task keys for ${task.taskId}`,
       )
     }
-    assert.deepStrictEqual(Object.keys(taskOf(t, "alpha").tokens).sort(), ["cache", "input", "output", "reasoning"])
-    assert.deepStrictEqual(Object.keys(taskOf(t, "alpha").tokens.cache).sort(), ["read", "write"])
-    for (const u of t.unattributed) assert.deepStrictEqual(Object.keys(u).sort(), ["bucket", "costUsd"])
+    assert.deepStrictEqual(Object.keys(taskOf(t, "alpha").tokens).sort(cmp), ["cache", "input", "output", "reasoning"])
+    assert.deepStrictEqual(Object.keys(taskOf(t, "alpha").tokens.cache).sort(cmp), ["read", "write"])
+    for (const u of t.unattributed) assert.deepStrictEqual(Object.keys(u).sort(cmp), ["bucket", "costUsd"])
   }
 })
 
@@ -870,8 +880,10 @@ await check("R6.6 (6): a task whose last event is non-terminal pins endedAt to i
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: "0" }
 function gitInit(root) {
-  execFileSync("git", ["init", "-q"], { cwd: root, env: GIT_ENV, stdio: "ignore" })
-  execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "init"], {
+  const gitBin = resolveTrustedExecutable("git")
+  assert(gitBin, "git executable must be available")
+  execFileSync(gitBin, ["init", "-q"], { cwd: root, env: GIT_ENV, stdio: "ignore" })
+  execFileSync(gitBin, ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "init"], {
     cwd: root,
     env: GIT_ENV,
     stdio: "ignore",

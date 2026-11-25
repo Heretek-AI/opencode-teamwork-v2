@@ -31,7 +31,9 @@ await registerTeamworkTools(
               name: tool.name,
               namespace: tool.options?.namespace ?? null,
               codemode: tool.options?.codemode ?? null,
-              required: Array.isArray(schema?.required) ? [...schema.required].sort() : [],
+              required: Array.isArray(schema?.required)
+                ? [...schema.required].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+                : [],
               schemaDigest: sha256(schema ?? {}),
             })
           },
@@ -43,7 +45,7 @@ await registerTeamworkTools(
 )
 tools.sort((a, b) => a.id.localeCompare(b.id))
 
-const commands = COMMANDS.map((c) => c.name).sort()
+const commands = COMMANDS.map((c) => c.name).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
 const snapshot = { tools, commands, toolCount: tools.length, commandCount: commands.length }
 
 const outIdx = process.argv.indexOf("--out")

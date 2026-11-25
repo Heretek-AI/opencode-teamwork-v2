@@ -136,7 +136,7 @@ export async function loadHost(
     }),
   )
 
-  const client = Client.make({ baseUrl: "http://opencode.local", fetch: embedded.fetch })
+  const client = Client.make({ baseUrl: "https://opencode.local", fetch: embedded.fetch })
   const host: any = Object.assign(client, {
     sessions: client.session,
     events: client.event,

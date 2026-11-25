@@ -9,6 +9,7 @@
 
 import { runDoctor, CHECK_NAMES, nextSteps } from "../lib/doctor.mjs"
 import { TEAM_AGENTS, PACKAGE_NAME, writeModelMap } from "../lib/team.mjs"
+import { resolveTrustedExecutable } from "../plugins/opencode-teamwork/safe-fs.mjs"
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, dirname } from "node:path"
@@ -61,7 +62,9 @@ function makeHealthyConfig() {
 /** A fresh temp dir that is an actual git work tree (for the pass path). */
 function makeGitRepo() {
   const dir = makeTemp("teamwork-doctor-git-")
-  execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" })
+  const gitBin = resolveTrustedExecutable("git")
+  assert(gitBin, "git executable must be available")
+  execFileSync(gitBin, ["init"], { cwd: dir, stdio: "ignore" })
   return dir
 }
 

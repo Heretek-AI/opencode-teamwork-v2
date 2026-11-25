@@ -8,7 +8,7 @@
 import { collectSecurityReport, hardenedExitCode, SECURITY_CHECK_NAMES } from "../lib/security.mjs"
 import { TEAM_AGENTS } from "../lib/team.mjs"
 import { recordWriteAnomaly, setWriteAnomalyAuditPathForTest } from "../plugins/opencode-teamwork/safe-fs.mjs"
-import { mkdtempSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -467,6 +467,131 @@ try {
     assert.strictEqual(repoRun.status, 0, `README/docs must be clean:\n${repoRun.stdout}${repoRun.stderr}`)
 
     console.log("✓ the lint fails forbidden claims, accepts a negated boundary note, and the repo docs are clean")
+  }
+
+  // ==========================================================================
+  // 5. AGENTS.md Rule #7 (OPENCODE_DB & channel DB resolution) & S3923 group names
+  // ==========================================================================
+  {
+    console.log("Testing DB path resolution (Rule #7) and string/null group normalization (S3923)...")
+    const dbRoot = join(testDir, "db-resolution")
+    const xdgData = join(dbRoot, "xdg-data")
+    const ocDir = join(xdgData, "opencode")
+    mkdirSync(ocDir, { recursive: true })
+
+    // 5a. OPENCODE_DB absolute path: 0600 passes, 0644 fails
+    const absDb = join(dbRoot, "custom-abs.db")
+    writeFileSync(absDb, "sqlite")
+    chmodSync(absDb, 0o600)
+    const absPass = collectSecurityReport(
+      allPassOptions({
+        dbPath: undefined,
+        env: { OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: "fixture-public-key", OPENCODE_DB: absDb, HOME: dbRoot, XDG_DATA_HOME: xdgData },
+      }),
+    )
+    assert.strictEqual(absPass.checks.find((c) => c.name === "db_mode").status, "pass")
+
+    chmodSync(absDb, 0o644)
+    const absFail = collectSecurityReport(
+      allPassOptions({
+        dbPath: undefined,
+        env: { OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: "fixture-public-key", OPENCODE_DB: absDb, HOME: dbRoot, XDG_DATA_HOME: xdgData },
+      }),
+    )
+    assert.strictEqual(absFail.checks.find((c) => c.name === "db_mode").status, "fail")
+
+    // 5b. OPENCODE_DB relative path resolves against primary XDG_DATA_HOME/opencode root
+    const relDb = join(ocDir, "rel-sub.db")
+    writeFileSync(relDb, "sqlite")
+    chmodSync(relDb, 0o644)
+    const relFail = collectSecurityReport(
+      allPassOptions({
+        dbPath: undefined,
+        env: { OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: "fixture-public-key", OPENCODE_DB: "rel-sub.db", HOME: dbRoot, XDG_DATA_HOME: xdgData },
+      }),
+    )
+    const relCheck = relFail.checks.find((c) => c.name === "db_mode")
+    assert.strictEqual(relCheck.status, "fail")
+    assert(relCheck.message.includes("rel-sub.db"), relCheck.message)
+
+    // 5c. OPENCODE_DB=":memory:" passes without statting a file
+    const memPass = collectSecurityReport(
+      allPassOptions({
+        dbPath: undefined,
+        env: { OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: "fixture-public-key", OPENCODE_DB: ":memory:", HOME: dbRoot, XDG_DATA_HOME: xdgData },
+      }),
+    )
+    const memCheck = memPass.checks.find((c) => c.name === "db_mode")
+    assert.strictEqual(memCheck.status, "pass")
+    assert(memCheck.message.includes(":memory:"), memCheck.message)
+
+    // 5d. OPENCODE_CHANNEL="nightly" inspects opencode-nightly.db even if opencode.db is 0600
+    const defaultDb = join(ocDir, "opencode.db")
+    const nightlyDb = join(ocDir, "opencode-nightly.db")
+    writeFileSync(defaultDb, "sqlite")
+    chmodSync(defaultDb, 0o600)
+    writeFileSync(nightlyDb, "sqlite")
+    chmodSync(nightlyDb, 0o644)
+    const nightlyFail = collectSecurityReport(
+      allPassOptions({
+        dbPath: undefined,
+        env: { OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: "fixture-public-key", OPENCODE_CHANNEL: "nightly", HOME: dbRoot, XDG_DATA_HOME: xdgData },
+      }),
+    )
+    const nightlyCheck = nightlyFail.checks.find((c) => c.name === "db_mode")
+    assert.strictEqual(nightlyCheck.status, "fail")
+    assert(nightlyCheck.message.includes("opencode-nightly.db"), nightlyCheck.message)
+
+    // 5e. OPENCODE_CHANNEL="dev" (unscoped) and OPENCODE_DISABLE_CHANNEL_DB="1" inspect opencode.db
+    const devPass = collectSecurityReport(
+      allPassOptions({
+        dbPath: undefined,
+        env: { OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: "fixture-public-key", OPENCODE_CHANNEL: "dev", HOME: dbRoot, XDG_DATA_HOME: xdgData },
+      }),
+    )
+    assert.strictEqual(devPass.checks.find((c) => c.name === "db_mode").status, "pass")
+    const disabledPass = collectSecurityReport(
+      allPassOptions({
+        dbPath: undefined,
+        env: {
+          OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: "fixture-public-key",
+          OPENCODE_CHANNEL: "nightly",
+          OPENCODE_DISABLE_CHANNEL_DB: "1",
+          HOME: dbRoot,
+          XDG_DATA_HOME: xdgData,
+        },
+      }),
+    )
+    assert.strictEqual(disabledPass.checks.find((c) => c.name === "db_mode").status, "pass")
+
+    // 5f. Default unset OPENCODE_CHANNEL prefers opencode-local.db over opencode.db
+    const localDb = join(ocDir, "opencode-local.db")
+    writeFileSync(localDb, "sqlite")
+    chmodSync(localDb, 0o644)
+    const localFail = collectSecurityReport(
+      allPassOptions({
+        dbPath: undefined,
+        env: { OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY: "fixture-public-key", HOME: dbRoot, XDG_DATA_HOME: xdgData },
+      }),
+    )
+    const localCheck = localFail.checks.find((c) => c.name === "db_mode")
+    assert.strictEqual(localCheck.status, "fail")
+    assert(localCheck.message.includes("opencode-local.db"), localCheck.message)
+
+    // 5g. S3923: string GIDs, group names, and null/undefined entries normalize cleanly
+    const groupFile = join(dbRoot, "group-s3923")
+    writeFileSync(groupFile, "users:x:1000:\ndocker:x:998:\n")
+    const strGroupsReport = collectSecurityReport(
+      allPassOptions({
+        groupFile,
+        groups: [null, undefined, "998", "wheel"],
+      }),
+    )
+    const grpCheck = strGroupsReport.checks.find((c) => c.name === "privileged_groups")
+    assert.strictEqual(grpCheck.status, "fail", grpCheck.message)
+    assert(grpCheck.message.includes("docker") && grpCheck.message.includes("wheel"), grpCheck.message)
+
+    console.log("✓ Rule #7 DB resolution (OPENCODE_DB, :memory:, channels, precedence) and S3923 group normalization pass")
   }
 
   console.log("All security tests passed")

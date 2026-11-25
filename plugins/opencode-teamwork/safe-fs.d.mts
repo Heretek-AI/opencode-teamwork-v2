@@ -194,3 +194,11 @@ export function unlinkWithin(run: string, relPath: string, options?: WriteOption
 export function createDirWithin(run: string, relPath: string, options?: WriteOptions): { status: "ok"; path: string }
 export function recentWriteAnomalies(limit?: number): WriteAnomaly[]
 export function onWriteAnomaly(sink: ((anomaly: WriteAnomaly) => void) | null): void
+
+export interface ResolveExecutableOptions {
+  env?: Record<string, string | undefined>
+  standardOnly?: boolean
+  allowPath?: boolean
+}
+
+export function resolveTrustedExecutable(binName: string, options?: ResolveExecutableOptions): string | null

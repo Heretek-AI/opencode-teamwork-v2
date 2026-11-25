@@ -32,6 +32,7 @@ import { collectSecurityReport, hardenedExitCode } from "../lib/security.mjs"
 import { buildTimeline, renderTimeline, timelineWarnings } from "../lib/timeline.mjs"
 import { buildExportData, renderExport } from "../lib/export.mjs"
 import { verifyRun, renderVerify, verifyExitCode, VerifyUsageError } from "../lib/verify.mjs"
+import { readRegularBounded } from "../plugins/opencode-teamwork/safe-fs.mjs"
 
 // Echo a user-supplied value in an error message: control characters become "?"
 // and the value is capped, so a hostile argv cannot inject escapes or bloat stderr.
@@ -628,10 +629,9 @@ const DOCTOR_INDICATORS = { pass: "[✓]", warn: "[!]", fail: "[✗]" }
 function runPlanRequirePinnedWrites(runDir) {
   if (!runDir) return undefined
   try {
-    const file = join(runDir, "plan.dag.json")
-    const st = lstatSync(file)
-    if (!st.isFile() || st.size > 64 * 1024) return undefined
-    const parsed = JSON.parse(readFileSync(file, "utf8"))
+    const read = readRegularBounded(join(runDir, "plan.dag.json"), 64 * 1024)
+    if (read.status !== "ok") return undefined
+    const parsed = JSON.parse(read.text)
     return parsed?.requirePinnedWrites === true
   } catch {
     return undefined

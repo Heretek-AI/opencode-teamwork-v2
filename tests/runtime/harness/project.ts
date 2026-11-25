@@ -13,6 +13,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } fro
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
+import { resolveTrustedExecutable } from "../../../plugins/opencode-teamwork/safe-fs.mjs"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -46,7 +47,9 @@ function makeDir(...parts: string[]) {
 }
 
 function git(root: string, args: string[]) {
-  execFileSync("git", args, {
+  const gitBin = resolveTrustedExecutable("git")
+  if (!gitBin) throw new Error("git executable not found")
+  execFileSync(gitBin, args, {
     cwd: root,
     stdio: "ignore",
     env: {
@@ -71,14 +74,15 @@ export function createBaseEnvironment(): string {
   makeDir(base, "xdg-data")
   makeDir(base, "xdg-cache")
   makeDir(base, "xdg-state")
-  makeDir(base, "tmp")
+  const privateTmp = join(base, "tmp")
+  mkdirSync(privateTmp, { recursive: true, mode: 0o700 })
   process.env.HOME = home
   process.env.OPENCODE_TEST_HOME = home
   process.env.XDG_CONFIG_HOME = join(base, "xdg-config")
   process.env.XDG_DATA_HOME = join(base, "xdg-data")
   process.env.XDG_CACHE_HOME = join(base, "xdg-cache")
   process.env.XDG_STATE_HOME = join(base, "xdg-state")
-  process.env.TMPDIR = join(base, "tmp")
+  process.env.TMPDIR = privateTmp // NOSONAR (S5443): private 0o700 mkdtempSync subdir, never shared /tmp
   process.env.TEAMWORK_L1_BASE = base
   process.env.OPENCODE_DB = ":memory:"
   // The plugin mints an HMAC key on first use; a fixed key keeps that path

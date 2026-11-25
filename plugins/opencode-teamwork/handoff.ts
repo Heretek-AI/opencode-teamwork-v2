@@ -663,7 +663,7 @@ export function listHandoffFiles(run: string): string[] {
   try {
     return readdirSync(join(run, HANDOFF_DIR))
       .filter((name) => /^[A-Za-z0-9._-]+\.md$/.test(name))
-      .sort()
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
   } catch {
     return []
   }

@@ -51,7 +51,7 @@ import {
 } from "./document-review.ts"
 import { authorizeToolCall } from "./authorize.ts"
 import { BUDGET_HALT_PCT, budgetPercent, budgetThresholdReached } from "./budget.ts"
-import { assertSafeUrl, safeFetch } from "./url-guard.ts"
+import { assertSafeUrl, parseLoopbackServiceUrl, safeFetch } from "./url-guard.ts"
 import {
   classifyRoute as classifyLemmaRoute,
   evaluateLemmaFinalEvidence,
@@ -183,6 +183,7 @@ import {
   fdWithin,
   onWriteAnomaly,
   readWithinBounded,
+  resolveTrustedExecutable,
   setRunRequirePinnedWrites,
   supportsFdContainment,
   touchWithin,
@@ -372,12 +373,11 @@ function getOpencodeService(ctx?: any): { url: string; auth: string } | undefine
   }
   for (const p of candidates) {
     try {
-      if (existsSync(p)) {
-        const raw = JSON.parse(readFileSync(p, "utf8"))
-        if (raw?.url) {
-          const auth = "Basic " + Buffer.from(`opencode:${raw.password ?? ""}`).toString("base64")
-          return { url: raw.url, auth }
-        }
+      const raw = JSON.parse(readFileSync(p, "utf8"))
+      const safeUrl = parseLoopbackServiceUrl(raw?.url)
+      if (safeUrl) {
+        const auth = "Basic " + Buffer.from(`opencode:${raw.password ?? ""}`).toString("base64")
+        return { url: safeUrl, auth }
       }
     } catch {}
   }
@@ -394,6 +394,8 @@ async function fetchServiceTree(
   rootIds: string[],
   warnings: string[] = [],
 ): Promise<SessionUsageItem[] | undefined> {
+  const baseUrl = parseLoopbackServiceUrl(url)
+  if (!baseUrl) return undefined
   const sessions: SessionUsageItem[] = []
   const seen = new Set<string>()
   const queue: string[] = rootIds.filter(validSessionId)
@@ -402,12 +404,14 @@ async function fetchServiceTree(
     if (!validSessionId(rootId) || seen.has(rootId)) continue
     seen.add(rootId)
     try {
-      const res = await fetch(`${url}/api/session/${encodeURIComponent(rootId)}`, {
+      const res = await safeFetch(`${baseUrl}/api/session/${encodeURIComponent(rootId)}`, {
+        loopbackOnly: true,
         headers: { Authorization: auth },
-        signal: AbortSignal.timeout(3000),
+        timeoutMs: 3000,
+        maxBytes: 4 * 1024 * 1024,
       })
-      if (res.ok) {
-        const json: any = await res.json()
+      if (res.ok && res.status >= 200 && res.status < 300 && res.body) {
+        const json: any = JSON.parse(res.body.toString("utf8"))
         const s = json?.data
         if (s && typeof s.cost === "number") {
           sessions.push({
@@ -433,12 +437,14 @@ async function fetchServiceTree(
       try {
         const query = new URLSearchParams({ parentID: parentId, limit: String(SERVICE_TREE_PAGE_LIMIT) })
         if (cursor) query.set("cursor", cursor)
-        const res = await fetch(`${url}/api/session?${query.toString()}`, {
+        const res = await safeFetch(`${baseUrl}/api/session?${query.toString()}`, {
+          loopbackOnly: true,
           headers: { Authorization: auth },
-          signal: AbortSignal.timeout(3000),
+          timeoutMs: 3000,
+          maxBytes: 4 * 1024 * 1024,
         })
-        if (!res.ok) break
-        const json: any = await res.json()
+        if (!res.ok || res.status < 200 || res.status >= 300 || !res.body) break
+        const json: any = JSON.parse(res.body.toString("utf8"))
         const children = Array.isArray(json?.data) ? json.data : []
         for (const c of children) {
           const childId = c?.id
@@ -535,7 +541,9 @@ async function readSessionTreeUsage(
         )
         SELECT id, coalesce(parent_id, ''), coalesce(agent, ''), cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write FROM tree;
       `
-      const raw = execFileSync("sqlite3", [dbPath, "-separator", "\t", sql], { encoding: "utf8", timeout: 5000 })
+      const sqliteBin = resolveTrustedExecutable("sqlite3")
+      if (!sqliteBin) throw new Error("sqlite3 unavailable")
+      const raw = execFileSync(sqliteBin, [dbPath, "-separator", "\t", sql], { encoding: "utf8", timeout: 5000 })
       const lines = raw.trim().split("\n").filter(Boolean)
       if (lines.length > 0) {
         return {
@@ -2080,8 +2088,10 @@ function deriveClaimState(
 // ---------------------------------------------------------------------------
 
 function execGitCapture(cwd: string, args: string[]): string | undefined {
+  const gitBin = resolveTrustedExecutable("git")
+  if (!gitBin) return undefined
   try {
-    return execFileSync("git", args, {
+    return execFileSync(gitBin, args, {
       cwd,
       encoding: "utf8",
       timeout: 15000,
@@ -2134,31 +2144,49 @@ function scanUntracked(cwd: string): { count: number; digest: string; truncated:
   const names = raw
     .split("\u0000")
     .filter(Boolean)
-    .sort()
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
   if (names.length > MAX_UNTRACKED_FILES) {
     return { count: names.length, digest: "unknown", truncated: true }
   }
   const hash = createHash("sha256")
   let bytes = 0
+  const nofollow = fsConstants.O_NOFOLLOW || 0
+  const nonblock = fsConstants.O_NONBLOCK || 0
   for (const name of names) {
     hash.update(name)
     hash.update("\u0000")
     const file = join(cwd, name)
+    let fd: number | null = null
     try {
-      const st = lstatSync(file)
-      if (st.isSymbolicLink()) {
-        hash.update("symlink")
-        continue
+      if (nofollow === 0 || nonblock === 0) {
+        const st = lstatSync(file)
+        if (st.isSymbolicLink()) {
+          hash.update("symlink")
+          continue
+        }
+        if (!st.isFile()) {
+          hash.update("nonregular")
+          continue
+        }
       }
-      if (!st.isFile()) {
+      fd = openSync(file, fsConstants.O_RDONLY | nofollow | nonblock)
+      const fst = fstatSync(fd)
+      if (!fst.isFile()) {
         hash.update("nonregular")
         continue
       }
-      bytes += st.size
+      bytes += fst.size
       if (bytes > MAX_UNTRACKED_BYTES) return { count: names.length, digest: "unknown", truncated: true }
-      hash.update(readFileSync(file))
-    } catch {
-      hash.update("unreadable")
+      hash.update(readFileSync(fd))
+    } catch (err: any) {
+      if (err?.code === "ELOOP" || err?.code === "EMLINK") hash.update("symlink")
+      else hash.update("unreadable")
+    } finally {
+      if (fd !== null) {
+        try {
+          closeSync(fd)
+        } catch {}
+      }
     }
   }
   return { count: names.length, digest: hash.digest("hex"), truncated: false }
@@ -2227,34 +2255,56 @@ function collectArtifactFiles(
   out: Array<{ path: string; sha256: string; bytes: number }>,
   budget: { bytes: number },
 ): "ok" | "truncated" {
-  let st
-  try {
-    st = lstatSync(target)
-  } catch {
-    return "ok"
-  }
-  if (st.isSymbolicLink()) return "ok"
-  if (st.isFile()) {
-    if (out.length >= MAX_UNTRACKED_FILES) return "truncated"
+  const nofollow = fsConstants.O_NOFOLLOW || 0
+  const nonblock = fsConstants.O_NONBLOCK || 0
+  if (nofollow === 0 || nonblock === 0) {
     try {
-      const data = readFileSync(target)
-      budget.bytes += data.byteLength
-      if (budget.bytes > MAX_UNTRACKED_BYTES) return "truncated"
-      out.push({ path: relative(run, target), sha256: sha256Hex(data), bytes: data.byteLength })
+      if (lstatSync(target).isSymbolicLink()) return "ok"
     } catch {
-      out.push({ path: relative(run, target), sha256: "unreadable", bytes: 0 })
+      return "ok"
     }
-    return "ok"
   }
-  if (!st.isDirectory()) return "ok"
-  let entries: string[]
+
+  let isDir = false
+  let fd: number | null = null
   try {
-    entries = readdirSync(target).sort()
+    fd = openSync(target, fsConstants.O_RDONLY | nofollow | nonblock)
+    const st = fstatSync(fd)
+    if (st.isFile()) {
+      if (out.length >= MAX_UNTRACKED_FILES) return "truncated"
+      try {
+        const data = readFileSync(fd)
+        budget.bytes += data.byteLength
+        if (budget.bytes > MAX_UNTRACKED_BYTES) return "truncated"
+        out.push({ path: relative(run, target), sha256: sha256Hex(data), bytes: data.byteLength })
+      } catch {
+        out.push({ path: relative(run, target), sha256: "unreadable", bytes: 0 })
+      }
+      return "ok"
+    }
+    if (!st.isDirectory()) return "ok"
+    isDir = true
+  } catch (err: any) {
+    if (err?.code === "EISDIR") isDir = true
+    else return "ok"
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd)
+      } catch {}
+    }
+  }
+  if (!isDir) return "ok"
+
+  let entries
+  try {
+    entries = readdirSync(target, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
   } catch {
     return "ok"
   }
-  for (const entry of entries) {
-    if (collectArtifactFiles(run, join(target, entry), out, budget) === "truncated") return "truncated"
+  for (const dirent of entries) {
+    if (dirent.isSymbolicLink()) continue
+    if (collectArtifactFiles(run, join(target, dirent.name), out, budget) === "truncated") return "truncated"
   }
   return "ok"
 }
@@ -4591,63 +4641,82 @@ type ApprovalReadResult =
 
 /** Read one approval file without following a symlink and without trusting its owner. */
 function readApprovalDocument(file: string, owner: number | undefined): ApprovalReadResult {
-  let before: ReturnType<typeof lstatSync>
-  try {
-    before = lstatSync(file)
-  } catch (err: any) {
-    return {
-      ok: false,
-      code: err?.code === "ENOENT" ? "AUTH_APPROVAL_MISSING" : "AUTH_APPROVAL_UNTRUSTED",
-      message:
-        err?.code === "ENOENT"
-          ? `approval artifact ${clean(file, 200)} does not exist`
-          : `approval artifact ${clean(file, 200)} cannot be inspected (${err?.code ?? "error"})`,
+  const nofollow = fsConstants.O_NOFOLLOW || 0
+  const nonblock = fsConstants.O_NONBLOCK || 0
+  if (nofollow === 0 || nonblock === 0) {
+    try {
+      if (lstatSync(file).isSymbolicLink()) {
+        return { ok: false, code: "AUTH_APPROVAL_UNTRUSTED", message: `approval artifact ${clean(file, 200)} is a symlink` }
+      }
+    } catch (err: any) {
+      return {
+        ok: false,
+        code: err?.code === "ENOENT" ? "AUTH_APPROVAL_MISSING" : "AUTH_APPROVAL_UNTRUSTED",
+        message:
+          err?.code === "ENOENT"
+            ? `approval artifact ${clean(file, 200)} does not exist`
+            : `approval artifact ${clean(file, 200)} cannot be inspected (${err?.code ?? "error"})`,
+      }
     }
   }
-  if (before.isSymbolicLink()) {
-    return { ok: false, code: "AUTH_APPROVAL_UNTRUSTED", message: `approval artifact ${clean(file, 200)} is a symlink` }
-  }
-  if (!before.isFile()) {
-    return { ok: false, code: "AUTH_APPROVAL_UNTRUSTED", message: `approval artifact ${clean(file, 200)} is not a regular file` }
-  }
-  if (before.size > APPROVAL_FILE_MAX_BYTES) {
-    return {
-      ok: false,
-      code: "AUTH_APPROVAL_UNTRUSTED",
-      message: `approval artifact ${clean(file, 200)} is larger than ${APPROVAL_FILE_MAX_BYTES} bytes`,
-    }
-  }
-  if (owner === undefined || before.uid === owner) {
-    return {
-      ok: false,
-      code: "AUTH_APPROVAL_UNTRUSTED",
-      message: `approval artifact ${clean(file, 200)} is owned by the run UID; approvals must come from a different principal`,
-    }
-  }
+
   let fd: number | undefined
   try {
-    fd = openSync(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0))
-    const after = fstatSync(fd)
-    if (
-      !after.isFile() ||
-      after.uid !== before.uid ||
-      after.dev !== before.dev ||
-      after.ino !== before.ino
-    ) {
+    try {
+      fd = openSync(file, fsConstants.O_RDONLY | nofollow | nonblock)
+    } catch (err: any) {
+      if (err?.code === "ENOENT") {
+        return { ok: false, code: "AUTH_APPROVAL_MISSING", message: `approval artifact ${clean(file, 200)} does not exist` }
+      }
+      if (err?.code === "ELOOP" || err?.code === "EMLINK") {
+        return { ok: false, code: "AUTH_APPROVAL_UNTRUSTED", message: `approval artifact ${clean(file, 200)} is a symlink` }
+      }
       return {
         ok: false,
         code: "AUTH_APPROVAL_UNTRUSTED",
-        message: `approval artifact ${clean(file, 200)} changed identity while it was opened`,
+        message: `approval artifact ${clean(file, 200)} cannot be inspected (${err?.code ?? "error"})`,
       }
     }
-    if (after.size > APPROVAL_FILE_MAX_BYTES) {
+    const st = fstatSync(fd)
+    if (!st.isFile()) {
+      return { ok: false, code: "AUTH_APPROVAL_UNTRUSTED", message: `approval artifact ${clean(file, 200)} is not a regular file` }
+    }
+    if (st.size > APPROVAL_FILE_MAX_BYTES) {
+      return {
+        ok: false,
+        code: "AUTH_APPROVAL_UNTRUSTED",
+        message: `approval artifact ${clean(file, 200)} is larger than ${APPROVAL_FILE_MAX_BYTES} bytes`,
+      }
+    }
+    if (owner === undefined || st.uid === owner) {
+      return {
+        ok: false,
+        code: "AUTH_APPROVAL_UNTRUSTED",
+        message: `approval artifact ${clean(file, 200)} is owned by the run UID; approvals must come from a different principal`,
+      }
+    }
+    const cap = APPROVAL_FILE_MAX_BYTES + 1
+    const buf = Buffer.alloc(cap)
+    let total = 0
+    while (total < cap) {
+      let n: number
+      try {
+        n = readSync(fd, buf, total, cap - total, null)
+      } catch (readErr: any) {
+        if (readErr?.code === "EINTR") continue
+        throw readErr
+      }
+      if (n === 0) break
+      total += n
+    }
+    if (total > APPROVAL_FILE_MAX_BYTES) {
       return {
         ok: false,
         code: "AUTH_APPROVAL_UNTRUSTED",
         message: `approval artifact ${clean(file, 200)} grew beyond ${APPROVAL_FILE_MAX_BYTES} bytes while it was opened`,
       }
     }
-    const text = readFileSync(fd, "utf8")
+    const text = buf.subarray(0, total).toString("utf8")
     let data: any
     try {
       data = JSON.parse(text)
@@ -12857,9 +12926,13 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const baseBranch = `teamwork/base-${runId}`
 
         const execGit = (args: string[], cwd = root) => {
+          const gitBin = resolveTrustedExecutable("git")
+          if (!gitBin) {
+            return { stdout: "", stderr: "git executable not found", code: 1 }
+          }
           try {
             return {
-              stdout: execFileSync("git", args, { cwd, encoding: "utf8", timeout: 15000, stdio: ["pipe", "pipe", "pipe"] }).trim(),
+              stdout: execFileSync(gitBin, args, { cwd, encoding: "utf8", timeout: 15000, stdio: ["pipe", "pipe", "pipe"] }).trim(),
               code: 0,
             }
           } catch (e: any) {

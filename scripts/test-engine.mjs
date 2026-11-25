@@ -25,8 +25,8 @@ import { BUDGET_HALT_PCT, budgetPercent, budgetThresholdReached } from "../plugi
 import { renderGateStatus, evaluateStrictGate } from "../plugins/opencode-teamwork/strict.ts"
 import { evaluateVictoryGate } from "../plugins/opencode-teamwork/victory.ts"
 import { withCrossProcessLock, crossProcessLockPath, observeLockArtifact, quarantineStaleLock } from "../plugins/opencode-teamwork/locks.ts"
-import { recordWriteAnomaly, setWriteAnomalyAuditPathForTest, unacknowledgedWriteAnomalies } from "../plugins/opencode-teamwork/safe-fs.mjs"
-import { assertSafeUrl, blockedAddressReason } from "../plugins/opencode-teamwork/url-guard.ts"
+import { recordWriteAnomaly, resolveTrustedExecutable, setWriteAnomalyAuditPathForTest, unacknowledgedWriteAnomalies } from "../plugins/opencode-teamwork/safe-fs.mjs"
+import { assertSafeUrl, blockedAddressReason, parseLoopbackServiceUrl } from "../plugins/opencode-teamwork/url-guard.ts"
 import { refreshRunBriefing, MAX_BRIEFING_BYTES, refreshAgentBriefing, readAgentBriefingExcerpt, agentBriefingRelativePath, MAX_AGENT_BRIEFING_DIRS } from "../plugins/opencode-teamwork/briefing.ts"
 import { writeHandoff, MAX_HANDOFF_ENTRIES, MAX_HANDOFF_INDEX_BYTES, HANDOFF_SECTION_LABELS, evaluateHandoffGateChecked, readWorkerHandoffBinding } from "../plugins/opencode-teamwork/handoff.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
@@ -45,11 +45,15 @@ import {
 import {
   appendFileSync,
   chmodSync,
+  closeSync,
+  constants as fsConstants,
   existsSync,
+  futimesSync,
   linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -67,8 +71,15 @@ import { deflateSync } from "node:zlib"
 import { createHash, generateKeyPairSync, randomBytes } from "node:crypto"
 import assert from "node:assert"
 
-// Absolute git binary for the new worktree assertions; never PATH-resolved.
-const GIT_BIN = ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"].find(existsSync) ?? "/usr/bin/git"
+// Absolute git binary for the new worktree assertions; resolved via trusted directories.
+const GIT_BIN = resolveTrustedExecutable("git") ?? "/usr/bin/git"
+const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+function assertApprox(actual, expected, msg) {
+  assert(
+    typeof actual === "number" && Math.abs(actual - expected) < 1e-9,
+    msg ?? `expected ${expected} (+/- 1e-9), got ${actual}`,
+  )
+}
 
 const testDir = mkdtempSync(join(tmpdir(), "teamwork-engine-test-"))
 // Keep the durable write-anomaly audit hermetic (never the real config dir).
@@ -2035,7 +2046,7 @@ try {
   const auditArtifact = JSON.parse(readFileSync(evidenceAuditFile(auditRun), "utf8"))
   assert.strictEqual(auditArtifact.integrityMode, "demo")
   assert.deepStrictEqual(
-    auditArtifact.ruleChecks.map((c) => c.rule).sort(),
+    auditArtifact.ruleChecks.map((c) => c.rule).sort(cmp),
     ["core_logic_copied", "delegated_core_work", "fabricated_output", "test_source_read"],
     "a demo PASS must cover exactly the rules forbidden at demo",
   )
@@ -3380,12 +3391,12 @@ try {
 
   const gitRepoDir = mkdtempSync(join(tmpdir(), "teamwork-git-test-"))
   try {
-    execFileSync("git", ["init"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
-    execFileSync("git", ["config", "user.email", "test@test.com"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
-    execFileSync("git", ["config", "user.name", "Test Runner"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["init"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["config", "user.email", "test@test.com"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["config", "user.name", "Test Runner"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
     writeFileSync(join(gitRepoDir, "README.md"), "# Teamwork Test Repo\n")
-    execFileSync("git", ["add", "README.md"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
-    execFileSync("git", ["commit", "-m", "Initial commit"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["add", "README.md"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["commit", "-m", "Initial commit"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
 
     const gitTools = {}
     await registerTeamworkTools(
@@ -3433,8 +3444,8 @@ try {
 
     // 3. Make change in worker worktree and commit
     writeFileSync(join(workerSetup.worktreePath, "feature.txt"), "hello world\n")
-    execFileSync("git", ["add", "feature.txt"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
-    execFileSync("git", ["commit", "-m", "Add feature.txt"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["add", "feature.txt"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["commit", "-m", "Add feature.txt"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
 
     // 4. Test diff
     const diffRes = await gitTools.teamwork_worktree.execute({
@@ -3456,12 +3467,12 @@ try {
 
     // 6. Test conflict handling: worker modifies file differently than sentinel
     writeFileSync(join(sentinelSetup.worktreePath, "conflict.txt"), "sentinel version\n")
-    execFileSync("git", ["add", "conflict.txt"], { cwd: sentinelSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
-    execFileSync("git", ["commit", "-m", "Sentinel commit"], { cwd: sentinelSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["add", "conflict.txt"], { cwd: sentinelSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["commit", "-m", "Sentinel commit"], { cwd: sentinelSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
 
     writeFileSync(join(workerSetup.worktreePath, "conflict.txt"), "worker conflicting version\n")
-    execFileSync("git", ["add", "conflict.txt"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
-    execFileSync("git", ["commit", "-m", "Worker conflicting commit"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["add", "conflict.txt"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["commit", "-m", "Worker conflicting commit"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
 
     const conflictMergeRes = await gitTools.teamwork_worktree.execute({
       sessionId: gitSessionId,
@@ -3688,15 +3699,18 @@ try {
 
   // Probe ONCE which SQLite backend can seed the session_v2 fixture table:
   // node:sqlite (preferred) or the sqlite3 CLI. Returns null when neither exists.
+  const SQLITE_BIN = resolveTrustedExecutable("sqlite3")
   async function probeSqliteBackend() {
     try {
       const mod = await import("node:sqlite")
       if (typeof mod.DatabaseSync === "function") return "node:sqlite"
     } catch {}
-    try {
-      execFileSync("sqlite3", ["--version"], { stdio: ["pipe", "pipe", "pipe"] })
-      return "sqlite3"
-    } catch {}
+    if (SQLITE_BIN) {
+      try {
+        execFileSync(SQLITE_BIN, ["--version"], { stdio: ["pipe", "pipe", "pipe"] })
+        return "sqlite3"
+      } catch {}
+    }
     return null
   }
   const sqliteBackend = await probeSqliteBackend()
@@ -3722,7 +3736,8 @@ try {
         db.close()
       }
     } else {
-      execFileSync("sqlite3", [dbPath], { input: ddl + values.join("\n"), stdio: ["pipe", "pipe", "pipe"] })
+      assert(SQLITE_BIN, "sqlite3 executable must be available")
+      execFileSync(SQLITE_BIN, [dbPath], { input: ddl + values.join("\n"), stdio: ["pipe", "pipe", "pipe"] })
     }
   }
 
@@ -3785,10 +3800,10 @@ try {
       const res = await f.tools.teamwork_cost.execute({ sessionId: RUN_A, taskId: "alpha" }, { sessionID: ROOT_SES })
       assert(res.content.includes("opencode database"), `spend must come from the session DB, got: ${res.content}`)
       const costs = JSON.parse(readFileSync(runFile(f.root, RUN_A, "costs.json"), "utf8"))
-      assert.strictEqual(costs.byTask.alpha, 0.3, "subagent spend must bucket to the taskId")
+      assertApprox(costs.byTask.alpha, 0.3, "subagent spend must bucket to the taskId")
       assert.strictEqual(costs.byTask["team/worker"], undefined, "byTask['team/worker'] must NOT grow when a taskId is given")
       assert.deepStrictEqual(Object.keys(costs.byTask), ["alpha"])
-      assert.strictEqual(costs.spentUsd, 0.3)
+      assertApprox(costs.spentUsd, 0.3)
       console.log("✓ non-root spend with taskId buckets to the task; byTask['team/worker'] does not grow")
     }
 
@@ -3798,7 +3813,7 @@ try {
       await seedSessionDb(dbPath, [rootRow, workerRow(0.3, T1)])
       await f.tools.teamwork_cost.execute({ sessionId: RUN_B }, { sessionID: ROOT_SES })
       const costs = JSON.parse(readFileSync(runFile(f.root, RUN_B, "costs.json"), "utf8"))
-      assert.strictEqual(costs.byTask["team/worker"], 0.3, "without a taskId, non-root spend must bucket by agent name")
+      assertApprox(costs.byTask["team/worker"], 0.3, "without a taskId, non-root spend must bucket by agent name")
       assert.deepStrictEqual(Object.keys(costs.byTask), ["team/worker"], "no task bucket may appear without a taskId")
       assert.deepStrictEqual(Object.keys(costs.byTaskTokens), ["team/worker"], "byTaskTokens keys must mirror byTask")
       console.log("✓ without taskId, non-root spend still buckets by agent name (legacy regression guard)")
@@ -3827,7 +3842,7 @@ try {
       ])
       await f.tools.teamwork_cost.execute({ sessionId: RUN_C, taskId: "alpha" }, { sessionID: ROOT_SES })
       const costs = JSON.parse(readFileSync(runFile(f.root, RUN_C, "costs.json"), "utf8"))
-      assert.strictEqual(costs.byTask.alpha, 0.65, "cost must accumulate 0.3 + 0.2 + 0.15 delta")
+      assertApprox(costs.byTask.alpha, 0.65, "cost must accumulate 0.3 + 0.2 + 0.15 delta")
       // Expected = sum of all sessions' current totals: root(R2) + child1(T1') + child2(T2).
       assert.deepStrictEqual(costs.byTaskTokens.alpha, {
         input: 500 + 1500 + 300,
@@ -3836,12 +3851,12 @@ try {
         cache: { read: 30 + 50 + 10, write: 3 + 5 + 1 },
       }, "byTaskTokens must SUM per-session token deltas across the tree")
       const bucket = costs.byTaskTokens.alpha
-      assert.deepStrictEqual(Object.keys(bucket).sort(), ["cache", "input", "output", "reasoning"])
-      assert.deepStrictEqual(Object.keys(bucket.cache).sort(), ["read", "write"])
+      assert.deepStrictEqual(Object.keys(bucket).sort(cmp), ["cache", "input", "output", "reasoning"])
+      assert.deepStrictEqual(Object.keys(bucket.cache).sort(cmp), ["read", "write"])
       for (const v of [bucket.input, bucket.output, bucket.reasoning, bucket.cache.read, bucket.cache.write]) {
         assert(Number.isFinite(v) && Number.isInteger(v) && v >= 0, `token value must be a finite non-negative integer, got ${v}`)
       }
-      assert.deepStrictEqual(Object.keys(costs.byTaskTokens).sort(), Object.keys(costs.byTask).sort(), "byTaskTokens keys must match byTask keys")
+      assert.deepStrictEqual(Object.keys(costs.byTaskTokens).sort(cmp), Object.keys(costs.byTask).sort(cmp), "byTaskTokens keys must match byTask keys")
       console.log("✓ byTaskTokens sums per-session token deltas across the tree (absolute-write mutation is caught)")
     }
 
@@ -3856,7 +3871,7 @@ try {
       const res = await f.tools.teamwork_cost.execute({ sessionId: RUN_D, taskId: "alpha" }, { sessionID: ROOT_SES })
       assert(res.content.includes("Budget:"), `cost must complete without crashing, got: ${res.content}`)
       const costs = JSON.parse(readFileSync(file, "utf8"))
-      assert.strictEqual(costs.byTask.alpha, 0.3)
+      assertApprox(costs.byTask.alpha, 0.3)
       assert.strictEqual(costs.byTaskTokens.alpha.input, 1000, "a legacy costs.json must gain the byTaskTokens bucket")
       console.log("✓ pre-existing costs.json without byTaskTokens is tolerated")
     }
@@ -4194,7 +4209,7 @@ try {
     const server = createServer((req, res) => {
       requests.push(req.url)
       res.setHeader("content-type", "application/json")
-      const url = new URL(req.url, "http://fixture")
+      const url = new URL(req.url, "https://fixture")
       if (url.pathname === `/api/session/${ROOT}`) {
         res.end(
           JSON.stringify({
@@ -4282,6 +4297,96 @@ try {
     }
   } finally {
     rmSync(pageDir, { recursive: true, force: true })
+  }
+}
+
+// ==========================================
+// Part 1d-ter: CodeQL js/file-access-to-http — service.json loopback guard
+// ==========================================
+{
+  console.log("Testing service.json loopback URL validation (CodeQL #61/#62)...")
+  assert.strictEqual(parseLoopbackServiceUrl("http://127.0.0.1:4096"), "http://127.0.0.1:4096")
+  assert.strictEqual(parseLoopbackServiceUrl("http://localhost:4096/"), "http://localhost:4096")
+  assert.strictEqual(parseLoopbackServiceUrl("https://[::1]:8443"), "https://[::1]:8443")
+  for (const bad of [
+    "http://169.254.169.254/latest/meta-data",
+    "http://169.254.169.254",
+    "https://evil.example",
+    "http://10.0.0.1:4096",
+    "http://user:pass@127.0.0.1:4096",
+    "http://127.0.0.1:4096/bad",
+    "http://127.0.0.1:4096?x=1",
+    "ftp://127.0.0.1:4096",
+  ]) {
+    assert.strictEqual(parseLoopbackServiceUrl(bad), undefined, `must reject non-loopback/malformed service URL: ${bad}`)
+  }
+
+  const extResolved = await assertSafeUrl("http://evil.example:4096/api/session", {
+    loopbackOnly: true,
+    resolveHost: async () => [{ address: "93.184.216.34", family: 4 }],
+  })
+  assert.strictEqual(extResolved.ok, false)
+  assert.strictEqual(extResolved.code, "URL_BLOCKED_ADDRESS")
+
+  const dnsRebound = await assertSafeUrl("http://localhost:4096/api/session", {
+    loopbackOnly: true,
+    resolveHost: async () => [
+      { address: "127.0.0.1", family: 4 },
+      { address: "169.254.169.254", family: 4 },
+    ],
+  })
+  assert.strictEqual(dnsRebound.ok, false)
+  assert.strictEqual(dnsRebound.code, "URL_BLOCKED_ADDRESS")
+
+  const okLoop = await assertSafeUrl("http://localhost:4096/api/session", {
+    loopbackOnly: true,
+    resolveHost: async () => [{ address: "127.0.0.1", family: 4 }],
+  })
+  assert.strictEqual(okLoop.ok, true)
+
+  const svcDir = mkdtempSync(join(tmpdir(), "teamwork-svc-guard-"))
+  const home = join(svcDir, "home")
+  const root = join(svcDir, "repo")
+  mkdirSync(root, { recursive: true })
+  const savedEnv = {}
+  for (const k of ["HOME", "USERPROFILE", "XDG_DATA_HOME", "XDG_STATE_HOME", "LOCALAPPDATA", "OPENCODE_DB"]) {
+    savedEnv[k] = process.env[k]
+  }
+  try {
+    process.env.HOME = home
+    process.env.USERPROFILE = home
+    process.env.XDG_DATA_HOME = join(home, "data")
+    process.env.XDG_STATE_HOME = join(home, "state")
+    process.env.LOCALAPPDATA = join(home, "localappdata")
+    delete process.env.OPENCODE_DB
+    mkdirSync(join(home, "state", "opencode"), { recursive: true })
+    writeFileSync(
+      join(home, "state", "opencode", "service.json"),
+      JSON.stringify({ url: "http://169.254.169.254", password: "secret" }),
+    )
+    const tools = {}
+    await registerTeamworkTools(
+      {
+        tool: { transform: async (cb) => cb({ namespace: () => {}, add: (tool) => registerTool(tools, tool, withFixtureSession) }) },
+        session: { get: async () => undefined },
+        storage: storageFor(root),
+      },
+      root,
+    )
+    const RUN = "20261124-000000-svcguard"
+    await tools.teamwork_plan.execute(
+      { sessionId: RUN, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "alpha" }] },
+      { sessionID: "ses_svc_root" },
+    )
+    const costRes = await tools.teamwork_cost.execute({ sessionId: RUN }, { sessionID: "ses_svc_root" })
+    assert(!costRes.content.includes("opencode service API"), `non-loopback service.json URL must be ignored: ${costRes.content}`)
+    console.log("✓ service.json loopback validator rejects metadata/external/credentialed/path URLs and allows loopback")
+  } finally {
+    for (const k of Object.keys(savedEnv)) {
+      if (savedEnv[k] === undefined) delete process.env[k]
+      else process.env[k] = savedEnv[k]
+    }
+    rmSync(svcDir, { recursive: true, force: true })
   }
 }
 
@@ -4411,7 +4516,7 @@ try {
 {
   console.log("Testing prototype-key integrity and tool-result sanitising (SEC-1, SEC-3)...")
   const testDir7 = mkdtempSync(join(tmpdir(), "teamwork-sec1-test-"))
-  const protoSnapshot = () => Reflect.ownKeys(Object.prototype).map(String).sort().join(",")
+  const protoSnapshot = () => Reflect.ownKeys(Object.prototype).map(String).sort(cmp).join(",")
   const protoBefore = protoSnapshot()
   const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k)
   const costsOf = (root, runId) => JSON.parse(readFileSync(join(root, ".opencode", "teamwork", runId, "costs.json"), "utf8"))
@@ -4586,8 +4691,8 @@ try {
         const res = await f.tools.teamwork_cost.execute({ sessionId: RUN, taskId: "constructor" }, { sessionID: "ses_sec1_root" })
         assert(!res.content.includes("NaN"), `no NaN in breakdown: ${res.content}`)
         const costs = costsOf(f.root, RUN)
-        assert.strictEqual(costs.byTask.constructor, 0.3, "worker spend must bucket to 'constructor'")
-        assert.strictEqual(costs.spentUsd, 0.3)
+        assertApprox(costs.byTask.constructor, 0.3, "worker spend must bucket to 'constructor'")
+        assertApprox(costs.spentUsd, 0.3)
         assert(hasOwn(costs.byTaskTokens, "constructor"), "byTaskTokens must hold an own 'constructor' key")
         assert.deepStrictEqual(costs.byTaskTokens.constructor, {
           input: 1000,
@@ -4632,7 +4737,7 @@ try {
     { id: "team/formalization-reviewer", deny: ["edit", "shell", "subagent", "webfetch"] },
     { id: "team/referee", deny: ["edit", "shell", "subagent", "webfetch"] },
     { id: "team/victory-auditor", deny: ["edit", "subagent", "webfetch"] },
-  ].map((p) => ({ ...p, deny: [...p.deny].sort() }))
+  ].map((p) => ({ ...p, deny: [...p.deny].sort(cmp) }))
 
   // --- 8a: READ_ONLY_ACTIONS holds exactly the documented deny sets.
   const toolsSrc = readFileSync(join(repoRoot, "plugins/opencode-teamwork/tools.ts"), "utf8")
@@ -4640,11 +4745,11 @@ try {
   assert(table, "READ_ONLY_ACTIONS table must exist in tools.ts")
   const enforced = {}
   for (const m of table[1].matchAll(/"([^"]+)":\s*new Set\(\[([^\]]*)\]\)/g)) {
-    enforced[m[1]] = [...m[2].matchAll(/"([^"]+)"/g)].map((a) => a[1]).sort()
+    enforced[m[1]] = [...m[2].matchAll(/"([^"]+)"/g)].map((a) => a[1]).sort(cmp)
   }
   assert.deepStrictEqual(
-    Object.keys(enforced).sort(),
-    POLICY.map((p) => p.id).sort(),
+    Object.keys(enforced).sort(cmp),
+    POLICY.map((p) => p.id).sort(cmp),
     "READ_ONLY_ACTIONS must list exactly the agents covered by this test",
   )
   for (const p of POLICY) {
@@ -4659,8 +4764,8 @@ try {
   assert(start >= 0, "README must state the per-agent read-only policy")
   const end = readme.indexOf("\n\n", start)
   const paragraph = readme.slice(start, end === -1 ? undefined : end)
-  const documented = [...new Set([...paragraph.matchAll(/`(team\/[a-z-]+)`/g)].map((m) => m[1]))].sort()
-  const editDeniers = POLICY.filter((p) => p.deny.includes("edit")).map((p) => p.id).sort()
+  const documented = [...new Set([...paragraph.matchAll(/`(team\/[a-z-]+)`/g)].map((m) => m[1]))].sort(cmp)
+  const editDeniers = POLICY.filter((p) => p.deny.includes("edit")).map((p) => p.id).sort(cmp)
   assert.deepStrictEqual(documented, editDeniers, "README must document exactly the edit-denying agents as read-only")
   assert(/can modify files/i.test(paragraph), "README must state that shell can modify files")
   assert(
@@ -11633,27 +11738,34 @@ process.exit(0);
       const lockTarget = join(concDir, "lock-protocol-target.json")
       const lockPath = crossProcessLockPath(lockTarget)
       const old = new Date(Date.now() - 120000)
+      const writeLockFixture = (path, body, mtime) => {
+        const fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600)
+        try {
+          writeFileSync(fd, body)
+          if (mtime) futimesSync(fd, mtime, mtime)
+        } finally {
+          closeSync(fd)
+        }
+      }
 
-      writeFileSync(lockPath, "")
-      utimesSync(lockPath, old, old)
+      writeLockFixture(lockPath, "", old)
       await withCrossProcessLock(lockTarget, () => undefined, { leaseMs: 30000, timeoutMs: 1000 })
-      assert(!existsSync(lockPath), "an empty lock older than the lease must be reclaimed")
+      assert.strictEqual(observeLockArtifact(lockPath), undefined, "an empty lock older than the lease must be reclaimed")
 
-      writeFileSync(lockPath, '{"pid":')
-      utimesSync(lockPath, old, old)
+      writeLockFixture(lockPath, '{"pid":', old)
       await withCrossProcessLock(lockTarget, () => undefined, { leaseMs: 30000, timeoutMs: 1000 })
-      assert(!existsSync(lockPath), "a partial lock older than the lease must be reclaimed")
+      assert.strictEqual(observeLockArtifact(lockPath), undefined, "a partial lock older than the lease must be reclaimed")
 
       // Falsified owner.at: a future timestamp cannot defeat mtime aging...
-      writeFileSync(
+      writeLockFixture(
         lockPath,
         JSON.stringify({ pid: 999999, host: hostname(), at: "2100-01-01T00:00:00.000Z", nonce: "future-at" }),
+        old,
       )
-      utimesSync(lockPath, old, old)
       await withCrossProcessLock(lockTarget, () => undefined, { leaseMs: 30000, timeoutMs: 1000 })
-      assert(!existsSync(lockPath), "a falsified future owner.at must not defeat mtime aging")
+      assert.strictEqual(observeLockArtifact(lockPath), undefined, "a falsified future owner.at must not defeat mtime aging")
       // ...and an old owner.at cannot make a fresh lock stale.
-      writeFileSync(
+      writeLockFixture(
         lockPath,
         JSON.stringify({ pid: 999999, host: hostname(), at: "2000-01-01T00:00:00.000Z", nonce: "old-at" }),
       )
@@ -11865,7 +11977,9 @@ process.exit(0);
       const first = pruneTeamworkWorktrees(pruneRoot, { all: true })
       assert.deepStrictEqual(first.removed, ["20261122-000034-prune-stale"], `only the stale run may be pruned: ${JSON.stringify(first)}`)
       assert.strictEqual(first.refused.length, 4, `four claims must block: ${JSON.stringify(first.refused)}`)
-      const blockedStates = first.refused.map((entry) => entry.claims[0]?.state).sort()
+      const blockedStates = first.refused
+        .map((entry) => entry.claims[0]?.state)
+        .sort((a, b) => cmp(String(a ?? ""), String(b ?? "")))
       assert.deepStrictEqual(blockedStates, ["cross-host", "expired", "live", "needs-inspection"], JSON.stringify(blockedStates))
       for (const id of ["20261122-000030-prune-live", "20261122-000033-prune-crosshost"]) {
         assert(existsSync(join(worktreeBase, id)), `${id} must survive a refused prune`)

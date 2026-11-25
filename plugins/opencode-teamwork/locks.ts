@@ -31,13 +31,18 @@
 
 import {
   closeSync,
+  constants as fsConstants,
+  fstatSync,
   linkSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs"
@@ -49,6 +54,7 @@ import {
   containmentModeRefusal,
   fdTraversalMode,
   pinParent,
+  readRegularBounded,
   recordWriteAnomaly,
   resolveRunPolicy,
 } from "./safe-fs.mjs"
@@ -225,43 +231,109 @@ function readOwnerText(raw: string): LockOwner | undefined {
  * `<lockPath>/owner.json`.
  */
 export function observeLockArtifact(lockPath: string): LockArtifactObservation | undefined {
-  let stat
-  try {
-    stat = lstatSync(lockPath)
-  } catch (err: any) {
-    if (err?.code === "ENOENT") return undefined
-    throw err
-  }
-  if (stat.isSymbolicLink()) {
-    throw new Error(`refused: "${lockPath}" is a symlink; refusing to use it as a lock file`)
-  }
-  const kind: "file" | "directory" = stat.isDirectory() ? "directory" : "file"
+  const nofollow = fsConstants.O_NOFOLLOW || 0
+  const nonblock = fsConstants.O_NONBLOCK || 0
+  let stat: ReturnType<typeof lstatSync>
   let raw: string | undefined
-  try {
-    if (kind === "directory") {
-      const ownerFile = join(lockPath, "owner.json")
-      const ownerStat = lstatSync(ownerFile)
-      if (ownerStat.isFile() && !ownerStat.isSymbolicLink() && ownerStat.size <= 4096) {
-        raw = readFileSync(ownerFile, "utf8")
-      }
-    } else if (stat.isFile() && stat.size <= 4096) {
-      raw = readFileSync(lockPath, "utf8")
+
+  if (nofollow === 0 || nonblock === 0) {
+    try {
+      stat = lstatSync(lockPath)
+    } catch (err: any) {
+      if (err?.code === "ENOENT") return undefined
+      throw err
     }
-    // A FIFO/socket/device (or an oversized/planted symlink) at the lock path
-    // is left unread (reading a FIFO would block); it is treated as an
-    // unreadable artifact and ages out after the lease.
-  } catch {
-    raw = undefined
+    if (stat.isSymbolicLink()) {
+      throw new Error(`refused: "${lockPath}" is a symlink; refusing to use it as a lock file`)
+    }
+    const kind: "file" | "directory" = stat.isDirectory() ? "directory" : "file"
+    if (kind === "directory") {
+      const read = readRegularBounded(join(lockPath, "owner.json"), 4096)
+      raw = read.status === "ok" ? read.text : undefined
+    } else if (stat.isFile() && stat.size <= 4096) {
+      const read = readRegularBounded(lockPath, 4096)
+      raw = read.status === "ok" ? read.text : undefined
+    }
+    const owner = raw === undefined ? undefined : readOwnerText(raw)
+    return {
+      path: lockPath,
+      kind,
+      mtimeMs: stat.mtimeMs,
+      ino: typeof stat.ino === "number" && stat.ino > 0 ? stat.ino : undefined,
+      nonce: owner?.nonce ?? "",
+      owner,
+      readable: owner !== undefined,
+    }
   }
-  const owner = raw === undefined ? undefined : readOwnerText(raw)
-  return {
-    path: lockPath,
-    kind,
-    mtimeMs: stat.mtimeMs,
-    ino: typeof stat.ino === "number" && stat.ino > 0 ? stat.ino : undefined,
-    nonce: owner?.nonce ?? "",
-    owner,
-    readable: owner !== undefined,
+
+  let fd: number | null = null
+  try {
+    try {
+      fd = openSync(lockPath, fsConstants.O_RDONLY | nofollow | nonblock)
+    } catch (err: any) {
+      if (err?.code === "ENOENT") return undefined
+      if (err?.code === "ELOOP" || err?.code === "EMLINK") {
+        throw new Error(`refused: "${lockPath}" is a symlink; refusing to use it as a lock file`)
+      }
+      if (err?.code === "EISDIR") {
+        const dirStat = statSync(lockPath)
+        const read = readRegularBounded(join(lockPath, "owner.json"), 4096)
+        raw = read.status === "ok" ? read.text : undefined
+        const owner = raw === undefined ? undefined : readOwnerText(raw)
+        return {
+          path: lockPath,
+          kind: "directory",
+          mtimeMs: dirStat.mtimeMs,
+          ino: typeof dirStat.ino === "number" && dirStat.ino > 0 ? dirStat.ino : undefined,
+          nonce: owner?.nonce ?? "",
+          owner,
+          readable: owner !== undefined,
+        }
+      }
+      throw err
+    }
+
+    stat = fstatSync(fd)
+    const kind: "file" | "directory" = stat.isDirectory() ? "directory" : "file"
+    try {
+      if (kind === "directory") {
+        const read = readRegularBounded(join(lockPath, "owner.json"), 4096)
+        raw = read.status === "ok" ? read.text : undefined
+      } else if (stat.isFile() && stat.size <= 4096) {
+        const buf = Buffer.alloc(4097)
+        let total = 0
+        while (total < buf.length) {
+          let n: number
+          try {
+            n = readSync(fd, buf, total, buf.length - total, null)
+          } catch (readErr: any) {
+            if (readErr?.code === "EINTR") continue
+            throw readErr
+          }
+          if (n === 0) break
+          total += n
+        }
+        if (total <= 4096) raw = buf.subarray(0, total).toString("utf8")
+      }
+    } catch {
+      raw = undefined
+    }
+    const owner = raw === undefined ? undefined : readOwnerText(raw)
+    return {
+      path: lockPath,
+      kind,
+      mtimeMs: stat.mtimeMs,
+      ino: typeof stat.ino === "number" && stat.ino > 0 ? stat.ino : undefined,
+      nonce: owner?.nonce ?? "",
+      owner,
+      readable: owner !== undefined,
+    }
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd)
+      } catch {}
+    }
   }
 }
 

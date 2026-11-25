@@ -33,10 +33,12 @@
 // documented in docs/GUARDRAILS.md and ADR 0010.
 
 import {
+  accessSync,
   closeSync,
   constants as fsConstants,
   fsyncSync,
   fstatSync,
+  ftruncateSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -51,7 +53,7 @@ import {
 } from "node:fs"
 import { createHash, randomBytes } from "node:crypto"
 import { homedir } from "node:os"
-import { basename, dirname, isAbsolute, join, relative, resolve, sep, win32 as win32Path } from "node:path"
+import { basename, delimiter as pathDelimiter, dirname, isAbsolute, join, relative, resolve, sep, win32 as win32Path } from "node:path"
 
 const PROC_SELF_FD = "/proc/self/fd"
 const DELETED_SUFFIX = " (deleted)"
@@ -687,7 +689,7 @@ function pruneIncidentDir(dir) {
     const cap = maxIncidentFiles()
     const files = readdirSync(dir)
       .filter((name) => name.endsWith(".json") && !name.startsWith("."))
-      .sort()
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
     if (files.length <= cap) return
     const excess = files.length - cap
     for (let i = 0; i < excess; i++) {
@@ -735,7 +737,7 @@ export function listContainmentIncidents(run, options = {}) {
   try {
     files = readdirSync(dir)
       .filter((name) => name.endsWith(".json") && !name.startsWith("."))
-      .sort()
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
   } catch {
     return out
   }
@@ -758,27 +760,47 @@ function anomalyKey(record) {
 }
 
 function persistWriteAnomaly(record) {
+  let fd = null
   try {
     const file = writeAnomalyAuditPath()
     mkdirSync(dirname(file), { recursive: true })
-    let size = 0
-    try {
-      size = statSync(file).size
-    } catch {}
-    if (size > MAX_ANOMALY_AUDIT_BYTES) {
-      const tail = readRegularBounded(file, MAX_ANOMALY_AUDIT_TAIL_BYTES)
-      const text = tail.status === "ok" ? tail.text.slice(tail.text.indexOf("\n") + 1) : ""
-      writeFileSync(file, text, { mode: 0o600 })
-    }
+    const nofollow = fsConstants.O_NOFOLLOW || 0
+    fd = openSync(file, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_APPEND | nofollow, 0o600)
+    const st = fstatSync(fd)
+    if (!st.isFile()) return
     const line = JSON.stringify({ ...record, id: record.id ?? anomalyKey(record).slice(0, 256) }) + "\n"
-    const fd = openSync(file, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND, 0o600)
-    try {
+    if (st.size > MAX_ANOMALY_AUDIT_BYTES) {
+      const cap = Math.min(st.size, MAX_ANOMALY_AUDIT_TAIL_BYTES)
+      const buf = Buffer.alloc(cap)
+      let total = 0
+      const startPos = Math.max(0, st.size - cap)
+      while (total < cap) {
+        let n
+        try {
+          n = readSync(fd, buf, total, cap - total, startPos + total)
+        } catch (err) {
+          if (err?.code === "EINTR") continue
+          throw err
+        }
+        if (n === 0) break
+        total += n
+      }
+      const rawTail = buf.subarray(0, total).toString("utf8")
+      const nl = rawTail.indexOf("\n")
+      const tailText = nl >= 0 ? rawTail.slice(nl + 1) : ""
+      ftruncateSync(fd, 0)
+      writeAllSync(fd, Buffer.from(tailText + line, "utf8"))
+    } else {
       writeAllSync(fd, Buffer.from(line, "utf8"))
-    } finally {
-      closeSync(fd)
     }
   } catch {
     // A diagnostic must never break the writer.
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd)
+      } catch {}
+    }
   }
 }
 
@@ -1048,26 +1070,39 @@ export function openPinnedRoot(run) {
       "refused: a pinned run directory requires Linux /proc/self/fd; nothing was written",
     )
   }
-  let lst
-  try {
-    lst = lstatSync(run)
-  } catch (err) {
-    if (err?.code === "ENOENT") return refused("run-missing", "refused: run directory does not exist")
-    return refused("unreadable", "refused: run directory is not accessible")
-  }
-  if (lst.isSymbolicLink()) return refused("run-symlink", "refused: run directory is a symlink")
-  if (!lst.isDirectory()) return refused("run-not-directory", "refused: run path is not a directory")
-  let real
-  try {
-    real = realpathSync(run)
-  } catch {
-    return refused("unreadable", "refused: run directory is not resolvable")
-  }
   let fd = null
   try {
     fd = openSync(run, fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY || 0) | (fsConstants.O_NOFOLLOW || 0))
   } catch (err) {
-    return refused("unreadable", `refused: cannot open run directory (${sanitize(err?.code || err?.message)})`)
+    const code = err?.code
+    if (code === "ENOENT") return refused("run-missing", "refused: run directory does not exist")
+    if (code === "ELOOP" || code === "EMLINK") return refused("run-symlink", "refused: run directory is a symlink")
+    if (code === "ENOTDIR") return refused("run-not-directory", "refused: run path is not a directory")
+    return refused("unreadable", `refused: cannot open run directory (${sanitize(code || err?.message)})`)
+  }
+  let st
+  try {
+    st = fstatSync(fd)
+  } catch (err) {
+    try {
+      closeSync(fd)
+    } catch {}
+    return refused("unreadable", `refused: cannot stat run directory (${sanitize(err?.code || err?.message)})`)
+  }
+  if (!st.isDirectory()) {
+    try {
+      closeSync(fd)
+    } catch {}
+    return refused("run-not-directory", "refused: run path is not a directory")
+  }
+  let real
+  try {
+    real = realpathSync(run)
+  } catch {
+    try {
+      closeSync(fd)
+    } catch {}
+    return refused("unreadable", "refused: run directory is not resolvable")
   }
   if (!fdExactly(real, fd)) {
     try {
@@ -1092,16 +1127,22 @@ export function openOrCreateDir(parentFd, name) {
   assertSingleSegment(name)
   const path = `${PROC_SELF_FD}/${parentFd}/${name}`
   const flags = fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY || 0) | (fsConstants.O_NOFOLLOW || 0)
+  let suppressedMkdirErr = null
+  try {
+    mkdirSync(path, { mode: 0o700 })
+  } catch (mkdirErr) {
+    const code = mkdirErr?.code
+    if (code === "EROFS" || code === "EACCES") {
+      suppressedMkdirErr = mkdirErr
+    } else if (code !== "EEXIST") {
+      throw mkdirErr
+    }
+  }
   try {
     return openSync(path, flags)
-  } catch (err) {
-    if (err?.code !== "ENOENT") throw err
-    try {
-      mkdirSync(path, { mode: 0o700 })
-    } catch (mkdirErr) {
-      if (mkdirErr?.code !== "EEXIST") throw mkdirErr
-    }
-    return openSync(path, flags)
+  } catch (openErr) {
+    if (openErr?.code === "ENOENT" && suppressedMkdirErr) throw suppressedMkdirErr
+    throw openErr
   }
 }
 
@@ -2251,4 +2292,92 @@ function appendLineDetective(run, relPath, buildLineFromFd, options) {
       } catch {}
     }
   }
+}
+
+const TRUSTED_BIN_NAME = /^[A-Za-z0-9._-]+$/
+const STANDARD_POSIX_BIN_DIRS = ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+
+function isTrustedExecutableDir(dir, currentUid) {
+  if (!dir || !isAbsolute(dir)) return false
+  try {
+    const st = statSync(dir)
+    if (!st.isDirectory()) return false
+    if (process.platform === "win32") return true
+    if ((st.mode & 0o002) !== 0) return false
+    if (currentUid !== null && st.uid !== 0 && st.uid !== currentUid) return false
+    return true
+  } catch {
+    return false
+  }
+}
+
+function resolveExecutableInDir(dir, binName, pathext) {
+  if (process.platform === "win32") {
+    const lower = binName.toLowerCase()
+    const hasExt = pathext.some((ext) => ext && lower.endsWith(ext.toLowerCase()))
+    const candidates = hasExt ? [binName] : [binName, ...pathext.map((ext) => `${binName}${ext}`)]
+    for (const name of candidates) {
+      const full = join(dir, name)
+      try {
+        if (statSync(full).isFile()) return full
+      } catch {}
+    }
+    return null
+  }
+  const full = join(dir, binName)
+  try {
+    const st = statSync(full)
+    if (!st.isFile()) return null
+    if ((st.mode & 0o002) !== 0) return null
+    accessSync(full, fsConstants.X_OK)
+    return full
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Resolve a command name (`git`, `sqlite3`, `opencode`, `mkfifo`, etc.) to a
+ * validated absolute executable path, avoiding unqualified `PATH` lookup
+ * (Sonar S4036). Searches trusted `PATH` entries in order (absolute, existing,
+ * non-world-writable, owned by root or the current user) unless
+ * `options.standardOnly` is true, then falls back to standard immutable POSIX
+ * directories (`["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]`).
+ */
+export function resolveTrustedExecutable(binName, options = {}) {
+  if (typeof binName !== "string" || !TRUSTED_BIN_NAME.test(binName)) return null
+  const env = options?.env ?? process.env
+  const currentUid = typeof process.getuid === "function" ? process.getuid() : null
+  const pathext =
+    process.platform === "win32"
+      ? String(env?.PATHEXT || ".COM;.EXE;.BAT;.CMD")
+          .split(";")
+          .filter(Boolean)
+      : []
+
+  const candidates = []
+  const seen = new Set()
+  const addDir = (dir) => {
+    const trimmed = typeof dir === "string" ? dir.trim() : ""
+    if (!trimmed || seen.has(trimmed)) return
+    seen.add(trimmed)
+    candidates.push(trimmed)
+  }
+
+  if (!options?.standardOnly && options?.allowPath !== false) {
+    const rawPath = String(env?.PATH ?? "")
+    for (const entry of rawPath.split(pathDelimiter)) {
+      addDir(entry)
+    }
+  }
+  if (process.platform !== "win32") {
+    for (const dir of STANDARD_POSIX_BIN_DIRS) addDir(dir)
+  }
+
+  for (const dir of candidates) {
+    if (!isTrustedExecutableDir(dir, currentUid)) continue
+    const found = resolveExecutableInDir(dir, binName, pathext)
+    if (found) return found
+  }
+  return null
 }

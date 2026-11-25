@@ -220,7 +220,10 @@ check("host-repair independence: unknown keys are rejected even without patternP
   }
   const wrapped = strictInput(plain)
   // Both non-enumerable guards exist and are invisible to JSON serialization.
-  assert.deepStrictEqual(Object.keys(plain).sort(), ["additionalProperties", "properties", "type"])
+  assert.deepStrictEqual(
+    Object.keys(plain).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+    ["additionalProperties", "properties", "type"],
+  )
   assert.ok("patternProperties" in plain && "allOf" in plain)
   // Even if a future host deletes patternProperties before calling validate, strictness holds.
   delete plain.patternProperties

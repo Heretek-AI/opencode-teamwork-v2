@@ -63,10 +63,11 @@ test("A2 catalog: exactly 26 effective teamwork_* ids with namespace + codemode 
   try {
     const { list } = await openLocationTools(loaded, project.root)
     const tools = new Map(list.map((tool: any) => [String(tool.id), tool]))
-    const ids = [...tools.keys()].sort()
+    const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
+    const ids = [...tools.keys()].sort(cmp)
     const teamwork = ids.filter((id) => id.startsWith("teamwork_"))
 
-    expect(teamwork).toEqual([...EXPECTED_TOOLS].sort())
+    expect(teamwork).toEqual([...EXPECTED_TOOLS].sort(cmp))
     expect(ids).not.toContain("plan")
     expect(ids).not.toContain("next")
 

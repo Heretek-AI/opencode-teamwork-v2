@@ -43,7 +43,7 @@ test("I1 standard run: two tasks, one verifier retry, real worktrees, stamped PA
 
       const claimed = await next(fx)
       expect(claimed.content).toContain("READY FOR WORKER (2)")
-      expect((claimed.readyForWorker as any[]).map((task) => task.id).sort()).toEqual(["T1", "T2"])
+      expect((claimed.readyForWorker as any[]).map((task) => task.id).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))).toEqual(["T1", "T2"])
       for (const taskId of ["T1", "T2"]) {
         expect(state(fx).tasks[taskId].claim.by).toBe(fx.root.id)
       }
@@ -72,7 +72,7 @@ test("I1 standard run: two tasks, one verifier retry, real worktrees, stamped PA
       expect(typeof finalJson.generatedBy?.session).toBe("string")
       expect(finalJson.generatedBy.session.length).toBeGreaterThan(0)
       expect(Number.isNaN(Date.parse(String(finalJson.generatedAt)))).toBe(false)
-      expect(Object.keys(finalJson.evidence.reportDigests).sort()).toEqual(["T1", "T2"])
+      expect(Object.keys(finalJson.evidence.reportDigests).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))).toEqual(["T1", "T2"])
       expect(finalJson.evidence.auditDigest).toMatch(/^[0-9a-f]{64}$/)
       expect(finalJson.evidence.handoffs).toBeDefined()
       expect(finalJson.evidence.handoffs.mode).toBe("skip")

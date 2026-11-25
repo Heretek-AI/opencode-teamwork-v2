@@ -77,11 +77,12 @@ await registerTeamworkTools(
   ROOT,
 )
 
-const ids = [...registered.keys()].sort()
+const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+const ids = [...registered.keys()].sort(cmp)
 assert.deepStrictEqual(
   ids,
-  [...EXPECTED_TOOLS].sort(),
-  `the registered teamwork_* ids drifted.\nregistered: ${ids.join(", ")}\nexpected:   ${[...EXPECTED_TOOLS].sort().join(", ")}`,
+  [...EXPECTED_TOOLS].sort(cmp),
+  `the registered teamwork_* ids drifted.\nregistered: ${ids.join(", ")}\nexpected:   ${[...EXPECTED_TOOLS].sort(cmp).join(", ")}`,
 )
 
 // The validator enforces exactly this subset; a schema using anything else
