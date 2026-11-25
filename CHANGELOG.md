@@ -16,9 +16,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   from a clean checkout and verifies the uploaded record with
   `scripts/check-attest-input.mjs` before loading the key.
 - **Release publishing:** `publish.yml` no longer holds `id-token: write` in
-  the job that runs `npm test`/T4. A separate publish job starts from a clean
-  checkout, verifies the uploaded tarball's sha256, re-packs the clean checkout
-  and requires a byte-identical digest, then publishes that tarball.
+  the job that runs `npm test`/T4. A separate publish job is gated to
+  `refs/tags/v*`, so a `workflow_dispatch` on a branch can only run the
+  unprivileged `verify` dry-run. The publish job starts from a clean checkout,
+  verifies the uploaded tarball's sha256, re-packs the clean checkout and
+  requires a byte-identical digest, then publishes that tarball.
 - **Action pinning:** all `actions/*` uses are pinned to full commit SHAs with
   the version in a comment (`checkout`, `setup-node`, `setup-python`, `cache`,
   `upload-artifact`, `download-artifact`, `github-script`).

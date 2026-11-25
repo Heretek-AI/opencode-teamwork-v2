@@ -247,14 +247,26 @@ try {
       const publishAt = publish.search(/^  publish:$/m)
       assert.ok(publishAt > 0, "publish.yml must keep a separate publish job")
       const verifyJob = publish.slice(0, publishAt)
+      const publishJob = publish.slice(publishAt)
       assert.ok(verifyJob.includes("npm test"), "the verify job should run the tests")
       assert.ok(!verifyJob.includes("id-token"), "the test job must not request an OIDC token")
+      assert.ok(!verifyJob.includes("npm publish"), "the verify dry-run must never publish")
+      assert.ok(publishJob.includes("npm publish"), "the publish job should publish the verified tarball")
+      assert.match(
+        publishJob,
+        /^\s+if:\s+startsWith\(github\.ref,\s*'refs\/tags\/v'\)\s*$/m,
+        "the publish job must be gated to refs/tags/v*",
+      )
+      // Explicitly document why the gate is enough for the workflow_dispatch case.
+      for (const ref of ["refs/heads/main", "refs/heads/fix/ci-trust", "refs/pull/1/merge"]) {
+        assert.ok(!ref.startsWith("refs/tags/v"), `${ref} must not pass the publish tag gate`)
+      }
       assert.strictEqual(
         (publish.match(/id-token:\s*write/g) || []).length,
         1,
         "only the publish job should request id-token: write",
       )
-      console.log("✓ workflow guard: fixed path only, test job has no OIDC/key, publish job is separate")
+      console.log("✓ workflow guard: fixed path only, test job has no OIDC/key, publish is tag-gated")
     }
   }
 

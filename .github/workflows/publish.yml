@@ -19,12 +19,19 @@ name: Publish Package
 # `contents: read` only. It has no OIDC token and no registry credential, so a
 # test-writable script cannot mint a trusted-publishing token.
 #
-# `publish` is the only job with `id-token: write`. It starts from a fresh
-# checkout of the same commit, downloads the tarball produced by `verify`,
-# verifies its sha256, and re-packs the clean checkout (`--ignore-scripts`) to
-# prove the artifact still matches the repository. Only then does it invoke
-# `npm publish` on the tarball, which — unlike a directory publish — runs no
-# repository lifecycle scripts either.
+# `publish` is the only job with `id-token: write`. It is gated to
+# `refs/tags/v*`, so a `workflow_dispatch` on a branch can only run the
+# unprivileged `verify` dry-run and can never reach `npm publish`. The publish
+# job starts from a fresh checkout of the same commit, downloads the tarball
+# produced by `verify`, verifies its sha256, and re-packs the clean checkout
+# (`--ignore-scripts`) to prove the artifact still matches the repository. Only
+# then does it invoke `npm publish` on the tarball, which — unlike a directory
+# publish — runs no repository lifecycle scripts either.
+#
+# No protected `npm-publish` environment is configured in this repository, so
+# this job intentionally has no `environment:` (adding an unconfigured one would
+# block the release). Create the environment with required reviewers and add
+# `environment: npm-publish` here if that gate is wanted.
 
 on:
   push:
@@ -94,7 +101,8 @@ jobs:
 
       # Only new tag pushes are guarded; existing tags are never rewritten. A
       # release tag must be an ancestor of origin/main, so a tag on a detached
-      # or sibling commit cannot publish code that main does not contain.
+      # or sibling commit cannot publish code that main does not contain. A
+      # branch workflow_dispatch skips this step (the publish job is tag-gated).
       - name: Release tag provenance
         if: startsWith(github.ref, 'refs/tags/')
         run: |
@@ -162,6 +170,9 @@ jobs:
   publish:
     name: Publish verified tarball
     needs: verify
+    # Branch/workflow_dispatch runs stop at `verify` (safe dry-run). Only a
+    # pushed release tag can reach the OIDC-token-bearing publish job.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: read
