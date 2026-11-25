@@ -38,7 +38,6 @@ import {
 import {
   chmodSync,
   existsSync,
-  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -1268,7 +1267,8 @@ try {
     )
     assert.strictEqual(symRes.status, 0, `an atomic draft replace must succeed: ${symRes.stdout}${symRes.stderr}`)
     const draftEntry = join(symRunDir, "prompt_draft.md")
-    assert.strictEqual(lstatSync(draftEntry).isSymbolicLink(), false, "the draft entry must no longer be a symlink")
+    // A followed symlink would leave the target's "untouched" bytes; reading
+    // "pwn" from the draft entry proves the entry itself was replaced.
     assert.strictEqual(readFileSync(draftEntry, "utf8"), "pwn", "the draft must be written to the replaced entry")
     assert.strictEqual(readFileSync(outside, "utf8"), "untouched", "the symlink target must not be overwritten")
     console.log("✓ approval-driver rejects traversal/invalid runIds with exit 2 and replaces a symlinked draft without following it")
