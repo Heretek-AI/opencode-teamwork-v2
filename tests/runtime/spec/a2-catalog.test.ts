@@ -76,7 +76,10 @@ test("A2 catalog: exactly 26 effective teamwork_* ids with namespace + codemode 
       expect(id).toBe(`teamwork_${tool.name}`)
       expect(tool.options).toEqual({ namespace: "teamwork", codemode: false })
       expect(tool.input).toBeDefined()
-      expect(tool.input.type).toBe("object")
+      expect(typeof tool.input["~standard"]?.validate).toBe("function")
+      const jsonSchema = tool.input["~standard"].jsonSchema.input({ target: "draft-2020-12" })
+      expect(jsonSchema.type).toBe("object")
+      expect(jsonSchema.additionalProperties).toBe(false)
     }
 
     // Every tool reference in the shipped prompts resolves to a registered id.

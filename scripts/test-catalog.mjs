@@ -10,7 +10,9 @@
 // the other tests use and asserts:
 //   * exactly EXPECTED_TOOLS teamwork_* ids, no bare-name registration;
 //   * options.namespace === "teamwork" and options.codemode === false;
-//   * every input schema is an object schema;
+//   * every input schema is the strict Standard-Schema wrapper (ADR 0019), its
+//     model-facing JSON Schema is still an object schema, and every keyword it
+//     uses is in the validator's supported set;
 //   * every teamwork_* token referenced by agents/team/**/*.md and the command
 //     templates resolves to a registered id (path literals such as
 //     ~/teamwork_projects are not tool references).
@@ -20,6 +22,7 @@
 
 import { registerTeamworkTools } from "../plugins/opencode-teamwork/tools.ts"
 import { COMMANDS } from "../plugins/opencode-teamwork/index.ts"
+import { SUPPORTED_KEYWORDS, isStrictInput, strictInput } from "../plugins/opencode-teamwork/tool-schema.mjs"
 import { effectiveToolName } from "./tool-registry.mjs"
 import { readdirSync, readFileSync } from "node:fs"
 import { join } from "node:path"
@@ -81,6 +84,27 @@ assert.deepStrictEqual(
   `the registered teamwork_* ids drifted.\nregistered: ${ids.join(", ")}\nexpected:   ${[...EXPECTED_TOOLS].sort().join(", ")}`,
 )
 
+// The validator enforces exactly this subset; a schema using anything else
+// must fail registration rather than be silently under-validated. Walk the
+// model-facing schema independently of `strictInput`'s own assertion so a
+// keyword the wrapper forgot to reject is still caught here.
+function assertSupportedKeywords(schema, id, path = id) {
+  assert(schema && typeof schema === "object" && !Array.isArray(schema), `${path}: schema must be an object`)
+  for (const key of Object.keys(schema)) {
+    assert(SUPPORTED_KEYWORDS.includes(key), `${path}: unsupported schema keyword "${key}" (ADR 0019)`)
+  }
+  if (schema.properties) {
+    for (const [name, child] of Object.entries(schema.properties)) assertSupportedKeywords(child, id, `${path}.${name}`)
+  }
+  if (schema.items) assertSupportedKeywords(schema.items, id, `${path}[]`)
+  if (schema.additionalProperties && typeof schema.additionalProperties === "object") {
+    assertSupportedKeywords(schema.additionalProperties, id, `${path}.*`)
+  }
+  for (const [index, child] of (schema.anyOf ?? []).entries()) {
+    assertSupportedKeywords(child, id, `${path}.anyOf[${index}]`)
+  }
+}
+
 for (const [id, tool] of registered) {
   assert(id.startsWith("teamwork_"), `bare-name registration "${id}" — add options.namespace`)
   assert.deepStrictEqual(
@@ -88,9 +112,23 @@ for (const [id, tool] of registered) {
     { namespace: "teamwork", codemode: false },
     `${id} must declare options {namespace:"teamwork", codemode:false}`,
   )
-  assert(!tool.input || tool.input.type === "object", `${id} must use an object input schema`)
-  assert(tool.input && typeof tool.input === "object", `${id} must declare an input schema`)
+  assert(isStrictInput(tool.input), `${id} input must be wrapped in strictInput (ADR 0019)`)
+  const jsonSchema = tool.input["~standard"].jsonSchema.input({ target: "draft-2020-12" })
+  assert(jsonSchema && jsonSchema.type === "object", `${id} must expose an object input schema to the model`)
+  assert.strictEqual(jsonSchema.additionalProperties, false, `${id} root object must reject unknown properties`)
+  assertSupportedKeywords(jsonSchema, id)
 }
+
+// The guard itself must be able to fail: an unsupported keyword is refused at
+// registration time, not treated as an annotation.
+let unsupportedRefused = false
+try {
+  strictInput({ type: "object", properties: { x: { type: "string", format: "email" } }, additionalProperties: false })
+} catch (error) {
+  unsupportedRefused = /unsupported keyword "format"/.test(String(error?.message))
+}
+assert(unsupportedRefused, "strictInput must refuse an unsupported keyword (format)")
+
 
 function markdownFiles(dir) {
   const files = []
