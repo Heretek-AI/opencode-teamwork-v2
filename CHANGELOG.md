@@ -19,11 +19,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rerun-cleanup `finally` (`S1143`); added line-targeted, justified
   suppressions for the approval-driver containment sink (`S8707`), the
   plain-http negative fixture (`S5332`), and the intentional no-lockfile
-  host-drift install (`S8543`); test helpers now resolve `sqlite3`, `npm`, and
-  `bun` through `resolveTrustedExecutable` (`S4036`); and `verify
-  --fetch-jwks` now routes OIDC discovery and the JWKS through the URL guard
-  (`S8476`/`S5144`) with HTTPS-only, loopback/private/link-local/metadata
-  refusal, no redirects, DNS pinning, and a 512 KiB cap.
+  host-drift install (`S8543`); the approval driver also refuses a symlinked
+  `prompt_draft.md`; test helpers now resolve `sqlite3`, `npm`, and `bun`
+  through `resolveTrustedExecutable` (`S4036`); and `verify --fetch-jwks` now
+  routes OIDC discovery and the JWKS through the URL guard (`S8476`/`S5144`)
+  with HTTPS-only, loopback/private/link-local/metadata refusal, no redirects,
+  DNS pinning, a 512 KiB cap, and a 10 s total deadline (the localhost test
+  opt-in is ignored on this path). The nightly host-drift probe now runs in a
+  separate `contents: read` job with no persisted checkout credentials, while
+  the `issues: write` reporting step downloads only the captured diagnostics.
 - **Shared URL guard:** `plugins/opencode-teamwork/url-guard.ts` is now
   `url-guard.mjs` plus `url-guard.d.mts`, so the Node CLI and the plugin use
   one implementation. Intranet or offline OIDC issuers use

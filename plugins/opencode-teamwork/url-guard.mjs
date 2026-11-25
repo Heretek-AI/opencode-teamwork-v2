@@ -264,6 +264,9 @@ export async function assertSafeUrl(rawUrl, options = {}) {
 }
 
 function requestPinned(safe, options, address) {
+  if (options.signal?.aborted) {
+    return Promise.resolve(refuse("URL_TIMEOUT", "URL request timed out"))
+  }
   const method = options.method === "HEAD" ? "HEAD" : "GET"
   const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : 5000
   const maxBytes = Number.isFinite(options.maxBytes) && options.maxBytes > 0 ? options.maxBytes : 5 * 1024 * 1024
@@ -338,6 +341,18 @@ function requestPinned(safe, options, address) {
     } catch (err) {
       done(refuse("URL_NETWORK", `URL request failed (${String(err?.code || err?.message || "network error").slice(0, 120)})`))
       return
+    }
+
+    // A total deadline (not just socket inactivity): a slow-drip response must
+    // be cancellable end-to-end. The caller owns the signal/timer.
+    const onAbort = () => {
+      const err = new Error("timeout")
+      err.code = "URL_TIMEOUT"
+      req.destroy(err)
+    }
+    if (options.signal) {
+      options.signal.addEventListener("abort", onAbort, { once: true })
+      req.on("close", () => options.signal.removeEventListener("abort", onAbort))
     }
 
     req.setTimeout(timeoutMs, () => {

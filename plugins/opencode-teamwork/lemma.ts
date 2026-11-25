@@ -431,11 +431,17 @@ function runLeapDoctor(
     const output = cleanBlock(combined, 2000).trim()
     const detail =
       firstNonEmptyLine(stderr) || firstNonEmptyLine(stdout) || err?.code || err?.message || "leap doctor failed"
-    // WARN requires a real non-zero exit: a timeout, spawn failure (ENOENT), or
-    // output overflow is never downgraded, even when partial output mentions
-    // LEAN_PROJECT_DIR.
+    // WARN requires a real non-zero exit: a timeout, signal termination, spawn
+    // failure (ENOENT), or output overflow is never downgraded, even when
+    // partial output mentions LEAN_PROJECT_DIR.
+    const executionError =
+      err?.code === "ETIMEDOUT" ||
+      err?.code === "ENOBUFS" ||
+      err?.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" ||
+      Boolean(err?.signal)
     const doctorExit = typeof err?.status === "number" ? err.status : null
     if (
+      !executionError &&
       doctorExit !== null &&
       doctorExit !== 0 &&
       failedChecks.length > 0 &&

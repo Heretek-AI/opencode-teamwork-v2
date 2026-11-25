@@ -670,13 +670,22 @@ async function fetchGuardedOidcJson(rawUrl, label) {
   if (parsed.username || parsed.password) {
     throw new Error(`${label} must not embed credentials`)
   }
-  const guarded = await assertSafeUrl(parsed.href)
+  // The CLI contract is public issuers only: never honor the test/development
+  // localhost opt-in on this path. The signal is a total deadline, not just a
+  // socket-inactivity timeout, so a slow-drip issuer cannot stall verify.
+  const deadline = AbortSignal.timeout(OIDC_FETCH_TIMEOUT_MS)
+  const guarded = await assertSafeUrl(parsed.href, { allowLocalhost: false })
   if (!guarded.ok) {
     throw new Error(`${label} ${parsed.href} refused (${guarded.code}): ${guarded.error}`)
+  }
+  if (deadline.aborted) {
+    throw new Error(`${label} ${parsed.href} timed out after ${OIDC_FETCH_TIMEOUT_MS}ms`)
   }
   const res = await safeFetch(guarded.url.href, {
     timeoutMs: OIDC_FETCH_TIMEOUT_MS,
     maxBytes: OIDC_FETCH_MAX_BYTES,
+    allowLocalhost: false,
+    signal: deadline,
   })
   if (!res.ok) {
     throw new Error(`${label} ${parsed.href} failed (${res.code}): ${res.error}`)

@@ -34,6 +34,8 @@ export interface SafeFetchOptions extends AssertSafeUrlOptions {
   timeoutMs?: number
   maxBytes?: number
   headers?: Record<string, string>
+  /** Optional end-to-end deadline. The request is destroyed when this aborts. */
+  signal?: AbortSignal
 }
 
 export interface SafeFetchSuccess {

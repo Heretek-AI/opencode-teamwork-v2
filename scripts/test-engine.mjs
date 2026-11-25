@@ -28,7 +28,7 @@ import { renderGateStatus, evaluateStrictGate } from "../plugins/opencode-teamwo
 import { evaluateVictoryGate } from "../plugins/opencode-teamwork/victory.ts"
 import { withCrossProcessLock, crossProcessLockPath, observeLockArtifact, quarantineStaleLock } from "../plugins/opencode-teamwork/locks.ts"
 import { recordWriteAnomaly, resolveTrustedExecutable, setWriteAnomalyAuditPathForTest, unacknowledgedWriteAnomalies } from "../plugins/opencode-teamwork/safe-fs.mjs"
-import { assertSafeUrl, blockedAddressReason, parseLoopbackServiceUrl } from "../plugins/opencode-teamwork/url-guard.mjs"
+import { assertSafeUrl, blockedAddressReason, parseLoopbackServiceUrl, safeFetch } from "../plugins/opencode-teamwork/url-guard.mjs"
 import { refreshRunBriefing, MAX_BRIEFING_BYTES, refreshAgentBriefing, readAgentBriefingExcerpt, agentBriefingRelativePath, MAX_AGENT_BRIEFING_DIRS } from "../plugins/opencode-teamwork/briefing.ts"
 import { writeHandoff, MAX_HANDOFF_ENTRIES, MAX_HANDOFF_INDEX_BYTES, HANDOFF_SECTION_LABELS, evaluateHandoffGateChecked, readWorkerHandoffBinding } from "../plugins/opencode-teamwork/handoff.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
@@ -4349,6 +4349,32 @@ try {
   })
   assert.strictEqual(okLoop.ok, true)
 
+  // A total deadline must abort a slow-drip response, not only socket inactivity.
+  const slowServer = createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" })
+    res.write("{")
+    const beat = setInterval(() => res.write(" "), 100)
+    res.on("close", () => clearInterval(beat))
+  })
+  await new Promise((resolve) => slowServer.listen(0, "127.0.0.1", resolve))
+  try {
+    const slowAddress = slowServer.address()
+    assert(slowAddress && typeof slowAddress === "object", "slow-drip fixture must bind a TCP port")
+    const started = Date.now()
+    const slowRes = await safeFetch(`http://127.0.0.1:${slowAddress.port}/slow`, {
+      allowLocalhost: true,
+      timeoutMs: 5000,
+      signal: AbortSignal.timeout(300),
+    })
+    assert.strictEqual(slowRes.ok, false, "a slow-drip response must not complete")
+    assert.strictEqual(slowRes.code, "URL_TIMEOUT")
+    assert(Date.now() - started < 2000, "the total deadline must abort a slow-drip response promptly")
+  } finally {
+    if (typeof slowServer.closeAllConnections === "function") slowServer.closeAllConnections()
+    await new Promise((resolve) => slowServer.close(resolve))
+  }
+  console.log("✓ url-guard total deadline aborts slow-drip responses")
+
   const svcDir = mkdtempSync(join(tmpdir(), "teamwork-svc-guard-"))
   const home = join(svcDir, "home")
   const root = join(svcDir, "repo")
@@ -6971,6 +6997,33 @@ process.exit(0);
       assert.strictEqual(probeDoctorBare.leap.doctor?.status, "OUTAGE")
       assert.deepStrictEqual(probeDoctorBare.leap.doctor?.failedChecks, [])
       assert(probeDoctorBare.leap.doctor?.error?.includes("doctor failed"), "the bounded doctor error must be surfaced")
+
+      // A doctor killed by the probe timeout must stay OUTAGE even when a
+      // wrapper prints a project-only FAIL and exits non-zero after SIGTERM.
+      const doctorTimeoutDir = mkdtempSync(join(lemmaTestDir, "doctor-timeout-"))
+      writeStubBin(doctorTimeoutDir, "lean", `console.log("Lean (version 4.14.0)")`)
+      writeStubBin(doctorTimeoutDir, "lake", `console.log("Lake version 5.0.0")`)
+      writeStubBin(
+        doctorTimeoutDir,
+        "leap",
+        `
+const args = process.argv.slice(2);
+if (args.includes("doctor")) {
+  console.log("[FAIL] LEAN_PROJECT_DIR -- no local Lean project found");
+  setTimeout(() => {}, 5000);
+} else if (args.includes("--version")) {
+  process.exit(2);
+} else {
+  console.log("usage: leap ...");
+  process.exit(0);
+}
+`,
+      )
+      const probeDoctorTimeout = probeLemmaToolchain({ env: { PATH: doctorTimeoutDir }, timeoutMs: 300 })
+      assert.strictEqual(probeDoctorTimeout.ready, false, "a timed-out doctor must not be downgraded to WARN")
+      assert.strictEqual(probeDoctorTimeout.status, "OUTAGE")
+      assert.strictEqual(probeDoctorTimeout.leap.doctor?.status, "OUTAGE")
+      assert.match(String(probeDoctorTimeout.leap.doctor?.error), /timed out/i)
 
       const refusalMsg = formatMissingToolchainRefusal(probeNoLeap)
       assert(refusalMsg.startsWith("refused:"), "refusal must start with refused:")

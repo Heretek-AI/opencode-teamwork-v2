@@ -772,12 +772,13 @@ function checkIds(result) {
   return result.checks.map((check) => check.id)
 }
 
-function runCli(args, timeout = 30000) {
+function runCli(args, timeout = 30000, extraEnv = {}) {
   try {
     const stdout = execFileSync(process.execPath, [CLI, ...args], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
       timeout,
+      env: { ...process.env, ...extraEnv },
     })
     return { code: 0, stdout, stderr: "" }
   } catch (err) {
@@ -2109,7 +2110,13 @@ async function main() {
       assert.match(res.stderr, entry.pattern, `${entry.why}: unexpected stderr: ${res.stderr}`)
       assert(res.stderr.length < 1000, `${entry.why}: stderr is not bounded (${res.stderr.length} bytes)`)
     }
-    ok("T38 --fetch-jwks refuses non-https, loopback, metadata, and IPv6 loopback issuers (exit 2)")
+    // The OIDC path must not honor the guard's localhost test opt-in.
+    const allowed = runCli(["verify", "--fetch-jwks", "https://127.0.0.1:9"], 15000, {
+      OPENCODE_TEAMWORK_ALLOW_LOCALHOST: "1",
+    })
+    assert.strictEqual(allowed.code, 2, `localhost opt-in: expected exit 2, got ${allowed.code}: ${allowed.stderr}`)
+    assert.match(allowed.stderr, /loopback/i, `localhost opt-in must still refuse loopback: ${allowed.stderr}`)
+    ok("T38 --fetch-jwks refuses non-https, loopback, metadata, and IPv6 loopback issuers (exit 2), even with the localhost opt-in")
   }
 
   rmSync(TEST_ROOT, { recursive: true, force: true })
