@@ -4376,11 +4376,140 @@ try {
     assert.strictEqual(slowRes.ok, false, "a slow-drip response must not complete")
     assert.strictEqual(slowRes.code, "URL_TIMEOUT")
     assert(Date.now() - started < 2000, "the total deadline must abort a slow-drip response promptly")
+
+    // Without a caller signal, safeFetch must still own an end-to-end deadline
+    // so a caller that only passes the socket-inactivity timeout cannot hang.
+    const internalStarted = Date.now()
+    const internalRes = await safeFetch(`http://127.0.0.1:${slowAddress.port}/slow`, {
+      allowLocalhost: true,
+      timeoutMs: 5000,
+      totalTimeoutMs: 300,
+    })
+    assert.strictEqual(internalRes.ok, false, "the internal deadline must also abort a slow-drip response")
+    assert.strictEqual(internalRes.code, "URL_TIMEOUT")
+    assert(Date.now() - internalStarted < 2000, "safeFetch must create a total deadline when no signal is supplied")
   } finally {
     if (typeof slowServer.closeAllConnections === "function") slowServer.closeAllConnections()
     await new Promise((resolve) => slowServer.close(resolve))
   }
-  console.log("✓ url-guard total deadline aborts slow-drip responses")
+  console.log("✓ url-guard total deadline aborts slow-drip responses (caller signal and internal default)")
+
+  // Early Content-Length refusal must destroy the socket instead of draining
+  // the body after the tool has already returned.
+  {
+    let bodyClosed = false
+    const leakServer = createServer((req, res) => {
+      res.writeHead(200, { "content-length": String(64 * 1024 * 1024) })
+      const beat = setInterval(() => res.write(Buffer.alloc(1024)), 20)
+      res.on("close", () => {
+        bodyClosed = true
+        clearInterval(beat)
+      })
+    })
+    await new Promise((resolve) => leakServer.listen(0, "127.0.0.1", resolve))
+    try {
+      const addr = leakServer.address()
+      assert(addr && typeof addr === "object", "content-length fixture must bind a TCP port")
+      const started = Date.now()
+      const tooLarge = await safeFetch(`http://127.0.0.1:${addr.port}/huge`, {
+        allowLocalhost: true,
+        timeoutMs: 5000,
+        maxBytes: 1024,
+      })
+      assert.strictEqual(tooLarge.ok, false)
+      assert.strictEqual(tooLarge.code, "URL_TOO_LARGE")
+      assert(Date.now() - started < 1500, "an oversized Content-Length must be refused promptly")
+      const closeDeadline = Date.now() + 1500
+      while (!bodyClosed && Date.now() < closeDeadline) await new Promise((resolve) => setTimeout(resolve, 20))
+      assert(bodyClosed, "an oversized Content-Length must destroy the response instead of draining the slow body")
+    } finally {
+      if (typeof leakServer.closeAllConnections === "function") leakServer.closeAllConnections()
+      await new Promise((resolve) => leakServer.close(resolve))
+    }
+
+    // HEAD returns headers only; it must also close the socket promptly rather
+    // than leave a keep-alive connection (and its server-side response) open.
+    let headClosed = false
+    const headServer = createServer((req, res) => {
+      res.writeHead(200, { "content-type": "text/plain" })
+      res.flushHeaders()
+      res.on("close", () => {
+        headClosed = true
+      })
+    })
+    await new Promise((resolve) => headServer.listen(0, "127.0.0.1", resolve))
+    try {
+      const addr = headServer.address()
+      assert(addr && typeof addr === "object", "HEAD fixture must bind a TCP port")
+      const headRes = await safeFetch(`http://127.0.0.1:${addr.port}/head`, {
+        method: "HEAD",
+        allowLocalhost: true,
+        timeoutMs: 5000,
+      })
+      assert.strictEqual(headRes.ok, true)
+      assert.strictEqual(headRes.status, 200)
+      const closeDeadline = Date.now() + 1500
+      while (!headClosed && Date.now() < closeDeadline) await new Promise((resolve) => setTimeout(resolve, 20))
+      assert(headClosed, "HEAD must destroy the response/socket instead of leaving it open")
+    } finally {
+      if (typeof headServer.closeAllConnections === "function") headServer.closeAllConnections()
+      await new Promise((resolve) => headServer.close(resolve))
+    }
+    console.log("✓ url-guard early Content-Length and HEAD refusals destroy the socket")
+  }
+
+  // A per-address timeout (for example an IPv6 blackhole) must fall through to
+  // the next validated address while the caller's total deadline is live.
+  {
+    const hanging = createServer(() => {})
+    const healthy = createServer((req, res) => {
+      res.writeHead(200, { "content-type": "text/plain" })
+      res.end("fallback-ok")
+    })
+    let healthyHits = 0
+    healthy.on("request", () => {
+      healthyHits++
+    })
+    await new Promise((resolve) => hanging.listen(0, "127.0.0.2", resolve))
+    const sharedPort = hanging.address().port
+    await new Promise((resolve) => healthy.listen(sharedPort, "127.0.0.1", resolve))
+    try {
+      const started = Date.now()
+      const retried = await safeFetch(`http://dual-stack.invalid:${sharedPort}/fallback`, {
+        allowLocalhost: true,
+        timeoutMs: 200,
+        resolveHost: async () => [
+          { address: "127.0.0.2", family: 4 },
+          { address: "127.0.0.1", family: 4 },
+        ],
+      })
+      assert.strictEqual(retried.ok, true, `a first-address timeout must retry the next address: ${JSON.stringify(retried)}`)
+      assert.strictEqual(retried.body.toString("utf8"), "fallback-ok")
+      assert.strictEqual(healthyHits, 1)
+      assert(Date.now() - started < 3000, "the retry must not wait for the default total deadline")
+
+      // A caller deadline that fires during the first attempt is final: do not
+      // spend the remaining budget on another address.
+      const aborted = await safeFetch(`http://dual-stack-abort.invalid:${sharedPort}/aborted`, {
+        allowLocalhost: true,
+        timeoutMs: 5000,
+        signal: AbortSignal.timeout(200),
+        resolveHost: async () => [
+          { address: "127.0.0.2", family: 4 },
+          { address: "127.0.0.1", family: 4 },
+        ],
+      })
+      assert.strictEqual(aborted.ok, false)
+      assert.strictEqual(aborted.code, "URL_TIMEOUT")
+      assert.strictEqual(healthyHits, 1, "an expired caller signal must not start another address attempt")
+    } finally {
+      if (typeof hanging.closeAllConnections === "function") hanging.closeAllConnections()
+      if (typeof healthy.closeAllConnections === "function") healthy.closeAllConnections()
+      await new Promise((resolve) => hanging.close(resolve))
+      await new Promise((resolve) => healthy.close(resolve))
+    }
+    console.log("✓ url-guard retries a per-address timeout on the next validated address")
+  }
 
   const svcDir = mkdtempSync(join(tmpdir(), "teamwork-svc-guard-"))
   const home = join(svcDir, "home")

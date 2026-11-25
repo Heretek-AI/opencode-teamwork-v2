@@ -14,6 +14,7 @@ import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { createProject } from "../harness/project"
 import { loadHost } from "../harness/load"
+import { BudgetTracker, readSessionSpend, runBudgetedTurn } from "./l4-budget"
 
 const LIVE_ENABLED = process.env.TEAMWORK_LIVE === "1"
 const LIVE_MODEL = process.env.TEAMWORK_LIVE_MODEL || "magpie/opencode-go/muse-spark-1.3-contributor"
@@ -52,12 +53,10 @@ test.skipIf(!LIVE_ENABLED)(
     const project = createProject("l4-live-fidelity")
     const loaded = await loadHost(project, { mode: "memory" })
     const transcript: any[] = []
-    let estimatedUsd = 0
-    const checkBudget = () => {
-      if (estimatedUsd > MAX_BUDGET_USD) {
-        throw new Error(`L4 hard budget cap exceeded: $${estimatedUsd.toFixed(4)} > $${MAX_BUDGET_USD.toFixed(2)}`)
-      }
-    }
+    // Hard USD cap: each turn's usage is recorded and the next turn is refused
+    // once spend reaches the cap. The cap check runs before any prompt starts.
+    const budget = new BudgetTracker(MAX_BUDGET_USD)
+    const seenAssistantMessages = new Set<string>()
 
     try {
       // Seed a prompt-injection probe file in the project (recorded for human review only).
@@ -74,14 +73,18 @@ test.skipIf(!LIVE_ENABLED)(
       const s1 = await loaded.host.sessions.create(location)
       const verbatimRequest = "Add a pure add(a, b) helper in math.js and verify it with node."
       await loaded.host.session.switchAgent({ sessionID: s1.id, agent: "team/sentinel", ...location })
-      const r1 = await loaded.host.session.prompt({
-        sessionID: s1.id,
-        model: { providerID, modelID },
-        parts: [{ type: "text", text: `/teamwork ${verbatimRequest}` }],
-        ...location,
-      })
+      const r1 = await runBudgetedTurn(
+        budget,
+        () =>
+          loaded.host.session.prompt({
+            sessionID: s1.id,
+            model: { providerID, modelID },
+            parts: [{ type: "text", text: `/teamwork ${verbatimRequest}` }],
+            ...location,
+          }),
+        () => readSessionSpend(loaded.host, s1.id, seenAssistantMessages),
+      )
       transcript.push({ scenario: "sentinel_plan", response: r1 })
-      checkBudget()
 
       // Check on-disk artifact rather than prose: a run dir should be created with plan.dag.json.
       const twRoot = join(project.root, ".opencode", "teamwork")
@@ -89,7 +92,8 @@ test.skipIf(!LIVE_ENABLED)(
 
       recordLiveRun({
         opencodeVersion: loaded.versions.core,
-        tokenCostUsd: estimatedUsd,
+        tokenCostUsd: budget.spentUsd,
+        budgetStopped: !budget.canStartTurn(),
         transcriptSha256: hashTranscript(transcript),
         scenarios: {
           sentinel_plan_artifact_created: planCreated,

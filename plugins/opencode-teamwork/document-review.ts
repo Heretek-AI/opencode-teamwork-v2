@@ -1175,6 +1175,7 @@ async function readUrlDocument(
     const fetched = await safeFetch(parsed.toString(), {
       method: "GET",
       timeoutMs: URL_FETCH_TIMEOUT_MS,
+      signal: AbortSignal.timeout(URL_FETCH_TIMEOUT_MS),
       maxBytes: MAX_DOCUMENT_BYTES,
     })
     if (!fetched.ok) {
@@ -1195,7 +1196,9 @@ async function readUrlDocument(
       if (location) {
         try {
           const next = new URL(String(location), parsed)
-          const target = await assertSafeUrl(next.toString())
+          const target = await assertSafeUrl(next.toString(), {
+            signal: AbortSignal.timeout(URL_FETCH_TIMEOUT_MS),
+          })
           if (!target.ok) {
             return {
               ok: false,
