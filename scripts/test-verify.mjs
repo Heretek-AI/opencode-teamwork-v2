@@ -39,6 +39,7 @@ import {
   verifyExitCode,
   verifyRun,
 } from "../lib/verify.mjs"
+import { resolveTrustedExecutable } from "../plugins/opencode-teamwork/safe-fs.mjs"
 
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "teamwork-verify-test-"))
 const CLI = resolve("bin/opencode-teamwork.mjs")
@@ -126,7 +127,7 @@ function listFiles(root, prefix = "") {
     else if (dirent.isDirectory()) out.push(...listFiles(root, rel))
     else if (dirent.isFile()) out.push(rel)
   }
-  return out.sort()
+  return out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
 }
 
 /**
@@ -791,7 +792,9 @@ function signedArgs(ctx) {
 }
 
 function gitRun(cwd, args) {
-  return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()
+  const gitBin = resolveTrustedExecutable("git")
+  assert(gitBin, "git executable must be available")
+  return execFileSync(gitBin, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim()
 }
 
 function initGitRepo(root) {
@@ -1336,7 +1339,8 @@ async function main() {
     try {
       const result = await verify(ctx)
       assert.strictEqual(result.verdict, "PASS", JSON.stringify(result.reasons))
-      assert.deepStrictEqual(listFiles(ctx.run).sort(), [...before.keys()].sort())
+      const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+      assert.deepStrictEqual(listFiles(ctx.run).sort(cmp), [...before.keys()].sort(cmp))
       for (const [rel, st] of before) {
         const now = statSync(join(ctx.run, rel))
         assert.strictEqual(now.size, st.size, `${rel} size changed`)
@@ -1536,7 +1540,8 @@ async function main() {
     assert(kept.checks.some((c) => c.id === "rerun:worktrees" && c.status === "skip"))
     rmSync(keptPath, { recursive: true, force: true })
     try {
-      execFileSync("git", ["-C", repo, "worktree", "prune"], { stdio: "ignore" })
+      const gitBin = resolveTrustedExecutable("git")
+      if (gitBin) execFileSync(gitBin, ["-C", repo, "worktree", "prune"], { stdio: "ignore" })
     } catch {}
     ok("T23 --keep-worktree leaves the worktree and reports its path")
   }
@@ -1908,6 +1913,183 @@ async function main() {
     }
     assert.strictEqual(refused, 1)
     ok("T35 attest-sign.mjs produces a verifiable artifact and refuses a mismatched manifest digest")
+  }
+
+  // T36: real OIDC JWT validation, forged issuer refusal, cross-repo/ref replay, UNKNOWN without JWKS (#44)
+  {
+    const { generateKeyPairSync, sign: cryptoSign } = await import("node:crypto")
+    const { evaluateAttestation, signAttestation, ATTESTATION_CODES } = await import("../plugins/opencode-teamwork/attestation.mjs")
+    const attKeys = generateKeyPairSync("ed25519")
+    const oidcKeys = generateKeyPairSync("ed25519")
+    const oidcJwk = { ...oidcKeys.publicKey.export({ format: "jwk" }), kid: "oidc-k1", alg: "EdDSA" }
+    const jwks = { keys: [oidcJwk] }
+
+    function makeJwt(claims, privKey = oidcKeys.privateKey, kid = "oidc-k1") {
+      const h = Buffer.from(JSON.stringify({ alg: "EdDSA", typ: "JWT", kid })).toString("base64url")
+      const p = Buffer.from(JSON.stringify(claims)).toString("base64url")
+      const sig = cryptoSign(null, Buffer.from(`${h}.${p}`, "utf8"), privKey).toString("base64url")
+      return `${h}.${p}.${sig}`
+    }
+
+    const nowSec = Math.floor(Date.now() / 1000)
+    const runNonce = "A".repeat(24)
+    const sha = "a".repeat(40)
+    const planHash = "b".repeat(64)
+    const promptHash = "c".repeat(64)
+    const basePayload = {
+      v: 1,
+      provider: "github-actions",
+      workflow: "ci-attestation",
+      runId: "r-oidc-1",
+      runAttempt: 1,
+      repository: "Heretek-AI/opencode-teamwork-v2",
+      commitSha: sha,
+      promptHash,
+      planHash,
+      commands: [],
+      oidc: {
+        issuer: "https://token.actions.githubusercontent.com",
+        subject: "repo:Heretek-AI/opencode-teamwork-v2:ref:refs/heads/main",
+        audience: "opencode-teamwork",
+        ref: "refs/heads/main",
+      },
+      issuedAt: new Date(nowSec * 1000).toISOString(),
+      expiresAt: new Date((nowSec + 3600) * 1000).toISOString(),
+    }
+
+    // 1. Forged issuer string without token fails when requireOidcToken is true.
+    const noTokenArt = signAttestation(basePayload, { privateKey: attKeys.privateKey, keyId: "att-1", nonce: runNonce })
+    const forged = evaluateAttestation({
+      artifact: noTokenArt,
+      policy: "required",
+      publicKey: attKeys.publicKey,
+      expectedKeyId: "att-1",
+      expectedIssuer: "https://token.actions.githubusercontent.com",
+      oidcJwks: jwks,
+      requireOidcToken: true,
+      runId: "r-oidc-1",
+      runNonce,
+      planHash,
+      promptHash,
+    })
+    assert.strictEqual(forged.status, "INVALID")
+    assert.strictEqual(forged.code, ATTESTATION_CODES.untrusted)
+
+    // 2. Valid signed OIDC token passes.
+    const validToken = makeJwt({
+      iss: "https://token.actions.githubusercontent.com",
+      aud: "opencode-teamwork",
+      sub: "repo:Heretek-AI/opencode-teamwork-v2:ref:refs/heads/main",
+      repository: "Heretek-AI/opencode-teamwork-v2",
+      ref: "refs/heads/main",
+      sha,
+      exp: nowSec + 600,
+    })
+    const validArt = signAttestation(
+      { ...basePayload, oidc: { ...basePayload.oidc, token: validToken } },
+      { privateKey: attKeys.privateKey, keyId: "att-1", nonce: runNonce },
+    )
+    const validRes = evaluateAttestation({
+      artifact: validArt,
+      policy: "required",
+      publicKey: attKeys.publicKey,
+      expectedKeyId: "att-1",
+      expectedIssuer: "https://token.actions.githubusercontent.com",
+      expectedAudience: "opencode-teamwork",
+      expectedRepository: "Heretek-AI/opencode-teamwork-v2",
+      expectedRef: "refs/heads/main",
+      oidcJwks: jwks,
+      requireOidcToken: true,
+      runId: "r-oidc-1",
+      runNonce,
+      planHash,
+      promptHash,
+    })
+    assert.strictEqual(validRes.status, "ATTESTED")
+
+    // 3. Missing JWKS trust material reports UNKNOWN.
+    const unknownRes = evaluateAttestation({
+      artifact: validArt,
+      policy: "required",
+      publicKey: attKeys.publicKey,
+      expectedKeyId: "att-1",
+      expectedIssuer: "https://token.actions.githubusercontent.com",
+      requireOidcToken: true,
+      runId: "r-oidc-1",
+      runNonce,
+      planHash,
+      promptHash,
+    })
+    assert.strictEqual(unknownRes.status, "UNKNOWN")
+
+    // 4. Cross-repository and cross-ref replay fail with AUTH_ATTESTATION_REPLAY.
+    const wrongRepo = evaluateAttestation({
+      artifact: validArt,
+      policy: "required",
+      publicKey: attKeys.publicKey,
+      expectedKeyId: "att-1",
+      expectedIssuer: "https://token.actions.githubusercontent.com",
+      expectedRepository: "OtherOrg/other-repo",
+      oidcJwks: jwks,
+      requireOidcToken: true,
+      runId: "r-oidc-1",
+      runNonce,
+      planHash,
+      promptHash,
+    })
+    assert.strictEqual(wrongRepo.status, "INVALID")
+    assert.strictEqual(wrongRepo.code, ATTESTATION_CODES.replay)
+
+    const wrongRef = evaluateAttestation({
+      artifact: validArt,
+      policy: "required",
+      publicKey: attKeys.publicKey,
+      expectedKeyId: "att-1",
+      expectedIssuer: "https://token.actions.githubusercontent.com",
+      expectedRef: "refs/heads/feature",
+      oidcJwks: jwks,
+      requireOidcToken: true,
+      runId: "r-oidc-1",
+      runNonce,
+      planHash,
+      promptHash,
+    })
+    assert.strictEqual(wrongRef.status, "INVALID")
+    assert.strictEqual(wrongRef.code, ATTESTATION_CODES.replay)
+    ok("T36 OIDC real-token verification, forged-issuer refusal, replay checks, and UNKNOWN without JWKS")
+  }
+
+  // -------------------------------------------------------------------------
+  // T37 — S3923: omitted requireHandoffs resolves to "skip"; "required" still enforces
+  // -------------------------------------------------------------------------
+  {
+    const omitted = await makeRun({ tag: "t37-omitted", unsigned: true, requireHandoffs: undefined, victoryAudit: "skip" })
+    delete omitted.plan.requireHandoffs
+    delete omitted.state.requireHandoffs
+    writeJson(join(omitted.run, "plan.dag.json"), omitted.plan)
+    writeJson(join(omitted.run, "state.json"), omitted.state)
+    writeJson(join(omitted.run, "verify", "report-R1.json"), makeReportPayload(omitted, "R1"))
+    const resOmitted = await verify(omitted)
+    assert.strictEqual(
+      resOmitted.checks.some((c) => c.id.startsWith("handoff:matrix") || c.id === "report:R1:handoff"),
+      false,
+      `omitted requireHandoffs must skip handoff matrix/report checks: ${JSON.stringify(resOmitted.checks)}`,
+    )
+
+    const required = await makeRun({ tag: "t37-required", unsigned: true, requireHandoffs: "required", victoryAudit: "skip" })
+    writeJson(join(required.run, "verify", "report-R1.json"), makeReportPayload(required, "R1"))
+    const resRequired = await verify(required)
+    assert.strictEqual(
+      resRequired.checks.find((c) => c.id === "handoff:matrix")?.status,
+      "fail",
+      `requireHandoffs=required without handoffs must fail handoff:matrix: ${JSON.stringify(resRequired.checks)}`,
+    )
+    assert.strictEqual(
+      resRequired.checks.find((c) => c.id === "report:R1:handoff")?.status,
+      "fail",
+      `requireHandoffs=required without workerHandoff binding must fail report:R1:handoff: ${JSON.stringify(resRequired.checks)}`,
+    )
+    ok("T37 omitted requireHandoffs defaults to skip while required still enforces handoffs")
   }
 
   rmSync(TEST_ROOT, { recursive: true, force: true })

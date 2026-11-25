@@ -40,7 +40,7 @@ test("A6 storage namespacing: two plugin instances with different ids keep separ
     expect(await b.get("l1/a-only")).toBeUndefined()
 
     const scanned = await a.scan({ prefix: "l1/" })
-    expect(scanned.entries.map((entry: any) => entry.key).sort()).toEqual(["l1/a-only", "l1/roundtrip"])
+    expect(scanned.entries.map((entry: any) => entry.key).sort((a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0))).toEqual(["l1/a-only", "l1/roundtrip"])
   } finally {
     await loaded.close()
     project.cleanup()

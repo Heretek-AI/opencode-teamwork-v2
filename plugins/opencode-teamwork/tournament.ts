@@ -13,11 +13,12 @@
 
 import { lstatSync, realpathSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
-import { assertPinnedWritePolicy, readRegularBounded, readWithinBounded, writeFileAtomicWithin } from "./safe-fs.mjs"
+import { assertPinnedWritePolicy, readWithinBounded, writeFileAtomicWithin } from "./safe-fs.mjs"
 import type { SafeFsRead } from "./safe-fs.mjs"
 import { BUDGET_HALT_PCT, budgetPercent } from "./budget.ts"
+import { clean, cleanBlock } from "./text-utils.ts"
 
-export const TOURNAMENT_LIMITS = {
+const TOURNAMENT_LIMITS = {
   MAX_LEVELS: 4,
   MAX_WIDTH: 8,
   MAX_CANDIDATES: 64,
@@ -32,7 +33,7 @@ export const TOURNAMENT_LIMITS = {
   DEFAULT_PASS_THRESHOLD: 70,
 } as const
 
-export const CANDIDATE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
+const CANDIDATE_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/
 const RESERVED_KEYS = new Set(["__proto__", "constructor", "prototype"])
 
 export const TOURNAMENT_ACTIVE_PHASES = new Set([
@@ -42,7 +43,7 @@ export const TOURNAMENT_ACTIVE_PHASES = new Set([
   "REFEREE_SCORE",
   "VICTORY_AUDIT",
 ])
-export const TOURNAMENT_TERMINAL_PHASES = new Set(["COMPLETED", "FAILED", "CANCELLED", "BUDGET_HALTED"])
+const TOURNAMENT_TERMINAL_PHASES = new Set(["COMPLETED", "FAILED", "CANCELLED", "BUDGET_HALTED"])
 export const TOURNAMENT_PHASES = new Set([...TOURNAMENT_ACTIVE_PHASES, ...TOURNAMENT_TERMINAL_PHASES])
 
 export type TournamentPhase =
@@ -173,7 +174,7 @@ export interface TournamentManifest {
   updatedAt: string
 }
 
-export interface RouteResult {
+export interface TournamentRouteResult {
   route: string
   topology: string
   massiveProofOptIn: boolean
@@ -191,7 +192,6 @@ export interface RouteResult {
 }
 
 export const MAX_MANIFEST_BYTES = 8 * 1024 * 1024
-export const MAX_CANDIDATE_BYTES = 1 * 1024 * 1024
 export const MAX_REPORT_BYTES = 2 * 1024 * 1024
 
 /**
@@ -202,24 +202,7 @@ export const MAX_REPORT_BYTES = 2 * 1024 * 1024
  */
 export const MAX_VERIFIER_REPORT_BYTES = 1024 * 1024
 
-export function clean(value: unknown, max = 64): string {
-  const s = typeof value === "string" ? value : typeof value === "number" || typeof value === "boolean" ? String(value) : ""
-  // \x00-\x1f already covers \t (0x09), \n (0x0a) and \r (0x0d); \x7f-\x9f
-  // already covers U+0085. Listing them again is redundant (Sonar S5869).
-  return s
-    .replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]/g, " ")
-    .slice(0, max)
-}
-
-export function cleanBlock(value: unknown, max = 2000): string {
-  const raw = typeof value === "string" ? value : typeof value === "number" || typeof value === "boolean" ? String(value) : ""
-  // \r (0x0d) is inside \x0b-\x1f and U+0085 is inside \x7f-\x9f; the ranges
-  // already skip \n (0x0a) intentionally so one line can hold one round.
-  const s = raw.replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f\u2028\u2029]/g, " ")
-  return s.length > max ? s.slice(0, Math.max(0, max - 1)) + "…" : s
-}
-
-export function nullMap<T = any>(src?: unknown): Record<string, T> {
+function nullMap<T = any>(src?: unknown): Record<string, T> {
   const out: Record<string, T> = Object.create(null)
   if (src && typeof src === "object" && !Array.isArray(src)) {
     for (const k of Object.keys(src as object)) {
@@ -230,7 +213,7 @@ export function nullMap<T = any>(src?: unknown): Record<string, T> {
   return out
 }
 
-export function isSafeCandidateId(id: unknown): id is string {
+function isSafeCandidateId(id: unknown): id is string {
   return typeof id === "string" && !RESERVED_KEYS.has(id) && CANDIDATE_ID.test(id)
 }
 
@@ -352,24 +335,6 @@ export type BoundedReadResult =
   | { status: "ok"; text: string; bytes?: Buffer }
   | { status: "absent" }
   | { status: "error"; error: string }
-
-/**
- * Read a bounded view of `file`, refusing symlinks and non-regular files.
- *
- * This is the rootless primitive: it delegates to the shared
- * `readRegularBounded` in `./safe-fs.mjs` (O_NOFOLLOW makes the open fail on a
- * final symlink, O_NONBLOCK keeps a FIFO from blocking open(), fstat on the
- * returned fd is authoritative, EINTR is retried, EAGAIN and every other error
- * fail closed). It cannot enforce run containment because it has no root; use
- * `readBoundedRunFile` / `readWithinBounded` for run artifacts.
- *
- * ADR 0004 boundary: `readBoundedRunFile` additionally checks the opened fd's
- * `/proc/self/fd` path on Linux. macOS/Windows keep the checks above and the
- * documented intermediate-component residual risk.
- */
-export function readBoundedFileNoFollow(file: string, maxBytes: number): BoundedReadResult {
-  return toBoundedResult(readRegularBounded(file, maxBytes), file, maxBytes)
-}
 
 function toBoundedResult(r: SafeFsRead, file: string, maxBytes: number): BoundedReadResult {
   if (r.status === "ok") return { status: "ok", text: r.text, ...(r.bytes ? { bytes: r.bytes } : {}) }
@@ -621,7 +586,7 @@ export function maskCodeAndQuotes(text: string): string {
  * tournament\"") must not opt in; an unquoted affirmative request still does.
  * Not applied globally: quoting only matters where a phrase grants authority.
  */
-export function maskQuotedExamples(text: string): string {
+function maskQuotedExamples(text: string): string {
   const s = typeof text === "string" ? text : ""
   let out = ""
   let i = 0
@@ -651,15 +616,15 @@ const EXPLICIT_LARGE_TEAM_OPT_IN_RE =
 const NEGATED_LARGE_TEAM_RE =
   /\b(?:do\s+not|don'?t|never|without|no|avoid|skip|not)\s+(?:(?:using|running|spinning\s+up|triggering|enabling|trying|use|run|spin\s+up|trigger|enable|try|want\s+to\s+(?:use|run|spin\s+up|trigger|enable|try)|want)\s+)?(?:(?:a|an|the)\s+)?(?:massive[- ]?proof(?:-swarm)?|(?:very\s+|extremely\s+)?large[- ]?team(?:\s+(?:proof|tournament))?|(?:very\s+)?big\s+team|massively\s+parallel(?:\s+proof)?|(?:proof\s+)?tournament(?:\s+search)?|100\+?\s*searchers|very\s+many\s+agents)\b/i
 
-export function hasMathProofIntent(proseOnly: string): boolean {
+function hasMathProofIntent(proseOnly: string): boolean {
   return MATH_PROOF_INTENT_RE.test(proseOnly)
 }
 
-export function hasExplicitLargeTeamOptIn(proseOnly: string): boolean {
+function hasExplicitLargeTeamOptIn(proseOnly: string): boolean {
   return EXPLICIT_LARGE_TEAM_OPT_IN_RE.test(proseOnly)
 }
 
-export function hasNegatedLargeTeam(proseOnly: string): boolean {
+function hasNegatedLargeTeam(proseOnly: string): boolean {
   return NEGATED_LARGE_TEAM_RE.test(proseOnly)
 }
 
@@ -695,10 +660,10 @@ function hasExplicitLeanProveIntent(proseOnly: string): boolean {
 }
 const LEAN_BARE_EXT_RE = /(?:^|[\s"'(\[])[^\s"'`]+\.lean(?:$|[\s"')\].,:;!?])/i
 
-export function classifyRoute(
+export function classifyTournamentRoute(
   input: string | { request?: string; inputs?: string[]; hasDocument?: boolean; cwd?: string },
   _root?: string,
-): RouteResult {
+): TournamentRouteResult {
   const raw = typeof input === "string" ? input : String(input?.request ?? "")
   const inputs = typeof input === "string" ? [] : Array.isArray(input?.inputs) ? input.inputs.map(String) : []
   const hasDocFlag = typeof input === "string" ? false : input?.hasDocument === true
@@ -838,7 +803,7 @@ export function classifyRoute(
 // Config Validation & Budget Estimation
 // ---------------------------------------------------------------------------
 
-export function validateTournamentConfig(
+function validateTournamentConfig(
   raw?: unknown,
 ): { ok: true; config: TournamentConfig } | { ok: false; error: string } {
   if (raw !== undefined && raw !== null && (typeof raw !== "object" || Array.isArray(raw))) {
@@ -1078,7 +1043,7 @@ export function compareCandidates(a: CandidateNode, b: CandidateNode): number {
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
 }
 
-export function rankCandidates(candidatesMap: Record<string, CandidateNode>): RankedCandidate[] {
+function rankCandidates(candidatesMap: Record<string, CandidateNode>): RankedCandidate[] {
   const list: CandidateNode[] = []
   for (const key of Object.keys(candidatesMap)) {
     if (RESERVED_KEYS.has(key)) continue
@@ -1112,7 +1077,7 @@ export function manifestPathOf(run: string): string {
   return join(run, "tournament", "manifest.json")
 }
 
-export function verdictPathOf(run: string): string {
+function verdictPathOf(run: string): string {
   return join(run, "tournament", "verdict.json")
 }
 
@@ -1179,7 +1144,7 @@ export function readTournamentVerdict(
   return { status: "ok", verdict: v }
 }
 
-export function writeTournamentManifest(run: string, manifest: TournamentManifest): void {
+function writeTournamentManifest(run: string, manifest: TournamentManifest): void {
   writeSafeRunJson(run, manifestPathOf(run), manifest)
 }
 

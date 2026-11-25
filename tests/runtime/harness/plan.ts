@@ -7,15 +7,16 @@
 
 import { execFileSync } from "node:child_process"
 import { createHash } from "node:crypto"
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { closeSync, constants as fsConstants, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { dirname, join, relative } from "node:path"
+import { resolveTrustedExecutable } from "../../../plugins/opencode-teamwork/safe-fs.mjs"
 import type { LoadedHost } from "./load"
 import { importTeamwork, loadHost } from "./load"
 import { createProject, type Project } from "./project"
 import { createSession, execute, type RunSession, type ToolResult } from "./run"
 
-export const DEFAULT_RUN_ID = "20261124-000000-l2"
-export const DEFAULT_REQUEST = "Ship a deterministic two-task change with tests."
+const DEFAULT_RUN_ID = "20261124-000000-l2"
+const DEFAULT_REQUEST = "Ship a deterministic two-task change with tests."
 
 export interface PlanOptions {
   readonly sessionId?: string
@@ -199,7 +200,7 @@ export function runFile(project: Project, runId: string, relativePath: string): 
   return join(runDir(project, runId), relativePath)
 }
 
-export function readJson<T = any>(path: string): T | undefined {
+function readJson<T = any>(path: string): T | undefined {
   try {
     return JSON.parse(readFileSync(path, "utf8")) as T
   } catch {
@@ -254,16 +255,8 @@ export function writeSpec(project: Project, runId: string, text: string): string
   return file
 }
 
-export function sha256(data: string | Buffer): string {
+function sha256(data: string | Buffer): string {
   return createHash("sha256").update(data).digest("hex")
-}
-
-export function fileSha256(path: string): string | undefined {
-  try {
-    return sha256(readFileSync(path))
-  } catch {
-    return undefined
-  }
 }
 
 /** Sorted relative path -> sha256 for every regular file under `dir`. */
@@ -276,16 +269,29 @@ export function snapshotTree(dir: string): Record<string, string> {
     } catch {
       return
     }
-    for (const entry of entries.sort()) {
+    for (const entry of entries.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))) {
       const path = join(current, entry)
-      let st
+      let fd: number | null = null
+      let isDir = false
       try {
-        st = statSync(path)
-      } catch {
-        continue
+        fd = openSync(path, fsConstants.O_RDONLY)
+        const st = fstatSync(fd)
+        if (st.isDirectory()) {
+          isDir = true
+        } else if (st.isFile()) {
+          out[relative(dir, path).split("\\").join("/")] = sha256(readFileSync(fd))
+        }
+      } catch (err: any) {
+        if (err?.code === "EISDIR") isDir = true
+        else continue
+      } finally {
+        if (fd !== null) {
+          try {
+            closeSync(fd)
+          } catch {}
+        }
       }
-      if (st.isDirectory()) walk(path)
-      else if (st.isFile()) out[relative(dir, path).split("\\").join("/")] = sha256(readFileSync(path))
+      if (isDir) walk(path)
     }
   }
   walk(dir)
@@ -298,11 +304,12 @@ export function treeDiff(before: Record<string, string>, after: Record<string, s
   removed: string[]
   changed: string[]
 } {
-  const added = Object.keys(after).filter((key) => !(key in before)).sort()
-  const removed = Object.keys(before).filter((key) => !(key in after)).sort()
+  const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
+  const added = Object.keys(after).filter((key) => !(key in before)).sort(cmp)
+  const removed = Object.keys(before).filter((key) => !(key in after)).sort(cmp)
   const changed = Object.keys(before)
     .filter((key) => key in after && before[key] !== after[key])
-    .sort()
+    .sort(cmp)
   return { added, removed, changed }
 }
 
@@ -311,7 +318,9 @@ export function treeDiff(before: Record<string, string>, after: Record<string, s
 // ---------------------------------------------------------------------------
 
 function git(cwd: string, args: string[]): string {
-  return execFileSync("git", args, {
+  const gitBin = resolveTrustedExecutable("git")
+  if (!gitBin) throw new Error("git executable not found")
+  return execFileSync(gitBin, args, {
     cwd,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
@@ -333,8 +342,8 @@ export function gitCommitCount(cwd: string): number {
   return Number(git(cwd, ["rev-list", "--count", "HEAD"]))
 }
 
-export const baseBranch = (runId: string) => `teamwork/base-${runId}`
-export const taskBranch = (runId: string, taskId: string) => `teamwork/${runId}-${taskId}`
+const baseBranch = (runId: string) => `teamwork/base-${runId}`
+const taskBranch = (runId: string, taskId: string) => `teamwork/${runId}-${taskId}`
 
 /**
  * Create the run's base branch and one clean worktree for `taskId` at the
@@ -367,8 +376,4 @@ export function commitInWorktree(
   git(worktree, ["add", "--", relativePath])
   git(worktree, ["commit", "-qm", message])
   return gitHead(worktree)
-}
-
-export function worktreeExists(path: string): boolean {
-  return existsSync(path)
 }

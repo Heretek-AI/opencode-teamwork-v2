@@ -275,6 +275,11 @@ function run(argv) {
     const runAttempt = o["run-attempt"] === undefined ? 1 : Number(o["run-attempt"])
     if (!Number.isInteger(runAttempt) || runAttempt < 1) return usage("--run-attempt must be a positive integer")
 
+    let oidcToken
+    if (typeof o["oidc-token"] === "string" && o["oidc-token"].trim() !== "") {
+      const raw = o["oidc-token"].trim()
+      oidcToken = raw.startsWith("@") ? readFileSync(resolve(raw.slice(1)), "utf8").trim() : raw
+    }
     const payload = {
       v: 1,
       provider,
@@ -294,6 +299,8 @@ function run(argv) {
           o["oidc-subject"] ?? (repository ? `repo:${repository}:ref:${String(o.ref ?? "refs/heads/main")}` : "unknown"),
         ).trim(),
         audience: String(o["oidc-audience"] ?? "opencode-teamwork").trim(),
+        ...(o["oidc-ref"] ? { ref: String(o["oidc-ref"]).trim() } : {}),
+        ...(oidcToken ? { token: oidcToken } : {}),
       },
       issuedAt: new Date(issuedAtMs).toISOString(),
       expiresAt: new Date(expiresAtMs).toISOString(),

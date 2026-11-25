@@ -4,37 +4,37 @@
 // Erasable TypeScript compatible with Node 22+ `--experimental-strip-types`.
 
 import {
-  accessSync,
   constants as fsConstants,
   existsSync,
   lstatSync,
   realpathSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs"
 import { execFileSync, spawnSync } from "node:child_process"
 import { createHash, randomBytes } from "node:crypto"
-import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path"
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path"
 import {
   createDirWithin,
   readRegularBounded,
   readWithinBounded,
+  resolveTrustedExecutable,
   unlinkWithin,
   writeFileAtomicWithin,
   writeOnceWithin,
 } from "./safe-fs.mjs"
+import { clean, cleanBlock } from "./text-utils.ts"
 
-export const MAX_LEMMA_DEPTH = 3
-export const MAX_LEMMA_WIDTH = 4
-export const MAX_LEMMA_NODES = 24
-export const MAX_LEMMA_RETRIES = 4
-export const MAX_FORMALIZATION_ROUNDS = 3
-export const MAX_LEMMA_ALLOWED_AXIOMS = 32
-export const LEMMA_POLICY_VERSION = 1
-export const MAX_LEMMA_FILE_BYTES = 1024 * 1024 // 1 MiB
+const MAX_LEMMA_DEPTH = 3
+const MAX_LEMMA_WIDTH = 4
+const MAX_LEMMA_NODES = 24
+const MAX_LEMMA_RETRIES = 4
+const MAX_FORMALIZATION_ROUNDS = 3
+const MAX_LEMMA_ALLOWED_AXIOMS = 32
+const LEMMA_POLICY_VERSION = 1
+const MAX_LEMMA_FILE_BYTES = 1024 * 1024 // 1 MiB
 
-export const DEFAULT_LEMMA_BOUNDS = {
+const DEFAULT_LEMMA_BOUNDS = {
   maxDepth: 3,
   maxWidth: 4,
   maxNodes: 16,
@@ -65,6 +65,12 @@ export type LemmaBinaryName = "lean" | "lake" | "leap" | "leap-tools"
 export const LEAP_REQUIREMENT = "leap (LEAP CLI) or legacy leap-tools"
 export type LemmaRequirement = "lean" | "lake" | typeof LEAP_REQUIREMENT
 
+export interface LeapDoctorResult {
+  status: ProbeStatus
+  output: string
+  error?: string
+}
+
 export interface BinaryProbeResult {
   name: LemmaBinaryName
   available: boolean
@@ -72,6 +78,8 @@ export interface BinaryProbeResult {
   path: string | null
   version: string | null
   error?: string
+  /** LEAP only: the result of `leap doctor` (the CLI's own environment check). */
+  doctor?: LeapDoctorResult
 }
 
 export interface LemmaProbeResult {
@@ -102,7 +110,7 @@ export type CanonicalTopology =
   | "massive-proof"
   | "document-review"
 
-export interface RouteClassification {
+export interface LemmaRouteClassification {
   route: RouteName
   topology: CanonicalTopology
   lemmaMode: boolean
@@ -116,7 +124,7 @@ export interface RouteClassification {
 
 export const LEMMA_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 
-export function isSafeLemmaId(id: unknown): id is string {
+function isSafeLemmaId(id: unknown): id is string {
   return typeof id === "string" && LEMMA_ID.test(id) && id !== "." && id !== ".."
 }
 
@@ -126,34 +134,13 @@ function asStr(value: unknown): string {
   return ""
 }
 
-export function clean(value: unknown, max = 64): string {
-  return asStr(value)
-    .replace(/[\r\n\t\x00-\x1f\x7f-\x9f\u0085\u2028\u2029]/g, " ")
-    .slice(0, max)
-}
-
-export function cleanBlock(value: unknown, max = 2000): string {
-  const s = asStr(value).replace(/[\r\x00-\x09\x0b-\x1f\x7f-\x9f\u0085\u2028\u2029]/g, " ")
-  return s.length > max ? s.slice(0, Math.max(0, max - 1)) + "…" : s
-}
-
-export function refuseSymlink(file: string): void {
-  try {
-    if (lstatSync(file).isSymbolicLink()) {
-      throw new Error(`refused: refusing to access symlink "${basename(file)}"`)
-    }
-  } catch (e: any) {
-    if (e?.code !== "ENOENT") throw e
-  }
-}
-
 /**
  * Validate a relative path inside `runDir`:
  * - Rejects empty/absolute paths or `..`/`.` segments
  * - Refuses any symlinked component along the path (including dangling target)
  * - Verifies `realpathSync` containment for existing ancestors and target
  */
-export function ensureSafeSubpath(runDir: string, relPath: string): { path?: string; runReal?: string; error?: string } {
+function ensureSafeSubpath(runDir: string, relPath: string): { path?: string; runReal?: string; error?: string } {
   if (typeof relPath !== "string" || !relPath.trim()) {
     return { error: "refused: empty relative path" }
   }
@@ -216,7 +203,7 @@ export function ensureSafeSubpath(runDir: string, relPath: string): { path?: str
  * /proc/self/fd path on Linux (ADR 0004). Arbitrary non-run `options.filePath`
  * reads keep the rootless behavior.
  */
-export function readBoundedRegular(
+function readBoundedRegular(
   file: string,
   maxBytes = MAX_LEMMA_FILE_BYTES,
   runReal?: string,
@@ -273,28 +260,15 @@ function readJsonSafe<T>(runDir: string, relPath: string): { value?: T; error?: 
 // ---------------------------------------------------------------------------
 
 function resolveExecutableOnPath(binName: string, pathEnv: string | undefined): string | null {
-  const dirs = String(pathEnv ?? "")
-    .split(delimiter)
-    .map((d) => d.trim())
-    .filter(Boolean)
-  for (const dir of dirs) {
-    const candidate = join(dir, binName)
-    try {
-      const lst = lstatSync(candidate)
-      if (lst.isSymbolicLink()) {
-        // elan shims on PATH may be symlinks to the elan binary
-        const targetStat = statSync(candidate)
-        if (!targetStat.isFile()) continue
-      } else if (!lst.isFile()) {
-        continue
-      }
-      accessSync(candidate, fsConstants.X_OK)
-      return candidate
-    } catch {
-      continue
-    }
-  }
-  return null
+  // S4036: a binary found through an attacker-writable or relative PATH entry
+  // can execute planted code. Reuse the trusted-directory resolver; set
+  // fallbackToStandard: false so a probe that intentionally narrows PATH (for
+  // example a fixture that simulates a missing toolchain) does not silently pick
+  // up a host binary from /usr/bin.
+  return resolveTrustedExecutable(binName, {
+    env: { PATH: pathEnv, PATHEXT: process.env.PATHEXT },
+    fallbackToStandard: false,
+  })
 }
 
 function firstNonEmptyLine(text: unknown): string {
@@ -398,7 +372,7 @@ function probeBinary(
   }
 }
 
-export function buildInstallInstructions(): string {
+function buildInstallInstructions(): string {
   return [
     "Required toolchain installation instructions:",
     "1. Lean 4 (`lean` and `lake` via `elan`):",
@@ -418,15 +392,67 @@ export function buildInstallInstructions(): string {
   ].join("\n")
 }
 
+function runLeapDoctor(
+  resolved: string,
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number,
+): LeapDoctorResult {
+  try {
+    const out = execFileSync(resolved, ["doctor"], {
+      env,
+      timeout: timeoutMs,
+      maxBuffer: 256 * 1024,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    })
+    return { status: "READY", output: cleanBlock(out, 2000).trim() }
+  } catch (err: any) {
+    const stderr = String(err?.stderr ?? "")
+    const stdout = String(err?.stdout ?? "")
+    const detail =
+      firstNonEmptyLine(stderr) || firstNonEmptyLine(stdout) || err?.code || err?.message || "leap doctor failed"
+    return {
+      status: "OUTAGE",
+      output: cleanBlock(stdout || stderr, 2000).trim(),
+      error: err?.code === "ETIMEDOUT" ? `leap doctor timed out after ${timeoutMs}ms` : clean(detail, 180),
+    }
+  }
+}
+
 function probeLeapCli(env: NodeJS.ProcessEnv, timeoutMs: number): BinaryProbeResult {
   // `leap` is the current console script; fall back to the legacy `leap-tools`
   // name only when `leap` is absent. A present-but-broken `leap` is an OUTAGE,
   // not a reason to silently use another binary.
   const leap = probeBinary("leap", env, timeoutMs, true)
-  if (leap.available || leap.path !== null) return leap
-  const legacy = probeBinary("leap-tools", env, timeoutMs, true)
-  if (legacy.available || legacy.path !== null) return legacy
-  return { ...leap, error: "neither `leap` nor legacy `leap-tools` found on PATH" }
+  const chosen =
+    leap.available || leap.path !== null ? leap : probeBinary("leap-tools", env, timeoutMs, true)
+  if (!chosen.available && chosen.path === null) {
+    return {
+      ...chosen,
+      doctor: { status: "MISSING", output: "", error: "leap doctor not run: the CLI is not on PATH" },
+      error: "neither `leap` nor legacy `leap-tools` found on PATH",
+    }
+  }
+  if (!chosen.available || chosen.path === null) {
+    return {
+      ...chosen,
+      doctor: { status: "OUTAGE", output: "", error: "leap doctor not run: the CLI probe failed" },
+    }
+  }
+  // A5/A7: `leap --help` only proves the console script starts. `leap doctor`
+  // is the CLI's own environment check (toolchain, cache, Mathlib state), so a
+  // failing doctor makes the CLI unusable for LEMMA even though `--help` works.
+  const doctor = runLeapDoctor(chosen.path, env, timeoutMs)
+  if (doctor.status !== "READY") {
+    return {
+      ...chosen,
+      available: false,
+      status: "OUTAGE",
+      error: `leap doctor failed: ${doctor.error ?? "unhealthy LEAP environment"}`,
+      doctor,
+    }
+  }
+  return { ...chosen, doctor }
 }
 
 export function probeLemmaToolchain(options?: { env?: NodeJS.ProcessEnv; timeoutMs?: number }): LemmaProbeResult {
@@ -464,9 +490,14 @@ export function formatMissingToolchainRefusal(probe: LemmaProbeResult): string {
     `  - lean: ${describeProbe(probe.lean)}`,
     `  - lake: ${describeProbe(probe.lake)}`,
     `  - ${LEAP_REQUIREMENT}: ${describeProbe(probe.leap)}`,
+    ...(probe.leap.doctor
+      ? [
+          `  - leap doctor: ${probe.leap.doctor.status}${probe.leap.doctor.output ? ` (${cleanBlock(probe.leap.doctor.output, 300).trim()})` : ""}${probe.leap.doctor.error ? ` — ${probe.leap.doctor.error}` : ""}`,
+        ]
+      : []),
   ]
   return [
-    `refused: LEMMA route requires Lean 4 (lean, lake) and a LEAP CLI binary (${LEAP_REQUIREMENT}), which are not ready (status: ${probe.status}; missing/unusable: ${probe.missing.join(", ")}). Nothing was written; zero budget spent.`,
+    `refused: LEMMA route requires Lean 4 (lean, lake) and a LEAP CLI binary (${LEAP_REQUIREMENT}), which are not ready (status: ${probe.status}; missing/unusable: ${probe.missing.join(", ")}). No run directory or plan artifact was created; zero budget spent.`,
     "Toolchain probe:",
     ...details,
     "",
@@ -490,7 +521,7 @@ function stripTrailingUnclosedFence(text: string, marker: string): string {
   return text.slice(0, idx) + " "
 }
 
-export function maskFencedCodeBlocks(rawText: string): string {
+function maskFencedCodeBlocks(rawText: string): string {
   const noPairedTicks = rawText.replace(/```[\s\S]*?```/g, " ").replace(/~~~[\s\S]*?~~~/g, " ")
   const noUnclosedTicks = stripTrailingUnclosedFence(stripTrailingUnclosedFence(noPairedTicks, "```"), "~~~")
   return noUnclosedTicks
@@ -502,7 +533,7 @@ export function maskFencedCodeBlocks(rawText: string): string {
     })
 }
 
-export function hasLeanSignal(rawText: string): boolean {
+function hasLeanSignal(rawText: string): boolean {
   if (!rawText) return false
   if (/\b[A-Za-z0-9_./-]+\.lean\b/i.test(rawText)) return true
   if (/\blean\s*4\b/i.test(rawText) || /\bleap-tools\b/i.test(rawText)) return true
@@ -551,7 +582,7 @@ function clauseHasExplicitProofCheck(clause: string): boolean {
   )
 }
 
-export function hasExplicitLeanRequest(proseOnly: string): boolean {
+function hasExplicitLeanRequest(proseOnly: string): boolean {
   if (!proseOnly || !proseOnly.trim()) return false
 
   const hasProseLeanTarget =
@@ -608,10 +639,10 @@ function isDocumentReviewRequest(rawText: string, proseOnly: string, inputs: str
   return hasDocument === true || suppliedDocInInputs || suppliedDocInText
 }
 
-export function classifyRoute(
+export function classifyLemmaRoute(
   input: string | { request?: string; inputs?: string[]; hasDocument?: boolean },
   _root?: string,
-): RouteClassification {
+): LemmaRouteClassification {
   const rawText = typeof input === "string" ? input : String(input?.request ?? "")
   const inputs = typeof input === "string" ? [] : (Array.isArray(input?.inputs) ? input.inputs : []).map(String)
   const hasDocument = typeof input === "string" ? false : input?.hasDocument === true
@@ -909,13 +940,13 @@ const LEAN_DECL_START_RE =
   /(?:^|\n)[ \t]*(?:@\[[^\]]*\][ \t]*)*(?:(?:private|protected|noncomputable|unsafe|partial)[ \t]+)*(theorem|lemma)[ \t]+(«[^»]+»|[A-Za-z_][A-Za-z0-9_'.]*)/g
 
 /** Collapse whitespace in a Lean statement/type so formatting differences do not matter. */
-export function normalizeLeanStatement(statement: unknown): string {
+function normalizeLeanStatement(statement: unknown): string {
   return stripLeanComments(String(statement ?? ""))
     .replace(/\s+/g, " ")
     .trim()
 }
 
-export interface LeanMaskResult {
+interface LeanMaskResult {
   text?: string
   error?: string
 }
@@ -983,7 +1014,7 @@ function findLeanQuotationEnd(source: string, openParen: number): number {
  * Unreliable delimiters fail closed: a caller must not guess what a quotation
  * contains. This is a lexical defense, not a Lean parser.
  */
-export function maskLeanDeclarationsSource(source: string): LeanMaskResult {
+function maskLeanDeclarationsSource(source: string): LeanMaskResult {
   const src = String(source ?? "")
   let out = ""
   let i = 0
@@ -1093,7 +1124,7 @@ function stripSimpleBinderParens(binders: string): string | null {
  * equivalent `(n : Nat) : P` and `∀ n : Nat, P` spellings, so binder forms are
  * expanded. This is still a syntactic comparison, never semantic equality.
  */
-export function leanStatementVariants(statement: unknown): string[] {
+function leanStatementVariants(statement: unknown): string[] {
   const raw = normalizeLeanStatement(statement)
   const variants = new Set<string>()
   if (!raw) return []
@@ -1286,7 +1317,7 @@ export function bindVerifiedDeclaration(
 // ---------------------------------------------------------------------------
 
 /** Axioms Lean itself and Mathlib treat as standard, non-proof-relevant trust. */
-export const STANDARD_LEAN_AXIOMS = ["Classical.choice", "propext", "Quot.sound"] as const
+const STANDARD_LEAN_AXIOMS = ["Classical.choice", "propext", "Quot.sound"] as const
 
 export interface AxiomDependencyCheck {
   recognized: boolean
@@ -1320,14 +1351,14 @@ export function detectAxiomProbeHijacks(source: string): string[] {
   ]
 }
 
-export interface AxiomDependencyEvaluation {
+interface AxiomDependencyEvaluation {
   dependencies: string[]
   unauthorized: string[]
   findings: string[]
 }
 
 /** Classify a dependency list against the standard axioms + caller allowlist. */
-export function evaluateAxiomDependencies(
+function evaluateAxiomDependencies(
   dependencies: string[],
   allowedAxioms: string[] = [],
 ): AxiomDependencyEvaluation {
@@ -1813,7 +1844,7 @@ export function canonicalAxiomSet(values: unknown): string[] {
         .map((value) => stripGuillemets(String(value ?? "").trim()))
         .filter(Boolean),
     ),
-  ].sort((a, b) => a.localeCompare(b))
+  ].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
 }
 
 export function sameAxiomSet(a: unknown, b: unknown): boolean {
@@ -1943,7 +1974,7 @@ export interface LemmaNodeRecord {
   updatedAt: string
 }
 
-export interface LemmaManifest {
+interface LemmaManifest {
   version: number
   sessionId: string
   phase: "FORMALIZE" | "SOLVING" | "VERIFIED" | "BLOCKED"
@@ -1962,7 +1993,7 @@ export interface LemmaManifest {
   updatedAt: string
 }
 
-export interface FormalizationReviewFile {
+interface FormalizationReviewFile {
   rounds: Array<{
     round: number
     phase: "preSearch" | "final"

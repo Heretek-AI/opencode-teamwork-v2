@@ -29,17 +29,16 @@ const DIGEST_DOMAIN_KEY = Buffer.from([
   0x61, 0x63, 0x74, 0x2d, 0x64, 0x69, 0x67, 0x65, 0x73, 0x74, 0x2d, 0x76, 0x31,
 ])
 
-export const SIGNATURE_DOMAIN = "teamwork-artifact-v1"
-export const WITNESS_DOMAIN = "teamwork-witness-v1"
-export const SIGNER_APPROVAL_DOMAIN = "teamwork-signer-approval-v1"
+const SIGNATURE_DOMAIN = "teamwork-artifact-v1"
+const WITNESS_DOMAIN = "teamwork-witness-v1"
+const SIGNER_APPROVAL_DOMAIN = "teamwork-signer-approval-v1"
 /**
  * CI attestation (0.18.0). A distinct domain keeps an attestation signature
  * from being replayable as a run artifact, a witness receipt, or an approval.
  * The envelope is the same v1 `_auth` shape; only the signed bytes differ.
  */
-export const ATTESTATION_DOMAIN = "teamwork-ci-attestation-v1"
+const ATTESTATION_DOMAIN = "teamwork-ci-attestation-v1"
 export const AUTH_ED25519 = "ed25519"
-export const AUTH_HMAC = "hmac-sha256"
 
 /**
  * Canonical JSON: object keys sorted, arrays in order, no whitespace. Throws on

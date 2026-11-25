@@ -45,6 +45,7 @@ export interface SafeUrl {
 
 export interface AssertSafeUrlOptions {
   allowLocalhost?: boolean
+  loopbackOnly?: boolean
   /** Test seam; production always uses the system resolver. */
   resolveHost?: (hostname: string) => Promise<Array<{ address: string; family: 4 | 6 }>>
 }
@@ -65,7 +66,7 @@ export interface SafeFetchSuccess {
 
 export type SafeFetchResult = SafeFetchSuccess | UrlGuardFailure
 
-export function localhostOptInEnabled(): boolean {
+function localhostOptInEnabled(): boolean {
   return process.env[ALLOW_LOCALHOST_ENV] === "1"
 }
 
@@ -198,6 +199,45 @@ export function blockedAddressReason(address: string, allowLocalhost = false): s
 }
 
 /**
+ * Validate and normalize a local OpenCode service origin URL (from `service*.json`).
+ * Only `http:` / `https:` origins pointing at loopback IPs (`127.0.0.0/8`, `::1`,
+ * `::ffff:127.0.0.0/8`) or `localhost` / `*.localhost` with no credentials,
+ * path, query, or fragment are accepted. Returns a reconstructed clean origin
+ * string (`http(s)://host[:port]`) or `undefined`.
+ */
+export function parseLoopbackServiceUrl(rawUrl: string): string | undefined {
+  let parsed: URL
+  try {
+    parsed = new URL(String(rawUrl || "").trim())
+  } catch {
+    return undefined
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined
+  if (parsed.username || parsed.password) return undefined
+  if ((parsed.pathname !== "/" && parsed.pathname !== "") || parsed.search || parsed.hash) return undefined
+  const host = normalizeHost(parsed.hostname)
+  if (!host) return undefined
+  const family = isIP(host)
+  if (family !== 0) {
+    if (blockedAddressReason(host, false) !== "loopback" || blockedAddressReason(host, true) !== undefined) {
+      return undefined
+    }
+  } else if (host !== "localhost" && !host.endsWith(".localhost")) {
+    return undefined
+  }
+  let portSuffix = ""
+  if (parsed.port) {
+    if (!/^\d{1,5}$/.test(parsed.port)) return undefined
+    const portNum = Number(parsed.port)
+    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) return undefined
+    portSuffix = `:${portNum}`
+  }
+  const scheme = parsed.protocol === "https:" ? "https:" : "http:"
+  const hostAuthority = parsed.hostname.startsWith("[") ? `[${host}]` : host
+  return `${scheme}//${hostAuthority}${portSuffix}`
+}
+
+/**
  * Validate a URL and resolve every address it names. All answers must be
  * public; a hostname with one private answer is refused as a whole.
  */
@@ -215,7 +255,8 @@ export async function assertSafeUrl(rawUrl: string, options: AssertSafeUrlOption
     return refuse("URL_CREDENTIALS", "URLs with embedded credentials are not fetched")
   }
 
-  const allowLocalhost = options.allowLocalhost ?? localhostOptInEnabled()
+  const loopbackOnly = options.loopbackOnly === true
+  const allowLocalhost = loopbackOnly ? true : (options.allowLocalhost ?? localhostOptInEnabled())
   const host = normalizeHost(parsed.hostname)
   if (!host) return refuse("URL_INVALID", "URL has no hostname")
 
@@ -225,6 +266,9 @@ export async function assertSafeUrl(rawUrl: string, options: AssertSafeUrlOption
     const family = literal as 4 | 6
     addresses = [{ address: host, family }]
   } else {
+    if (loopbackOnly && host !== "localhost" && !host.endsWith(".localhost")) {
+      return refuse("URL_BLOCKED_ADDRESS", `URL host "${host}" is not a loopback address`)
+    }
     if ((host === "localhost" || host.endsWith(".localhost")) && !allowLocalhost) {
       return refuse("URL_BLOCKED_ADDRESS", "URL host is localhost (loopback is blocked; set OPENCODE_TEAMWORK_ALLOW_LOCALHOST=1 only for local tests)")
     }
@@ -244,9 +288,15 @@ export async function assertSafeUrl(rawUrl: string, options: AssertSafeUrlOption
   }
 
   for (const entry of addresses) {
-    const reason = blockedAddressReason(entry.address, allowLocalhost)
-    if (reason) {
-      return refuse("URL_BLOCKED_ADDRESS", `URL resolves to a blocked ${reason} address (${entry.address})`)
+    if (loopbackOnly) {
+      if (blockedAddressReason(entry.address, false) !== "loopback" || blockedAddressReason(entry.address, true) !== undefined) {
+        return refuse("URL_BLOCKED_ADDRESS", `URL resolves to a non-loopback address (${entry.address})`)
+      }
+    } else {
+      const reason = blockedAddressReason(entry.address, allowLocalhost)
+      if (reason) {
+        return refuse("URL_BLOCKED_ADDRESS", `URL resolves to a blocked ${reason} address (${entry.address})`)
+      }
     }
   }
 
@@ -356,7 +406,11 @@ function requestPinned(
  * `assertSafeUrl` first. The connection is pinned to the validated address.
  */
 export async function safeFetch(rawUrl: string, options: SafeFetchOptions = {}): Promise<SafeFetchResult> {
-  const safe = await assertSafeUrl(rawUrl, { allowLocalhost: options.allowLocalhost })
+  const safe = await assertSafeUrl(rawUrl, {
+    allowLocalhost: options.allowLocalhost,
+    loopbackOnly: options.loopbackOnly,
+    resolveHost: options.resolveHost,
+  })
   if (!safe.ok) return safe
   let last: SafeFetchResult | undefined
   for (const address of safe.addresses) {

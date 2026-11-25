@@ -14,9 +14,11 @@
 // host can simulate the different-principal approval directory.
 
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
-import { dirname, join } from "node:path"
+import { dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { registerTeamworkTools, setApprovalOwnerUidForTest } from "../plugins/opencode-teamwork/tools.ts"
 import { registerTool } from "./tool-registry.mjs"
+
+const SESSION_ID = /^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$/
 
 const input = JSON.parse(process.argv[2] || "{}")
 const root = input.root
@@ -24,8 +26,16 @@ const storagePath = input.storage
 const runId = input.runId
 const ROOT_SESSION = "ses_approval_root"
 
-if (!root || !storagePath || !runId) {
-  console.error("approval-driver: root, storage and runId are required")
+if (!root || !storagePath || typeof runId !== "string" || !SESSION_ID.test(runId)) {
+  console.error("approval-driver: root, storage and a valid runId are required")
+  process.exit(2)
+}
+
+const teamworkRoot = resolve(root, ".opencode", "teamwork")
+const runDir = resolve(teamworkRoot, runId)
+const relRunDir = relative(teamworkRoot, runDir)
+if (!relRunDir || relRunDir === ".." || relRunDir.startsWith("..") || isAbsolute(relRunDir)) {
+  console.error("approval-driver: runId resolves outside teamwork root")
   process.exit(2)
 }
 
@@ -90,7 +100,7 @@ await registerTeamworkTools(
 if (typeof input.ownerUid === "number") setApprovalOwnerUidForTest(input.ownerUid)
 
 function runFile(name) {
-  return join(root, ".opencode", "teamwork", runId, name)
+  return resolve(runDir, name)
 }
 
 function reply(value) {
@@ -99,10 +109,9 @@ function reply(value) {
 
 try {
   if (input.action === "write-draft") {
-    const dir = join(root, ".opencode", "teamwork", runId)
-    mkdirSync(dir, { recursive: true })
-    const file = join(dir, "prompt_draft.md")
-    if (lstatSync(dir).isSymbolicLink()) throw new Error("the run directory is a symlink")
+    mkdirSync(runDir, { recursive: true })
+    const file = resolve(runDir, "prompt_draft.md")
+    if (lstatSync(runDir).isSymbolicLink()) throw new Error("the run directory is a symlink")
     writeFileSync(file, String(input.draft ?? ""), "utf8")
     reply({ ok: true, path: file, bytes: Buffer.byteLength(String(input.draft ?? "")) })
   } else if (input.action === "plan") {

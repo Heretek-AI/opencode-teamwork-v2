@@ -33,13 +33,16 @@
 // documented in docs/GUARDRAILS.md and ADR 0010.
 
 import {
+  accessSync,
   closeSync,
   constants as fsConstants,
   fsyncSync,
   fstatSync,
+  ftruncateSync,
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readSync,
   realpathSync,
   renameSync,
@@ -50,7 +53,7 @@ import {
 } from "node:fs"
 import { createHash, randomBytes } from "node:crypto"
 import { homedir } from "node:os"
-import { basename, dirname, isAbsolute, join, relative, resolve, sep, win32 as win32Path } from "node:path"
+import { basename, delimiter as pathDelimiter, dirname, isAbsolute, join, relative, resolve, sep, win32 as win32Path } from "node:path"
 
 const PROC_SELF_FD = "/proc/self/fd"
 const DELETED_SUFFIX = " (deleted)"
@@ -376,7 +379,7 @@ function boundMap(map, max) {
 }
 
 /** Every identity key that names this run (lexical path, realpath, dev:ino). */
-export function runPolicyKeys(run) {
+function runPolicyKeys(run) {
   const keys = []
   const add = (key) => {
     if (key && !keys.includes(key)) keys.push(key)
@@ -498,11 +501,6 @@ export function setRunRequirePinnedWrites(run, enabled) {
   boundMap(pinnedPolicyCleared, MAX_PINNED_REQUIRED_RUNS)
 }
 
-/** True when this run's writes must be pinned. */
-export function runRequiresPinnedWrites(run) {
-  return resolveRunPolicy(run).required
-}
-
 /**
  * The one refusal used by both the writer and the lock layer, so the message
  * (including the run id) and the machine-readable reason are identical.
@@ -542,7 +540,7 @@ export function assertPinnedWritePolicy(run, options = {}) {
 const MAX_MODE_DIAGNOSTIC_RUNS = 512
 const modeDiagnosticRuns = new Set()
 
-export function noteTraversalModeForRun(run) {
+function noteTraversalModeForRun(run) {
   const mode = currentTraversalMode()
   if (mode === "pinned") return
   let key
@@ -599,9 +597,14 @@ export function onWriteAnomaly(sink) {
 const MAX_ANOMALY_AUDIT_BYTES = 1024 * 1024
 const MAX_ANOMALY_AUDIT_TAIL_BYTES = 256 * 1024
 const MAX_ANOMALY_READ_BYTES = 1024 * 1024
+const DEFAULT_MAX_INCIDENT_FILES = 100
+const MAX_INCIDENT_FILE_BYTES = 64 * 1024
 const DIAGNOSTIC_ANOMALY_KINDS = new Set(["detective_mode", "detective-lock"])
 const AUDIT_PATH_ENV = "OPENCODE_TEAMWORK_ANOMALY_AUDIT"
+const INCIDENTS_DIR_ENV = "OPENCODE_TEAMWORK_INCIDENTS_DIR"
 let anomalyAuditPathOverride = null
+let incidentDirOverride = null
+let maxIncidentFilesOverride = null
 
 function configDirForAudit(env) {
   const explicit = env?.OPENCODE_TEAMWORK_CONFIG || env?.OPENCODE_CONFIG_DIR
@@ -611,7 +614,7 @@ function configDirForAudit(env) {
 }
 
 /** The durable anomaly audit path (overridable for hermetic tests). */
-export function writeAnomalyAuditPath(env = process.env) {
+function writeAnomalyAuditPath(env = process.env) {
   if (anomalyAuditPathOverride) return anomalyAuditPathOverride
   if (env?.[AUDIT_PATH_ENV]) return resolve(String(env[AUDIT_PATH_ENV]))
   return join(configDirForAudit(env), "teamwork", "write-anomalies.jsonl")
@@ -622,32 +625,177 @@ export function setWriteAnomalyAuditPathForTest(path) {
   anomalyAuditPathOverride = typeof path === "string" && path ? resolve(path) : null
 }
 
+/**
+ * Directory for per-incident structured JSON manifests (outside every run).
+ * When the audit path is overridden for hermetic tests, defaults beside it so
+ * tests never touch the operator's real config directory.
+ */
+function writeIncidentDir(env = process.env) {
+  if (incidentDirOverride) return incidentDirOverride
+  if (env?.[INCIDENTS_DIR_ENV]) return resolve(String(env[INCIDENTS_DIR_ENV]))
+  if (anomalyAuditPathOverride) return join(dirname(anomalyAuditPathOverride), "incidents")
+  return join(configDirForAudit(env), "teamwork", "incidents")
+}
+
+/** Test seam: point per-incident manifests at a temp directory (null restores default). */
+export function setIncidentDirForTest(dir) {
+  incidentDirOverride = typeof dir === "string" && dir ? resolve(dir) : null
+}
+
+/** Test seam: override the bounded incident-file retention cap (null restores default). */
+export function setMaxIncidentFilesForTest(limit) {
+  maxIncidentFilesOverride = Number.isInteger(limit) && limit > 0 ? limit : null
+}
+
+function maxIncidentFiles() {
+  return maxIncidentFilesOverride ?? DEFAULT_MAX_INCIDENT_FILES
+}
+
+function buildIncidentManifest(record) {
+  return {
+    v: 1,
+    id: record.id ?? `${Date.now()}-${randomBytes(6).toString("hex")}`,
+    at: record.at ?? new Date().toISOString(),
+    kind: record.kind ?? "unknown",
+    mode: record.mode ?? fdTraversalMode(),
+    platform: record.platform ?? process.platform,
+    phase: record.phase ?? null,
+    run: record.run ?? null,
+    name: record.name ?? null,
+    targetRealpathBefore: record.targetRealpathBefore ?? record.dir ?? null,
+    targetRealpathAfter: record.targetRealpathAfter ?? record.destRealAfter ?? null,
+    pinnedIdentity: record.pinnedIdentity ?? null,
+    observedIdentity: record.observedIdentity ?? null,
+    intendedDigest: record.intendedDigest ?? record.intendedSha256 ?? null,
+    intendedBytes: Number.isFinite(record.intendedBytes)
+      ? record.intendedBytes
+      : Number.isFinite(record.bytesWritten)
+        ? record.bytesWritten
+        : null,
+    tempName: record.tempName ?? (typeof record.tempPath === "string" ? basename(record.tempPath) : null),
+    detail: record.detail ?? null,
+    rollbackAttempted: false,
+    note: "detection is a report about an event that already happened; no rollback was attempted",
+  }
+}
+
+function pruneIncidentDir(dir) {
+  try {
+    const cap = maxIncidentFiles()
+    const files = readdirSync(dir)
+      .filter((name) => name.endsWith(".json") && !name.startsWith("."))
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+    if (files.length <= cap) return
+    const excess = files.length - cap
+    for (let i = 0; i < excess; i++) {
+      try {
+        unlinkSync(join(dir, files[i]))
+      } catch {}
+    }
+  } catch {}
+}
+
+/**
+ * Persist one structured JSON manifest per non-diagnostic containment refusal,
+ * outside the run directory, bounded and pruned. Never throws into the writer.
+ */
+function persistIncidentManifest(record) {
+  if (!record || record.event === "anomaly_ack" || record.event === "write_intent" || record.event === "write_commit") {
+    return null
+  }
+  if (DIAGNOSTIC_ANOMALY_KINDS.has(record.kind)) return null
+  try {
+    const dir = writeIncidentDir()
+    mkdirSync(dir, { recursive: true })
+    const manifest = buildIncidentManifest(record)
+    const stamp = String(manifest.at).replace(/[:.]/g, "-")
+    const fileName = `${stamp}-${randomBytes(4).toString("hex")}.json`
+    const tempPath = join(dir, `.${fileName}.tmp`)
+    const finalPath = join(dir, fileName)
+    writeFileSync(tempPath, JSON.stringify(manifest, null, 2) + "\n", { mode: 0o600 })
+    renameSync(tempPath, finalPath)
+    pruneIncidentDir(dir)
+    return finalPath
+  } catch {
+    return null
+  }
+}
+
+/**
+ * List structured containment incident manifests recorded outside the run
+ * (optionally filtered to one `run`). Oldest first.
+ */
+export function listContainmentIncidents(run, options = {}) {
+  const dir = options?.incidentDir ? resolve(String(options.incidentDir)) : writeIncidentDir(options?.env ?? process.env)
+  const out = []
+  let files = []
+  try {
+    files = readdirSync(dir)
+      .filter((name) => name.endsWith(".json") && !name.startsWith("."))
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+  } catch {
+    return out
+  }
+  for (const name of files) {
+    const full = join(dir, name)
+    const read = readRegularBounded(full, MAX_INCIDENT_FILE_BYTES)
+    if (read.status !== "ok") continue
+    try {
+      const parsed = JSON.parse(read.text)
+      if (!parsed || typeof parsed !== "object") continue
+      if (run && !sameRun(parsed.run, run)) continue
+      out.push({ ...parsed, file: full })
+    } catch {}
+  }
+  return out
+}
+
 function anomalyKey(record) {
   return `${record.at}|${record.kind}|${record.run ?? ""}|${record.name ?? ""}|${record.detail ?? ""}`
 }
 
 function persistWriteAnomaly(record) {
+  let fd = null
   try {
     const file = writeAnomalyAuditPath()
     mkdirSync(dirname(file), { recursive: true })
-    let size = 0
-    try {
-      size = statSync(file).size
-    } catch {}
-    if (size > MAX_ANOMALY_AUDIT_BYTES) {
-      const tail = readRegularBounded(file, MAX_ANOMALY_AUDIT_TAIL_BYTES)
-      const text = tail.status === "ok" ? tail.text.slice(tail.text.indexOf("\n") + 1) : ""
-      writeFileSync(file, text, { mode: 0o600 })
-    }
+    const nofollow = fsConstants.O_NOFOLLOW || 0
+    fd = openSync(file, fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_APPEND | nofollow, 0o600)
+    const st = fstatSync(fd)
+    if (!st.isFile()) return
     const line = JSON.stringify({ ...record, id: record.id ?? anomalyKey(record).slice(0, 256) }) + "\n"
-    const fd = openSync(file, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_APPEND, 0o600)
-    try {
+    if (st.size > MAX_ANOMALY_AUDIT_BYTES) {
+      const cap = Math.min(st.size, MAX_ANOMALY_AUDIT_TAIL_BYTES)
+      const buf = Buffer.alloc(cap)
+      let total = 0
+      const startPos = Math.max(0, st.size - cap)
+      while (total < cap) {
+        let n
+        try {
+          n = readSync(fd, buf, total, cap - total, startPos + total)
+        } catch (err) {
+          if (err?.code === "EINTR") continue
+          throw err
+        }
+        if (n === 0) break
+        total += n
+      }
+      const rawTail = buf.subarray(0, total).toString("utf8")
+      const nl = rawTail.indexOf("\n")
+      const tailText = nl >= 0 ? rawTail.slice(nl + 1) : ""
+      ftruncateSync(fd, 0)
+      writeAllSync(fd, Buffer.from(tailText + line, "utf8"))
+    } else {
       writeAllSync(fd, Buffer.from(line, "utf8"))
-    } finally {
-      closeSync(fd)
     }
   } catch {
     // A diagnostic must never break the writer.
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd)
+      } catch {}
+    }
   }
 }
 
@@ -761,7 +909,11 @@ export function writeAnomaliesForRun(run, options = {}) {
     seen.add(key)
     out.push({ ...record, acknowledged: acknowledgedAt(record) })
   }
-  out.sort((a, b) => String(a.at).localeCompare(String(b.at)))
+  out.sort((a, b) => {
+    const left = String(a.at)
+    const right = String(b.at)
+    return left < right ? -1 : left > right ? 1 : 0
+  })
   return out
 }
 
@@ -806,6 +958,8 @@ export function recordWriteAnomaly(entry) {
     } catch {}
   }
   persistWriteAnomaly(record)
+  const incidentFile = persistIncidentManifest(record)
+  if (incidentFile) record.incidentFile = incidentFile
   try {
     writeAuditSink?.(record)
   } catch {
@@ -873,7 +1027,7 @@ export function assertSingleSegment(name) {
 }
 
 /** The real path of an open descriptor (Linux /proc/self/fd only). Throws. */
-export function fdPath(fd) {
+function fdPath(fd) {
   return realpathSync(`${PROC_SELF_FD}/${fd}`)
 }
 
@@ -882,7 +1036,7 @@ export function fdPath(fd) {
  * The run root itself is accepted; " (deleted)" and every non-exact realpath are
  * refused. False when the mode is not "pinned" or the fd cannot be resolved.
  */
-export function fdExactly(real, fd) {
+function fdExactly(real, fd) {
   if (currentTraversalMode() !== "pinned") return false
   let path
   try {
@@ -915,26 +1069,49 @@ export function openPinnedRoot(run) {
       "refused: a pinned run directory requires Linux /proc/self/fd; nothing was written",
     )
   }
-  let lst
-  try {
-    lst = lstatSync(run)
-  } catch (err) {
-    if (err?.code === "ENOENT") return refused("run-missing", "refused: run directory does not exist")
-    return refused("unreadable", "refused: run directory is not accessible")
-  }
-  if (lst.isSymbolicLink()) return refused("run-symlink", "refused: run directory is a symlink")
-  if (!lst.isDirectory()) return refused("run-not-directory", "refused: run path is not a directory")
-  let real
-  try {
-    real = realpathSync(run)
-  } catch {
-    return refused("unreadable", "refused: run directory is not resolvable")
-  }
   let fd = null
   try {
     fd = openSync(run, fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY || 0) | (fsConstants.O_NOFOLLOW || 0))
   } catch (err) {
-    return refused("unreadable", `refused: cannot open run directory (${sanitize(err?.code || err?.message)})`)
+    const code = err?.code
+    if (code === "ENOENT") return refused("run-missing", "refused: run directory does not exist")
+    if (code === "ELOOP" || code === "EMLINK") return refused("run-symlink", "refused: run directory is a symlink")
+    if (code === "ENOTDIR") {
+      // Linux returns ENOTDIR (not ELOOP) when O_DIRECTORY|O_NOFOLLOW meets a
+      // symlink, so classify from lstat. This only sharpens the diagnostic; the
+      // refusal itself already happened in open(2) above.
+      let isSymlink = false
+      try {
+        isSymlink = lstatSync(run).isSymbolicLink()
+      } catch {}
+      if (isSymlink) return refused("run-symlink", "refused: run directory is a symlink")
+      return refused("run-not-directory", "refused: run path is not a directory")
+    }
+    return refused("unreadable", `refused: cannot open run directory (${sanitize(code || err?.message)})`)
+  }
+  let st
+  try {
+    st = fstatSync(fd)
+  } catch (err) {
+    try {
+      closeSync(fd)
+    } catch {}
+    return refused("unreadable", `refused: cannot stat run directory (${sanitize(err?.code || err?.message)})`)
+  }
+  if (!st.isDirectory()) {
+    try {
+      closeSync(fd)
+    } catch {}
+    return refused("run-not-directory", "refused: run path is not a directory")
+  }
+  let real
+  try {
+    real = realpathSync(run)
+  } catch {
+    try {
+      closeSync(fd)
+    } catch {}
+    return refused("unreadable", "refused: run directory is not resolvable")
   }
   if (!fdExactly(real, fd)) {
     try {
@@ -946,7 +1123,7 @@ export function openPinnedRoot(run) {
 }
 
 /** Open one child directory relative to a pinned parent (never follows a link). */
-export function openChildDir(parentFd, name) {
+function openChildDir(parentFd, name) {
   assertSingleSegment(name)
   return openSync(
     `${PROC_SELF_FD}/${parentFd}/${name}`,
@@ -955,20 +1132,26 @@ export function openChildDir(parentFd, name) {
 }
 
 /** Open a child directory, creating exactly that one segment when absent. */
-export function openOrCreateDir(parentFd, name) {
+function openOrCreateDir(parentFd, name) {
   assertSingleSegment(name)
   const path = `${PROC_SELF_FD}/${parentFd}/${name}`
   const flags = fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY || 0) | (fsConstants.O_NOFOLLOW || 0)
+  let suppressedMkdirErr = null
+  try {
+    mkdirSync(path, { mode: 0o700 })
+  } catch (mkdirErr) {
+    const code = mkdirErr?.code
+    if (code === "EROFS" || code === "EACCES") {
+      suppressedMkdirErr = mkdirErr
+    } else if (code !== "EEXIST") {
+      throw mkdirErr
+    }
+  }
   try {
     return openSync(path, flags)
-  } catch (err) {
-    if (err?.code !== "ENOENT") throw err
-    try {
-      mkdirSync(path, { mode: 0o700 })
-    } catch (mkdirErr) {
-      if (mkdirErr?.code !== "EEXIST") throw mkdirErr
-    }
-    return openSync(path, flags)
+  } catch (openErr) {
+    if (openErr?.code === "ENOENT" && suppressedMkdirErr) throw suppressedMkdirErr
+    throw openErr
   }
 }
 
@@ -1186,7 +1369,7 @@ export function writeFileAtomicAt(dirFd, name, content, options = {}) {
 }
 
 /** Create `name` once (O_CREAT|O_EXCL|O_NOFOLLOW). `EEXIST` is propagated. */
-export function writeOnceAt(dirFd, name, content, options = {}) {
+function writeOnceAt(dirFd, name, content, options = {}) {
   assertSingleSegment(name)
   const data = toBuffer(content)
   const destPath = `${PROC_SELF_FD}/${dirFd}/${name}`
@@ -1229,7 +1412,7 @@ export function writeOnceAt(dirFd, name, content, options = {}) {
 }
 
 /** Create `name` with `content` only if it does not exist; EEXIST is a no-op. */
-export function touchAt(dirFd, name, content, options = {}) {
+function touchAt(dirFd, name, content, options = {}) {
   try {
     return writeOnceAt(dirFd, name, content, options)
   } catch (err) {
@@ -1244,7 +1427,7 @@ export function touchAt(dirFd, name, content, options = {}) {
  * is built from *that* descriptor (so a sequence number cannot be computed from
  * a different inode), written with one non-positional write, and fsync'ed.
  */
-export function appendLineAt(dirFd, name, buildLineFromFd, options = {}) {
+function appendLineAt(dirFd, name, buildLineFromFd, options = {}) {
   assertSingleSegment(name)
   const destPath = `${PROC_SELF_FD}/${dirFd}/${name}`
   let fd = null
@@ -1286,7 +1469,7 @@ export function appendLineAt(dirFd, name, buildLineFromFd, options = {}) {
 }
 
 /** Unlink `name` inside a pinned directory (cleanup helper). */
-export function unlinkAt(dirFd, name) {
+function unlinkAt(dirFd, name) {
   assertSingleSegment(name)
   try {
     unlinkSync(`${PROC_SELF_FD}/${dirFd}/${name}`)
@@ -1780,26 +1963,44 @@ function detectiveTarget(run, relPath, options = {}) {
   return { dest, dirReal, runReal, run, name: segments[segments.length - 1], segments, ancestors }
 }
 
-function detectivePostCheck(target, recorded) {
+function detectivePostCheck(target, recorded, tempName = null) {
   try {
     verifyAncestorIdentities(target, "post-write")
     const dirReal = realpathSync(dirname(target.dest))
+    const pinnedIdentity = recorded ? { dev: recorded.dev, ino: recorded.ino } : null
     if (dirReal !== target.runReal && !isPathWithin(target.runReal, dirReal)) {
       recordWriteAnomaly({
         kind: "detective-containment",
+        phase: "post-write",
         run: target.run ?? null,
         name: target.name,
-        detail: "post-write parent realpath is outside the run",
+        targetRealpathBefore: target.dirReal ?? null,
+        targetRealpathAfter: dirReal,
+        pinnedIdentity,
+        observedIdentity: null,
+        intendedDigest: recorded?.sha256 ?? null,
+        intendedBytes: recorded?.bytes ?? null,
+        tempName,
+        detail: "post-write parent realpath is outside the run; detection is a report about an event that already happened",
       })
       throw refusalError("containment", "refused: post-write containment check failed")
     }
     const after = lstatSync(target.dest)
+    const observedIdentity = { dev: after.dev, ino: after.ino }
     if (!after.isFile() || !sameIdentity(after, recorded)) {
       recordWriteAnomaly({
         kind: "detective-identity",
+        phase: "post-write",
         run: target.run ?? null,
         name: target.name,
-        detail: "post-write inode does not match the temp inode",
+        targetRealpathBefore: target.dirReal ?? null,
+        targetRealpathAfter: dirReal,
+        pinnedIdentity,
+        observedIdentity,
+        intendedDigest: recorded?.sha256 ?? null,
+        intendedBytes: recorded?.bytes ?? null,
+        tempName,
+        detail: "post-write inode does not match the temp inode; detection is a report about an event that already happened",
       })
       throw refusalError("identity", `refused: "${sanitize(target.name)}" failed the post-write identity check`)
     }
@@ -1812,19 +2013,39 @@ function detectivePostCheck(target, recorded) {
       if (reread.status !== "ok" || sha256Bytes(reread.bytes ?? Buffer.from(reread.text, "utf8")) !== recorded.sha256) {
         recordWriteAnomaly({
           kind: "detective-identity",
+          phase: "post-write",
           run: target.run ?? null,
           name: target.name,
-          detail: "post-write bytes do not match the bytes that were written (same inode, different content)",
+          targetRealpathBefore: target.dirReal ?? null,
+          targetRealpathAfter: dirReal,
+          pinnedIdentity,
+          observedIdentity,
+          intendedDigest: recorded.sha256,
+          intendedBytes: recorded.bytes,
+          tempName,
+          detail: "post-write bytes do not match the bytes that were written (same inode, different content); detection is a report about an event that already happened",
         })
         throw refusalError("identity", `refused: "${sanitize(target.name)}" failed the post-write byte-identity check`)
       }
     }
   } catch (err) {
     if (err?.code === "EREFUSED") throw err
+    let dirRealAfter = null
+    try {
+      dirRealAfter = realpathSync(dirname(target.dest))
+    } catch {}
     recordWriteAnomaly({
       kind: "detective-postcheck",
+      phase: "post-write",
       run: target.run ?? null,
       name: target.name,
+      targetRealpathBefore: target.dirReal ?? null,
+      targetRealpathAfter: dirRealAfter,
+      pinnedIdentity: recorded ? { dev: recorded.dev, ino: recorded.ino } : null,
+      observedIdentity: null,
+      intendedDigest: recorded?.sha256 ?? null,
+      intendedBytes: recorded?.bytes ?? null,
+      tempName,
       detail: sanitize(err?.message),
     })
     throw refusalError("postcheck", "refused: post-write containment check failed")
@@ -1884,7 +2105,7 @@ function writeFileAtomicDetective(run, relPath, content, options) {
       options.afterRename({ dirFd: null, tempName: temp, destName: target.name, destPath: target.dest })
     }
     phase = "post-check"
-    detectivePostCheck(target, recorded)
+    detectivePostCheck(target, recorded, basename(temp))
     completeDetectiveWriteIntent(intent)
     return { status: "ok", bytes: data.length, name: target.name, path: target.dest }
   } catch (err) {
@@ -2080,4 +2301,95 @@ function appendLineDetective(run, relPath, buildLineFromFd, options) {
       } catch {}
     }
   }
+}
+
+const TRUSTED_BIN_NAME = /^[A-Za-z0-9._-]+$/
+const STANDARD_POSIX_BIN_DIRS = ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]
+
+function isTrustedExecutableDir(dir, currentUid) {
+  if (!dir || !isAbsolute(dir)) return false
+  try {
+    const st = statSync(dir)
+    if (!st.isDirectory()) return false
+    if (process.platform === "win32") return true
+    if ((st.mode & 0o002) !== 0) return false
+    if (currentUid !== null && st.uid !== 0 && st.uid !== currentUid) return false
+    return true
+  } catch {
+    return false
+  }
+}
+
+function resolveExecutableInDir(dir, binName, pathext) {
+  if (process.platform === "win32") {
+    const lower = binName.toLowerCase()
+    const hasExt = pathext.some((ext) => ext && lower.endsWith(ext.toLowerCase()))
+    const candidates = hasExt ? [binName] : [binName, ...pathext.map((ext) => `${binName}${ext}`)]
+    for (const name of candidates) {
+      const full = join(dir, name)
+      try {
+        if (statSync(full).isFile()) return full
+      } catch {}
+    }
+    return null
+  }
+  const full = join(dir, binName)
+  try {
+    const st = statSync(full)
+    if (!st.isFile()) return null
+    if ((st.mode & 0o002) !== 0) return null
+    accessSync(full, fsConstants.X_OK)
+    return full
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Resolve a command name (`git`, `sqlite3`, `opencode`, `mkfifo`, etc.) to a
+ * validated absolute executable path, avoiding unqualified `PATH` lookup
+ * (Sonar S4036). Searches trusted `PATH` entries in order (absolute, existing,
+ * non-world-writable, owned by root or the current user) unless
+ * `options.standardOnly` is true, then falls back to standard immutable POSIX
+ * directories (`["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]`).
+ */
+export function resolveTrustedExecutable(binName, options = {}) {
+  if (typeof binName !== "string" || !TRUSTED_BIN_NAME.test(binName)) return null
+  // "." and ".." match the character class but are directory aliases, never
+  // executable names. Reject them before any join() can traverse a directory.
+  if (binName === "." || binName === "..") return null
+  const env = options?.env ?? process.env
+  const currentUid = typeof process.getuid === "function" ? process.getuid() : null
+  const pathext =
+    process.platform === "win32"
+      ? String(env?.PATHEXT || ".COM;.EXE;.BAT;.CMD")
+          .split(";")
+          .filter(Boolean)
+      : []
+
+  const candidates = []
+  const seen = new Set()
+  const addDir = (dir) => {
+    const trimmed = typeof dir === "string" ? dir.trim() : ""
+    if (!trimmed || seen.has(trimmed)) return
+    seen.add(trimmed)
+    candidates.push(trimmed)
+  }
+
+  if (!options?.standardOnly && options?.allowPath !== false) {
+    const rawPath = String(env?.PATH ?? "")
+    for (const entry of rawPath.split(pathDelimiter)) {
+      addDir(entry)
+    }
+  }
+  if (process.platform !== "win32" && options?.fallbackToStandard !== false) {
+    for (const dir of STANDARD_POSIX_BIN_DIRS) addDir(dir)
+  }
+
+  for (const dir of candidates) {
+    if (!isTrustedExecutableDir(dir, currentUid)) continue
+    const found = resolveExecutableInDir(dir, binName, pathext)
+    if (found) return found
+  }
+  return null
 }

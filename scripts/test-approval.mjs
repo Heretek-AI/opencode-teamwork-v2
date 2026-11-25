@@ -318,7 +318,7 @@ const die = (code, message) => { process.stdout.write(JSON.stringify({ ok: false
 const canon = (v) => {
   if (v === null) return "null"
   if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]"
-  if (typeof v === "object") return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + canon(v[k])).join(",") + "}"
+  if (typeof v === "object") return "{" + Object.keys(v).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).map((k) => JSON.stringify(k) + ":" + canon(v[k])).join(",") + "}"
   return JSON.stringify(v)
 }
 const sha256 = (value) => createHash("sha256").update(value).digest("hex")
@@ -1234,6 +1234,24 @@ try {
     assert(/OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR is not set/.test(noDir.stderr), noDir.stderr)
 
     console.log("✓ producer writes the documented file; the v2 stub accepts it; wrong digest/path/runId/expiry/replay fail; in-run output refused")
+  }
+
+  // Negative traversal tests for scripts/approval-driver.mjs (Sonar jssecurity:S8707).
+  {
+    console.log("Testing approval-driver runId path traversal refusal...")
+    const drvRoot = mkdtempSync(join(testDir, "drv-traversal-"))
+    const drvStorage = join(drvRoot, "storage.json")
+    for (const badRunId of ["../escape", "bad/id", "..", ".hidden", ""]) {
+      const res = spawnSync(
+        process.execPath,
+        [DRIVER, JSON.stringify({ root: drvRoot, storage: drvStorage, action: "write-draft", runId: badRunId, draft: "x" })],
+        { encoding: "utf8", timeout: 30_000 },
+      )
+      assert.strictEqual(res.status, 2, `bad runId ${JSON.stringify(badRunId)} must exit 2, got ${res.status}`)
+    }
+    assert(!existsSync(join(drvRoot, ".opencode", "escape", "prompt_draft.md")), "traversal must not write outside .opencode/teamwork")
+    assert(!existsSync(join(drvRoot, "escape", "prompt_draft.md")), "traversal must not write into root")
+    console.log("✓ approval-driver rejects traversal/invalid runIds with exit 2")
   }
 
   console.log("All authenticated prompt-approval tests passed")

@@ -1,0 +1,42 @@
+[Unit]
+Description=Teamwork Non-Oracle Signer Service (v2)
+Requires=teamwork-signer.socket
+After=teamwork-signer.socket
+
+[Service]
+Type=simple
+User=teamwork-signer
+Group=teamwork-signer
+ExecStart=/usr/local/bin/teamwork-signer \
+  --socket /run/teamwork-signer/signer.sock \
+  --key-file /etc/teamwork/signer-ed25519.pem \
+  --key-id signer_prod \
+  --approval-dir /var/lib/teamwork-approvals/signer \
+  --approver-key /etc/teamwork/approver-ed25519.pub \
+  --approver-key-id approver_prod \
+  --audit-log /var/log/teamwork/signer-audit.jsonl \
+  --ledger /var/lib/teamwork-signer/ledger.jsonl \
+  --max-request-bytes 262144 \
+  --max-approval-bytes 65536 \
+  --max-approval-ttl 86400 \
+  --clock-skew 300
+Restart=on-failure
+RestartSec=2s
+
+# Hardening directives per docs/SIGNER-PROTOCOL.md & docs/ADMIN-HARDENING.md
+NoNewPrivileges=yes
+MemoryDenyWriteExecute=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+UMask=0077
+ReadWritePaths=/run/teamwork-signer /var/log/teamwork /var/lib/teamwork-signer
+ReadOnlyPaths=/etc/teamwork /var/lib/teamwork-approvals/signer

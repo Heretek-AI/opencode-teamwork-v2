@@ -561,11 +561,12 @@ await check("CLI: `--session <id>` selects the named run (no unknown-argument wa
 // would already contain anything a broken `-o -` path leaked before this snapshot is taken.
 await check("CLI: `-o -` writes the document to stdout and creates no file", () => {
   const cleanRoot = makeRun()
-  const before = readdirSync(cleanRoot).sort()
+  const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+  const before = readdirSync(cleanRoot).sort(cmp)
   const res = runCli(["export", SESSION, "-o", "-"], cleanRoot)
   assert.strictEqual(res.status, 0, `-o - must exit 0, got ${res.status}: ${res.stderr}`)
   assert.strictEqual(res.stdout, renderExport(healthyData, { format: "html" }), "stdout must be exactly the rendered document")
-  assert.deepStrictEqual(readdirSync(cleanRoot).sort(), before, "-o - must not create any file in the project root")
+  assert.deepStrictEqual(readdirSync(cleanRoot).sort(cmp), before, "-o - must not create any file in the project root")
   assert(!existsSync(join(runDirOf(cleanRoot, SESSION), "report.html")), "-o - must not write the default report.html either")
 })
 

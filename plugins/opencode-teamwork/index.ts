@@ -18,7 +18,7 @@
 // loader never has to resolve node_modules for this file. The object shape below
 // is exactly what Plugin.define({ id, setup }) produces.
 
-import { registerTeamworkTools, registerTeamworkHooks } from "./tools.ts"
+import { parseTeamworkLaunch, registerTeamworkHooks, registerTeamworkTools } from "./tools.ts"
 
 type CommandSpec = {
   name: string
@@ -35,14 +35,14 @@ export const COMMANDS: CommandSpec[] = [
     agent: "team/sentinel",
     template: `$ARGUMENTS
 
-Look in \`.opencode/teamwork/\` for a recent \`prompt_draft.md\`. If you find one, ask the user to confirm the session ID. If not, run \`teamwork_route\` first (which checks \`document-review\` BEFORE Math/Proof when a document is supplied for critique, while rejecting PR/code reviews, bare filenames without supplied docs, and theorem-solving/coding requests), then ask 1-2 short questions if ambiguous or run the crafter (via /teamwork-craft) or proceed.
+Look in \`.opencode/teamwork/\` for a recent \`prompt_draft.md\`. If you find one, ask the user to confirm the session ID. If the task text above is empty, ask the user what task they would like to run; do not route or plan until they answer. Otherwise, require a non-empty \`prompt_draft.md\` before running \`teamwork_route\` (which checks \`document-review\` BEFORE Math/Proof when a document is supplied for critique, while rejecting PR/code reviews, bare filenames without supplied docs, and theorem-solving/coding requests). The one exception is a launch whose parameters say \`skipInterview=true\`: record that bypass and route immediately without the pre-routing interview. If the task is still ambiguous after routing, ask 1-2 short questions or run the crafter (via /teamwork-craft), then proceed.
 
 Then:
 
 0. Budget preflight: call \`teamwork_budget\`. If it reports console-credit budgeting applies (opencode/ models + opencode_console connected), call \`opencode_console_get_usage\`, compute \`remaining = min(limitDollars - spentDollars)\`, and ASK THE USER whether to use the FULL remaining budget or PARTIAL (half). Pass the choice to \`teamwork_plan\` or \`teamwork_document_triage\` as \`budgetUsd\` with \`budgetSource: "credits"\`.
 1. Plan the run:
    - For \`document-review\`: call \`teamwork_document_triage\` with \`sessionId\`, the supplied \`document\` (\`path\` / \`url\` / \`content\`), \`request\`, \`fetchUrl: true\` (when a URL is supplied without inline \`content\`), and bounded tree shapes (\`maxSegments <= 8\`, \`reviewTreeShape <= [4,2,1]\`, \`synthTreeShape <= [4,1]\`). Skip git worktrees for \`document-review\`.
-   - For coding / proof topologies: load the spec, then call \`teamwork_plan\` with the route's \`topology\` and the concrete task list \`tasks: [{ id, dependsOn, agent, maxRounds }]\` (both are required); pass the user's **verbatim** request (the text after /teamwork, before any spec rewrite) as \`request\` so \`<run>/ORIGINAL_REQUEST.md\` is written once, and pass the spec's numbered requirements as \`requirements: [{ id, text }]\` when it has acceptance criteria (otherwise the request-derived R1 is the baseline). Leave \`victoryAudit\` at its default \`required\`; only an explicit, recorded \`skip\` may bypass the final audit. Leave \`requireHandoffs\` at its default \`required\` when a request/requirements baseline exists; an explicit, recorded \`skip\` is allowed outside benchmark mode but is not the default. Pass \`verification: "strict"\` only when the user explicitly opts into strict verification (one falsifier challenge + one security-auditor audit per task); otherwise leave the \`standard\` default. It returns the canonical \`SESSION_ID\`. Never use a session id read from a file. Provision the sentinel worktree OUTSIDE the repo, quoting both args: \`git worktree add "\${TEAMWORK_WORKTREES_DIR:-../.teamwork-worktrees}/$SESSION_ID/sentinel" -b "teamwork/base-$SESSION_ID"\` (skip if not in a git repo).
+   - For coding / proof topologies: load the spec, then call \`teamwork_plan\` with the route's \`topology\` and the concrete task list \`tasks: [{ id, dependsOn, agent, maxRounds }]\` (both are required); pass the user's **verbatim** request (the text after /teamwork, before any spec rewrite) as \`request\` so \`<run>/ORIGINAL_REQUEST.md\` is written once, and pass the spec's numbered requirements as \`requirements: [{ id, text }]\` when it has acceptance criteria (otherwise the request-derived R1 is the baseline). Leave \`victoryAudit\` at its default \`required\`; only an explicit, recorded \`skip\` may bypass the final audit. Leave \`requireHandoffs\` at its default \`required\` when a request/requirements baseline exists; an explicit, recorded \`skip\` is allowed outside benchmark mode but is not the default. Pass \`verification: "strict"\` when the user explicitly opts in (one falsifier challenge + one security-auditor audit per task); \`distributed-coding\` already defaults to \`strict\`, so pass \`verification: "standard"\` only when the user explicitly opts out. Other topologies default to \`standard\`. It returns the canonical \`SESSION_ID\`. Never use a session id read from a file. Provision the sentinel worktree OUTSIDE the repo, quoting both args: \`git worktree add "\${TEAMWORK_WORKTREES_DIR:-../.teamwork-worktrees}/$SESSION_ID/sentinel" -b "teamwork/base-$SESSION_ID"\` (skip if not in a git repo).
 2. Build / inspect the DAG in \`.opencode/teamwork/<session-id>/plan.dag.json\`. Independent tasks run in parallel; dependent ones in topological order.
 3. Dispatch workers in topological order. Pass the run id (\`SESSION_ID\`) in every prompt and require each child to call \`teamwork_handoff({ sessionId: SESSION_ID, taskId, observation, logicChain, caveats, conclusion, verificationMethod })\` before reporting back; read \`.opencode/teamwork/<session-id>/handoffs/\` instead of replaying the child session.
    - For \`document-review\`: dispatch \`team/segment-reviewer\` per segment (\`seg-01\`..\`seg-0K\`) to persist bounded RSA nodes and \`unit-report.md\` via \`teamwork_document_record\`, then dispatch \`team/synthesizer\` on \`doc-synthesis\` to record \`synthesis/candidate-<I>.md\` and \`DOCUMENT_REVIEW_REPORT.md\` via \`teamwork_document_record\`.
@@ -55,7 +55,7 @@ Then:
 8. Independent victory audit (mandatory fidelity gate): after the milestone gate PASS, dispatch a **fresh-session** \`team/victory-auditor\` with \`ORIGINAL_REQUEST.md\` and \`requirements.json\`. It must inspect the delivered artifacts and run/inspect the tests itself, then call \`teamwork_victory_audit\` with \`VICTORY CONFIRMED\` or \`VICTORY REJECTED\`, then call \`teamwork_handoff\` with the run id (omit \`taskId\`) so its run-level handoff cites \`verify/victory.json\`. Only report completion after \`CONFIRMED\` and \`teamwork_next\` returns \`ALL_PASSED\` (or the plan explicitly recorded \`victoryAudit: "skip"\`). On \`REJECTED\`, forward its findings and resume the team.
 
 Hard caps (override in the spec if the user asks):
-- 4 rounds per task (6 for proof, 1 for small-focused, 24h for massive-proof — explicit opt-in only, bounded tournament levels + budget preflight)
+- 4 rounds per task (up to 32 for small-focused, 6 for proof, 24h for massive-proof — explicit opt-in only, bounded tournament levels + budget preflight)
 - Budget: derived from opencode_console credits when available (full or partial, per the user), else the default $20 session budget
 
 When done, write \`.opencode/teamwork/<session-id>/final.md\` and present. Tell the user:
@@ -116,7 +116,7 @@ If you want the v2 features (DAG engine, git worktrees per agent, typed artifact
   {
     name: "team-propose",
     description:
-      "Run only the propose step. Generates N candidate solutions in parallel and writes them under .opencode/teamwork/. Use when you want to inspect raw candidates before the falsifier step.",
+      "Legacy v1 command; prefer /teamwork for new runs. Run only the propose step. Generates N candidate solutions in parallel and writes them under .opencode/teamwork/. Use when you want to inspect raw candidates before the falsifier step.",
     agent: "team/orchestrator",
     template: `$ARGUMENTS
 
@@ -136,7 +136,7 @@ Report back: where the candidates are, a 1-line summary of each, and any pattern
   {
     name: "team-falsify",
     description:
-      "Run only the falsifier step on existing candidates. Use after /team-propose to get adversarial critique before deciding to synthesize.",
+      "Legacy v1 command; prefer /teamwork for new runs. Run only the falsifier step on existing candidates. Use after /team-propose to get adversarial critique before deciding to synthesize.",
     agent: "team/orchestrator",
     template: `$ARGUMENTS
 
@@ -157,7 +157,7 @@ Report back: the summary and a recommendation ("synthesis likely unnecessary, al
   {
     name: "team-synthesize",
     description:
-      "Run the synthesizer on existing candidates + critiques. Use after /team-falsify when candidates have been critiqued and a merge is needed.",
+      "Legacy v1 command; prefer /teamwork for new runs. Run the synthesizer on existing candidates + critiques. Use after /team-falsify when candidates have been critiqued and a merge is needed.",
     agent: "team/orchestrator",
     template: `$ARGUMENTS
 
@@ -175,7 +175,7 @@ Report back: where the synthesis is, what was kept from each source candidate, a
   {
     name: "team-review",
     description:
-      "Run the verifier on the current synthesis or candidate. Use after /team-synthesize (or directly on a candidate) to get a binary PASS/FAIL with evidence.",
+      "Legacy v1 command; prefer /teamwork for new runs. Run the verifier on the current synthesis or candidate. Use after /team-synthesize (or directly on a candidate) to get a binary PASS/FAIL with evidence.",
     agent: "team/orchestrator",
     template: `$ARGUMENTS
 
@@ -257,6 +257,11 @@ export async function warnMissingAgents(configDir?: string): Promise<{ configDir
 export default {
   id: "opencode-teamwork",
   async setup(ctx: any) {
+    // Process-level kill switch (docs/ARTIFACTS.md). Checked before the version
+    // warning, agent verification, tool registration, hooks, and commands, so a
+    // disabled plugin touches nothing.
+    const disabled = String(process.env.OPENCODE_TEAMWORK_DISABLED ?? "").trim().toLowerCase()
+    if (disabled === "1" || disabled === "true") return
     const versionCheck = checkOpencodeVersion(ctx?.app?.version)
     if (!versionCheck.ok) console.warn(`[opencode-teamwork] ${versionCheck.warning}`)
     await warnMissingAgents()
@@ -273,7 +278,31 @@ export default {
             // must switch the session agent explicitly.
             await ctx.session.switchAgent({ sessionID, agent: cmd.agent })
             const args = typeof prompt?.text === "string" ? prompt.text : ""
-            const text = cmd.template.split("$ARGUMENTS").join(args)
+            let text: string
+            if (cmd.name === "teamwork") {
+              // A1: only a leading [skip-interview] is a launch parameter. An
+              // empty remainder must ask the user instead of loading the routing
+              // template (which names teamwork_plan and the DAG).
+              const parsed = parseTeamworkLaunch(args)
+              if (parsed.text.trim() === "") {
+                text = "Ask the user what task they would like to run. Do not route or plan until they answer."
+              } else {
+                const launchLines = [`Launch parameters: skipInterview=${parsed.skipInterview ? "true" : "false"}.`]
+                if (parsed.skipInterview) {
+                  launchLines.push(
+                    "The leading [skip-interview] bracket was stripped from the task text; skip the pre-routing interview and record the bypass before routing.",
+                  )
+                }
+                if (parsed.ignoredBracket) {
+                  launchLines.push(
+                    `Ignored leading bracket: ${parsed.ignoredBracket} (not a recognised parameter; it remains part of the task).`,
+                  )
+                }
+                text = `${cmd.template.split("$ARGUMENTS").join(parsed.text)}\n\n${launchLines.join("\n")}`
+              }
+            } else {
+              text = cmd.template.split("$ARGUMENTS").join(args)
+            }
             await ctx.session.prompt({ ...prompt, sessionID, text, delivery })
           },
         })

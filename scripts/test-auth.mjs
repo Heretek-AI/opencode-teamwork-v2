@@ -429,7 +429,7 @@ try {
       assert(!("runId" in v1Request), "v1 has no runId")
       assert(!("approvalRef" in v1Request), "v1 has no approvalRef")
       assert.deepStrictEqual(
-        Object.keys(v1Request).sort(),
+        Object.keys(v1Request).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
         ["alg", "at", "digest", "keyId", "message", "nonce", "path", "v"],
         "the v1 request stays byte-compatible",
       )

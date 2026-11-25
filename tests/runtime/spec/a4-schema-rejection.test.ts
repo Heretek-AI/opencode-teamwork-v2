@@ -90,3 +90,52 @@ test("A4 an unknown nested property is refused and names its path", async () => 
     project.cleanup()
   }
 })
+
+test("A4 anyOf failure names the attempted branches and their reasons", async () => {
+  const project = createProject("a4-schema-anyof")
+  const loaded = await loadHost(project, { mode: "memory" })
+  try {
+    const tools = await openLocationTools(loaded, project.root)
+    toolById(tools, "teamwork_document_record")
+    const session = await loaded.host.sessions.create({ location: { directory: project.root } })
+    const target = { sessionID: session.id, agent: "team/sentinel" }
+
+    const refused = runtimeExecute(
+      tools,
+      "teamwork_document_record",
+      {
+        stage: "segment_analysis",
+        summary: "checked",
+        findings: [{ id: "F1", unexpectedField: 123 }],
+      },
+      target,
+    )
+    await expect(refused).rejects.toThrow(/findings\[0\].*branch 0 \(string\)/)
+    await expect(refused).rejects.toThrow(/branch 1 \(object\): unexpectedField: unknown property/)
+  } finally {
+    await loaded.close()
+    project.cleanup()
+  }
+})
+
+test("A4 host-repair-disabled fixture still rejects unknown keys", async () => {
+  const project = createProject("a4-schema-no-repair")
+  const loaded = await loadHost(project, { mode: "memory" })
+  try {
+    const tools = await openLocationTools(loaded, project.root)
+    const routeTool = toolById(tools, "teamwork_route")
+    // Simulate a host without opencode.tool.input.repair (and with patternProperties stripped):
+    // direct Standard Schema validation still rejects unknown keys.
+    const schemaObj = routeTool.input["~standard"].jsonSchema.input({ target: "draft-2020-12" })
+    delete schemaObj.patternProperties
+    const result = routeTool.input["~standard"].validate({
+      request: "Rename the files in this directory.",
+      unexpectedProperty: true,
+    })
+    expect(result.issues).toBeDefined()
+    expect(result.issues.some((i: any) => i.path.join(".") === "unexpectedProperty" && /unknown property/.test(i.message))).toBe(true)
+  } finally {
+    await loaded.close()
+    project.cleanup()
+  }
+})

@@ -45,9 +45,14 @@ import {
   createDirWithin,
   fdContainmentMode,
   fdTraversalMode,
+  listContainmentIncidents,
   openPinnedRoot,
   pinParent,
+  readRegularBounded,
   recentWriteAnomalies,
+  resolveTrustedExecutable,
+  setIncidentDirForTest,
+  setMaxIncidentFilesForTest,
   setDarwinRootFdCheckForTest,
   setFdContainmentModeForTest,
   setFdTraversalModeForTest,
@@ -122,15 +127,14 @@ function makeFixture() {
 }
 
 function markerIn(dir) {
-  for (const name of readdirSync(dir)) {
-    const p = join(dir, name)
-    const st = lstatSync(p)
-    if (st.isDirectory()) {
+  for (const dirent of readdirSync(dir, { withFileTypes: true })) {
+    if (dirent.isSymbolicLink()) continue
+    const p = join(dir, dirent.name)
+    if (dirent.isDirectory()) {
       if (markerIn(p)) return true
-    } else if (st.isFile()) {
-      try {
-        if (readFileSync(p, "utf8").includes(MARKER)) return true
-      } catch {}
+    } else if (dirent.isFile()) {
+      const read = readRegularBounded(p, 1024 * 1024)
+      if (read.status === "ok" && read.text.includes(MARKER)) return true
     }
   }
   return false
@@ -183,6 +187,20 @@ check("static intermediate symlink: pinned write refuses, outside gains nothing"
     (err) => /refused/.test(String(err.message)),
   )
   assert.strictEqual(existsSync(join(outside, "report.json")), false)
+})
+
+check("openPinnedRoot classifies a symlinked run directory as run-symlink, not run-not-directory", () => {
+  if (!PINNED) {
+    console.log(`SKIP: pinned writes unavailable (mode=${fdTraversalMode()}) — root symlink reason not asserted`)
+    return
+  }
+  const target = join(testDir, "outside-root")
+  mkdirSync(target, { recursive: true })
+  if (!makeTestLink(target, join(testDir, "run-link"), "dir")) return
+  const root = openPinnedRoot(join(testDir, "run-link"))
+  assert.strictEqual(root.status, "refused")
+  assert.strictEqual(root.reason, "run-symlink")
+  assert.match(root.message, /symlink/)
 })
 
 check("negative control: the old path-based mkdir+write DOES escape through the symlink", () => {
@@ -457,7 +475,7 @@ await checkAsync("write-once: concurrent ORIGINAL_REQUEST writes -> one wins, on
     runChild(WRITE_ONCE_CHILD, { RUN: run, BODY: "REQ-A" }),
     runChild(WRITE_ONCE_CHILD, { RUN: run, BODY: "REQ-B" }),
   ])
-  const outcomes = [a.stdout.trim(), b.stdout.trim()].sort()
+  const outcomes = [a.stdout.trim(), b.stdout.trim()].sort((x, y) => (x < y ? -1 : x > y ? 1 : 0))
   assert.deepStrictEqual(outcomes, ["EEXIST", "OK"], `unexpected outcomes: ${a.stdout}|${b.stdout}|${a.stderr}|${b.stderr}`)
   const body = readFileSync(join(run, "ORIGINAL_REQUEST.md"), "utf8")
   assert(body === "REQ-A" || body === "REQ-B", "the winning bytes must be one complete request")
@@ -502,7 +520,12 @@ check("FIFO at the append target is refused without hanging (child timeout)", ()
   }
   const { run } = makeFixture()
   const fifo = join(run, "events.fifo")
-  const mk = spawnSync("mkfifo", [fifo], { encoding: "utf8" })
+  const mkfifoBin = resolveTrustedExecutable("mkfifo")
+  if (!mkfifoBin) {
+    console.log("SKIP: mkfifo unavailable")
+    return
+  }
+  const mk = spawnSync(mkfifoBin, [fifo], { encoding: "utf8" })
   if (mk.status !== 0) {
     console.log("SKIP: mkfifo unavailable")
     return
@@ -1337,6 +1360,63 @@ await checkAsync("mkdir fallback: an owner-write failure removes the directory a
   )
   assert.strictEqual(ran, false, "the critical section must not run without a published owner")
   assert.strictEqual(existsSync(crossProcessLockPath(target)), false, "the broken lock directory must be removed")
+})
+
+// ------------------------------------------------- 15. durable incident manifests (#42)
+
+check("detective swap leaves one structured incident manifest outside the run and prunes to cap", () => {
+  const { run } = makeFixture()
+  const incidentDir = join(testDir, "incidents-42")
+  const auditFile = join(testDir, "audit-42.jsonl")
+  setWriteAnomalyAuditPathForTest(auditFile)
+  setIncidentDirForTest(incidentDir)
+  setMaxIncidentFilesForTest(3)
+  setFdTraversalModeForTest("detective")
+  try {
+    // Force 4 detective-mode post-rename inode swaps; each must refuse and write
+    // one structured manifest, then prune down to the cap of 3.
+    for (let i = 0; i < 4; i++) {
+      assert.throws(
+        () =>
+          writeFileAtomicWithin(run, `swap-${i}.json`, JSON.stringify({ n: i }), {
+            afterRename: ({ destPath }) => {
+              unlinkSync(destPath)
+              writeFileSync(destPath, JSON.stringify({ n: -1 }))
+            },
+          }),
+        (err) => err.reason === "identity",
+      )
+    }
+    const files = readdirSync(incidentDir).filter((f) => f.endsWith(".json"))
+    assert.strictEqual(files.length, 3, `incident dir must be pruned to cap 3, got ${files.length}`)
+    const incidents = listContainmentIncidents(run, { incidentDir })
+    assert.strictEqual(incidents.length, 3)
+    const last = incidents[incidents.length - 1]
+    assert.strictEqual(last.v, 1)
+    assert.strictEqual(last.kind, "detective-identity")
+    assert.strictEqual(last.mode, "detective")
+    assert.strictEqual(last.platform, process.platform)
+    assert.strictEqual(last.phase, "post-write")
+    assert.strictEqual(last.run, run)
+    assert.ok(typeof last.targetRealpathBefore === "string" && last.targetRealpathBefore.length > 0)
+    assert.ok(typeof last.targetRealpathAfter === "string" && last.targetRealpathAfter.length > 0)
+    assert.ok(last.pinnedIdentity && Number.isFinite(last.pinnedIdentity.ino))
+    assert.ok(last.observedIdentity && Number.isFinite(last.observedIdentity.ino))
+    assert.notStrictEqual(last.pinnedIdentity.ino, last.observedIdentity.ino)
+    assert.match(String(last.intendedDigest), /^[0-9a-f]{64}$/)
+    assert.ok(Number.isFinite(last.intendedBytes) && last.intendedBytes > 0)
+    assert.ok(typeof last.tempName === "string" && last.tempName.endsWith(".tmp"))
+    assert.strictEqual(last.rollbackAttempted, false)
+    assert.match(String(last.note), /already happened/)
+    // Unacknowledged anomalies block final_verify / surface needs-inspection.
+    const pending = unacknowledgedWriteAnomalies(run, { auditPath: auditFile })
+    assert.ok(pending.length >= 4)
+  } finally {
+    setFdTraversalModeForTest(null)
+    setMaxIncidentFilesForTest(null)
+    setIncidentDirForTest(null)
+    setWriteAnomalyAuditPathForTest(null)
+  }
 })
 
 rmSync(testDir, { recursive: true, force: true })

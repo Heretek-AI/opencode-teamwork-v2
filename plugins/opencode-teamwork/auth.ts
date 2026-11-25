@@ -53,6 +53,7 @@ import { spawn } from "node:child_process"
 import { lstatSync, realpathSync } from "node:fs"
 import { isAbsolute, join } from "node:path"
 import {
+  AUTH_ED25519,
   artifactSignatureInput,
   canonicalJson,
   contentSha256Hex,
@@ -63,43 +64,41 @@ import {
   witnessSignatureInput,
 } from "./approval-format.mjs"
 
-export { artifactSignatureInput, canonicalJson, payloadDigest, sha256Hex }
+export { canonicalJson, payloadDigest, sha256Hex }
 
-export const AUTH_ALG = "hmac-sha256"
-export const AUTH_ED25519 = "ed25519"
+const AUTH_ALG = "hmac-sha256"
 export type AuthAlg = typeof AUTH_ALG | typeof AUTH_ED25519
-export const AUTH_VERSION = 1
 export const KEY_RING_STORAGE_KEY = "auth/key/ring"
 export const ENV_KEY = "OPENCODE_TEAMWORK_HMAC_KEY"
 export const ENV_KEY_ID = "OPENCODE_TEAMWORK_HMAC_KEY_ID"
-export const ENV_ED25519_PRIVATE_KEY = "OPENCODE_TEAMWORK_ED25519_PRIVATE_KEY"
-export const ENV_ED25519_PUBLIC_KEY = "OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY"
+const ENV_ED25519_PRIVATE_KEY = "OPENCODE_TEAMWORK_ED25519_PRIVATE_KEY"
+const ENV_ED25519_PUBLIC_KEY = "OPENCODE_TEAMWORK_ED25519_PUBLIC_KEY"
 export const ENV_ED25519_KEY_ID = "OPENCODE_TEAMWORK_ED25519_KEY_ID"
-export const ENV_SIGNER = "OPENCODE_TEAMWORK_SIGNER"
-export const ENV_SIGNER_PUBLIC_KEY = "OPENCODE_TEAMWORK_SIGNER_PUBLIC_KEY"
-export const ENV_SIGNER_KEY_ID = "OPENCODE_TEAMWORK_SIGNER_KEY_ID"
-export const ENV_SIGNER_TIMEOUT_MS = "OPENCODE_TEAMWORK_SIGNER_TIMEOUT_MS"
-export const ENV_WITNESS = "OPENCODE_TEAMWORK_WITNESS"
-export const ENV_WITNESS_TIMEOUT_MS = "OPENCODE_TEAMWORK_WITNESS_TIMEOUT_MS"
+const ENV_SIGNER = "OPENCODE_TEAMWORK_SIGNER"
+const ENV_SIGNER_PUBLIC_KEY = "OPENCODE_TEAMWORK_SIGNER_PUBLIC_KEY"
+const ENV_SIGNER_KEY_ID = "OPENCODE_TEAMWORK_SIGNER_KEY_ID"
+const ENV_SIGNER_TIMEOUT_MS = "OPENCODE_TEAMWORK_SIGNER_TIMEOUT_MS"
+const ENV_WITNESS = "OPENCODE_TEAMWORK_WITNESS"
+const ENV_WITNESS_TIMEOUT_MS = "OPENCODE_TEAMWORK_WITNESS_TIMEOUT_MS"
 /**
  * Verify-only witness key (0.14.0). When configured, final_verify requires a
  * signed witness receipt; when unset, a receipt is recorded as `unverified`.
  */
-export const ENV_WITNESS_PUBLIC_KEY = "OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY"
-export const ENV_WITNESS_KEY_ID = "OPENCODE_TEAMWORK_WITNESS_KEY_ID"
+const ENV_WITNESS_PUBLIC_KEY = "OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY"
+const ENV_WITNESS_KEY_ID = "OPENCODE_TEAMWORK_WITNESS_KEY_ID"
 /**
  * Signer protocol v2 (0.14.0). When set, the command signer receives
  * `{v:2, op:"sign-artifact", runId, approvalRef, …}`; when unset, the exact v1
  * request is sent for byte-compatible back-compat.
  */
-export const ENV_SIGNER_APPROVAL_DIR = "OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR"
+const ENV_SIGNER_APPROVAL_DIR = "OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR"
 /**
  * Verify-only approval key (0.10.2). A human/CI approval must be signed by a
  * key distinct from the run's `runKeyId`; this public key is how the verifier
  * learns that key without making it the run's signing key.
  */
-export const ENV_APPROVAL_PUBLIC_KEY = "OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY"
-export const ENV_APPROVAL_KEY_ID = "OPENCODE_TEAMWORK_APPROVAL_KEY_ID"
+const ENV_APPROVAL_PUBLIC_KEY = "OPENCODE_TEAMWORK_APPROVAL_PUBLIC_KEY"
+const ENV_APPROVAL_KEY_ID = "OPENCODE_TEAMWORK_APPROVAL_KEY_ID"
 const KEY_RING_MAX_KEYS = 3
 const DEFAULT_TIMEOUT_MS = 5000
 const MAX_TIMEOUT_MS = 60000
@@ -145,7 +144,7 @@ export interface AuthEnvelope {
   at: string
 }
 
-export interface AuthIndexRecord {
+interface AuthIndexRecord {
   v: 1
   path: string
   digest: string
@@ -157,7 +156,7 @@ export interface AuthIndexRecord {
   at: string
 }
 
-export interface KeyRecord {
+interface KeyRecord {
   keyId: string
   /** Defaults to `hmac-sha256` for pre-Ed25519 rings. */
   alg?: AuthAlg
@@ -171,7 +170,7 @@ export interface KeyRecord {
   retiredAt?: string
 }
 
-export interface KeyRing {
+interface KeyRing {
   version: 1
   keys: KeyRecord[]
 }
@@ -245,7 +244,7 @@ function hmacHex(key: string, payload: string): string | undefined {
 }
 
 /** Length-safe comparison of two lowercase sha256 hex strings. */
-export function timingSafeEqualHex(a: unknown, b: unknown): boolean {
+function timingSafeEqualHex(a: unknown, b: unknown): boolean {
   if (typeof a !== "string" || typeof b !== "string") return false
   if (!SHA256_HEX.test(a) || !SHA256_HEX.test(b)) return false
   try {

@@ -19,27 +19,26 @@
 import { basename, join } from "node:path"
 import {
   MAX_VERIFIER_REPORT_BYTES,
-  clean,
-  cleanBlock,
   isSafeTaskId,
   readBoundedRunFile,
   readBoundedRunJson,
   writeSafeRunJson,
 } from "./tournament.ts"
+import { clean, cleanBlock } from "./text-utils.ts"
 import { canonicalJson, sha256Hex, type AuthContext, type AuthEnvelope, type AuthFailure } from "./auth.ts"
 
 export const VICTORY_AUDITOR_AGENT = "team/victory-auditor"
 export const VICTORY_CONFIRMED = "VICTORY CONFIRMED"
-export const VICTORY_REJECTED = "VICTORY REJECTED"
-export const VICTORY_VERDICTS = [VICTORY_CONFIRMED, VICTORY_REJECTED] as const
+const VICTORY_REJECTED = "VICTORY REJECTED"
+const VICTORY_VERDICTS = [VICTORY_CONFIRMED, VICTORY_REJECTED] as const
 export type VictoryVerdictKind = (typeof VICTORY_VERDICTS)[number]
 
-export const REQUIREMENT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/
-export const REQUIREMENTS_MAX_ITEMS = 50
-export const REQUIREMENT_TEXT_MAX = 2000
-export const VICTORY_FINDINGS_MAX = 50
-export const VICTORY_SUMMARY_MAX = 2000
-export const VICTORY_SKIP_REASON_MAX = 500
+const REQUIREMENT_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/
+const REQUIREMENTS_MAX_ITEMS = 50
+const REQUIREMENT_TEXT_MAX = 2000
+const VICTORY_FINDINGS_MAX = 50
+const VICTORY_SUMMARY_MAX = 2000
+const VICTORY_SKIP_REASON_MAX = 500
 
 const MAX_REQUIREMENTS_BYTES = 256 * 1024
 const MAX_VICTORY_BYTES = 512 * 1024
@@ -96,6 +95,8 @@ export interface VictoryVerdictFile {
   requirements: VictoryRequirementResult[]
   findings: string[]
   summary: string
+  /** A4: 1-based count of audits recorded for this run (absent = legacy first audit). */
+  auditCount?: number
   generatedAt: string
   _auth?: AuthEnvelope
 }
@@ -130,7 +131,7 @@ export type VictoryGate =
     }
 
 /** True when `value` is one of the two recognised victory verdicts. */
-export function normalizeVictoryVerdict(value: unknown): VictoryVerdictKind | undefined {
+function normalizeVictoryVerdict(value: unknown): VictoryVerdictKind | undefined {
   const text = typeof value === "string" ? value.trim() : ""
   return (VICTORY_VERDICTS as readonly string[]).includes(text) ? (text as VictoryVerdictKind) : undefined
 }
@@ -312,7 +313,7 @@ export function originalRequestHash(run: string): string | null {
 }
 
 /** Canonical digest of a requirements baseline (or null when absent). */
-export function requirementsBaselineHash(baseline: RequirementsFile | undefined): string | null {
+function requirementsBaselineHash(baseline: RequirementsFile | undefined): string | null {
   if (!baseline) return null
   return sha256Hex(canonicalJson(baseline))
 }
@@ -482,6 +483,25 @@ export async function recordVictoryAudit(
     }
   }
 
+  // A4: a small-focused run is a bounded refinement loop and gets at most two
+  // victory audits. A third request means the run already consumed its audit
+  // budget without a confirmed victory, so it must end as a terminal
+  // non-victory state instead of re-auditing forever. Other topologies are not
+  // capped. Legacy verdicts without auditCount count as the first audit.
+  const planRes = readBoundedRunJson<any>(run, join(run, "plan.dag.json"), MAX_PLAN_BYTES)
+  const planTopology = planRes.status === "ok" ? planRes.value?.topology : undefined
+  const previousAuditCount = existing
+    ? Math.max(1, Math.trunc(Number(existing.auditCount) || 1))
+    : 0
+  if (planTopology === "small-focused" && previousAuditCount >= 2) {
+    return {
+      ok: false,
+      error:
+        "refused: small-focused allows at most 2 victory audits; this run is in a terminal non-victory state (blocked, deadlocked, out of budget, or still failing requirements) and must stop without another audit. Report the open issues and the partial artifact instead.",
+    }
+  }
+  const auditCount = previousAuditCount + 1
+
   const findings = Array.isArray(input.findings)
     ? input.findings
         .slice(0, VICTORY_FINDINGS_MAX)
@@ -502,6 +522,7 @@ export async function recordVictoryAudit(
     requirements: results,
     findings,
     summary,
+    auditCount,
     generatedAt: new Date().toISOString(),
   }
 

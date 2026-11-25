@@ -14,6 +14,7 @@
 // run there.
 
 import {
+  chmodSync,
   closeSync,
   mkdirSync,
   mkdtempSync,
@@ -34,6 +35,7 @@ import {
   fdWithin,
   readRegularBounded,
   readWithinBounded,
+  resolveTrustedExecutable,
   supportsFdContainment,
 } from "../plugins/opencode-teamwork/safe-fs.mjs"
 
@@ -330,6 +332,36 @@ if (!supportsFdContainment()) {
       assert.strictEqual(res.status, 0, `negative control did not leak (status ${res.status}): ${res.stdout || ""} ${res.stderr || ""}`)
       assert(/LEAKED/.test(res.stdout || ""), `negative control must print LEAKED: ${res.stdout || ""} ${res.stderr || ""}`)
     })
+  })
+  check("resolveTrustedExecutable rejects unsafe names and world-writable dirs, accepts 0700 PATH override and standard fallback", () => {
+    assert.strictEqual(resolveTrustedExecutable("../sh"), null)
+    assert.strictEqual(resolveTrustedExecutable("a/b"), null)
+    assert.strictEqual(resolveTrustedExecutable(""), null)
+    assert.strictEqual(resolveTrustedExecutable("."), null)
+    assert.strictEqual(resolveTrustedExecutable(".."), null)
+
+    if (process.platform !== "win32") {
+      const binRoot = mkdtempSync(join(testDir, "bin-trust-"))
+      const privDir = join(binRoot, "priv")
+      const worldDir = join(binRoot, "world")
+      mkdirSync(privDir, { mode: 0o700 })
+      mkdirSync(worldDir, { mode: 0o777 })
+      chmodSync(worldDir, 0o777)
+
+      const privExe = join(privDir, "my-custom-tool")
+      const worldExe = join(worldDir, "world-only-tool")
+      writeFileSync(privExe, "#!/bin/sh\nexit 0\n")
+      chmodSync(privExe, 0o700)
+      writeFileSync(worldExe, "#!/bin/sh\nexit 0\n")
+      chmodSync(worldExe, 0o755)
+
+      assert.strictEqual(resolveTrustedExecutable("my-custom-tool", { env: { PATH: privDir } }), privExe)
+      assert.strictEqual(resolveTrustedExecutable("world-only-tool", { env: { PATH: worldDir } }), null)
+      assert.strictEqual(resolveTrustedExecutable("my-custom-tool", { env: { PATH: privDir }, standardOnly: true }), null)
+
+      const gitPath = resolveTrustedExecutable("git", { env: { PATH: "" } })
+      assert(gitPath && gitPath.endsWith("/git"), `expected standard fallback for git, got ${gitPath}`)
+    }
   })
 }
 

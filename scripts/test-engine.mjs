@@ -5,8 +5,9 @@ import { createAuthContext, canonicalJson, payloadDigest, sha256Hex } from "../p
 import {
   analyzeLeanDeclarations,
   bindVerifiedDeclaration,
+  canonicalAxiomSet,
   checkLeanAxiomDependencies,
-  classifyRoute as classifyLemmaRoute,
+  classifyLemmaRoute,
   detectAxiomProbeHijacks,
   detectLeanProofHoles,
   formatMissingToolchainRefusal,
@@ -20,13 +21,14 @@ import {
   validateLemmaPolicy,
   verifyLeanFile,
 } from "../plugins/opencode-teamwork/lemma.ts"
-import { compareCandidates, classifyRoute, maskCodeAndQuotes, clean, cleanBlock, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
+import { compareCandidates, classifyTournamentRoute, maskCodeAndQuotes, readBoundedRunFile, writeSafeRunFile } from "../plugins/opencode-teamwork/tournament.ts"
+import { clean, cleanBlock } from "../plugins/opencode-teamwork/text-utils.ts"
 import { BUDGET_HALT_PCT, budgetPercent, budgetThresholdReached } from "../plugins/opencode-teamwork/budget.ts"
 import { renderGateStatus, evaluateStrictGate } from "../plugins/opencode-teamwork/strict.ts"
 import { evaluateVictoryGate } from "../plugins/opencode-teamwork/victory.ts"
 import { withCrossProcessLock, crossProcessLockPath, observeLockArtifact, quarantineStaleLock } from "../plugins/opencode-teamwork/locks.ts"
-import { recordWriteAnomaly, setWriteAnomalyAuditPathForTest, unacknowledgedWriteAnomalies } from "../plugins/opencode-teamwork/safe-fs.mjs"
-import { assertSafeUrl, blockedAddressReason } from "../plugins/opencode-teamwork/url-guard.ts"
+import { recordWriteAnomaly, resolveTrustedExecutable, setWriteAnomalyAuditPathForTest, unacknowledgedWriteAnomalies } from "../plugins/opencode-teamwork/safe-fs.mjs"
+import { assertSafeUrl, blockedAddressReason, parseLoopbackServiceUrl } from "../plugins/opencode-teamwork/url-guard.ts"
 import { refreshRunBriefing, MAX_BRIEFING_BYTES, refreshAgentBriefing, readAgentBriefingExcerpt, agentBriefingRelativePath, MAX_AGENT_BRIEFING_DIRS } from "../plugins/opencode-teamwork/briefing.ts"
 import { writeHandoff, MAX_HANDOFF_ENTRIES, MAX_HANDOFF_INDEX_BYTES, HANDOFF_SECTION_LABELS, evaluateHandoffGateChecked, readWorkerHandoffBinding } from "../plugins/opencode-teamwork/handoff.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
@@ -45,11 +47,15 @@ import {
 import {
   appendFileSync,
   chmodSync,
+  closeSync,
+  constants as fsConstants,
   existsSync,
+  futimesSync,
   linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   readdirSync,
   rmSync,
@@ -67,8 +73,15 @@ import { deflateSync } from "node:zlib"
 import { createHash, generateKeyPairSync, randomBytes } from "node:crypto"
 import assert from "node:assert"
 
-// Absolute git binary for the new worktree assertions; never PATH-resolved.
-const GIT_BIN = ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"].find(existsSync) ?? "/usr/bin/git"
+// Absolute git binary for the new worktree assertions; resolved via trusted directories.
+const GIT_BIN = resolveTrustedExecutable("git") ?? "/usr/bin/git"
+const cmp = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+function assertApprox(actual, expected, msg) {
+  assert(
+    typeof actual === "number" && Math.abs(actual - expected) < 1e-9,
+    msg ?? `expected ${expected} (+/- 1e-9), got ${actual}`,
+  )
+}
 
 const testDir = mkdtempSync(join(tmpdir(), "teamwork-engine-test-"))
 // Keep the durable write-anomaly audit hermetic (never the real config dir).
@@ -480,6 +493,9 @@ try {
   const planRes = await registeredTools.teamwork_plan.execute({
     sessionId: "20261018-000000-test",
     topology: "distributed-coding",
+    // M4 A6: distributed-coding now defaults to the strict wave; this fixture
+    // exercises the DAG/final-verification engine, so it explicitly opts out.
+    verification: "standard",
     skipInterview: true, // fixture: this part exercises the DAG engine, not the spec presence gate
     tasks: [
       { id: "T1", dependsOn: [], maxRounds: 2 },
@@ -2035,7 +2051,7 @@ try {
   const auditArtifact = JSON.parse(readFileSync(evidenceAuditFile(auditRun), "utf8"))
   assert.strictEqual(auditArtifact.integrityMode, "demo")
   assert.deepStrictEqual(
-    auditArtifact.ruleChecks.map((c) => c.rule).sort(),
+    auditArtifact.ruleChecks.map((c) => c.rule).sort(cmp),
     ["core_logic_copied", "delegated_core_work", "fabricated_output", "test_source_read"],
     "a demo PASS must cover exactly the rules forbidden at demo",
   )
@@ -3380,12 +3396,12 @@ try {
 
   const gitRepoDir = mkdtempSync(join(tmpdir(), "teamwork-git-test-"))
   try {
-    execFileSync("git", ["init"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
-    execFileSync("git", ["config", "user.email", "test@test.com"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
-    execFileSync("git", ["config", "user.name", "Test Runner"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["init"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["config", "user.email", "test@test.com"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["config", "user.name", "Test Runner"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
     writeFileSync(join(gitRepoDir, "README.md"), "# Teamwork Test Repo\n")
-    execFileSync("git", ["add", "README.md"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
-    execFileSync("git", ["commit", "-m", "Initial commit"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["add", "README.md"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["commit", "-m", "Initial commit"], { cwd: gitRepoDir, stdio: ["pipe", "pipe", "pipe"] })
 
     const gitTools = {}
     await registerTeamworkTools(
@@ -3433,8 +3449,8 @@ try {
 
     // 3. Make change in worker worktree and commit
     writeFileSync(join(workerSetup.worktreePath, "feature.txt"), "hello world\n")
-    execFileSync("git", ["add", "feature.txt"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
-    execFileSync("git", ["commit", "-m", "Add feature.txt"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["add", "feature.txt"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["commit", "-m", "Add feature.txt"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
 
     // 4. Test diff
     const diffRes = await gitTools.teamwork_worktree.execute({
@@ -3456,12 +3472,12 @@ try {
 
     // 6. Test conflict handling: worker modifies file differently than sentinel
     writeFileSync(join(sentinelSetup.worktreePath, "conflict.txt"), "sentinel version\n")
-    execFileSync("git", ["add", "conflict.txt"], { cwd: sentinelSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
-    execFileSync("git", ["commit", "-m", "Sentinel commit"], { cwd: sentinelSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["add", "conflict.txt"], { cwd: sentinelSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["commit", "-m", "Sentinel commit"], { cwd: sentinelSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
 
     writeFileSync(join(workerSetup.worktreePath, "conflict.txt"), "worker conflicting version\n")
-    execFileSync("git", ["add", "conflict.txt"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
-    execFileSync("git", ["commit", "-m", "Worker conflicting commit"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["add", "conflict.txt"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
+    execFileSync(GIT_BIN, ["commit", "-m", "Worker conflicting commit"], { cwd: workerSetup.worktreePath, stdio: ["pipe", "pipe", "pipe"] })
 
     const conflictMergeRes = await gitTools.teamwork_worktree.execute({
       sessionId: gitSessionId,
@@ -3688,15 +3704,18 @@ try {
 
   // Probe ONCE which SQLite backend can seed the session_v2 fixture table:
   // node:sqlite (preferred) or the sqlite3 CLI. Returns null when neither exists.
+  const SQLITE_BIN = resolveTrustedExecutable("sqlite3")
   async function probeSqliteBackend() {
     try {
       const mod = await import("node:sqlite")
       if (typeof mod.DatabaseSync === "function") return "node:sqlite"
     } catch {}
-    try {
-      execFileSync("sqlite3", ["--version"], { stdio: ["pipe", "pipe", "pipe"] })
-      return "sqlite3"
-    } catch {}
+    if (SQLITE_BIN) {
+      try {
+        execFileSync(SQLITE_BIN, ["--version"], { stdio: ["pipe", "pipe", "pipe"] })
+        return "sqlite3"
+      } catch {}
+    }
     return null
   }
   const sqliteBackend = await probeSqliteBackend()
@@ -3722,7 +3741,8 @@ try {
         db.close()
       }
     } else {
-      execFileSync("sqlite3", [dbPath], { input: ddl + values.join("\n"), stdio: ["pipe", "pipe", "pipe"] })
+      assert(SQLITE_BIN, "sqlite3 executable must be available")
+      execFileSync(SQLITE_BIN, [dbPath], { input: ddl + values.join("\n"), stdio: ["pipe", "pipe", "pipe"] })
     }
   }
 
@@ -3785,10 +3805,10 @@ try {
       const res = await f.tools.teamwork_cost.execute({ sessionId: RUN_A, taskId: "alpha" }, { sessionID: ROOT_SES })
       assert(res.content.includes("opencode database"), `spend must come from the session DB, got: ${res.content}`)
       const costs = JSON.parse(readFileSync(runFile(f.root, RUN_A, "costs.json"), "utf8"))
-      assert.strictEqual(costs.byTask.alpha, 0.3, "subagent spend must bucket to the taskId")
+      assertApprox(costs.byTask.alpha, 0.3, "subagent spend must bucket to the taskId")
       assert.strictEqual(costs.byTask["team/worker"], undefined, "byTask['team/worker'] must NOT grow when a taskId is given")
       assert.deepStrictEqual(Object.keys(costs.byTask), ["alpha"])
-      assert.strictEqual(costs.spentUsd, 0.3)
+      assertApprox(costs.spentUsd, 0.3)
       console.log("✓ non-root spend with taskId buckets to the task; byTask['team/worker'] does not grow")
     }
 
@@ -3798,7 +3818,7 @@ try {
       await seedSessionDb(dbPath, [rootRow, workerRow(0.3, T1)])
       await f.tools.teamwork_cost.execute({ sessionId: RUN_B }, { sessionID: ROOT_SES })
       const costs = JSON.parse(readFileSync(runFile(f.root, RUN_B, "costs.json"), "utf8"))
-      assert.strictEqual(costs.byTask["team/worker"], 0.3, "without a taskId, non-root spend must bucket by agent name")
+      assertApprox(costs.byTask["team/worker"], 0.3, "without a taskId, non-root spend must bucket by agent name")
       assert.deepStrictEqual(Object.keys(costs.byTask), ["team/worker"], "no task bucket may appear without a taskId")
       assert.deepStrictEqual(Object.keys(costs.byTaskTokens), ["team/worker"], "byTaskTokens keys must mirror byTask")
       console.log("✓ without taskId, non-root spend still buckets by agent name (legacy regression guard)")
@@ -3827,7 +3847,7 @@ try {
       ])
       await f.tools.teamwork_cost.execute({ sessionId: RUN_C, taskId: "alpha" }, { sessionID: ROOT_SES })
       const costs = JSON.parse(readFileSync(runFile(f.root, RUN_C, "costs.json"), "utf8"))
-      assert.strictEqual(costs.byTask.alpha, 0.65, "cost must accumulate 0.3 + 0.2 + 0.15 delta")
+      assertApprox(costs.byTask.alpha, 0.65, "cost must accumulate 0.3 + 0.2 + 0.15 delta")
       // Expected = sum of all sessions' current totals: root(R2) + child1(T1') + child2(T2).
       assert.deepStrictEqual(costs.byTaskTokens.alpha, {
         input: 500 + 1500 + 300,
@@ -3836,12 +3856,12 @@ try {
         cache: { read: 30 + 50 + 10, write: 3 + 5 + 1 },
       }, "byTaskTokens must SUM per-session token deltas across the tree")
       const bucket = costs.byTaskTokens.alpha
-      assert.deepStrictEqual(Object.keys(bucket).sort(), ["cache", "input", "output", "reasoning"])
-      assert.deepStrictEqual(Object.keys(bucket.cache).sort(), ["read", "write"])
+      assert.deepStrictEqual(Object.keys(bucket).sort(cmp), ["cache", "input", "output", "reasoning"])
+      assert.deepStrictEqual(Object.keys(bucket.cache).sort(cmp), ["read", "write"])
       for (const v of [bucket.input, bucket.output, bucket.reasoning, bucket.cache.read, bucket.cache.write]) {
         assert(Number.isFinite(v) && Number.isInteger(v) && v >= 0, `token value must be a finite non-negative integer, got ${v}`)
       }
-      assert.deepStrictEqual(Object.keys(costs.byTaskTokens).sort(), Object.keys(costs.byTask).sort(), "byTaskTokens keys must match byTask keys")
+      assert.deepStrictEqual(Object.keys(costs.byTaskTokens).sort(cmp), Object.keys(costs.byTask).sort(cmp), "byTaskTokens keys must match byTask keys")
       console.log("✓ byTaskTokens sums per-session token deltas across the tree (absolute-write mutation is caught)")
     }
 
@@ -3856,7 +3876,7 @@ try {
       const res = await f.tools.teamwork_cost.execute({ sessionId: RUN_D, taskId: "alpha" }, { sessionID: ROOT_SES })
       assert(res.content.includes("Budget:"), `cost must complete without crashing, got: ${res.content}`)
       const costs = JSON.parse(readFileSync(file, "utf8"))
-      assert.strictEqual(costs.byTask.alpha, 0.3)
+      assertApprox(costs.byTask.alpha, 0.3)
       assert.strictEqual(costs.byTaskTokens.alpha.input, 1000, "a legacy costs.json must gain the byTaskTokens bucket")
       console.log("✓ pre-existing costs.json without byTaskTokens is tolerated")
     }
@@ -4194,7 +4214,7 @@ try {
     const server = createServer((req, res) => {
       requests.push(req.url)
       res.setHeader("content-type", "application/json")
-      const url = new URL(req.url, "http://fixture")
+      const url = new URL(req.url, "https://fixture")
       if (url.pathname === `/api/session/${ROOT}`) {
         res.end(
           JSON.stringify({
@@ -4282,6 +4302,96 @@ try {
     }
   } finally {
     rmSync(pageDir, { recursive: true, force: true })
+  }
+}
+
+// ==========================================
+// Part 1d-ter: CodeQL js/file-access-to-http — service.json loopback guard
+// ==========================================
+{
+  console.log("Testing service.json loopback URL validation (CodeQL #61/#62)...")
+  assert.strictEqual(parseLoopbackServiceUrl("http://127.0.0.1:4096"), "http://127.0.0.1:4096")
+  assert.strictEqual(parseLoopbackServiceUrl("http://localhost:4096/"), "http://localhost:4096")
+  assert.strictEqual(parseLoopbackServiceUrl("https://[::1]:8443"), "https://[::1]:8443")
+  for (const bad of [
+    "http://169.254.169.254/latest/meta-data",
+    "http://169.254.169.254",
+    "https://evil.example",
+    "http://10.0.0.1:4096",
+    "http://user:pass@127.0.0.1:4096",
+    "http://127.0.0.1:4096/bad",
+    "http://127.0.0.1:4096?x=1",
+    "ftp://127.0.0.1:4096",
+  ]) {
+    assert.strictEqual(parseLoopbackServiceUrl(bad), undefined, `must reject non-loopback/malformed service URL: ${bad}`)
+  }
+
+  const extResolved = await assertSafeUrl("http://evil.example:4096/api/session", {
+    loopbackOnly: true,
+    resolveHost: async () => [{ address: "93.184.216.34", family: 4 }],
+  })
+  assert.strictEqual(extResolved.ok, false)
+  assert.strictEqual(extResolved.code, "URL_BLOCKED_ADDRESS")
+
+  const dnsRebound = await assertSafeUrl("http://localhost:4096/api/session", {
+    loopbackOnly: true,
+    resolveHost: async () => [
+      { address: "127.0.0.1", family: 4 },
+      { address: "169.254.169.254", family: 4 },
+    ],
+  })
+  assert.strictEqual(dnsRebound.ok, false)
+  assert.strictEqual(dnsRebound.code, "URL_BLOCKED_ADDRESS")
+
+  const okLoop = await assertSafeUrl("http://localhost:4096/api/session", {
+    loopbackOnly: true,
+    resolveHost: async () => [{ address: "127.0.0.1", family: 4 }],
+  })
+  assert.strictEqual(okLoop.ok, true)
+
+  const svcDir = mkdtempSync(join(tmpdir(), "teamwork-svc-guard-"))
+  const home = join(svcDir, "home")
+  const root = join(svcDir, "repo")
+  mkdirSync(root, { recursive: true })
+  const savedEnv = {}
+  for (const k of ["HOME", "USERPROFILE", "XDG_DATA_HOME", "XDG_STATE_HOME", "LOCALAPPDATA", "OPENCODE_DB"]) {
+    savedEnv[k] = process.env[k]
+  }
+  try {
+    process.env.HOME = home
+    process.env.USERPROFILE = home
+    process.env.XDG_DATA_HOME = join(home, "data")
+    process.env.XDG_STATE_HOME = join(home, "state")
+    process.env.LOCALAPPDATA = join(home, "localappdata")
+    delete process.env.OPENCODE_DB
+    mkdirSync(join(home, "state", "opencode"), { recursive: true })
+    writeFileSync(
+      join(home, "state", "opencode", "service.json"),
+      JSON.stringify({ url: "http://169.254.169.254", password: "secret" }),
+    )
+    const tools = {}
+    await registerTeamworkTools(
+      {
+        tool: { transform: async (cb) => cb({ namespace: () => {}, add: (tool) => registerTool(tools, tool, withFixtureSession) }) },
+        session: { get: async () => undefined },
+        storage: storageFor(root),
+      },
+      root,
+    )
+    const RUN = "20261124-000000-svcguard"
+    await tools.teamwork_plan.execute(
+      { sessionId: RUN, topology: "iterative-coding", skipInterview: true, tasks: [{ id: "alpha" }] },
+      { sessionID: "ses_svc_root" },
+    )
+    const costRes = await tools.teamwork_cost.execute({ sessionId: RUN }, { sessionID: "ses_svc_root" })
+    assert(!costRes.content.includes("opencode service API"), `non-loopback service.json URL must be ignored: ${costRes.content}`)
+    console.log("✓ service.json loopback validator rejects metadata/external/credentialed/path URLs and allows loopback")
+  } finally {
+    for (const k of Object.keys(savedEnv)) {
+      if (savedEnv[k] === undefined) delete process.env[k]
+      else process.env[k] = savedEnv[k]
+    }
+    rmSync(svcDir, { recursive: true, force: true })
   }
 }
 
@@ -4411,7 +4521,7 @@ try {
 {
   console.log("Testing prototype-key integrity and tool-result sanitising (SEC-1, SEC-3)...")
   const testDir7 = mkdtempSync(join(tmpdir(), "teamwork-sec1-test-"))
-  const protoSnapshot = () => Reflect.ownKeys(Object.prototype).map(String).sort().join(",")
+  const protoSnapshot = () => Reflect.ownKeys(Object.prototype).map(String).sort(cmp).join(",")
   const protoBefore = protoSnapshot()
   const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k)
   const costsOf = (root, runId) => JSON.parse(readFileSync(join(root, ".opencode", "teamwork", runId, "costs.json"), "utf8"))
@@ -4586,8 +4696,8 @@ try {
         const res = await f.tools.teamwork_cost.execute({ sessionId: RUN, taskId: "constructor" }, { sessionID: "ses_sec1_root" })
         assert(!res.content.includes("NaN"), `no NaN in breakdown: ${res.content}`)
         const costs = costsOf(f.root, RUN)
-        assert.strictEqual(costs.byTask.constructor, 0.3, "worker spend must bucket to 'constructor'")
-        assert.strictEqual(costs.spentUsd, 0.3)
+        assertApprox(costs.byTask.constructor, 0.3, "worker spend must bucket to 'constructor'")
+        assertApprox(costs.spentUsd, 0.3)
         assert(hasOwn(costs.byTaskTokens, "constructor"), "byTaskTokens must hold an own 'constructor' key")
         assert.deepStrictEqual(costs.byTaskTokens.constructor, {
           input: 1000,
@@ -4625,14 +4735,14 @@ try {
   // cannot disagree with itself.
   const POLICY = [
     { id: "team/verifier", deny: ["edit", "subagent", "webfetch"] },
-    { id: "team/falsifier", deny: ["edit", "shell", "subagent"] },
+    { id: "team/falsifier", deny: ["edit", "subagent"] },
     { id: "team/scout", deny: ["edit", "subagent"] },
     { id: "team/security-auditor", deny: ["edit", "subagent", "webfetch"] },
     { id: "team/segment-reviewer", deny: ["edit", "shell", "subagent", "webfetch"] },
     { id: "team/formalization-reviewer", deny: ["edit", "shell", "subagent", "webfetch"] },
     { id: "team/referee", deny: ["edit", "shell", "subagent", "webfetch"] },
     { id: "team/victory-auditor", deny: ["edit", "subagent", "webfetch"] },
-  ].map((p) => ({ ...p, deny: [...p.deny].sort() }))
+  ].map((p) => ({ ...p, deny: [...p.deny].sort(cmp) }))
 
   // --- 8a: READ_ONLY_ACTIONS holds exactly the documented deny sets.
   const toolsSrc = readFileSync(join(repoRoot, "plugins/opencode-teamwork/tools.ts"), "utf8")
@@ -4640,11 +4750,11 @@ try {
   assert(table, "READ_ONLY_ACTIONS table must exist in tools.ts")
   const enforced = {}
   for (const m of table[1].matchAll(/"([^"]+)":\s*new Set\(\[([^\]]*)\]\)/g)) {
-    enforced[m[1]] = [...m[2].matchAll(/"([^"]+)"/g)].map((a) => a[1]).sort()
+    enforced[m[1]] = [...m[2].matchAll(/"([^"]+)"/g)].map((a) => a[1]).sort(cmp)
   }
   assert.deepStrictEqual(
-    Object.keys(enforced).sort(),
-    POLICY.map((p) => p.id).sort(),
+    Object.keys(enforced).sort(cmp),
+    POLICY.map((p) => p.id).sort(cmp),
     "READ_ONLY_ACTIONS must list exactly the agents covered by this test",
   )
   for (const p of POLICY) {
@@ -4659,13 +4769,13 @@ try {
   assert(start >= 0, "README must state the per-agent read-only policy")
   const end = readme.indexOf("\n\n", start)
   const paragraph = readme.slice(start, end === -1 ? undefined : end)
-  const documented = [...new Set([...paragraph.matchAll(/`(team\/[a-z-]+)`/g)].map((m) => m[1]))].sort()
-  const editDeniers = POLICY.filter((p) => p.deny.includes("edit")).map((p) => p.id).sort()
+  const documented = [...new Set([...paragraph.matchAll(/`(team\/[a-z-]+)`/g)].map((m) => m[1]))].sort(cmp)
+  const editDeniers = POLICY.filter((p) => p.deny.includes("edit")).map((p) => p.id).sort(cmp)
   assert.deepStrictEqual(documented, editDeniers, "README must document exactly the edit-denying agents as read-only")
   assert(/can modify files/i.test(paragraph), "README must state that shell can modify files")
   assert(
     /falsifier[^.]*shell|shell[^.]*falsifier/i.test(paragraph),
-    "README must state that the falsifier's deny set includes shell",
+    "README must state the falsifier's shell policy",
   )
   console.log("✓ README documents every edit-denying team agent, plus the shell caveat and the falsifier exception")
 
@@ -5052,7 +5162,8 @@ try {
     assert(corruptRes.content.startsWith("refused:"), `Corrupt PDF must be refused: ${corruptRes.content}`)
     assert(!existsSync(join(docRoot, ".opencode", "teamwork", corruptRun)), "Corrupt PDF must not create run dir")
 
-    // Image-only empty PDF flags needs_ingestor
+    // Image-only PDF without the pypdfium2/Pillow ingestor: pre-mkdir refusal
+    // (A7). The tool must record root PREREQUISITES.md and create no run dir.
     writeFileSync(join(docRoot, "scanned.pdf"), buildPdf([{ bytes: Buffer.from("q 100 0 0 100 0 0 cm /Im0 Do Q", "latin1"), flate: false }]))
     const scannedRun = "20261122-000002-scanpdf"
     const scannedRes = await tools.teamwork_document_triage.execute({
@@ -5060,9 +5171,12 @@ try {
       document: { path: "scanned.pdf" },
       skipInterview: true,
     })
-    assert.strictEqual(scannedRes.extractionStatus, "needs_ingestor", `Empty PDF must report needs_ingestor: ${scannedRes.content}`)
+    assert(scannedRes.content.startsWith("refused:"), `Empty PDF without pypdfium2 must refuse: ${scannedRes.content}`)
+    assert(/MISSING|pypdfium2|Pillow/i.test(scannedRes.content), `refusal must name the missing PDF prerequisites: ${scannedRes.content}`)
+    assert(existsSync(join(docRoot, "PREREQUISITES.md")), "MISSING PDF prerequisites must write root PREREQUISITES.md")
+    assert(!existsSync(join(docRoot, ".opencode", "teamwork", scannedRun)), "MISSING PDF prerequisites must create no run dir")
 
-    // Image-only PDF with empty PATH (pdftotext unavailable) cleanly returns needs_ingestor
+    // Image-only PDF with empty PATH (python3/pdftotext unavailable) also refuses cleanly.
     const savedPath = process.env.PATH
     try {
       process.env.PATH = ""
@@ -5072,16 +5186,44 @@ try {
         document: { path: "scanned.pdf" },
         skipInterview: true,
       })
-      assert.strictEqual(
-        noPdfTextRes.extractionStatus,
-        "needs_ingestor",
-        `Empty PDF without pdftotext on PATH must return needs_ingestor: ${noPdfTextRes.content}`,
+      assert(noPdfTextRes.content.startsWith("refused:"), `Empty PATH must refuse with MISSING: ${noPdfTextRes.content}`)
+      assert(!existsSync(join(docRoot, ".opencode", "teamwork", noPdfTextRun)), "Empty PATH refusal must create no run dir")
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH
+      else process.env.PATH = savedPath
+    }
+
+    // Image-only PDF WITH a pypdfium2/Pillow-capable python3: extraction succeeds
+    // and the run is planned normally.
+    const pyBin = join(docRoot, "pybin")
+    mkdirSync(pyBin, { recursive: true })
+    const pyStub = join(pyBin, "python3")
+    writeFileSync(
+      pyStub,
+      `#!${process.execPath}\nconst a = process.argv.slice(2).join(" ");\nif (a.includes("pypdfium2") && a.includes("PIL")) { console.log(JSON.stringify({ ok: true, pages: ["Stub image PDF page text."] })); process.exit(0); }\nprocess.exit(0);\n`,
+    )
+    chmodSync(pyStub, 0o755)
+    try {
+      process.env.PATH = `${pyBin}:${savedPath ?? ""}`
+      const stubRun = "20261122-000002-stubpdf"
+      const stubRes = await tools.teamwork_document_triage.execute({
+        sessionId: stubRun,
+        document: { path: "scanned.pdf" },
+        skipInterview: true,
+      })
+      assert(!String(stubRes.content).startsWith("refused:"), `stub ingestor must succeed: ${stubRes.content}`)
+      assert.strictEqual(stubRes.extractionStatus, "extracted", "stub ingestor must mark the PDF extracted")
+      assert(
+        readFileSync(join(docRoot, ".opencode", "teamwork", stubRun, "document-review", "DOCUMENT_TEXT_MAP.md"), "utf8").includes(
+          "Stub image PDF page text.",
+        ),
+        "stub ingestor text must reach DOCUMENT_TEXT_MAP.md",
       )
     } finally {
       if (savedPath === undefined) delete process.env.PATH
       else process.env.PATH = savedPath
     }
-    console.log("✓ 9.2 Positive PDF + FlateDecode + corrupt refusal + needs_ingestor passed")
+    console.log("✓ 9.2 Positive PDF + FlateDecode + corrupt refusal + pypdfium2 ingestor passed")
 
     // --- 9.3: Positive inline content & localhost URL ---
     const inlineRun = "20261122-000003-inline"
@@ -6584,6 +6726,19 @@ try {
     console.log("✓ 9.0 sentinel/orchestrator teamwork_plan calls record the verbatim request")
   }
 
+  // --- 9.0b Axiom allowlists are canonicalized by code unit, not locale.
+  {
+    const sorted = canonicalAxiomSet(["z", "ä", "A", "z", " "])
+    assert.deepStrictEqual(
+      sorted,
+      ["A", "z", "ä"],
+      "canonicalAxiomSet must sort by code unit so the persisted policy hash is locale-independent",
+    )
+    assert.deepStrictEqual(canonicalAxiomSet(["b", "a"]), ["a", "b"])
+    assert.deepStrictEqual(canonicalAxiomSet("not-an-array"), [])
+    console.log("✓ 9.0b canonicalAxiomSet uses a locale-independent comparator")
+  }
+
   const writeStubBin = (dir, name, scriptBody) => {
     const p = join(dir, name)
     writeFileSync(p, `#!${process.execPath}\n${scriptBody}\n`, "utf8")
@@ -6772,6 +6927,23 @@ process.exit(0);
       assert(upperRoutePlan.content.startsWith("refused:"), `uppercase route LEMMA must refuse before mkdir: ${upperRoutePlan.content}`)
       assert(!existsSync(join(rootNoTool, ".opencode", "teamwork", "20261018-000000-lemma-upper")), "uppercase route refusal must create zero dirs")
       console.log("✓ 9.1 pre-mkdir / pre-spending refusal & install instructions verified")
+    }
+
+    // --- 9.1b S4036: toolchain probes refuse a world-writable PATH entry ---
+    {
+      const worldDir = mkdtempSync(join(lemmaTestDir, "world-path-"))
+      chmodSync(worldDir, 0o777)
+      writeStubBin(worldDir, "lean", `console.log("Lean (version 4.12.0)")`)
+      writeStubBin(worldDir, "lake", `console.log("Lake version 5.0.0")`)
+      writeStubBin(worldDir, "leap", `console.log("leap 0.3.1")`)
+      const probe = probeLemmaToolchain({ env: { PATH: worldDir } })
+      assert.strictEqual(probe.ready, false, "a world-writable PATH entry must not satisfy the LEMMA probe")
+      assert.strictEqual(probe.lean.status, "MISSING", "lean from a world-writable PATH dir must be ignored")
+      assert.strictEqual(probe.lake.status, "MISSING", "lake from a world-writable PATH dir must be ignored")
+      assert.strictEqual(probe.leap.status, "MISSING", "leap from a world-writable PATH dir must be ignored")
+      const relativeProbe = probeLemmaToolchain({ env: { PATH: "." } })
+      assert.strictEqual(relativeProbe.ready, false, "a relative PATH entry must not satisfy the LEMMA probe")
+      console.log("✓ 9.1b LEMMA probes use the trusted executable resolver (S4036)")
     }
 
     // --- 9.2 Explicit opt-in gating ---
@@ -7840,7 +8012,7 @@ process.exit(0);
   assert(!tildeMasked.includes("SECRET") && !tildeMasked.includes("massive-proof"), "tilde-fenced text must be masked")
   const tildeUnclosed = maskCodeAndQuotes("keep\n~~~\nSECRET")
   assert(tildeUnclosed.includes("keep") && !tildeUnclosed.includes("SECRET"), "unclosed tilde fence must mask to end of input")
-  const rTilde = classifyRoute("Prove this theorem.\n~~~\nuse massive-proof tournament with 100+ searchers\n~~~")
+  const rTilde = classifyTournamentRoute("Prove this theorem.\n~~~\nuse massive-proof tournament with 100+ searchers\n~~~")
   assert.strictEqual(rTilde.topology, "proof", "tilde-fenced opt-in must be masked out")
   assert.strictEqual(rTilde.massiveProofOptIn, false, "tilde-fenced opt-in must not enable massive-proof")
   // mF4v: an inline ~~~ run inside a tilde block is content, not a closer.
@@ -7867,27 +8039,27 @@ process.exit(0);
   console.log("✓ clean()/cleanBlock() drop objects/arrays and keep primitive/control-char behaviour")
 
   // --- 10.4 Routing regex edges.
-  const rThisPr = classifyRoute({ request: "review thisPR", inputs: ["notes.md"] })
+  const rThisPr = classifyTournamentRoute({ request: "review thisPR", inputs: ["notes.md"] })
   assert.strictEqual(rThisPr.topology, "document-review", "review thisPR must not be treated as a PR review")
-  const rMyCode = classifyRoute({ request: "review mycode", inputs: ["notes.md"] })
+  const rMyCode = classifyTournamentRoute({ request: "review mycode", inputs: ["notes.md"] })
   assert.strictEqual(rMyCode.topology, "document-review", "review mycode must not be treated as a code review")
-  const rRealPr = classifyRoute({ request: "review this PR", inputs: ["notes.md"] })
+  const rRealPr = classifyTournamentRoute({ request: "review this PR", inputs: ["notes.md"] })
   assert.strictEqual(rRealPr.topology, "distributed-coding", "review this PR must still be treated as a PR review")
 
-  const rCjkDoc = classifyRoute("review 论文.md and summarize it")
+  const rCjkDoc = classifyTournamentRoute("review 论文.md and summarize it")
   assert.strictEqual(rCjkDoc.topology, "document-review", "non-ASCII filename must still count as a supplied document")
 
-  const rLeanBackup = classifyRoute("open foo.lean-backup")
+  const rLeanBackup = classifyTournamentRoute("open foo.lean-backup")
   assert.strictEqual(rLeanBackup.signals.leanBareMention, false, "foo.lean-backup must not be treated as a bare .lean file")
 
-  const rLeanCross = classifyRoute("Formalize the theorem in Lean\nand then prove it")
+  const rLeanCross = classifyTournamentRoute("Formalize the theorem in Lean\nand then prove it")
   assert.strictEqual(rLeanCross.topology, "proof", "Lean explicit intent must survive a real cross-line gap")
   assert.strictEqual(rLeanCross.lemmaMode, true)
 
-  const rLeanFalsePositive = classifyRoute("We run a lean manufacturing line and need to prove ROI")
+  const rLeanFalsePositive = classifyTournamentRoute("We run a lean manufacturing line and need to prove ROI")
   assert.strictEqual(rLeanFalsePositive.lemmaMode, false, "lowercase 'lean manufacturing' must not set lemmaMode")
 
-  const rLeanLower = classifyRoute("Prove this theorem in lean")
+  const rLeanLower = classifyTournamentRoute("Prove this theorem in lean")
   assert.strictEqual(rLeanLower.lemmaMode, true, "explicit 'in lean' must still set lemmaMode")
   console.log("✓ routing regex edges (PR/code review, non-ASCII docs, lean-backup, Lean proximity) hold")
 
@@ -11633,27 +11805,34 @@ process.exit(0);
       const lockTarget = join(concDir, "lock-protocol-target.json")
       const lockPath = crossProcessLockPath(lockTarget)
       const old = new Date(Date.now() - 120000)
+      const writeLockFixture = (path, body, mtime) => {
+        const fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600)
+        try {
+          writeFileSync(fd, body)
+          if (mtime) futimesSync(fd, mtime, mtime)
+        } finally {
+          closeSync(fd)
+        }
+      }
 
-      writeFileSync(lockPath, "")
-      utimesSync(lockPath, old, old)
+      writeLockFixture(lockPath, "", old)
       await withCrossProcessLock(lockTarget, () => undefined, { leaseMs: 30000, timeoutMs: 1000 })
-      assert(!existsSync(lockPath), "an empty lock older than the lease must be reclaimed")
+      assert.strictEqual(observeLockArtifact(lockPath), undefined, "an empty lock older than the lease must be reclaimed")
 
-      writeFileSync(lockPath, '{"pid":')
-      utimesSync(lockPath, old, old)
+      writeLockFixture(lockPath, '{"pid":', old)
       await withCrossProcessLock(lockTarget, () => undefined, { leaseMs: 30000, timeoutMs: 1000 })
-      assert(!existsSync(lockPath), "a partial lock older than the lease must be reclaimed")
+      assert.strictEqual(observeLockArtifact(lockPath), undefined, "a partial lock older than the lease must be reclaimed")
 
       // Falsified owner.at: a future timestamp cannot defeat mtime aging...
-      writeFileSync(
+      writeLockFixture(
         lockPath,
         JSON.stringify({ pid: 999999, host: hostname(), at: "2100-01-01T00:00:00.000Z", nonce: "future-at" }),
+        old,
       )
-      utimesSync(lockPath, old, old)
       await withCrossProcessLock(lockTarget, () => undefined, { leaseMs: 30000, timeoutMs: 1000 })
-      assert(!existsSync(lockPath), "a falsified future owner.at must not defeat mtime aging")
+      assert.strictEqual(observeLockArtifact(lockPath), undefined, "a falsified future owner.at must not defeat mtime aging")
       // ...and an old owner.at cannot make a fresh lock stale.
-      writeFileSync(
+      writeLockFixture(
         lockPath,
         JSON.stringify({ pid: 999999, host: hostname(), at: "2000-01-01T00:00:00.000Z", nonce: "old-at" }),
       )
@@ -11865,7 +12044,9 @@ process.exit(0);
       const first = pruneTeamworkWorktrees(pruneRoot, { all: true })
       assert.deepStrictEqual(first.removed, ["20261122-000034-prune-stale"], `only the stale run may be pruned: ${JSON.stringify(first)}`)
       assert.strictEqual(first.refused.length, 4, `four claims must block: ${JSON.stringify(first.refused)}`)
-      const blockedStates = first.refused.map((entry) => entry.claims[0]?.state).sort()
+      const blockedStates = first.refused
+        .map((entry) => entry.claims[0]?.state)
+        .sort((a, b) => cmp(String(a ?? ""), String(b ?? "")))
       assert.deepStrictEqual(blockedStates, ["cross-host", "expired", "live", "needs-inspection"], JSON.stringify(blockedStates))
       for (const id of ["20261122-000030-prune-live", "20261122-000033-prune-crosshost"]) {
         assert(existsSync(join(worktreeBase, id)), `${id} must survive a refused prune`)

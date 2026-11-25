@@ -10,6 +10,7 @@
 // plan tool's default $20 budget because the cost tool floors the percentage.
 
 import { registerTeamworkTools } from "../plugins/opencode-teamwork/tools.ts"
+import { resolveTrustedExecutable } from "../plugins/opencode-teamwork/safe-fs.mjs"
 import { registerTool } from "./tool-registry.mjs"
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -58,6 +59,13 @@ function sqlLiteral(value) {
   return `'${String(value).replace(/'/g, "''")}'`
 }
 
+function assertApprox(actual, expected, msg) {
+  assert(
+    typeof actual === "number" && Math.abs(actual - expected) < 1e-9,
+    msg ?? `expected ${expected} (+/- 1e-9), got ${actual}`,
+  )
+}
+
 async function createFixtureDatabase(file = dbPath, rows = ROWS) {
   const mod = await loadNodeSqlite()
   if (mod && typeof mod.DatabaseSync === "function") {
@@ -83,7 +91,9 @@ async function createFixtureDatabase(file = dbPath, rows = ROWS) {
           .join(", ")})`,
     ),
   ]
-  execFileSync("sqlite3", [file, statements.join(";\n") + ";"], { encoding: "utf8", timeout: 5000 })
+  const sqliteBin = resolveTrustedExecutable("sqlite3")
+  assert(sqliteBin, "sqlite3 executable must be available for fallback test")
+  execFileSync(sqliteBin, [file, statements.join(";\n") + ";"], { encoding: "utf8", timeout: 5000 })
 }
 
 // Minimal ctx.storage shim: the plan tool requires a signed baseline (or an
@@ -158,7 +168,7 @@ try {
   assert(costRes.content.includes("spent: $"), "Should report spent amount")
   assert.strictEqual(costRes.pct, Math.floor((EXPECTED_SPENT / 20) * 100), "Percentage must use the complete tree")
   const costs = JSON.parse(readFileSync(join(testDir, ".opencode", "teamwork", RUN_ID, "costs.json"), "utf8"))
-  assert.strictEqual(costs.spentUsd, EXPECTED_SPENT, "The whole root/child/grandchild tree must be counted")
+  assertApprox(costs.spentUsd, EXPECTED_SPENT, "The whole root/child/grandchild tree must be counted")
 
   // 3. Second call should not double count.
   const costRes2 = await registeredTools.teamwork_cost.execute({}, { sessionID: ROOT })

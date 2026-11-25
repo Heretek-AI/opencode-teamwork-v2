@@ -44,7 +44,7 @@ export interface ToolResult {
 const locationTools = new WeakMap<object, Promise<any>>()
 
 /** The project location's registered tool list + snapshot, cached per host. */
-export function toolsFor(loaded: LoadedHost): Promise<any> {
+function toolsFor(loaded: LoadedHost): Promise<any> {
   let cached = locationTools.get(loaded as object)
   if (!cached) {
     cached = openLocationTools(loaded, loaded.project.root)
@@ -54,7 +54,7 @@ export function toolsFor(loaded: LoadedHost): Promise<any> {
 }
 
 /** `plan` -> `teamwork_plan`; an already-effective id is kept as-is. */
-export function effectiveToolName(name: string): string {
+function effectiveToolName(name: string): string {
   const raw = String(name ?? "").trim()
   return raw.startsWith("teamwork_") ? raw : `teamwork_${raw}`
 }
@@ -74,13 +74,6 @@ export async function createSession(loaded: LoadedHost, options: CreateSessionOp
     parentID: created.parentID ?? parent?.id ?? null,
     info: created,
   }
-}
-
-/** Switch the session's agent through the host API, as a command would. */
-export async function selectAgent(loaded: LoadedHost, session: RunSession, agent: string): Promise<RunSession> {
-  await loaded.host.sessions.switchAgent({ sessionID: session.id, agent })
-  const info = await loaded.host.sessions.get({ sessionID: session.id })
-  return { id: session.id, agent, parentID: info?.parentID ?? session.parentID, info }
 }
 
 function normalize(name: string, raw: any): ToolResult {
@@ -113,12 +106,18 @@ export async function execute(
   session: RunSession,
   name: string,
   input: Record<string, unknown> = {},
+  options: { readonly signal?: AbortSignal; readonly cancel?: unknown } = {},
 ): Promise<ToolResult> {
   const effective = effectiveToolName(name)
   try {
     const tools = await toolsFor(loaded)
     const tool = toolById(tools, effective)
-    const raw = await rawExecute(tool, input, { sessionID: session.id, agent: session.agent })
+    const raw = await rawExecute(tool, input, {
+      sessionID: session.id,
+      agent: session.agent,
+      ...(options.signal ? { signal: options.signal } : {}),
+      ...(options.cancel !== undefined ? { cancel: options.cancel } : {}),
+    })
     return normalize(effective, raw)
   } catch (error) {
     return failure(effective, error)

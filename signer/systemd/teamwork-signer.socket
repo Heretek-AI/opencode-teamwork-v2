@@ -1,0 +1,12 @@
+[Unit]
+Description=Teamwork Non-Oracle Signer Socket (v2)
+
+[Socket]
+ListenStream=/run/teamwork-signer/signer.sock
+SocketUser=teamwork-signer
+SocketGroup=teamwork-workload
+SocketMode=0660
+DirectoryMode=0750
+
+[Install]
+WantedBy=sockets.target

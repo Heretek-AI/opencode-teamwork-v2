@@ -100,9 +100,6 @@ export interface WriteAnomaly {
   through?: string
 }
 
-/** Every identity key (lexical path, realpath, dev:ino) that names a run. */
-export function runPolicyKeys(run: string): string[]
-
 /**
  * Resolve the pinned-write policy for a run: env assertion OR a plan assertion
  * (`requirePinnedWrites: true` in plan.dag.json), keyed by realpath + (dev, ino)
@@ -119,9 +116,13 @@ export function resolveRunPolicy(run: string): {
 /** The shared `containment-mode` refusal (writer and lock layer). */
 export function containmentModeRefusal(run: string, mode?: FdTraversalMode): Error
 
-/** The durable anomaly audit path (config dir, never a run). */
-export function writeAnomalyAuditPath(env?: Record<string, string | undefined>): string
 export function setWriteAnomalyAuditPathForTest(path: string | null): void
+export function setIncidentDirForTest(dir: string | null): void
+export function setMaxIncidentFilesForTest(limit: number | null): void
+export function listContainmentIncidents(
+  run?: string,
+  options?: { incidentDir?: string; env?: Record<string, string | undefined> },
+): Array<Record<string, unknown>>
 export function writeAnomaliesForRun(
   run?: string,
   options?: { includeDiagnostics?: boolean; auditPath?: string; env?: Record<string, string | undefined> },
@@ -133,11 +134,7 @@ export function unacknowledgedWriteAnomalies(
 export function acknowledgeWriteAnomalies(run?: string): WriteAnomaly | null
 
 export function assertSingleSegment(name: string): string
-export function fdPath(fd: number): string
-export function fdExactly(real: string, fd: number): boolean
 export function openPinnedRoot(run: string): PinnedRoot | WriteRefusal
-export function openChildDir(parentFd: number, name: string): number
-export function openOrCreateDir(parentFd: number, name: string): number
 export function pinParent(
   run: string,
   relPath: string,
@@ -156,34 +153,30 @@ export function writeFileAtomicWithin(
   content: string | Buffer,
   options?: WriteOptions,
 ): WriteOk
-export function writeOnceAt(
-  dirFd: number,
-  name: string,
-  content: string | Buffer,
-  options?: WriteOptions,
-): WriteOk
 export function writeOnceWithin(
   run: string,
   relPath: string,
   content: string | Buffer,
   options?: WriteOptions,
 ): WriteOk
-export function touchAt(dirFd: number, name: string, content: string | Buffer, options?: WriteOptions): TouchResult
 export function touchWithin(run: string, relPath: string, content: string | Buffer, options?: WriteOptions): TouchResult
-export function appendLineAt(
-  dirFd: number,
-  name: string,
-  buildLineFromFd: (fd: number, stat: unknown) => string,
-  options?: WriteOptions,
-): WriteOk
 export function appendLineWithin(
   run: string,
   relPath: string,
   buildLineFromFd: (fd: number, stat: unknown) => string,
   options?: WriteOptions,
 ): WriteOk
-export function unlinkAt(dirFd: number, name: string): boolean
 export function unlinkWithin(run: string, relPath: string, options?: WriteOptions): boolean
 export function createDirWithin(run: string, relPath: string, options?: WriteOptions): { status: "ok"; path: string }
 export function recentWriteAnomalies(limit?: number): WriteAnomaly[]
 export function onWriteAnomaly(sink: ((anomaly: WriteAnomaly) => void) | null): void
+
+export interface ResolveExecutableOptions {
+  env?: Record<string, string | undefined>
+  standardOnly?: boolean
+  /** Default true. Set false to search only the supplied PATH (no POSIX fallback dirs). */
+  fallbackToStandard?: boolean
+  allowPath?: boolean
+}
+
+export function resolveTrustedExecutable(binName: string, options?: ResolveExecutableOptions): string | null

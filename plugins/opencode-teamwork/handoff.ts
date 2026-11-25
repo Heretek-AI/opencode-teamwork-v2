@@ -17,18 +17,19 @@
 //
 // Zero runtime dependencies. Erasable TypeScript only.
 
-import { lstatSync, readdirSync } from "node:fs"
+import { lstatSync } from "node:fs"
 import { basename, join } from "node:path"
 import { sha256Hex } from "./auth.ts"
 import type { AuthContext, AuthEnvelope, AuthFailure } from "./auth.ts"
-import { clean, isSafeTaskId, readBoundedRunFile, readBoundedRunJson, writeSafeRunFile } from "./tournament.ts"
+import { isSafeTaskId, readBoundedRunFile, readBoundedRunJson, writeSafeRunFile } from "./tournament.ts"
+import { clean } from "./text-utils.ts"
 import { withPinnedCrossProcessLock } from "./locks.ts"
 
 /** Domain separator for the signed handoff index payload. */
-export const HANDOFF_AUTH_KIND = "teamwork.handoff"
-export const HANDOFF_AUTH_VERSION = 1
+const HANDOFF_AUTH_KIND = "teamwork.handoff"
+const HANDOFF_AUTH_VERSION = 1
 
-export const HANDOFF_SECTIONS = [
+const HANDOFF_SECTIONS = [
   "Observation",
   "Logic Chain",
   "Caveats",
@@ -39,17 +40,17 @@ export const HANDOFF_SECTIONS = [
 /** The exact heading labels, in order (`## 1. Observation` …). */
 export const HANDOFF_SECTION_LABELS = HANDOFF_SECTIONS.map((name, i) => `${i + 1}. ${name}`)
 
-export const HANDOFF_DIR = "handoffs"
-export const HANDOFF_INDEX_FILE = "index.json"
-export const RUN_LEVEL_HANDOFF_ID = "_run"
+const HANDOFF_DIR = "handoffs"
+const HANDOFF_INDEX_FILE = "index.json"
+const RUN_LEVEL_HANDOFF_ID = "_run"
 
 /** Whether final completion requires the handoff matrix or records an explicit skip. */
-export const HANDOFF_MODES = ["required", "skip"] as const
+const HANDOFF_MODES = ["required", "skip"] as const
 export type HandoffMode = (typeof HANDOFF_MODES)[number]
 /** Per-section cap after sanitisation (UTF-8 bytes). */
-export const MAX_HANDOFF_SECTION_BYTES = 2 * 1024
+const MAX_HANDOFF_SECTION_BYTES = 2 * 1024
 /** Total cap for the five section bodies (UTF-8 bytes). */
-export const MAX_HANDOFF_BYTES = 8 * 1024
+const MAX_HANDOFF_BYTES = 8 * 1024
 /** Index caps: newest 200 entries, 256 KiB on disk. */
 export const MAX_HANDOFF_ENTRIES = 200
 export const MAX_HANDOFF_INDEX_BYTES = 256 * 1024
@@ -62,7 +63,7 @@ const RUN_HANDOFF_PATH = /^handoffs\/[A-Za-z0-9._-]+\.md$/
 // verifier handoff, the worker handoff it follows (handoffs/*.md, 0.12.0).
 const CITE_PATH = /^(?:verify\/[A-Za-z0-9._-]+\.json|handoffs\/[A-Za-z0-9._-]+\.md)$/
 
-export const TASK_SCOPED_HANDOFF_ROLES = [
+const TASK_SCOPED_HANDOFF_ROLES = [
   "team/worker",
   "team/proof-worker",
   "team/segment-reviewer",
@@ -73,7 +74,7 @@ export const TASK_SCOPED_HANDOFF_ROLES = [
 ] as const
 
 /** These roles record run-level handoffs and must omit `taskId`. */
-export const RUN_LEVEL_HANDOFF_ROLES = ["team/victory-auditor", "team/sentinel", "team/orchestrator"] as const
+const RUN_LEVEL_HANDOFF_ROLES = ["team/victory-auditor", "team/sentinel", "team/orchestrator"] as const
 
 export interface HandoffCite {
   path: string
@@ -91,7 +92,7 @@ export interface WorkerHandoffBinding {
   sha256: string
 }
 
-export interface HandoffIndexEntry {
+interface HandoffIndexEntry {
   taskId: string
   agent: string
   agentSessionId: string
@@ -110,7 +111,7 @@ export interface HandoffIndexEntry {
   _auth?: AuthEnvelope
 }
 
-export interface HandoffIndex {
+interface HandoffIndex {
   version: 1
   sessionId: string
   updatedAt: string
@@ -125,7 +126,7 @@ export interface HandoffSections {
   verificationMethod: string
 }
 
-export interface NormalizedHandoffSection {
+interface NormalizedHandoffSection {
   label: string
   body: string
 }
@@ -148,7 +149,7 @@ function defuseHeading(line: string): string {
  * three or more blank lines, trims, and never returns a raw control character.
  * Oversize is refused by `validateHandoffSections`, not truncated here.
  */
-export function sanitizeHandoffText(value: unknown): string {
+function sanitizeHandoffText(value: unknown): string {
   const raw = String(value ?? "")
     .replace(/\r\n?/g, "\n")
     .replace(CONTROL_CHARS, " ")
@@ -165,7 +166,7 @@ export function sanitizeHandoffText(value: unknown): string {
  * non-empty after sanitisation; per-section and total caps are enforced before
  * anything is written.
  */
-export function validateHandoffSections(
+function validateHandoffSections(
   input: Partial<Record<keyof HandoffSections, unknown>>,
 ): { ok: true; sections: NormalizedHandoffSection[] } | { ok: false; error: string } {
   const sections: NormalizedHandoffSection[] = []
@@ -252,11 +253,11 @@ export function resolveHandoffScope(
   return { ok: true, taskKey: raw, taskId: raw }
 }
 
-export function handoffRelativePath(taskKey: string, agentSlug: string): string {
+function handoffRelativePath(taskKey: string, agentSlug: string): string {
   return `${HANDOFF_DIR}/${taskKey}-${agentSlug}.md`
 }
 
-export function handoffIndexRelativePath(): string {
+function handoffIndexRelativePath(): string {
   return `${HANDOFF_DIR}/${HANDOFF_INDEX_FILE}`
 }
 
@@ -264,7 +265,7 @@ export function handoffIndexRelativePath(): string {
  * The citation a role's handoff may carry when the artifact exists. Citations
  * are evidence pointers, never a verdict source.
  */
-export function handoffCiteRelativePath(agent: string, taskId?: string): string | undefined {
+function handoffCiteRelativePath(agent: string, taskId?: string): string | undefined {
   if (taskId) {
     if (agent === "team/verifier") return `verify/report-${taskId}.json`
     if (agent === "team/falsifier") return `verify/challenge-${taskId}.json`
@@ -498,7 +499,7 @@ interface WrittenHandoff {
 }
 
 /** Build the canonical payload that binds one index entry to its run and body. */
-export function handoffAuthPayload(runId: string, entry: HandoffIndexEntry): Record<string, unknown> {
+function handoffAuthPayload(runId: string, entry: HandoffIndexEntry): Record<string, unknown> {
   return {
     kind: HANDOFF_AUTH_KIND,
     v: HANDOFF_AUTH_VERSION,
@@ -627,7 +628,7 @@ async function signPreparedHandoff(prepared: PreparedHandoff, auth: AuthContext)
  * nothing is written in that case (the markdown is validated before its first
  * write). Use `writeHandoff` when an authenticity context is available.
  */
-export function writeHandoffSync(run: string, opts: WriteHandoffOptions): WrittenHandoff {
+function writeHandoffSync(run: string, opts: WriteHandoffOptions): WrittenHandoff {
   if (opts.auth) {
     throw new Error("refused: writeHandoffSync cannot sign; use the async writeHandoff")
   }
@@ -656,17 +657,6 @@ export async function writeHandoff(run: string, opts: WriteHandoffOptions): Prom
     }
     return finishHandoff(run, prepared, entry)
   })
-}
-
-/** List valid handoff documents (used by tests/diagnostics); never follows links. */
-export function listHandoffFiles(run: string): string[] {
-  try {
-    return readdirSync(join(run, HANDOFF_DIR))
-      .filter((name) => /^[A-Za-z0-9._-]+\.md$/.test(name))
-      .sort()
-  } catch {
-    return []
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -709,7 +699,7 @@ export interface RequiredHandoffPair {
   agent: string
 }
 
-export interface HandoffGateRequirement {
+interface HandoffGateRequirement {
   taskId: string
   /** One of these agents satisfies the requirement (exactly one entry). */
   agents: string[]
@@ -750,7 +740,7 @@ export interface HandoffAuthCheckOptions {
   manifestRunKeyId?: string
 }
 
-export interface HandoffEntryAuthCheck {
+interface HandoffEntryAuthCheck {
   status: "signed" | "unsigned" | "invalid"
   keyId?: string
   failure?: AuthFailure
@@ -761,7 +751,7 @@ export interface HandoffEntryAuthCheck {
  * the entry plus the run id, so a copied envelope fails on path/digest/run and a
  * changed entry field fails on the payload digest. Prose is never inspected.
  */
-export async function checkHandoffEntryAuth(
+async function checkHandoffEntryAuth(
   run: string,
   entry: HandoffIndexEntry,
   opts: HandoffAuthCheckOptions,
@@ -880,7 +870,7 @@ export async function evaluateHandoffGateChecked(
  * modes. The task's own assigned agent writes its worker handoff; verifier,
  * falsifier and security-auditor handoffs are added by mode, not by request.
  */
-export function requiredHandoffMatrix(
+function requiredHandoffMatrix(
   tasks: HandoffTaskRef[],
   opts: { strict: boolean; victoryAudit: boolean },
 ): { requirements: HandoffGateRequirement[]; errors: string[] } {
@@ -939,7 +929,7 @@ function readCiteHash(run: string, relPath: string): string | null {
  * victory artifact makes the handoff stale; a duplicate, unknown or tampered
  * index entry fails it. Handoff prose is never inspected for PASS/FAIL.
  */
-export function evaluateHandoffGate(
+function evaluateHandoffGate(
   run: string,
   tasks: HandoffTaskRef[],
   opts: { mode: HandoffMode; strict: boolean; victoryAudit: boolean },

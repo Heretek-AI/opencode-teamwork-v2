@@ -27,10 +27,12 @@ import {
 import { detectAvailableModels, pickModels, applyOverrides } from "../lib/picker.mjs"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import { runDoctor, nextSteps } from "../lib/doctor.mjs"
+import { inventoryLocks, unlockLock, formatLocksReport } from "../lib/locks-doctor.mjs"
 import { collectSecurityReport, hardenedExitCode } from "../lib/security.mjs"
 import { buildTimeline, renderTimeline, timelineWarnings } from "../lib/timeline.mjs"
 import { buildExportData, renderExport } from "../lib/export.mjs"
 import { verifyRun, renderVerify, verifyExitCode, VerifyUsageError } from "../lib/verify.mjs"
+import { readRegularBounded } from "../plugins/opencode-teamwork/safe-fs.mjs"
 
 // Echo a user-supplied value in an error message: control characters become "?"
 // and the value is capped, so a hostile argv cannot inject escapes or bloat stderr.
@@ -171,6 +173,15 @@ function parseArgs(argv) {
       case "--security":
         options.security = true
         break
+      case "--locks":
+        options.locks = true
+        break
+      case "--unlock":
+        options.unlock = rest.shift() ?? ""
+        break
+      case "--confirm":
+        options.confirm = true
+        break
       case "--require-hardened":
         options.security = true
         options.requireHardened = true
@@ -234,6 +245,24 @@ function parseArgs(argv) {
         break
       case "--attestation-issuer":
         options.attestationIssuer = rest.shift() ?? ""
+        break
+      case "--oidc-jwks":
+        options.oidcJwks = rest.shift() ?? ""
+        break
+      case "--fetch-jwks":
+        options.fetchJwks = rest.shift() ?? ""
+        break
+      case "--require-oidc":
+        options.requireOidcToken = true
+        break
+      case "--expected-repo":
+        options.attestationRepository = rest.shift() ?? ""
+        break
+      case "--expected-ref":
+        options.attestationRef = rest.shift() ?? ""
+        break
+      case "--expected-audience":
+        options.attestationAudience = rest.shift() ?? ""
         break
       case "--html":
         options.markdown = false
@@ -600,18 +629,58 @@ const DOCTOR_INDICATORS = { pass: "[✓]", warn: "[!]", fail: "[✗]" }
 function runPlanRequirePinnedWrites(runDir) {
   if (!runDir) return undefined
   try {
-    const file = join(runDir, "plan.dag.json")
-    const st = lstatSync(file)
-    if (!st.isFile() || st.size > 64 * 1024) return undefined
-    const parsed = JSON.parse(readFileSync(file, "utf8"))
+    const read = readRegularBounded(join(runDir, "plan.dag.json"), 64 * 1024)
+    if (read.status !== "ok") return undefined
+    const parsed = JSON.parse(read.text)
     return parsed?.requirePinnedWrites === true
   } catch {
     return undefined
   }
 }
 
+/**
+ * Opt-in CLI-only OIDC JWKS fetcher (`verify --fetch-jwks <issuer-url>`).
+ * Strictly HTTPS-only (no redirects to HTTP), bounded response size, never
+ * invoked unless the operator explicitly passes `--fetch-jwks`.
+ */
+async function fetchOidcJwks(issuerUrl) {
+  const base = String(issuerUrl || "").trim().replace(/\/+$/, "")
+  let parsed
+  try {
+    parsed = new URL(base)
+  } catch {
+    throw new Error(`--fetch-jwks issuer "${base}" is not a valid URL`)
+  }
+  if (parsed.protocol !== "https:") {
+    throw new Error(`--fetch-jwks requires an https:// issuer URL (got ${parsed.protocol})`)
+  }
+  const wellKnownUrl = `${base}/.well-known/openid-configuration`
+  const discoRes = await fetch(wellKnownUrl, { signal: AbortSignal.timeout(10_000) })
+  if (!discoRes.ok) throw new Error(`OIDC discovery ${wellKnownUrl} failed with HTTP ${discoRes.status}`)
+  const disco = await discoRes.json()
+  if (typeof disco?.jwks_uri !== "string" || !disco.jwks_uri.startsWith("https://")) {
+    throw new Error(`OIDC discovery at ${wellKnownUrl} returned no valid https:// jwks_uri`)
+  }
+  const jwksRes = await fetch(disco.jwks_uri, { signal: AbortSignal.timeout(10_000) })
+  if (!jwksRes.ok) throw new Error(`JWKS fetch ${disco.jwks_uri} failed with HTTP ${jwksRes.status}`)
+  const text = await jwksRes.text()
+  if (Buffer.byteLength(text, "utf8") > 512 * 1024) throw new Error("JWKS response exceeds 512 KiB bound")
+  const jwks = JSON.parse(text)
+  if (!Array.isArray(jwks?.keys)) throw new Error("JWKS response has no keys array")
+  return jwks
+}
+
 async function verifyCommand(options) {
   try {
+    let oidcJwks
+    if (options.fetchJwks) {
+      oidcJwks = await fetchOidcJwks(options.fetchJwks)
+    } else if (options.oidcJwks) {
+      oidcJwks = JSON.parse(readFileSync(resolve(options.oidcJwks), "utf8"))
+    } else if (process.env.OPENCODE_TEAMWORK_OIDC_JWKS) {
+      const raw = process.env.OPENCODE_TEAMWORK_OIDC_JWKS.trim()
+      oidcJwks = raw.startsWith("@") ? JSON.parse(readFileSync(resolve(raw.slice(1)), "utf8")) : JSON.parse(raw)
+    }
     const result = await verifyRun({
       cwd: process.cwd(),
       session: options.session,
@@ -634,6 +703,11 @@ async function verifyCommand(options) {
       attestationPublicKey: options.attestationPublicKey || undefined,
       attestationKeyId: options.attestationKeyId || undefined,
       attestationIssuer: options.attestationIssuer || undefined,
+      attestationAudience: options.attestationAudience || undefined,
+      attestationRepository: options.attestationRepository || undefined,
+      attestationRef: options.attestationRef || undefined,
+      oidcJwks,
+      requireOidcToken: options.requireOidcToken === true,
     })
     if (options.json) {
       // JSON.stringify escapes C0 only; escape DEL and C1 (incl. 0x9b CSI) too
@@ -660,6 +734,21 @@ async function verifyCommand(options) {
 }
 
 function doctorCommand(options) {
+  if (options.unlock !== undefined) {
+    const result = unlockLock(options.unlock, { confirm: options.confirm === true })
+    if (options.json) console.log(JSON.stringify(result, null, 2))
+    else console.log(result.message)
+    process.exitCode = result.ok ? 0 : 1
+    return
+  }
+  if (options.locks) {
+    const root = options.runDir ? resolve(options.runDir) : join(process.cwd(), ".opencode", "teamwork")
+    const inventory = inventoryLocks(root)
+    if (options.json) console.log(JSON.stringify(inventory, null, 2))
+    else console.log(formatLocksReport(inventory))
+    process.exitCode = 0
+    return
+  }
   const configDir = resolveConfigDir(options.configDir)
   const report = runDoctor({ configDir, cwd: process.cwd() })
   const steps = nextSteps(report.checks)

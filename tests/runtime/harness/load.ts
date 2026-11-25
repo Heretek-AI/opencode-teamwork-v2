@@ -57,7 +57,7 @@ function readPackageVersion(name: string) {
 }
 
 /** The exact versions under test, read from the installed tree. */
-export function installedVersions(): Versions {
+function installedVersions(): Versions {
   return {
     core: readPackageVersion("@opencode/core"),
     sdk: readPackageVersion("@opencode/sdk"),
@@ -67,7 +67,7 @@ export function installedVersions(): Versions {
   }
 }
 
-export const teamPluginUrl = (project: Project) => pathToFileURL(join(project.pluginDir, "index.ts")).href
+const teamPluginUrl = (project: Project) => pathToFileURL(join(project.pluginDir, "index.ts")).href
 
 /** Import the plugin module directly (only for static export checks). */
 export async function importTeamwork(project: Project) {
@@ -102,7 +102,10 @@ export async function loadHost(
 
   // The directory path is the on-disk `plugins` entry; the memory path passes
   // the object to the host. Never both, or the host reports a duplicate id.
-  if (mode === "directory") project.writeConfig([{ package: project.pluginDir }])
+  // TEAMWORK_PACKED_PACKAGE lets the T4 packed-tarball test load the installed
+  // npm artifact instead of the working tree.
+  const directoryPackage = process.env.TEAMWORK_PACKED_PACKAGE || project.pluginDir
+  if (mode === "directory") project.writeConfig([{ package: directoryPackage }])
   else project.writeConfig([])
 
   const capture = {} as Capture
@@ -133,7 +136,7 @@ export async function loadHost(
     }),
   )
 
-  const client = Client.make({ baseUrl: "http://opencode.local", fetch: embedded.fetch })
+  const client = Client.make({ baseUrl: "https://opencode.local", fetch: embedded.fetch })
   const host: any = Object.assign(client, {
     sessions: client.session,
     events: client.event,

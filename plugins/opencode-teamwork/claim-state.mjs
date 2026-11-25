@@ -12,7 +12,7 @@
 //     lease is live — it is never silently renewed or resumed;
 //   * cross-host wins over every other state (never auto-reclaimed).
 
-export const CLAIM_GRACE_MS = 5 * 60 * 1000
+const CLAIM_GRACE_MS = 5 * 60 * 1000
 
 /** States that mean a task is still in use (or cannot be trusted as idle). */
 export const BLOCKING_CLAIM_STATES = new Set(["live", "expired", "needs-inspection", "cross-host"])
@@ -48,10 +48,4 @@ export function deriveClaimStateFromClaim(claim, options) {
   else if (Number.isFinite(until) && now < until + graceMs) state = "expired"
   else state = "stale"
   return { state, remainingMs, ...(heartbeatAgeMs !== undefined ? { heartbeatAgeMs } : {}), crossHost, needsInspection: state === "needs-inspection" }
-}
-
-/** True when `claim` blocks prune/cleanup (live, expired, flagged or cross-host). */
-export function claimBlocksCleanup(claim, options) {
-  if (!claim || typeof claim !== "object") return false
-  return BLOCKING_CLAIM_STATES.has(deriveClaimStateFromClaim(claim, options).state)
 }

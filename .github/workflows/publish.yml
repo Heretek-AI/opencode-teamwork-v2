@@ -63,7 +63,7 @@ jobs:
       # fall back to the newest 11.x if the latest requires a newer Node.
       - name: Ensure recent npm
         run: |
-          npm install -g npm@latest || npm install -g "npm@^11"
+          npm install -g --ignore-scripts npm@11.21.3
           npm --version
           node -e "const v=require('child_process').execSync('npm --version').toString().trim().split('.').map(Number); if(v[0]<11||(v[0]===11&&v[1]<5)){console.error('npm too old for OIDC:',v.join('.'));process.exit(1)}"
 
@@ -84,6 +84,19 @@ jobs:
         run: |
           git fetch --tags --force
           node scripts/check-release-tag.mjs
+
+      # T4: pack the tarball, install into a clean project, verify sha256 and
+      # file whitelist, and run L1 catalog/commands specs against the install.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Install runtime harness dependencies (T4)
+        working-directory: tests/runtime
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Packed-tarball install test (T4)
+        run: node scripts/test-packed-tarball.mjs
 
       # `repository.url` in package.json must exactly match this GitHub repo or
       # provenance/OIDC verification fails. npm generates provenance

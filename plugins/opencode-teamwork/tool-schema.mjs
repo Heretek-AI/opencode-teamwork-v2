@@ -76,7 +76,7 @@ const pathText = (path) =>
  * each keyword has the shape the validator expects. Throws on the first
  * unsupported construct so a registration failure is loud and locatable.
  */
-export function assertSupportedSchema(schema, path = []) {
+function assertSupportedSchema(schema, path = []) {
   if (!isRecord(schema)) throw new Error(`strictInput: schema at ${pathText(path)} must be an object`)
   for (const key of Object.keys(schema)) {
     if (!SUPPORTED_KEYWORDS.includes(key)) {
@@ -189,13 +189,31 @@ function validateValue(schema, value, path, issues) {
     return
   }
   if (schema.anyOf !== undefined) {
-    const matches = schema.anyOf.some((child) => {
+    const branchFailures = []
+    const matches = schema.anyOf.some((child, index) => {
       const nested = []
       validateValue(child, value, path, nested)
-      return nested.length === 0
+      if (nested.length === 0) return true
+      const label = child.title || child.type || `branch[${index}]`
+      // Name every failing field in the branch (up to 4), not just the first:
+      // a conditional schema such as teamwork_plan's plan/follow-up pair must
+      // tell the caller that BOTH topology and tasks are missing.
+      const detail = nested
+        .slice(0, 4)
+        .map((issue) => {
+          const relPath = issue.path.slice(path.length)
+          const loc = relPath.length > 0 ? `${pathText(relPath)}: ` : ""
+          return `${loc}${issue.message}`
+        })
+        .join(", ")
+      const more = nested.length > 4 ? `, ...and ${nested.length - 4} more` : ""
+      branchFailures.push(`branch ${index} (${label}): ${detail}${more}`)
+      return false
     })
     if (!matches) {
-      fail(issues, path, "must match one of the allowed shapes")
+      const detail = branchFailures.slice(0, 4).join("; ")
+      const more = branchFailures.length > 4 ? `; ...and ${branchFailures.length - 4} more branch(es)` : ""
+      fail(issues, path, `must match one of the allowed shapes (${detail}${more})`)
       return
     }
   }
@@ -306,15 +324,40 @@ function validateValue(schema, value, path, issues) {
   }
 }
 
-/** Attach the non-enumerable repair guard to every strict object node. */
+/**
+ * Attach non-enumerable repair guards to every strict object node.
+ *
+ * OpenCode 2.4.1's built-in `opencode.tool.input.repair` plugin runs in
+ * `execute.before` before our Standard Schema validator and deletes undeclared
+ * keys whenever `schema.additionalProperties === false && !patterned && !composed`
+ * (`packages/core/src/plugin/tool-input-repair.ts:161-173`).
+ *
+ * Attaching both non-enumerable `patternProperties: {}` AND `allOf: []` keeps
+ * the serialized model-facing JSON Schema byte-identical while surviving even
+ * if a future host stops checking `patternProperties` alone. When host repair
+ * is absent or disabled, `~standard.validate` enforces strictness directly.
+ *
+ * `$ref` and `oneOf` remain intentionally unsupported and are refused loudly
+ * at registration time (`assertSupportedSchema`) rather than weakening
+ * validation or pulling in an external JSON Schema resolver.
+ */
 function guardRepairPass(schema) {
   if (!isRecord(schema)) return
-  if (schema.type === "object" && schema.additionalProperties === false && !("patternProperties" in schema)) {
-    Object.defineProperty(schema, "patternProperties", {
-      value: Object.freeze({}),
-      enumerable: false,
-      configurable: true,
-    })
+  if (schema.type === "object" && schema.additionalProperties === false) {
+    if (!("patternProperties" in schema)) {
+      Object.defineProperty(schema, "patternProperties", {
+        value: Object.freeze({}),
+        enumerable: false,
+        configurable: true,
+      })
+    }
+    if (!("allOf" in schema)) {
+      Object.defineProperty(schema, "allOf", {
+        value: Object.freeze([]),
+        enumerable: false,
+        configurable: true,
+      })
+    }
   }
   for (const child of Object.values(schema.properties ?? {})) guardRepairPass(child)
   if (isRecord(schema.items)) guardRepairPass(schema.items)

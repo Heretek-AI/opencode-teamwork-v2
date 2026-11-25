@@ -187,6 +187,51 @@ check("a required key absent from properties fails registration", () => {
   )
 })
 
+check("anyOf failure names the attempted branches and their reasons", () => {
+  const unionSchema = {
+    type: "object",
+    properties: {
+      finding: {
+        anyOf: [
+          { type: "string" },
+          {
+            type: "object",
+            properties: { id: { type: "string" } },
+            required: ["id"],
+            additionalProperties: false,
+          },
+        ],
+      },
+    },
+    additionalProperties: false,
+  }
+  const result = validate({ finding: { id: "F1", bogus: true } }, unionSchema)
+  assert.deepStrictEqual(issuePaths(result), ["finding"])
+  const msg = issueAt(result, "finding").message
+  assert.match(msg, /branch 0 \(string\): expected string, received object/)
+  assert.match(msg, /branch 1 \(object\): bogus: unknown property/)
+})
+
+check("host-repair independence: unknown keys are rejected even without patternProperties or repair pass", () => {
+  const plain = {
+    type: "object",
+    properties: { a: { type: "string" } },
+    additionalProperties: false,
+  }
+  const wrapped = strictInput(plain)
+  // Both non-enumerable guards exist and are invisible to JSON serialization.
+  assert.deepStrictEqual(
+    Object.keys(plain).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+    ["additionalProperties", "properties", "type"],
+  )
+  assert.ok("patternProperties" in plain && "allOf" in plain)
+  // Even if a future host deletes patternProperties before calling validate, strictness holds.
+  delete plain.patternProperties
+  const result = wrapped["~standard"].validate({ a: "ok", extra: 1 })
+  assert.deepStrictEqual(issuePaths(result), ["extra"])
+  assert.match(issueAt(result, "extra").message, /unknown property/)
+})
+
 if (failed > 0) {
   console.error(`\n${failed} strict input test(s) failed`)
   process.exit(1)
