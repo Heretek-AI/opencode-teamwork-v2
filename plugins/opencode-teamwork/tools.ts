@@ -148,6 +148,7 @@ import {
   type AuthFailure,
 } from "./auth.ts"
 import { contentSha256Hex, isApprovalNonce } from "./approval-format.mjs"
+import { strictInput } from "./tool-schema.mjs"
 import {
   ATTESTATION_PATH,
   ENV_ATTESTATION_ISSUER,
@@ -6877,7 +6878,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Create a Teamwork run directory and write plan.dag.json + state.json + costs.json. Returns the run path and the (validated) session id. Call this once before dispatching workers.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string", description: "Reuse an existing session id; omit to create one." },
@@ -7049,7 +7050,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["topology", "tasks"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const planRun = input?.sessionId ? resolveRun(root, input.sessionId).run : undefined
         const authz = await authorizeToolAction(ctx, planRun, "plan", undefined, context)
@@ -7064,7 +7065,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Deterministic route classifier. Evaluates Document Review (Priority 1, checked BEFORE Lean/LEMMA, massive-proof, and proof) with explicit supplied-document + critique-intent + negative-trigger guards, then Priorities 2-7. Read-only: writes nothing.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           request: { type: "string", description: "User request text to route." },
@@ -7082,7 +7083,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           checkPaths: { type: "boolean", description: "Default true. Verify explicit document paths in request exist as regular files inside root." },
         },
         additionalProperties: false,
-      },
+      }),
       execute: (input: any) => {
         // Document Review is the authority for Priority 1; LEMMA owns the
         // explicit Lean 4 gate for Priority 2; the tournament classifier owns
@@ -7195,7 +7196,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Ingest and partition a supplied Markdown/LaTeX/PDF/text/URL/inline document for the document-review topology. Validates bounds, path containment, and PDF headers BEFORE creating any run directory, then writes plan.dag.json (seg-01..seg-0K + doc-synthesis) and document-review/{manifest.json,DOCUMENT_TEXT_MAP.md,ANALYSIS_PARTITION.md}.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string" },
@@ -7226,7 +7227,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["document"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const sessionId = input?.sessionId || newSessionId()
         const resolvedSession = resolveRun(root, sessionId)
@@ -7395,7 +7396,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Persist bounded RSA tree node outputs, segment unit-reports, synthesis candidates, or final DOCUMENT_REVIEW_REPORT.md for a document-review run. Enforces SEGMENT_ID allowlist, manifest bounds, symlink refusal, realpath containment, and text sanitisation.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string" },
@@ -7431,7 +7432,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["stage", "summary"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -7640,7 +7641,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Re-run the input preflight for an existing run: check the files/URLs named by ORIGINAL_REQUEST.md plus any explicit inputs, write <run>/preflight.json, and append a preflight event. Never throws.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string", description: "Run to check; omit for the latest run." },
@@ -7655,7 +7656,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           },
         },
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -7714,14 +7715,14 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Read the active (or given) Teamwork run and summarize per-task progress. Lists unacknowledged write anomalies; a run with one reports needs-inspection. acknowledgeAnomalies: true records an explicit operator acknowledgement in the config-dir audit (never a run write).",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string" },
           acknowledgeAnomalies: { type: "boolean" },
         },
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -7823,7 +7824,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       name: "resume",
       options: { namespace: "teamwork", codemode: false },
       description: "Return the tasks that still need work (pending/running/fail) so a restarted Sentinel can continue where it stopped.",
-      input: { type: "object", properties: { sessionId: { type: "string" } }, additionalProperties: false },
+      input: strictInput({ type: "object", properties: { sessionId: { type: "string" } }, additionalProperties: false }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -7858,7 +7859,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Read the run budget and report real spend across the full session tree (Sentinel + all workers/verifiers). Uses OpenCode's native cost and token tracking; falls back to manual addUsd when client/db is unavailable. Warns at 80% and returns shouldHalt; the budget is advisory outside the massive-proof tournament, which is the only topology that enforces it. budgetUsd: 0 means no budget.",
-      input: { type: "object", properties: { sessionId: { type: "string" }, addUsd: { type: "number" }, taskId: { type: "string" } }, additionalProperties: false },
+      input: strictInput({ type: "object", properties: { sessionId: { type: "string" }, addUsd: { type: "number" }, taskId: { type: "string" } }, additionalProperties: false }),
       execute: async (input: any, context: any) => {
         // SEC-1: the taskId becomes a costs.byTask key. Refuse unsafe ids (e.g.
         // "__proto__", "a/b") before any read or write.
@@ -8095,7 +8096,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Preflight the run budget BEFORE teamwork_plan. Detects whether the session uses opencode/ (managed) models and whether the opencode_console MCP is connected. When both hold, tells the caller to fetch credits via opencode_console_get_usage and pass a full/partial budgetUsd to teamwork_plan. Otherwise, use the default budget.",
-      input: { type: "object", properties: {}, additionalProperties: false },
+      input: strictInput({ type: "object", properties: {}, additionalProperties: false }),
       execute: async (_input: any, context: any) => {
         const authz = await authorizeToolAction(ctx, undefined, "budget", undefined, context)
         if (!authz.ok) return { content: authz.content }
@@ -8126,7 +8127,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Bounded massive-proof tournament state machine (`estimate`, `init`, `propose`, `falsify`, `merge`, `score`, `audit`, `cancel`, `status`). Enforces explicit opt-in, bounded levels/width/candidates, budget preflight, deterministic candidate ranking, AbortSignal/budget-halt cancellation, and team/referee verdict gating.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           action: {
@@ -8187,7 +8188,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["action"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const action = clean(input?.action, 32).trim()
         const callSession = typeof context?.sessionID === "string" ? context.sessionID : undefined
@@ -8793,12 +8794,12 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       name: "pitfall",
       options: { namespace: "teamwork", codemode: false },
       description: "Append an answer-agnostic failure mode to the run's pitfall registry.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: { sessionId: { type: "string" }, round: { type: "number" }, taskId: { type: "string" }, pitfall: { type: "string" } },
         required: ["pitfall"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -8818,7 +8819,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Determine the next actionable tasks in the DAG based on dependencies and current lifecycle states. Returns tasks ready for worker dispatch, tasks ready for verifier dispatch, in-progress tasks, or signals completion/deadlock. In strict mode it returns NEEDS_STRICT_WAVE (or BLOCKED_BY_STRICT_WAVE) until every task has its falsifier challenge and security-auditor audit, and never ALL_PASSED before them. When the plan requires handoffs, it returns NEEDS_HANDOFFS (missing taskId:agent pairs) or BLOCKED_BY_HANDOFFS (stale/duplicate/unknown/tampered) before ALL_PASSED.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string", description: "Teamwork session id (defaults to active run)." },
@@ -8834,7 +8835,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           },
         },
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -9855,7 +9856,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Update a task's lifecycle status, round, branch, and verification report in state.json. Lifecycle: pending -> worker_active -> worker_done -> verifier_active -> verified_pass | verified_fail | blocked.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string" },
@@ -9896,7 +9897,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["taskId", "status"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -10512,7 +10513,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Explicit crash recovery for a claim (claim protocol 2). team/sentinel or team/orchestrator, from the run root or a descendant. Inspect the live and baseline fingerprints, then heartbeat, release, block, requeue or adopt the claim. inspect returns a single-use 10-minute token (stored hashed); adopt/requeue/block refuse without it and re-check the fingerprint, so a worktree that changed after inspection is INSPECTION_STALE. adopt marks a clean committed branch worker_done with a checkpoint and makes NO commit. requeue only when nothing changed, unless force+confirm explicitly discards the unverified changes. Nothing is ever auto-committed.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string", description: "Teamwork session id (defaults to the active run)." },
@@ -10535,7 +10536,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["taskId", "action"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -10886,7 +10887,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
       description:
         "Record the five-section handoff (Observation, Logic Chain, Caveats, Conclusion, Verification Method) for this agent. Writes <run>/handoffs/<taskId|_run>-<agent>.md and updates the bounded handoffs/index.json. Identity comes from the trusted calling session; task-scoped roles must name an existing task, while victory-auditor/sentinel/orchestrator record run-level handoffs. When the plan records requireHandoffs: \"required\", final_verify/next require the derived matrix and reject missing/stale/tampered handoffs, but the prose is never parsed as a PASS/FAIL verdict.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string", description: "Run id (SESSION_ID returned by teamwork_plan), not the OpenCode session id." },
@@ -10900,7 +10901,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["sessionId", "observation", "logicChain", "caveats", "conclusion", "verificationMethod"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -10991,7 +10992,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Record the findings of team/security-auditor and enforce the pre-merge security gate. Writes verify/security-audit.json. If Critical or High findings exist, or the auditor reports an integrity finding forbidden at the run's mode, marks status as FAIL and blocks final merge.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string" },
@@ -11027,7 +11028,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["status"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -11195,7 +11196,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Record the independent final acceptance verdict from team/victory-auditor. The auditor compares the delivered artifacts and tests against ORIGINAL_REQUEST.md and requirements.json. Only a trusted session whose agent is team/victory-auditor may call it (a caller-supplied label cannot self-authorize). Writes verify/victory.json; a CONFIRMED verdict is write-once.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string", description: "Teamwork session id (defaults to the active run)." },
@@ -11223,7 +11224,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["verdict", "requirements"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -11275,7 +11276,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Record one strict-verification verdict. Only team/falsifier may record kind=challenge (verdict PASS) and only team/security-auditor may record kind=audit (verdict CLEAN); the caller identity is derived from the trusted session and cannot be supplied as an input. Requires the task to exist and its verify/report-<taskId>.json to be PASS, binds the verdict to that report's sha256, writes verify/challenge-<taskId>.json or verify/audit-<taskId>.json atomically, appends a verification_wave event, and refuses re-recording the same report (a changed report is the only overwrite path).",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string" },
@@ -11293,7 +11294,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["sessionId", "taskId", "kind", "verdict"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -11356,7 +11357,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Write one bounded evidence artifact under verify/evidence/<name> (max 64 KiB, at most 32 files) through the pinned run writer. Returns {path, sha256, bytes}; cite the path from teamwork_wave_record so the strict gate re-hashes it. This records bytes, not a verdict.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string" },
@@ -11365,7 +11366,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["sessionId", "name", "content"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -11417,7 +11418,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Trusted writer for verify/report-<taskId>.json. Only a session whose trusted agent is team/verifier, descending from the run root, may call it. The task must exist in plan.dag.json and a PASS report must carry evidence (a summary or checks, every check passed, no fatal findings). A check may record argv-only command evidence (command/cwd/exitCode/output/durationMs); the engine computes commandSha256/outputBytes and writes a signed verify/rerun.json projection that `opencode-teamwork verify --rerun` can re-execute at the report's headSha. The report is signed for a signed run (run.manifest.json) and indexed in ctx.storage; final_verify re-checks the signature and the PASS evidence. A wrong agent, a missing task, an inconsistent PASS, a shell command line, or (under requiredProvenance \"command\") a programmatic check without a command is refused.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string" },
@@ -11495,7 +11496,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["sessionId", "taskId", "status"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -11803,7 +11804,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Compute and stamp the run's final verdict from artifacts. PASS requires every task to be verified_pass, every verify/report-<taskId>.json to be PASS, verify/security-audit.json to be PASS, and (unless the plan explicitly skipped it) a CONFIRMED independent victory audit bound to the current ORIGINAL_REQUEST.md. In strict mode it also requires verify/challenge-<taskId>.json (team/falsifier, PASS) and verify/audit-<taskId>.json (team/security-auditor, CLEAN) for every task, both bound by reportHash to the current verifier report, and writes GATE_STATUS.md. When requireHandoffs is required it also requires the continuity matrix (worker + verifier per task, falsifier + security-auditor per task in strict mode, one sentinel/orchestrator run-level, and the victory-auditor run-level handoff after a confirmed audit), rejecting missing/stale/duplicate/unknown/tampered handoffs without parsing their prose. Writes verify/final.json atomically and appends a final_verification event. The verdict is computed from evidence and cannot be overridden by input.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string" },
@@ -11830,7 +11831,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           },
         },
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -12799,7 +12800,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Deterministic git worktree manager for Teamwork runs: setup, diff, merge, resolve, and cleanup. Prevents in-repo nesting and isolates worker branches.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string" },
@@ -12827,7 +12828,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["action"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -13272,13 +13273,13 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Read-only probe for the external LEMMA toolchain (`lean`, `lake`, and the LEAP CLI `leap`, or legacy `leap-tools`) on PATH. Never touches disk and never installs packages.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           timeoutMs: { type: "number", description: "Optional per-binary probe timeout in ms (250..30000)." },
         },
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const authz = await authorizeToolAction(ctx, undefined, "lemma_probe", undefined, context)
         if (!authz.ok) return { content: authz.content }
@@ -13301,7 +13302,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Manage LEMMA Phase 0 formalization (problem_draft.lean -> preSearch APPROVE/REQUEST_CHANGES -> problem.lean) and final faithfulness review (FAITHFUL/UNFAITHFUL/MISFORMALIZED).",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string" },
@@ -13316,7 +13317,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["action"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -13391,7 +13392,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Manage bounded LEMMA decomposition tree nodes under lemma/nodes/<lemmaId>/ (create, update, blueprint, attempt) enforcing maxDepth, maxWidth, maxNodes, maxRetries, and cycle/symlink guards. Record `declaration` (Lean theorem/lemma name) and `statement` (exact Lean proposition type) so lemma_verify can bind the attempt to the approved proposition.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string" },
@@ -13407,7 +13408,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["action", "lemmaId"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
@@ -13445,7 +13446,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
       options: { namespace: "teamwork", codemode: false },
       description:
         "Execute real Lean 4 (`lean`, `lake env lean`, or `lake build`) on lemma/nodes/<lemmaId>/attempt-<r>.lean, bind the declared theorem/lemma name and type to the approved node statement, check transitive axiom dependencies via `#print axioms` against the allowlist approved in lemma/manifest.json at plan time, reject sorry/admit/unauthorized axioms even on exit 0, and stamp verify-<r>.json.",
-      input: {
+      input: strictInput({
         type: "object",
         properties: {
           sessionId: { type: "string" },
@@ -13456,7 +13457,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         },
         required: ["lemmaId"],
         additionalProperties: false,
-      },
+      }),
       execute: async (input: any, context: any) => {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }

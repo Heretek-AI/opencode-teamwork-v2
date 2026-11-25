@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.1] - 2026-11-24
+
+Strict tool inputs. OpenCode 2.4.1 does not enforce `additionalProperties:
+false`: its input-repair pass deletes undeclared keys before the runtime
+validator sees them. Every Teamwork tool now validates its own input, so an
+unknown key fails the call with `Tool.Error` and the offending path instead of
+being silently dropped.
+
+### Added
+
+- **`strictInput()`** (`plugins/opencode-teamwork/tool-schema.mjs`) wraps a JSON
+  Schema as a dependency-free Standard Schema. It rejects unknown object
+  properties at any depth unless the schema opts in with
+  `additionalProperties: true`, and enforces `required`, `type`, `enum`,
+  `const`, `anyOf`, `items`, numeric/string/array bounds, and `uniqueItems`.
+  Issues carry `{path, message}` and the runtime renders them as
+  `Tool.Error("Invalid arguments for tool ...")` with `a.b[0]` paths.
+- **Loud schema gate.** Registration asserts every schema uses only the
+  validated keyword subset; unsupported constructs (`$ref`, `oneOf`, `not`,
+  `format`, `patternProperties` in the source, an unconstrained object, an
+  array without `items`) fail loading and `scripts/test-catalog.mjs`.
+- **Tests:** `scripts/test-tool-schema.mjs` (top-level and nested unknown keys,
+  required, type, enum, array items, bounds, valid input, unsupported
+  constructs); L1 A4 now rejects top-level and nested unknown keys through the
+  snapshot executor and still accepts a valid call; L2 J1 checks
+  `teamwork_plan { bogus: 1 }` and the valid minimal body.
+
+### Changed
+
+- All 26 `teamwork_*` registrations use `input: strictInput({...})`. The
+  model-facing JSON Schema is returned unchanged (a non-enumerable empty
+  `patternProperties` prevents the host's repair pass from stripping keys and
+  is not serialized into the catalog).
+
+### Security
+
+- A caller can no longer rely on the host to discard a mistyped or extra
+  argument: the plugin refuses it before `execute`, so nothing is written.
+  `additionalProperties: true` records (tournament configuration and a few
+  pass-through fields) stay open by design.
+
 ## [0.18.0] - 2026-11-24
 
 CI attestation, signed by a principal distinct from the run key. A plan can now

@@ -95,7 +95,7 @@ Two host details the harness relies on:
 | A1 | Both load paths: plugin id, setup completes, state `active`, `ctx.app.version` is the installed `2.4.x` version. |
 | A2 | Exactly the 26 `teamwork_*` ids from `scripts/test-catalog.mjs`; each has `options.namespace === "teamwork"`, `options.codemode === false`, and an object JSON Schema input; no bare `plan`/`next`; every `teamwork_*` token in `agents/team/**/*.md` and the command templates resolves. |
 | A3 | The 7 commands are registered with their descriptions; invoking `team-review` substitutes `$ARGUMENTS`, switches the session to `team/orchestrator`, and admits the expanded prompt to the inbox. No model is configured; the model-less wake is interrupted. |
-| A4 | A missing required property yields the runtime `Tool.Error` text and writes nothing. The unknown-property case is **OBSERVED — host limitation** (below). |
+| A4 | A missing required property yields the runtime `Tool.Error` text and writes nothing. An unknown top-level key and an unknown nested key are refused by the plugin's strict Standard Schema (ADR 0019), naming the property path; a valid read-only call still succeeds. |
 | A5 | Synthetic `permission.evaluate` events: `team/verifier` `edit` denied; `team/victory-auditor` `shell` allowed and `edit` denied; `team/worker`/`build` untouched. Session permissions are set to allow so the outcome is the hook's, not the markdown's own deny rule. |
 | A6 | Two real plugin instances with different ids write the same key through `ctx.storage` and read back only their own value; values round-trip as JSON. |
 | A7 | Every `agents/team/*.md` parses as a config agent with `id`, `name`, non-empty `description`; no stray `AD` lines. |
@@ -110,6 +110,7 @@ Two host details the harness relies on:
 | I4 | Failure limits: `maxRounds` exhaustion coerces the task to `blocked`, the run records `PRESENT_PARTIAL`, `next` reports `DEADLOCK`, and nothing outside the run is written. The budget half asserts the documented advisory behaviour: at 1000% of `budgetUsd`, `teamwork_cost` returns `shouldHalt`/`thresholdPct`, but `next` still dispatches and `task_update` still starts a round; `budgetUsd: 0` is unlimited. |
 | I5 | Two OS processes race `next` on one run with a file-backed session DB: each task is claimed by exactly one process, `state.json` parses, and `events.jsonl` keeps one unique, contiguous, monotonic `seq` space. |
 | I6 | Offline verifier on produced runs: Ed25519 `--public-key @file` PASS, one-byte flip FAIL, a `chmod -R a-w` copy verifies PASS and is byte-identical afterwards, HMAC `--hmac-key` PASS, and `requiredProvenance: "command"` is UNKNOWN (exit 2) without `--rerun` and PASS (exit 0) with `--rerun` on a clean checkout. |
+| J1 | Strict input boundary: `teamwork_plan { bogus: 1 }` through the snapshot executor is `Tool.Error` naming `bogus` and writes nothing; the same tool with a valid minimal body still plans. |
 
 ## L2 execution model
 
@@ -129,14 +130,16 @@ the same raw/normalized distinction L1 A8 documents.
 
 ## Findings
 
-**Unknown input properties are stripped, not rejected (OpenCode 2.4.1).** The
-runtime converts a tool's JSON Schema to an Effect codec and decodes with
-`onExcessProperty: "ignore"`; `additionalProperties: false` therefore does not
-produce a `Tool.Error` at the runtime boundary. The A4 unknown-property test
-records this observed behavior (a read-only tool still succeeds and writes
-nothing). Rejecting unknown input properties requires the plugin to validate
-the raw input with a strict standard schema; that is a plugin change, not a
-harness change, and is not made on this branch.
+**Unknown input properties are rejected plugin-side (0.18.1, ADR 0019).** The
+host still does not enforce `additionalProperties: false`: the 2.4.1 input
+repair pass deletes undeclared keys before decode (`opencode.tool.input.repair`,
+`packages/core/src/plugin/tool-input-repair.ts:161-171`), and the JSON-Schema
+codec ignores excess properties. The plugin now registers each tool input as a
+Standard Schema (`packages/core/src/tool/runtime.ts:169-185`) whose `validate`
+rejects unknown keys at any depth and whose `jsonSchema.input` returns the
+original schema, so the catalog is unchanged. A non-enumerable empty
+`patternProperties` stops the repair pass from deleting keys without changing
+what the model sees. A4 and J1 assert the refusal and that nothing is written.
 
 **No L2 plugin defects were found.** `FINDINGS.md` records the three
 spec-wording observations that are not defects: structured results are invisible
