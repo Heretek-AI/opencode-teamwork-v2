@@ -1,7 +1,8 @@
 // opencode-teamwork — outbound URL guard (SSRF defence)
 //
-// URL ingestion (document-review) and input preflight can otherwise reach
-// loopback, private, link-local, and cloud-metadata endpoints. This module:
+// URL ingestion (document-review), input preflight, and the CLI OIDC JWKS
+// fetch can otherwise reach loopback, private, link-local, and cloud-metadata
+// endpoints. This module:
 //   * accepts only http/https URLs;
 //   * resolves the hostname itself and refuses loopback, private, link-local,
 //     unspecified, multicast/reserved, documentation, and metadata addresses
@@ -15,7 +16,8 @@
 // that permits loopback addresses only (never private/link-local/metadata).
 // The default is deny.
 //
-// Zero runtime dependencies. Erasable TypeScript only.
+// Plain ESM with zero runtime dependencies. Type declarations live in
+// `url-guard.d.mts`.
 
 import { lookup as dnsLookup } from "node:dns/promises"
 import { isIP } from "node:net"
@@ -24,61 +26,19 @@ import { request as httpsRequest } from "node:https"
 
 export const ALLOW_LOCALHOST_ENV = "OPENCODE_TEAMWORK_ALLOW_LOCALHOST"
 
-export type UrlGuardCode =
-  | "URL_INVALID"
-  | "URL_PROTOCOL"
-  | "URL_CREDENTIALS"
-  | "URL_BLOCKED_ADDRESS"
-  | "URL_DNS"
-  | "URL_NETWORK"
-  | "URL_TIMEOUT"
-  | "URL_TOO_LARGE"
-
-export type UrlGuardFailure = { ok: false; code: UrlGuardCode; error: string }
-
-export interface SafeUrl {
-  ok: true
-  url: URL
-  addresses: Array<{ address: string; family: 4 | 6 }>
-  allowLocalhost: boolean
-}
-
-export interface AssertSafeUrlOptions {
-  allowLocalhost?: boolean
-  loopbackOnly?: boolean
-  /** Test seam; production always uses the system resolver. */
-  resolveHost?: (hostname: string) => Promise<Array<{ address: string; family: 4 | 6 }>>
-}
-
-export interface SafeFetchOptions extends AssertSafeUrlOptions {
-  method?: "GET" | "HEAD"
-  timeoutMs?: number
-  maxBytes?: number
-  headers?: Record<string, string>
-}
-
-export interface SafeFetchSuccess {
-  ok: true
-  status: number
-  headers: Record<string, any>
-  body?: Buffer
-}
-
-export type SafeFetchResult = SafeFetchSuccess | UrlGuardFailure
-
-function localhostOptInEnabled(): boolean {
+function localhostOptInEnabled() {
   return process.env[ALLOW_LOCALHOST_ENV] === "1"
 }
 
-function refuse(code: UrlGuardCode, error: string): UrlGuardFailure {
+function refuse(code, error) {
   return { ok: false, code, error }
 }
 
-function normalizeHost(hostname: string): string {
+function normalizeHost(hostname) {
   return hostname.replace(/^\[/, "").replace(/\]$/, "").replace(/\.$/, "").toLowerCase()
 }
 
-function parseIpv4(value: string): number | undefined {
+function parseIpv4(value) {
   const parts = value.split(".")
   if (parts.length !== 4) return undefined
   let n = 0
@@ -91,10 +51,10 @@ function parseIpv4(value: string): number | undefined {
   return n
 }
 
-function ipv4BlockedReason(n: number, allowLocalhost: boolean): string | undefined {
-  const inRange = (base: string, bits: number): boolean => {
+function ipv4BlockedReason(n, allowLocalhost) {
+  const inRange = (base, bits) => {
     const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0
-    return (n & mask) === (parseIpv4(base)! & mask)
+    return (n & mask) === (parseIpv4(base) & mask)
   }
   if (inRange("127.0.0.0", 8)) return allowLocalhost ? undefined : "loopback"
   if (inRange("0.0.0.0", 8)) return "unspecified"
@@ -115,7 +75,7 @@ function ipv4BlockedReason(n: number, allowLocalhost: boolean): string | undefin
   return undefined
 }
 
-function parseIpv6(value: string): number[] | undefined {
+function parseIpv6(value) {
   let input = value.toLowerCase()
   const zone = input.indexOf("%")
   if (zone >= 0) input = input.slice(0, zone)
@@ -123,7 +83,7 @@ function parseIpv6(value: string): number[] | undefined {
 
   // Convert a trailing embedded IPv4 literal (e.g. ::ffff:127.0.0.1) to two
   // hextets so the rest of the parser has a uniform representation.
-  let embeddedIpv4: number | undefined
+  let embeddedIpv4
   const lastColon = input.lastIndexOf(":")
   const tail = lastColon >= 0 ? input.slice(lastColon + 1) : ""
   if (tail.includes(".")) {
@@ -146,7 +106,7 @@ function parseIpv6(value: string): number[] | undefined {
   }
   const hextets = [...left, ...Array(halves.length === 2 ? missing : 0).fill("0"), ...right]
   if (hextets.length !== 8) return undefined
-  const bytes: number[] = []
+  const bytes = []
   for (const hextet of hextets) {
     if (!/^[0-9a-f]{1,4}$/.test(hextet)) return undefined
     const word = parseInt(hextet, 16)
@@ -155,8 +115,8 @@ function parseIpv6(value: string): number[] | undefined {
   return bytes
 }
 
-function ipv6BlockedReason(bytes: number[], allowLocalhost: boolean): string | undefined {
-  const allZeroPrefix = (count: number) => bytes.slice(0, count).every((b) => b === 0)
+function ipv6BlockedReason(bytes, allowLocalhost) {
+  const allZeroPrefix = (count) => bytes.slice(0, count).every((b) => b === 0)
   if (allZeroPrefix(16)) return "unspecified"
   if (allZeroPrefix(15) && bytes[15] === 1) return allowLocalhost ? undefined : "loopback"
   const isMapped = allZeroPrefix(10) && bytes[10] === 0xff && bytes[11] === 0xff
@@ -184,7 +144,7 @@ function ipv6BlockedReason(bytes: number[], allowLocalhost: boolean): string | u
 }
 
 /** Classify one resolved address. Returns a human-readable reason when blocked. */
-export function blockedAddressReason(address: string, allowLocalhost = false): string | undefined {
+export function blockedAddressReason(address, allowLocalhost = false) {
   const value = normalizeHost(address)
   const family = isIP(value)
   if (family === 4) {
@@ -205,8 +165,8 @@ export function blockedAddressReason(address: string, allowLocalhost = false): s
  * path, query, or fragment are accepted. Returns a reconstructed clean origin
  * string (`http(s)://host[:port]`) or `undefined`.
  */
-export function parseLoopbackServiceUrl(rawUrl: string): string | undefined {
-  let parsed: URL
+export function parseLoopbackServiceUrl(rawUrl) {
+  let parsed
   try {
     parsed = new URL(String(rawUrl || "").trim())
   } catch {
@@ -241,8 +201,8 @@ export function parseLoopbackServiceUrl(rawUrl: string): string | undefined {
  * Validate a URL and resolve every address it names. All answers must be
  * public; a hostname with one private answer is refused as a whole.
  */
-export async function assertSafeUrl(rawUrl: string, options: AssertSafeUrlOptions = {}): Promise<SafeUrl | UrlGuardFailure> {
-  let parsed: URL
+export async function assertSafeUrl(rawUrl, options = {}) {
+  let parsed
   try {
     parsed = new URL(String(rawUrl || "").trim())
   } catch {
@@ -261,9 +221,9 @@ export async function assertSafeUrl(rawUrl: string, options: AssertSafeUrlOption
   if (!host) return refuse("URL_INVALID", "URL has no hostname")
 
   const literal = isIP(host)
-  let addresses: Array<{ address: string; family: 4 | 6 }>
+  let addresses
   if (literal) {
-    const family = literal as 4 | 6
+    const family = literal
     addresses = [{ address: host, family }]
   } else {
     if (loopbackOnly && host !== "localhost" && !host.endsWith(".localhost")) {
@@ -279,9 +239,9 @@ export async function assertSafeUrl(rawUrl: string, options: AssertSafeUrlOption
         const answers = await dnsLookup(host, { all: true, verbatim: true })
         addresses = answers
           .filter((entry) => entry.family === 4 || entry.family === 6)
-          .map((entry) => ({ address: entry.address, family: entry.family as 4 | 6 }))
+          .map((entry) => ({ address: entry.address, family: entry.family }))
       }
-    } catch (err: any) {
+    } catch (err) {
       return refuse("URL_DNS", `URL host could not be resolved (${String(err?.code || err?.message || "DNS error").slice(0, 120)})`)
     }
     if (addresses.length === 0) return refuse("URL_DNS", "URL host resolved to no addresses")
@@ -303,27 +263,23 @@ export async function assertSafeUrl(rawUrl: string, options: AssertSafeUrlOption
   return { ok: true, url: parsed, addresses, allowLocalhost }
 }
 
-function requestPinned(
-  safe: SafeUrl,
-  options: SafeFetchOptions,
-  address: { address: string; family: 4 | 6 },
-): Promise<SafeFetchResult> {
+function requestPinned(safe, options, address) {
   const method = options.method === "HEAD" ? "HEAD" : "GET"
-  const timeoutMs = Number.isFinite(options.timeoutMs) && (options.timeoutMs as number) > 0 ? (options.timeoutMs as number) : 5000
-  const maxBytes = Number.isFinite(options.maxBytes) && (options.maxBytes as number) > 0 ? (options.maxBytes as number) : 5 * 1024 * 1024
+  const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : 5000
+  const maxBytes = Number.isFinite(options.maxBytes) && options.maxBytes > 0 ? options.maxBytes : 5 * 1024 * 1024
   const url = safe.url
   const host = normalizeHost(url.hostname)
   const isIpHost = isIP(host) !== 0
 
   return new Promise((resolvePromise) => {
     let settled = false
-    const done = (result: SafeFetchResult) => {
+    const done = (result) => {
       if (settled) return
       settled = true
       resolvePromise(result)
     }
 
-    const lookup = (_hostname: string, lookupOptions: any, callback: any) => {
+    const lookup = (_hostname, lookupOptions, callback) => {
       if (lookupOptions && lookupOptions.all) {
         callback(null, [{ address: address.address, family: address.family }])
         return
@@ -331,7 +287,7 @@ function requestPinned(
       callback(null, address.address, address.family)
     }
 
-    let req: any
+    let req
     try {
       const requestImpl = url.protocol === "https:" ? httpsRequest : httpRequest
       req = requestImpl(
@@ -345,7 +301,7 @@ function requestPinned(
           lookup,
           ...(url.protocol === "https:" && !isIpHost ? { servername: host } : {}),
         },
-        (res: any) => {
+        (res) => {
           const headers = res.headers || {}
           const contentLength = Number(headers["content-length"] || 0)
           if (Number.isFinite(contentLength) && contentLength > maxBytes) {
@@ -358,9 +314,9 @@ function requestPinned(
             done({ ok: true, status: Number(res.statusCode) || 0, headers })
             return
           }
-          const chunks: Buffer[] = []
+          const chunks = []
           let total = 0
-          res.on("data", (chunk: Buffer) => {
+          res.on("data", (chunk) => {
             total += chunk.length
             if (total > maxBytes) {
               try {
@@ -374,22 +330,22 @@ function requestPinned(
           res.on("end", () => {
             done({ ok: true, status: Number(res.statusCode) || 0, headers, body: Buffer.concat(chunks, total) })
           })
-          res.on("error", (err: any) => {
+          res.on("error", (err) => {
             done(refuse("URL_NETWORK", `URL request failed (${String(err?.code || err?.message || "network error").slice(0, 120)})`))
           })
         },
       )
-    } catch (err: any) {
+    } catch (err) {
       done(refuse("URL_NETWORK", `URL request failed (${String(err?.code || err?.message || "network error").slice(0, 120)})`))
       return
     }
 
     req.setTimeout(timeoutMs, () => {
-      const err: any = new Error("timeout")
+      const err = new Error("timeout")
       err.code = "URL_TIMEOUT"
       req.destroy(err)
     })
-    req.on("error", (err: any) => {
+    req.on("error", (err) => {
       if (err?.code === "URL_TIMEOUT" || err?.code === "ETIMEDOUT") {
         done(refuse("URL_TIMEOUT", "URL request timed out"))
         return
@@ -405,14 +361,14 @@ function requestPinned(
  * the caller); callers that choose to follow one must validate the target with
  * `assertSafeUrl` first. The connection is pinned to the validated address.
  */
-export async function safeFetch(rawUrl: string, options: SafeFetchOptions = {}): Promise<SafeFetchResult> {
+export async function safeFetch(rawUrl, options = {}) {
   const safe = await assertSafeUrl(rawUrl, {
     allowLocalhost: options.allowLocalhost,
     loopbackOnly: options.loopbackOnly,
     resolveHost: options.resolveHost,
   })
   if (!safe.ok) return safe
-  let last: SafeFetchResult | undefined
+  let last
   for (const address of safe.addresses) {
     const result = await requestPinned(safe, options, address)
     if (result.ok) return result

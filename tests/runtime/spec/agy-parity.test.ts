@@ -318,7 +318,7 @@ describe("Tier 1: Feature Coverage [M1, M3, M4]", () => {
     }
   })
 
-  // --- M1.4: service*.json URL validation & url-guard.ts --------------------
+  // --- M1.4: service*.json URL validation & url-guard.mjs -------------------
   test("[M1.4] teamwork_cost reads session spend from validated loopback service-<channel>.json HTTP server", async () => {
     await withRun(
       "m1-4-service-loopback",
@@ -375,7 +375,7 @@ describe("Tier 1: Feature Coverage [M1, M3, M4]", () => {
         res.end("# Local Test Doc\n\nSection one.\n")
       },
       async ({ url }) => {
-        const mod = await import(pathToFileURL(join(PLUGIN_DIR, "url-guard.ts")).href)
+        const mod = await import(pathToFileURL(join(PLUGIN_DIR, "url-guard.mjs")).href)
         const res: any = await withEnv({ OPENCODE_TEAMWORK_ALLOW_LOCALHOST: "1" }, () =>
           mod.safeFetch(`${url}/doc.md`),
         )
@@ -846,7 +846,7 @@ describe("Tier 2: Boundary & Corner Cases [M1, M3, M4]", () => {
   })
 
   test("[M1.4] url-guard blocks metadata IP, credentials, file://, loopback (no opt-in), and 3xx redirects", async () => {
-    const mod = await import(pathToFileURL(join(PLUGIN_DIR, "url-guard.ts")).href)
+    const mod = await import(pathToFileURL(join(PLUGIN_DIR, "url-guard.mjs")).href)
     await withEnv({ OPENCODE_TEAMWORK_ALLOW_LOCALHOST: undefined }, async () => {
       expect((await mod.assertSafeUrl("http://169.254.169.254/latest/meta-data")).code).toBe("URL_BLOCKED_ADDRESS")
       expect((await mod.assertSafeUrl("http://127.0.0.1:8080/")).code).toBe("URL_BLOCKED_ADDRESS")

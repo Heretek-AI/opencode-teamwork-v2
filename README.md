@@ -113,7 +113,7 @@ fails closed for mutating tools. Read-only `teamwork_status`,
 `team/*` role. See `docs/GUARDRAILS.md` for the full matrix.
 
 **URL network policy.** `document.url` ingestion and preflight URL checks use
-`url-guard.ts`: http/https only, public addresses only (loopback, private,
+`url-guard.mjs`: http/https only, public addresses only (loopback, private,
 link-local, metadata, multicast, reserved, and IPv4-mapped IPv6 are rejected),
 DNS answers are validated and the connection is pinned to them, redirects are
 not followed (a `Location` is validated before refusal), and timeouts/size caps
@@ -430,7 +430,18 @@ opencode-teamwork verify --run-dir /path/to/run --public-key ... \
 # 0.18.0: verify a CI attestation signed by a key the run does not hold
 opencode-teamwork verify --run-dir /path/to/run --public-key ... \
   --attestation-public-key @ci-attestation.pub [--attestation-issuer <issuer>]
+
+# Fetch the issuer JWKS over HTTPS at verification time
+opencode-teamwork verify --run-dir /path/to/run --public-key ... \
+  --fetch-jwks https://token.actions.githubusercontent.com
 ```
+
+`--fetch-jwks <issuer>` fetches `/.well-known/openid-configuration` and then
+its `jwks_uri`. Both URLs must be `https:`, carry no credentials, resolve only
+to public addresses, and return a non-redirect 2xx; requests carry a 10 s
+timeout and a 512 KiB body cap. Loopback, private, link-local, and
+cloud-metadata issuers are refused on this network path; for an intranet
+issuer, or an offline copy, use `--oidc-jwks <file>`.
 
 Under a plan that recorded `requiredProvenance: "command"`, a PASS report must
 carry at least one programmatic check with an argv-only `command`, an exit code,

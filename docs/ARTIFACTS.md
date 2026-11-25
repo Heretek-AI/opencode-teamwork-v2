@@ -1304,7 +1304,7 @@ The block list is deliberately **narrow**:
 Path checks report `READY` (with `file`/`dir`) when the path exists and
 `MISSING` otherwise. URL checks record `UNCHECKED` when `checkUrls` is false
 (the default); with `checkUrls: true` each URL is first validated by the SSRF
-guard (`url-guard.ts`), then gets one `HEAD` request with a 3 s timeout and is
+guard (`url-guard.mjs`), then gets one `HEAD` request with a 3 s timeout and is
 `READY` on 2xx/3xx or `OUTAGE` on any other status, error or timeout. A URL whose
 hostname resolves to loopback/private/link-local/metadata (or any other
 non-public address) is `OUTAGE` before a connection is made; a 3xx `Location` is

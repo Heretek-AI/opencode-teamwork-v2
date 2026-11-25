@@ -41,7 +41,7 @@ import { createAuthContext } from "../plugins/opencode-teamwork/auth.ts"
 import { refreshRunBriefing } from "../plugins/opencode-teamwork/briefing.ts"
 import { probeLemmaToolchain } from "../plugins/opencode-teamwork/lemma.ts"
 import { evaluateStrictGate, renderGateStatus } from "../plugins/opencode-teamwork/strict.ts"
-import { setWriteAnomalyAuditPathForTest } from "../plugins/opencode-teamwork/safe-fs.mjs"
+import { setWriteAnomalyAuditPathForTest, resolveTrustedExecutable } from "../plugins/opencode-teamwork/safe-fs.mjs"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(HERE, "..")
@@ -50,6 +50,7 @@ const APPROVAL_DRIVER_PATH = join(REPO_ROOT, "scripts", "approval-driver.mjs")
 const PROMPT_LINT_PATH = join(REPO_ROOT, "scripts", "lint-prompts.mjs")
 const CATALOG_TEST_PATH = join(REPO_ROOT, "scripts", "test-catalog.mjs")
 const GIT_BIN = ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"].find(existsSync) ?? "git"
+const SQLITE_BIN = resolveTrustedExecutable("sqlite3")
 
 // CLI flags
 const args = process.argv.slice(2)
@@ -170,7 +171,12 @@ async function createSessionDb(dbPath, rows) {
           .join(", ")})`,
     ),
   ]
-  execFileSync("sqlite3", [dbPath, `${stmts.join(";\n")};`], { encoding: "utf8", timeout: 5000 })
+  if (!SQLITE_BIN) {
+    throw new Error(
+      "sqlite3 fallback unavailable: no trusted sqlite3 executable on PATH (install sqlite3 or use a Node build with the node:sqlite module)",
+    )
+  }
+  execFileSync(SQLITE_BIN, [dbPath, `${stmts.join(";\n")};`], { encoding: "utf8", timeout: 5000 })
 }
 
 const DEFAULT_AGENTS = {

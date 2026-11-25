@@ -46,7 +46,7 @@ jobs:
             fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + "\n");
           '
           rm -f "$RUNNER_TEMP/runtime-latest/bun.lock"
-          (cd "$RUNNER_TEMP/runtime-latest" && bun install --ignore-scripts)
+          (cd "$RUNNER_TEMP/runtime-latest" && bun install --ignore-scripts) # NOSONAR (S8543): intentional @opencode/*@latest resolution in an isolated copy; --ignore-scripts, no secrets, non-blocking
           node -e '
             const fs = require("fs");
             const base = process.env.RUNNER_TEMP + "/runtime-latest/node_modules";
