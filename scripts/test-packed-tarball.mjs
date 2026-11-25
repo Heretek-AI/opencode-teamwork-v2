@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 // T4 release gate: prove the shipped npm tarball installs cleanly and loads
-// inside the real OpenCode 2.4.1 runtime (Issue #46).
+// inside the real OpenCode 2.4.1 runtime (Issue #46). A1 directory mode is the
+// L1 package-load proof; e2e/packed-l2.test.ts adds an L2 plan smoke against
+// the same installed tree. A2/A3 still run in memory mode (working tree), so
+// the T4 gate does not cover every L2/L3 scenario from the packed artifact.
 //
 // Usage: node scripts/test-packed-tarball.mjs
 
@@ -76,10 +79,22 @@ try {
   assert.strictEqual(Object.keys(installedPkg.dependencies ?? {}).length, 0, "installed package must have zero runtime dependencies")
 
   // Load the packed artifact via `{ package: "<installed>" }` in L1 specs.
+  // A1's directory mode is the load proof; the packed L2 smoke plans a run
+  // through the installed package. A2/A3 run in memory mode against the
+  // working tree, so they are a command/catalog cross-check, not a second
+  // package-loading proof.
   if (existsSync(join(RUNTIME_DIR, "node_modules"))) {
     execFileSync(
       bunBin,
-      ["test", "--timeout", "30000", "spec/a1-load.test.ts", "spec/a2-catalog.test.ts", "spec/a3-commands.test.ts"],
+      [
+        "test",
+        "--timeout",
+        "30000",
+        "spec/a1-load.test.ts",
+        "spec/a2-catalog.test.ts",
+        "spec/a3-commands.test.ts",
+        "e2e/packed-l2.test.ts",
+      ],
       {
         cwd: RUNTIME_DIR,
         stdio: "inherit",
