@@ -38,6 +38,7 @@ import {
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -1265,10 +1266,12 @@ try {
       [DRIVER, JSON.stringify({ root: drvRoot, storage: drvStorage, action: "write-draft", runId: symRunId, draft: "pwn" })],
       { encoding: "utf8", timeout: 30_000 },
     )
-    assert.strictEqual(symRes.status, 1, `symlinked draft must be refused: ${symRes.stdout}${symRes.stderr}`)
-    assert.match(`${symRes.stdout}${symRes.stderr}`, /symlink/i, "the refusal must name the symlink")
+    assert.strictEqual(symRes.status, 0, `an atomic draft replace must succeed: ${symRes.stdout}${symRes.stderr}`)
+    const draftEntry = join(symRunDir, "prompt_draft.md")
+    assert.strictEqual(lstatSync(draftEntry).isSymbolicLink(), false, "the draft entry must no longer be a symlink")
+    assert.strictEqual(readFileSync(draftEntry, "utf8"), "pwn", "the draft must be written to the replaced entry")
     assert.strictEqual(readFileSync(outside, "utf8"), "untouched", "the symlink target must not be overwritten")
-    console.log("✓ approval-driver rejects traversal/invalid runIds with exit 2 and refuses a symlinked draft")
+    console.log("✓ approval-driver rejects traversal/invalid runIds with exit 2 and replaces a symlinked draft without following it")
   }
 
   console.log("All authenticated prompt-approval tests passed")

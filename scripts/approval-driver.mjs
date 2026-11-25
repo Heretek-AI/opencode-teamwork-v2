@@ -13,7 +13,8 @@
 // Test-only: `ownerUid` enables the plugin's ownership seam so a single-UID
 // host can simulate the different-principal approval directory.
 
-import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs"
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs"
+import { randomBytes } from "node:crypto"
 import { dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { registerTeamworkTools, setApprovalOwnerUidForTest } from "../plugins/opencode-teamwork/tools.ts"
 import { registerTool } from "./tool-registry.mjs"
@@ -112,12 +113,20 @@ try {
     mkdirSync(runDir, { recursive: true }) // NOSONAR (S8707): runId is allowlist-checked and runDir is containment-checked above
     const file = resolve(runDir, "prompt_draft.md") // NOSONAR (S8707): fixed child name under the containment-checked runDir
     if (lstatSync(runDir).isSymbolicLink()) throw new Error("the run directory is a symlink") // NOSONAR (S8707): runDir is containment-checked above
+    // Write a fresh temp file and rename it over the draft entry. O_EXCL never
+    // follows a planted symlink at the temp path, and rename(2) replaces the
+    // destination link itself rather than following it, so there is no
+    // check-then-write race on prompt_draft.md.
+    const tempFile = resolve(runDir, `.prompt_draft.${process.pid}.${randomBytes(6).toString("hex")}.tmp`) // NOSONAR (S8707): random single segment under the containment-checked runDir
     try {
-      if (lstatSync(file).isSymbolicLink()) throw new Error("the draft file is a symlink")
+      writeFileSync(tempFile, String(input.draft ?? ""), { encoding: "utf8", flag: "wx", mode: 0o600 }) // NOSONAR (S8707): O_EXCL create under the containment-checked runDir
+      renameSync(tempFile, file) // NOSONAR (S8707): atomic replace; the destination entry is not followed
     } catch (err) {
-      if (err?.code !== "ENOENT") throw err
+      try {
+        rmSync(tempFile, { force: true })
+      } catch {}
+      throw err
     }
-    writeFileSync(file, String(input.draft ?? ""), "utf8") // NOSONAR (S8707): runId allowlist plus containment check bound the directory, and the draft entry is refused if it is a symlink
     reply({ ok: true, path: file, bytes: Buffer.byteLength(String(input.draft ?? "")) })
   } else if (input.action === "plan") {
     const res = await tools.teamwork_plan.execute(
