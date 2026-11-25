@@ -4073,7 +4073,7 @@ function lemmaPrerequisitesBody(probe: LemmaProbeResult): string {
  * Dual-Track E2E gate and must be produced by the team, not pre-seeded.
  */
 function surveyStubBodies(tasks: Array<{ id?: unknown; agent?: unknown }>): Array<{ name: string; body: string }> {
-  const cell = (v: unknown, max = 64) => clean(v, max).replace(/\|/g, "\\|")
+  const cell = (v: unknown, max = 64) => clean(v, max).replace(/\\/g, "\\\\").replace(/\|/g, "\\|")
   const inventory = tasks.length
     ? tasks.map((t) => `| ${cell(t.id)} | ${cell(t.agent || "team/worker")} | pending |`)
     : ["| (none) | team/worker | pending |"]

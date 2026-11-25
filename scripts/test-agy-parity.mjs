@@ -338,7 +338,11 @@ function makeThreePhaseVictorySummary(verdict = "VICTORY CONFIRMED") {
 
 function securityBaseOpts(dir, overrides = {}) {
   const groupFile = join(dir, "group")
-  if (!existsSync(groupFile)) writeFileSync(groupFile, "users:x:1000:\nstaff:x:1001:\n")
+  try {
+    writeFileSync(groupFile, "users:x:1000:\nstaff:x:1001:\n", { flag: "wx" })
+  } catch (err) {
+    if (err?.code !== "EEXIST") throw err
+  }
   const repoRoot = join(dir, "repo")
   mkdirSync(repoRoot, { recursive: true })
   return {
