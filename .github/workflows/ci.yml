@@ -29,6 +29,13 @@ jobs:
         working-directory: tests/runtime
         run: bun test --timeout 30000
 
+  signer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test reference non-oracle signer (Rust)
+        run: cargo test --manifest-path signer/Cargo.toml
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -56,7 +63,7 @@ jobs:
           const fs = require("fs");
           const p = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/pack.json", "utf8"));
           const paths = p[0].files.map((f) => f.path);
-          const bad = paths.filter((x) => x === "docs/re" || x.startsWith("docs/re/") || x === "tests" || x.startsWith("tests/"));
+          const bad = paths.filter((x) => x === "docs/re" || x.startsWith("docs/re/") || x === "tests" || x.startsWith("tests/") || x === "signer" || x.startsWith("signer/"));
           const need = ["docs/ARTIFACTS.md", "docs/GUARDRAILS.md", "docs/ADMIN-HARDENING.md", "docs/SIGNER-PROTOCOL.md", "docs/adr/0005-artifact-authenticity.md", "docs/adr/0008-signer-spi-and-trust-levels.md", "docs/adr/0014-verifiable-witness-and-signer-v2.md", "docs/adr/0015-offline-verification.md", "docs/adr/0018-ci-attestation.md", "SECURITY.md", "scripts/hardening-check.sh", "scripts/attest-sign.mjs", "plugins/opencode-teamwork/index.ts", "plugins/opencode-teamwork/auth.ts", "plugins/opencode-teamwork/attestation.mjs", "plugins/opencode-teamwork/authorize.ts", "plugins/opencode-teamwork/url-guard.ts", "plugins/opencode-teamwork/strict.ts", "plugins/opencode-teamwork/briefing.ts", "plugins/opencode-teamwork/victory.ts", "plugins/opencode-teamwork/safe-fs.mjs", "lib/verify.mjs", "scripts/test-verify.mjs", "agents/team/victory-auditor.md"];
           const miss = need.filter((n) => !paths.includes(n));
           const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
