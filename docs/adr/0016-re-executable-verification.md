@@ -121,7 +121,14 @@ opencode-teamwork verify ... --rerun --repo <clean-checkout>
                        [--timeout <s>] [--keep-worktree]
 ```
 
-1. Verify the signed manifest, the reports and `verify/rerun.json`.
+1. Verify the signed manifest, the reports and `verify/rerun.json`. Before any
+   worktree is created or any command is spawned, all four must hold: the
+   manifest is present and authenticated; `verify/rerun.json` authenticates;
+   every report the rerun record names authenticates; and the rerun record
+   matches the report projection. A failure emits `rerun:trust` /
+   `RERUN_UNTRUSTED` (or the underlying `AUTH_*`) and executes nothing.
+   `--allow-unsigned` is a legacy-only concession and is refused as a usage
+   error with `--rerun`.
 2. For each recorded task, take `report.headSha` and create a detached worktree
    at that commit (`git worktree add --detach`). Missing `headSha` is
    `REPORT_UNBOUND`.
@@ -145,7 +152,16 @@ Exit codes:
 | binary cannot be executed | 2 | `command-unavailable` |
 | timeout | 1 | `command-timeout` |
 | shell line or escaping `cwd` | 1 | `command-refused` |
+| manifest, rerun record or a named report is unauthenticated | 1 or 2 | `RERUN_UNTRUSTED` |
 | source tree changed | 1 | `source-tree-modified` |
+
+**The worktree is not a sandbox.** `--rerun` executes commands recorded by the
+evidence author. The manifest and `verify/rerun.json` authenticate the record,
+not the safety of the command; the child runs with the caller's UID and can
+reach the rest of the machine. Use it only on evidence you are willing to
+execute. 0.19.2 refuses `--rerun` with `--allow-unsigned` and requires the
+signed manifest, its reports and the rerun links to authenticate before any
+command runs.
 
 Under `command`, `verify` without `--rerun` reports the claim as
 `provenance: claimed` and returns `UNKNOWN` (exit 2): a claimed observation is

@@ -3,7 +3,9 @@
 Status: **READY** (2026-11-25)
 
 The dual-track E2E suite described in [`TEST_INFRA.md`](TEST_INFRA.md) is green
-on the branch `release/0.19.1`, on top of OpenCode 2.4.1.
+on the 0.19.x branch line, on top of OpenCode 2.4.1. Counts below are labelled
+by where they were recorded; the 0.19.x evidence is the last full local run,
+and CI runs the same suite without an `opencode` binary on `PATH`.
 
 ## Last recorded run
 
@@ -11,10 +13,10 @@ on the branch `release/0.19.1`, on top of OpenCode 2.4.1.
 | --- | --- | --- |
 | L0 parity/regression | `npm run test:agy-parity` | **153/153** (T1 66, T2 65, T3 15, T4 7) |
 | Runtime parity | `cd tests/runtime && bun test --timeout 30000 spec/agy-parity.test.ts` | **62/62**, 0 fail |
-| Full runtime L1–L3 | `cd tests/runtime && bun test --timeout 30000` | **114 pass, 1 skip (L4 live), 0 fail** |
-| L0 repository suite | `npm test` | 15 suites, exit 0 |
+| Full runtime L1–L3 | `cd tests/runtime && bun test --timeout 30000` | **CI: 113 pass, 2 skip (process E2E when `opencode` is absent, L4 live), 0 fail**; local host with `opencode` on `PATH`: 114 pass, 1 skip (L4 live), 0 fail |
+| L0 repository suite | `npm test` | all L0 suites (15 at 0.19.1; the 0.19.2 attestation-input check adds one), exit 0 |
 | Rust signer | `cargo test --manifest-path signer/Cargo.toml` | 5/5 |
-| Packaging | `npm pack --dry-run` | 109 files, 0 dependencies, no `tests/`, `docs/re/`, or `signer/`; the parity script ships with the other test scripts |
+| Packaging | `npm pack --dry-run` | 110 files on the 0.19.2 release line (the URL/L4 `lib/oidc-fetch.mjs` adds one), 0 dependencies, no `tests/`, `docs/re/`, or `signer/`; the parity script ships with the other test scripts |
 
 ## What is covered
 
@@ -41,7 +43,8 @@ Every closed parity gap A1–A9 has at least one L0 case and one runtime spec:
   falsifier empirical shell with `edit` still denied.
 - **A7** PDF `pypdfium2`/`Pillow` pre-flight, root `PREREQUISITES.md` recording
   the actual `MISSING`/`OUTAGE` status (a `READY` probe writes nothing),
-  symlink refusal, `leap doctor`, pre-`mkdir` refusal.
+  symlink refusal, `leap doctor --offline` (a `LEAN_PROJECT_DIR`-only failure is
+  `WARN`, not a block), pre-`mkdir` refusal.
 - **A8** three-phase `=== VICTORY AUDIT REPORT ===`, acceptance of a legacy
   non-3-phase summary (the prompt mandates the format; the engine stores it
   verbatim), terminal non-victory discipline, `worker.md` handoff fix.

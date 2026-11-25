@@ -438,8 +438,9 @@ opencode-teamwork verify --run-dir /path/to/run --public-key ... \
 
 `--fetch-jwks <issuer>` fetches `/.well-known/openid-configuration` and then
 its `jwks_uri`. Both URLs must be `https:`, carry no credentials, resolve only
-to public addresses, and return a non-redirect 2xx; requests carry a 10 s
-timeout and a 512 KiB body cap. Loopback, private, link-local, and
+to public addresses, and return a non-redirect 2xx; one 10 s deadline spans
+discovery, DNS validation and the JWKS fetch, and bodies are capped at 512 KiB.
+Loopback, private, link-local, and
 cloud-metadata issuers are refused on this network path; for an intranet
 issuer, or an offline copy, use `--oidc-jwks <file>`.
 
@@ -450,12 +451,23 @@ an untruncated output digest and a `headSha`; the engine writes a signed
 `provenance: claimed` and returns `UNKNOWN` (exit 2) — never `PASS`.
 `--rerun` creates a detached worktree at the report's commit, runs the argv with
 no shell and a minimal environment, enforces the recorded timeout, and compares
-the exit code and stdout+stderr digest. A changed digest is
+the exit code and stdout+stderr digest. Before any worktree is created it
+requires the manifest, `verify/rerun.json` and every report the record names to
+authenticate, and the rerun record to match the report projection; otherwise it
+emits `RERUN_UNTRUSTED` and executes nothing. A changed digest is
 `output-digest-mismatch`, a non-zero exit is `command-failed`, a missing binary
 is exit 2 `command-unavailable`, a timeout is `command-timeout`, and a shell line
 or escaping `cwd` is `command-refused`. The source checkout is hashed before and
 after; the worktree is removed unless `--keep-worktree`. `declared` runs keep the
 0.15 behaviour.
+
+**`--rerun` executes code.** The commands come from a signed file, but a
+signature proves who recorded them, not that they are safe. A detached worktree
+is a checkout, not a sandbox: the recorded process runs with your UID and can
+reach the rest of the machine. Run `--rerun` only against evidence you are
+willing to execute, and prefer a disposable container or VM for untrusted runs.
+`--rerun` is refused together with `--allow-unsigned`; re-execution requires an
+authenticated manifest and reports.
 
 Since 0.18.0 a plan can set `attestationPolicy: "optional" | "required"`. A CI
 job runs `.github/workflows/attest.yml` (or `scripts/attest-sign.mjs`) under a
@@ -479,8 +491,12 @@ verdict's report/audit/requirements digests. It also names the four
 Exit codes: `0` verified, `1` fail, `2` unverifiable (no key, unsigned legacy,
 HMAC without a secret, required git/index unavailable), `3` usage.
 `--fail-on-warning` promotes a warning to exit 1, and `--allow-unsigned`
-analyses a legacy run without ever upgrading it to `PASS`. `--json` is the
-stable machine report; the human table is rendered from it.
+analyses a legacy run that has no `run.manifest.json` without ever upgrading it
+to `PASS`; it is refused with `--rerun`. When a manifest is present, signed or
+not, `--allow-unsigned` has no effect: a missing artifact envelope is `FAIL`, as
+is a missing handoff-index envelope on a run whose manifest requires signed
+handoffs. `--json` is the stable machine report; the human table is rendered
+from it.
 
 **Honest limit.** A verifier holding only the public key and a read-only copy can
 recompute every byte digest, citation, branch binding and cross-artifact
@@ -531,17 +547,25 @@ and [ADR 0017](docs/adr/0017-opencode-plugin-contract-and-test-strategy.md).
 
 Tracked in GitHub issues:
 
-- [#38](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/38) L4 live-model opt-in suite
-- [#39](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/39) nightly OpenCode host-drift job
-- [#40](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/40) apply and verify the admin hardening runbook
-- [#41](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/41) NFS harness and `doctor --locks/--unlock`
-- [#42](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/42) durable containment incident records
-- [#43](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/43) reference non-oracle signer
-- [#44](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/44) real OIDC claim validation for attestations
-- [#45](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/45) strict-input diagnostics and host-repair independence
-- [#46](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/46) packed-tarball release test
-- [#47](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/47) process-level CLI/server E2E harness
+- [#38](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/38) L4 live-model opt-in suite (harness and workflow exist; live runs remain opt-in)
+- [#40](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/40) apply and verify the admin hardening runbook on a real host
 - [#48](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/48) remaining Document Review and PDF corpus runs
+- [#51](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/51) document-review visual audit (per-page PNGs / `view_file`)
+- [#52](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/52) per-dispatch model override
+
+Security and release work in flight for 0.19.2 — tracked in the changelog and
+pull requests rather than a single issue — covers the `verify --rerun` trust
+gate, the `--allow-unsigned` restriction, attestation input validation,
+fail-closed trust/evidence, and the Sonar/packaging checks. The earlier matrix
+(#39, #41–#47) is implemented and closed.
+
+> **Breaking for signed LEMMA, tournament and document-review runs.** Those
+> writers still emit plain JSON/text without `_auth` envelopes, so
+> `final_verify` now refuses `PASS` (`LEMMA_EVIDENCE_UNSIGNED`,
+> `TOURNAMENT_EVIDENCE_UNSIGNED`, `DOCUMENT_REVIEW_EVIDENCE_UNSIGNED`) until
+> route-evidence signing lands in Phase 2. Explicit `allowUnsignedLegacy` runs
+> keep the historical behaviour. The alternative — an authenticated verdict
+> over unauthenticated evidence — is worse.
 
 ## Model assignment
 
@@ -733,8 +757,9 @@ documented separately:
   that turns a command signer from an oracle into a policy-enforcing signer.
   0.14.0 sends v2 (with `runId` and a derived `approvalRef`) when
   `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` is set, and the exact v1 request
-  otherwise. The signer itself is not shipped: it must be built and installed,
-  and a version mismatch fails closed with `AUTH_SIGNER_UNAVAILABLE`.
+  otherwise. A Rust reference signer is in [`signer/`](signer/) but is **not
+  shipped in the npm package**: review it, build it, install it, and own its
+  policy. A version mismatch fails closed with `AUTH_SIGNER_UNAVAILABLE`.
 - [`scripts/hardening-check.sh`](scripts/hardening-check.sh) — a read-only
   Linux verifier that prints `PASS`/`FAIL`/`UNKNOWN` per probe. It never
   modifies the host; `UNKNOWN` is not a pass.

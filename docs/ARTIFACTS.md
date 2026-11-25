@@ -437,6 +437,18 @@ modes and the hashes a later gate recomputes, so a control-plane downgrade is
   `legacy_unsigned_bypass` event. An unsigned baseline cannot require the
   handoff gate, so it records `requireHandoffs: "skip"`. `benchmark` refuses the
   bypass and refuses both `victoryAudit: "skip"` and `requireHandoffs: "skip"`.
+- **Route evidence (LEMMA / tournament / document-review):** these writers
+  currently emit plain JSON (`lemma/manifest.json`,
+  `lemma/formalization-review.json`, `lemma/nodes/<id>/verify-*.json`,
+  `tournament/manifest.json`, `tournament/verdict.json`,
+  `document-review/manifest.json`) and plain-text reports
+  (`document-review/segments/<id>/unit-report.md`,
+  `DOCUMENT_REVIEW_REPORT.md`) without `_auth` envelopes. On a signed run
+  `final_verify` therefore refuses to stamp PASS, naming
+  `LEMMA_EVIDENCE_UNSIGNED`, `TOURNAMENT_EVIDENCE_UNSIGNED`, or
+  `DOCUMENT_REVIEW_EVIDENCE_UNSIGNED`. An explicitly unsigned legacy run keeps
+  the historical behavior. This is a fail-closed guardrail, not a claim that
+  the evidence is authentic; signing these route artifacts is a later phase.
 
 ### `_auth` envelopes and the digest index (ADR 0005/0008)
 
@@ -2556,7 +2568,9 @@ asserted and the mode is not pinned, the check is a failure and
 one run directory plus a public key. It never writes into the run and never
 reads `ctx.storage`. Without `--rerun` it never executes a reported check; with
 `--rerun` it re-executes the signed `verify/rerun.json` commands in a disposable
-worktree (0.16.0). See [ADR 0015](adr/0015-offline-verification.md) and
+worktree (0.16.0; the worktree is not a sandbox — see
+[Re-execution](#re-execution-rerun-0160)). See
+[ADR 0015](adr/0015-offline-verification.md) and
 [ADR 0016](adr/0016-re-executable-verification.md).
 
 ```sh
@@ -2573,7 +2587,12 @@ opencode-teamwork verify --run-dir <path> --public-key ... \
 The manifest is the trust anchor. Its `_auth` is verified first; `runNonce`,
 `runKeyId` and the algorithm are read from the signed payload (not from
 storage), then every artifact is pinned to those values. A copied envelope
-fails on path, nonce, key id or digest.
+fails on path, nonce, key id or digest. A manifest `trustLevel` of
+`human-approved` or `ci-attested` is `trust:approval` /
+`AUTH_APPROVAL_UNVERIFIED` (`UNKNOWN`) because offline verification has no
+approval enforcement; `requireWitness` without a usable receipt is
+`trust:witness` / `AUTH_WITNESS_UNVERIFIED` (`UNKNOWN`). The JSON `trust` object
+carries `runTrustLevel`, `approval.status` and `witness.status`.
 
 ### What the verifier recomputes
 
@@ -2599,6 +2618,11 @@ mixed.
 ### Re-execution (`--rerun`, 0.16.0)
 
 `--rerun` needs `--repo <clean-checkout>` and a recorded `verify/rerun.json`.
+Before any worktree is created or command spawned it requires the signed
+manifest, `verify/rerun.json` and every report the record names to authenticate,
+and the rerun record to match the report projection. A failure is
+`rerun:trust` / `RERUN_UNTRUSTED` (or the underlying `AUTH_*`), and nothing is
+executed. `--allow-unsigned` cannot be combined with `--rerun`.
 For each check it creates a detached worktree at the report's `headSha`, runs
 the recorded argv with `spawnSync` (no shell, a minimal environment, `cwd`
 inside the worktree), enforces `timeoutMs` (capped by `--timeout <s>`), and
@@ -2606,6 +2630,15 @@ compares the exit code and the unkeyed sha256 of stdout+stderr to the recorded
 values. `sh -c`/`bash -c` and a `cwd` that escapes the worktree are refused.
 The source checkout is hashed before and after and a change is
 `source-tree-modified`. The worktree is removed unless `--keep-worktree`.
+
+**The worktree is not a sandbox.** `--rerun` executes commands recorded by
+whoever produced the signed evidence. A valid signature proves who recorded the
+command and that the record was not edited; it does not make the command safe.
+The child runs with your UID and can read and write anything your account can
+reach. Use `--rerun` only on evidence you are willing to execute, and use a
+disposable container or VM for untrusted runs. `--rerun` is refused with
+`--allow-unsigned`: re-execution needs an authenticated manifest, reports and
+`verify/rerun.json`.
 
 | Outcome | Exit | Code |
 | --- | --- | --- |
@@ -2626,8 +2659,12 @@ claim as `provenance: claimed` and returns `UNKNOWN`, never `PASS`. Under
 `0` verified (`PASS`), `1` fail (`FAIL`), `2` unverifiable (`UNKNOWN`), `3`
 usage. `--fail-on-warning` promotes a warning to exit 1. `--json` prints the
 stable object described in ADR 0015; the human table is rendered from it.
-`--allow-unsigned` analyses an unsigned legacy run but the verdict stays
-`UNKNOWN`: a missing signature is exactly what the verifier cannot supply.
+`--allow-unsigned` analyses a legacy run with no `run.manifest.json` but the
+verdict stays `UNKNOWN`: a missing signature is exactly what the verifier cannot
+supply. When a manifest is present, signed or not, `--allow-unsigned` has no
+effect: a missing artifact envelope is `FAIL`, as is a missing handoff-index
+envelope on a run whose manifest requires signed handoffs. It cannot be combined
+with `--rerun`.
 
 Since 0.18.0 `--json` also carries `attestation: {status, commitSha, keyId,
 issuer}` and `attested: boolean`. Without `--attestation-public-key` a present

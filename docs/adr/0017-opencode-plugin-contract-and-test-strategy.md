@@ -1,12 +1,13 @@
 # ADR 0017: OpenCode 2.4.1 Plugin Contract and Test Strategy
 
-- **Status:** Proposed (0.17.1)
+- **Status:** Accepted (implemented 0.17.1–0.18.1; harness evidence recorded in
+  [`TEST_READY.md`](../TEST_READY.md))
 - **Date:** 2026-11-24
 - **Scope:** `plugins/opencode-teamwork/index.ts`,
   `plugins/opencode-teamwork/tools.ts`,
   `plugins/opencode-teamwork/authorize.ts`,
   `plugins/opencode-teamwork/package.json`, `package.json`, `README.md`,
-  `scripts/test-engine.mjs`, planned `tests/runtime/`,
+  `scripts/test-engine.mjs`, `tests/runtime/`,
   `docs/OPENCODE-COMPATIBILITY.md`
 - **Depends on:** [OPENCODE-COMPATIBILITY.md](../OPENCODE-COMPATIBILITY.md)
   (the audited contract and the defect table this ADR decides to test)
@@ -227,5 +228,10 @@ The decision is satisfied when:
 5. L3 proves the worktree setup/merge path in a real repository;
 6. T4 installs the packed tarball and loads the plugin from it.
 
-Until those exist, this ADR is Proposed, and
-`docs/OPENCODE-COMPATIBILITY.md` is the only artifact.
+**Implementation note (0.19.2).** Items 1–6 are implemented. The generated
+`catalog.golden.json` was replaced by `scripts/test-catalog.mjs` (L0) plus
+`tests/runtime/spec/a2-catalog.test.ts` (real host); the explicit expected list
+is the reviewable artifact. T4 (`scripts/test-packed-tarball.mjs`) installs the
+packed tarball and loads it through the A1 directory-mode spec; A2/A3 in that
+same run still exercise the working-tree module. See
+`docs/OPENCODE-COMPATIBILITY.md` §4.1 and §5.4.

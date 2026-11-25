@@ -112,9 +112,20 @@ signed false observation still passes (see §4).
 
 A failed signature is `FAIL`, not `UNKNOWN`: a key was supplied and it did not
 verify the bytes. `UNKNOWN` is never promoted to `PASS`. `--allow-unsigned`
-permits relation analysis of an unsigned legacy run but the verdict stays
-`UNKNOWN`, because the missing signatures are exactly what the tool was asked to
-establish.
+permits relation analysis of a legacy run with no `run.manifest.json`, but the
+verdict stays `UNKNOWN`, because the missing signatures are exactly what the tool
+was asked to establish. When a manifest is present, signed or not,
+`--allow-unsigned` has no effect: a missing artifact envelope is `FAIL`, as is a
+missing handoff-index envelope on a run whose manifest requires signed handoffs.
+It cannot be combined with `--rerun`.
+
+`run.manifest.json` also carries a `trustLevel`. Offline `verify` has no
+approval enforcement, so `human-approved` and `ci-attested` emit
+`trust:approval` / `AUTH_APPROVAL_UNVERIFIED` (`UNKNOWN`), never `PASS`. A
+manifest with `requireWitness: true` and no usable witness receipt emits
+`trust:witness` / `AUTH_WITNESS_UNVERIFIED` (`UNKNOWN`). The `trust` object
+reports `runTrustLevel`, `approval.status` and `witness.status` so a consumer
+can distinguish "not required" from "not verified".
 
 ### 2.5 Stable JSON
 
