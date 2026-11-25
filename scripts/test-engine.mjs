@@ -4317,7 +4317,7 @@ try {
     "http://169.254.169.254/latest/meta-data",
     "http://169.254.169.254",
     "https://evil.example",
-    "http://10.0.0.1:4096",
+    "http://10.0.0.1:4096", // NOSONAR (S5332): negative fixture; plain-http private addresses must be rejected
     "http://user:pass@127.0.0.1:4096",
     "http://127.0.0.1:4096/bad",
     "http://127.0.0.1:4096?x=1",

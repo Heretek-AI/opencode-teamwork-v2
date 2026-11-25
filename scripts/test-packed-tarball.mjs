@@ -11,13 +11,25 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
+import { resolveTrustedExecutable } from "../plugins/opencode-teamwork/safe-fs.mjs"
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 const RUNTIME_DIR = join(ROOT, "tests", "runtime")
 
+const npmBin = resolveTrustedExecutable("npm")
+if (!npmBin) {
+  console.error("test-packed-tarball: no trusted npm executable found on PATH")
+  process.exit(1)
+}
+const bunBin = resolveTrustedExecutable("bun")
+if (!bunBin) {
+  console.error("test-packed-tarball: no trusted bun executable found on PATH")
+  process.exit(1)
+}
+
 const work = mkdtempSync(join(tmpdir(), "teamwork-t4-pack-"))
 try {
-  const packOut = execFileSync("npm", ["pack", "--json", "--pack-destination", work], {
+  const packOut = execFileSync(npmBin, ["pack", "--json", "--pack-destination", work], {
     cwd: ROOT,
     encoding: "utf8",
   })
@@ -53,7 +65,7 @@ try {
   const consumer = join(work, "consumer")
   mkdirSync(consumer, { recursive: true })
   writeFileSync(join(consumer, "package.json"), JSON.stringify({ name: "t4-consumer", private: true }) + "\n")
-  execFileSync("npm", ["install", "--no-audit", "--no-fund", tarballPath], {
+  execFileSync(npmBin, ["install", "--no-audit", "--no-fund", tarballPath], {
     cwd: consumer,
     stdio: "inherit",
   })
@@ -66,7 +78,7 @@ try {
   // Load the packed artifact via `{ package: "<installed>" }` in L1 specs.
   if (existsSync(join(RUNTIME_DIR, "node_modules"))) {
     execFileSync(
-      "bun",
+      bunBin,
       ["test", "--timeout", "30000", "spec/a1-load.test.ts", "spec/a2-catalog.test.ts", "spec/a3-commands.test.ts"],
       {
         cwd: RUNTIME_DIR,

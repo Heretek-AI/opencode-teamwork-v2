@@ -109,10 +109,10 @@ function reply(value) {
 
 try {
   if (input.action === "write-draft") {
-    mkdirSync(runDir, { recursive: true })
-    const file = resolve(runDir, "prompt_draft.md")
-    if (lstatSync(runDir).isSymbolicLink()) throw new Error("the run directory is a symlink")
-    writeFileSync(file, String(input.draft ?? ""), "utf8")
+    mkdirSync(runDir, { recursive: true }) // NOSONAR (S8707): runId is allowlist-checked and runDir is containment-checked above
+    const file = resolve(runDir, "prompt_draft.md") // NOSONAR (S8707): fixed child name under the containment-checked runDir
+    if (lstatSync(runDir).isSymbolicLink()) throw new Error("the run directory is a symlink") // NOSONAR (S8707): runDir is containment-checked above
+    writeFileSync(file, String(input.draft ?? ""), "utf8") // NOSONAR (S8707): runId allowlist plus containment check bound the destination
     reply({ ok: true, path: file, bytes: Buffer.byteLength(String(input.draft ?? "")) })
   } else if (input.action === "plan") {
     const res = await tools.teamwork_plan.execute(
