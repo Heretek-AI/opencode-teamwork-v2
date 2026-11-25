@@ -1,7 +1,7 @@
 # Audit, remediation and `agy` parity — November 2026
 
 - **Repository:** `Heretek-AI/opencode-teamwork-v2`
-- **Branch:** `feat/remediation-waves-1-4` (not merged, not pushed by this run)
+- **Branch:** `feat/remediation-waves-1-4`, merged into `main` at `884744e` and pushed
 - **Base for the audit:** `main` @ `efb5232ca` (last scanner analysis before the branch)
 - **Host contract:** OpenCode 2.4.1, zero runtime dependencies
 - **Reference behaviour:** `/home/john/.local/bin/agy` 1.5.17, `teamwork` command
@@ -30,11 +30,11 @@ symbol, and the tool output or observed `agy` behaviour that produced it.
 | Source | Baseline | After remediation (local) | Remote state |
 | --- | ---: | ---: | --- |
 | fallow dead-code | **255** issues: 18 unused files, 214 unused exports, 15 unused types, 5 duplicate exports, 1 unresolved import, 2 unlisted deps | **0** issues (exit 0) | n/a (local tool) |
-| SonarCloud open issues | **1,234** total; **1,050** outside `docs/re` (55 bugs, 45 vulnerabilities, 950 code smells) | Targeted bugs/vulnerabilities and the dead-code/duplication findings are fixed in the tree; the secrets scan is clean | The API still reports the `main` analysis until the branch is pushed and CI re-analyzes it |
-| GitHub code scanning | **44** alerts: 22 open, 14 fixed, 8 dismissed. Open: 19 `js/file-system-race`, 2 `js/file-access-to-http`, 1 `actions/unpinned-tag` | All 22 are addressed in the tree | Alert states flip to `fixed` only after a push and a CodeQL run on the branch |
+| SonarCloud open issues | **1,234** total; **1,050** outside `docs/re` (55 bugs, 45 vulnerabilities, 950 code smells) | Targeted bugs/vulnerabilities and the dead-code/duplication findings are fixed in the tree; the secrets scan is clean | The merge is pushed to `main`; the next SonarCloud analysis of `main` will replace this baseline (see §7) |
+| GitHub code scanning | **44** alerts: 22 open, 14 fixed, 8 dismissed. Open: 19 `js/file-system-race`, 2 `js/file-access-to-http`, 1 `actions/unpinned-tag` | All 22 are addressed in the tree | The merge is pushed to `main`; CodeQL is re-analyzing it (see §7) |
 | Runtime gates | 52 pass, 1 skip (L4 live), 0 fail | 113 pass, 1 skip (L4 live), 0 fail | local |
 | Rust signer | 5/5 | 5/5 | local |
-| Packaging | 103 files, 0 deps | 107 files, 0 deps (`text-utils.ts` added); no `tests/`, `docs/re/`, `signer/`, or parity script | local |
+| Packaging | 103 files, 0 deps | 108 files, 0 deps (`text-utils.ts` added; the parity script now ships with the other test scripts); no `tests/`, `docs/re/`, or `signer/` | local |
 
 The local-vs-remote distinction is deliberate. Nothing in this report claims
 that a remote scanner has already accepted the local fixes.
@@ -194,7 +194,7 @@ npm test                                   # exit 0; 15 L0 suites
 npm run test:agy-parity                    # 152/152 parity
 node scripts/lint-security-claims.mjs      # 31 files clean
 npm run lint:prompts                       # 15 agents, 6 topologies
-npm pack --dry-run                         # 107 files, 0 deps, no tests/docs/re/signer/parity
+npm pack --dry-run                         # 108 files, 0 deps, no tests/docs/re/signer
 cargo test --manifest-path signer/Cargo.toml  # 5/5
 fallow dead-code --no-cache                # 0 issues, exit 0
 cd tests/runtime && bun test --timeout 30000  # 113 pass, 1 skip (L4 live), 0 fail
@@ -218,9 +218,10 @@ secrets**.
 
 ## 7. Unresolved items and residual risks
 
-1. **Remote scanner state is pending.** CodeQL alerts and SonarCloud issues on
-   `main` keep their old state until this branch is pushed and analyzed. The
-   report deliberately does not claim otherwise.
+1. **Remote scanner state is being refreshed.** The merge is pushed to `main`
+   (`884744e`) and CodeQL is re-analyzing it; SonarCloud follows its own
+   `main` analysis. Until those finish, the baseline counts in §2 are the
+   pre-merge state, not a claim that the remote findings are already closed.
 2. **Sonar code smells remain.** The targeted bug/vulnerability/dead-code set is
    fixed; the large `S3776` cognitive-complexity family (and other style rules)
    was not mass-refactored. Reducing it safely is a separate change.
@@ -310,8 +311,8 @@ overall).
 - CLI probes -> `help` 0; unknown command 1; `verify` with no target, both
   targets, and a traversal id 3.
 - `node scripts/lint-security-claims.mjs` -> 31 files clean after this edit.
-- `npm pack --dry-run` -> 107 files, 0 dependencies; no `tests/`, `docs/re/`,
-  `signer/` or parity script.
+- `npm pack --dry-run` -> 108 files, 0 dependencies; no `tests/`, `docs/re/`,
+  or `signer/`; the parity script ships with the other test scripts.
 
 **Residual divergences (outside the eight surface-2 rubric points).**
 
@@ -328,7 +329,7 @@ overall).
   denies it for three (`segment-reviewer`, `formalization-reviewer`,
   `referee`). The code and the permission test agree; the matrix sentence is
   imprecise.
-- Report counts: `npm pack --dry-run` is 107 files and the claim lint sees 31
+- Report counts: `npm pack --dry-run` is 108 files and the claim lint sees 31
   files because this report, `TEST_INFRA.md` and `TEST_READY.md` were added;
   §§2 and 5 were refreshed to match.
 - `state.json` is unsigned coordinator state. No signature is claimed for the

@@ -1402,7 +1402,14 @@ check("detective swap leaves one structured incident manifest outside the run an
     assert.ok(typeof last.targetRealpathAfter === "string" && last.targetRealpathAfter.length > 0)
     assert.ok(last.pinnedIdentity && Number.isFinite(last.pinnedIdentity.ino))
     assert.ok(last.observedIdentity && Number.isFinite(last.observedIdentity.ino))
-    assert.notStrictEqual(last.pinnedIdentity.ino, last.observedIdentity.ino)
+    // A filesystem may reuse the inode immediately after unlink+create. The
+    // detective check still refuses the swap through its same-inode byte
+    // re-hash, so accept either a changed inode or the byte-identity detail.
+    assert.ok(
+      last.pinnedIdentity.ino !== last.observedIdentity.ino ||
+        /same inode, different content|bytes do not match/i.test(String(last.detail)),
+      "incident must show a changed inode or the same-inode byte-identity refusal",
+    )
     assert.match(String(last.intendedDigest), /^[0-9a-f]{64}$/)
     assert.ok(Number.isFinite(last.intendedBytes) && last.intendedBytes > 0)
     assert.ok(typeof last.tempName === "string" && last.tempName.endsWith(".tmp"))

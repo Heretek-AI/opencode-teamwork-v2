@@ -14,7 +14,7 @@ on the branch `feat/remediation-waves-1-4`, on top of OpenCode 2.4.1.
 | Full runtime L1–L3 | `cd tests/runtime && bun test --timeout 30000` | **113 pass, 1 skip (L4 live), 0 fail** |
 | L0 repository suite | `npm test` | 15 suites, exit 0 |
 | Rust signer | `cargo test --manifest-path signer/Cargo.toml` | 5/5 |
-| Packaging | `npm pack --dry-run` | 107 files, 0 dependencies, no `tests/`, `docs/re/`, `signer/`, or parity script |
+| Packaging | `npm pack --dry-run` | 108 files, 0 dependencies, no `tests/`, `docs/re/`, or `signer/`; the parity script ships with the other test scripts |
 
 ## What is covered
 
