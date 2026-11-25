@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Strict input hardening (#45):** Branch-specific `anyOf` failure diagnostics,
+  dual non-enumerable host-repair guards (`patternProperties` + `allOf`),
+  explicit `$ref`/`oneOf` refusal coverage, and host-repair-disabled L1 A4 test.
+- **Durable containment incident manifests (#42):** One bounded, pruned JSON
+  incident manifest per detective-mode refusal under `<configDir>/teamwork/incidents/`,
+  surfaced as `needs-inspection` in `teamwork_status`, `doctor --security`, and
+  `teamwork_final_verify` (never attempting rollback; detection reports an event
+  that already happened).
+- **Release packed-tarball T4 test (#46):** `scripts/test-packed-tarball.mjs`
+  packs, checks sha256 and `files` exclusions, installs into a clean consumer,
+  and runs L1 specs against the installed package before `npm publish`.
+- **Nightly OpenCode host-drift CI (#39):** `.github/workflows/host-drift.yml`
+  and `scripts/diff-host-catalog.mjs` test `@opencode/*@latest` nightly and
+  report drift in a single deduplicated `"OpenCode host drift"` issue.
+- **NFS/multi-host harness & `doctor --locks/--unlock` (#41):** Env-gated
+  `scripts/test-nfs.mjs` (`TEAMWORK_NFS_TEST_DIR`), `OPENCODE_TEAMWORK_TEST_HOST`
+  and fault seams in `locks.ts`, plus `lib/locks-doctor.mjs` (`--locks`
+  inventory and `--unlock <path> --confirm` restricted to same-host dead-pid
+  stale locks; locks remain best-effort duplicate suppression, never exactly-once).
+- **OIDC JWT claim verification & CLI `--fetch-jwks` (#44):** Zero-dependency
+  `RS256`/`ES256`/`EdDSA` OIDC token verification in `attestation.mjs`
+  (returning `UNKNOWN` without JWKS trust material; rejecting forged issuers and
+  cross-repo/ref replays), `id-token: write` in `attest.yml`, and opt-in
+  CLI-only `verify --fetch-jwks <https-issuer>`.
+- **Rust non-oracle reference signer (#43):** `signer/` implementing v2
+  `docs/SIGNER-PROTOCOL.md` (refuses v1, recomputes keyed digest, `O_NOFOLLOW`
+  + owner-mismatch refusal, Ed25519 approval verification, durable ledger,
+  audit-before-sign, hardened systemd units, and §3.3 vector + policy test suite;
+  excluded from npm tarball).
+- **Process-level E2E harness (#47):** `tests/runtime/e2e/process-e2e.test.ts`
+  boots real `opencode serve` processes with a local scripted provider and
+  verifies HTTP plugin load, command discovery, SSE streaming, and cross-process
+  SQLite state visibility.
+- **L4 live-model opt-in suite (#38):** `tests/runtime/live/l4-live.test.ts`
+  and `.github/workflows/live-l4.yml` (`TEAMWORK_LIVE=1`, default model
+  `magpie/opencode-go/muse-spark-1.3-contributor`, hard USD budget cap; prompt
+  fidelity evidence only).
+- **Corpus records (#48):** Added `docs/re/antigravity-teamwork/21-live-pdf-ingestion.md`
+  and `22-live-document-review-layout-2.md` with strict `OBSERVED`/`UNKNOWN`
+  evidence labels.
+
 ## [0.18.1] - 2026-11-24
 
 Strict tool inputs. OpenCode 2.4.1 does not enforce `additionalProperties:
