@@ -192,7 +192,12 @@ under that project. Sessions are the host's real sessions: a root
 - TUI rendering, prompt judgment, cost/provider truth, same-UID forgery, NFS
   lock semantics, and transient filesystem swaps. These are residuals in
   `docs/OPENCODE-COMPATIBILITY.md` §7 and are not made provable here.
-- The published tarball's installability (T4): `npm pack --dry-run` in CI checks
-  the file list, but nothing here installs the packed tarball.
+- The published tarball's full behaviour (T4): `scripts/test-packed-tarball.mjs`
+  installs the packed tarball and runs A1 directory mode plus the packed L2
+  plan smoke (`e2e/packed-l2.test.ts`, registered only when
+  `TEAMWORK_PACKED_PACKAGE` is set). A2/A3 still run in memory mode against the
+  working tree, and the L3 scenarios are not re-run from the tarball. The
+  tarball's file whitelist is covered by `npm pack --dry-run` and the CI
+  packaging guard.
 - Channel/dev builds and `@opencode/*@latest` drift (T3).
 

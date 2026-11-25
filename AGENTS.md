@@ -44,7 +44,7 @@ These are not style preferences; breaking them breaks the product.
 ## Testing
 
 ```sh
-npm test                                  # L0: unit, catalog, verifier, security
+npm test                                  # L0: unit, catalog, verifier, security, release consistency
 npm run lint:prompts                      # after changing agents or commands
 node scripts/lint-security-claims.mjs     # after changing docs
 npm pack --dry-run                       # packaging guard; tests/ and docs/re/ must not ship
@@ -98,15 +98,22 @@ bun run test                              # L1-L3 against the real OpenCode 2.4.
 | `lib/`, `bin/` | CLI: run reports, verify, approve, doctor |
 | `docs/ARTIFACTS.md` | run/artifact schema |
 | `docs/GUARDRAILS.md` | security boundary |
+| `signer/` | Rust reference non-oracle signer (never shipped in the npm package) |
 | `docs/ADMIN-HARDENING.md` | hardened deployment runbook |
 | `docs/SIGNER-PROTOCOL.md` | non-oracle signer contract |
 | `docs/OPENCODE-COMPATIBILITY.md` | host API audit and test strategy |
+| `docs/RELEASE-RUNBOOK.md` | release gates, tag-only publish, admin-owned rulesets |
+| `sonar-project.properties` | SonarCloud project/scope config (not shipped; policy in the audit report §3.2.1) |
 | `docs/re/` | reverse-engineering corpus (never shipped) |
 | `tests/runtime/` | L1-L3 integration harness (never shipped) |
 
 ## Open work
 
-Tracked in GitHub issues, starting at #38: live-model suite, host-drift job,
-admin hardening, NFS harness, containment incidents, reference signer, OIDC
-attestation, strict-input hardening, packed-tarball release test, process-level
-E2E, and the remaining corpus runs.
+Open GitHub issues: #38 (L4 live-model suite), #40 (admin hardening applied on a
+real host), #48 (remaining Document Review/PDF corpus), #51 (document-review
+visual audit) and #52 (per-dispatch model override). The 0.19.2
+security/release work — verify re-run trust gate, `--allow-unsigned`
+restriction, attestation input validation, fail-closed trust/evidence, and the
+Sonar/packaging checks — is tracked in the changelog and pull requests. The
+host-drift, NFS, containment-incident, signer, OIDC, strict-input,
+packed-tarball and process-E2E items (#39, #41–#47) are implemented and closed.

@@ -1,19 +1,20 @@
 # Admin hardening runbook: a policy-enforcing signer
 
-**Status:** deployment documentation for the 0.14.0 artifact-trust boundary.
-This is a runbook for an administrator. **None of these steps was executed on
-the host that wrote this document.** The commands are templates; substitute
-your identities and paths, review every line, and test on a disposable host
-first.
+**Status:** deployment documentation for the 0.14.0 artifact-trust boundary
+(plugin side unchanged through 0.19.2). This is a runbook for an administrator.
+**None of these steps was executed on the host that wrote this document.** The
+commands are templates; substitute your identities and paths, review every
+line, and test on a disposable host first.
 
-**The signer is not in this repository and is not shipped with the package.**
-The plugin can call `OPENCODE_TEAMWORK_SIGNER=command:<path>` and, with a signer
-approval directory, send a v2 request; the program at that path is yours. It
-must be built (the outline and test list are in
-[docs/SIGNER-PROTOCOL.md §8](SIGNER-PROTOCOL.md#8-reference-implementation-outline))
-and installed as root-owned code in Step 7 below. Do not describe a deployment
-as hardened because the plugin is configured; the signer's policy is the
-boundary.
+**The Rust reference signer is in [`signer/`](../signer/) but is not shipped
+with the npm package.** It is a non-oracle reference implementation of
+[docs/SIGNER-PROTOCOL.md](SIGNER-PROTOCOL.md), not a turnkey hardened service:
+review it, build it, and own its policy. The plugin can call
+`OPENCODE_TEAMWORK_SIGNER=command:<path>` and, with a signer approval
+directory, send a v2 request; the program at that path is yours. It must be
+built and installed as root-owned code in Step 7 below. Do not describe a
+deployment as hardened because the plugin is configured; the signer's policy is
+the boundary.
 
 This runbook builds the deployment that the package cannot build in-process: a
 signer in a different UID, root-owned signer code, a policy that refuses

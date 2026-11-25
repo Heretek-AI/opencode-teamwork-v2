@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 // T4 release gate: prove the shipped npm tarball installs cleanly and loads
-// inside the real OpenCode 2.4.1 runtime (Issue #46).
+// inside the real OpenCode 2.4.1 runtime (Issue #46). A1 directory mode is the
+// L1 package-load proof; e2e/packed-l2.test.ts adds an L2 plan smoke against
+// the same installed tree. A2/A3 still run in memory mode (working tree), so
+// the T4 gate does not cover every L2/L3 scenario from the packed artifact.
 //
 // Usage: node scripts/test-packed-tarball.mjs
 
@@ -17,9 +20,22 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 const RUNTIME_DIR = join(ROOT, "tests", "runtime")
 
 const npmBin = resolveTrustedExecutable("npm")
-if (!npmBin) {
-  console.error("test-packed-tarball: no trusted npm executable found on PATH")
-  process.exit(1)
+// Hosted setup-node exposes `npm` as a symlink to a non-executable npm-cli.js,
+// so the trusted executable resolver can reject it even though npm is the
+// toolchain's own bin. Fall back to the npm CLI beside process.execPath; this is
+// an absolute path, never a PATH lookup.
+const npmShim = join(dirname(process.execPath), process.platform === "win32" ? "npm.cmd" : "npm")
+const npmCli =
+  process.platform === "win32"
+    ? join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js")
+    : join(dirname(process.execPath), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js")
+function runNpm(args, options = {}) {
+  if (npmBin) return execFileSync(npmBin, args, options)
+  // The toolchain's own shim is an absolute path; the trusted-directory
+  // resolver rejects it only because it follows to a non-executable JS file.
+  if (existsSync(npmShim)) return execFileSync(npmShim, args, options)
+  if (existsSync(npmCli)) return execFileSync(process.execPath, [npmCli, ...args], options)
+  throw new Error("test-packed-tarball: no trusted npm executable or npm shim beside process.execPath")
 }
 const bunBin = resolveTrustedExecutable("bun")
 if (!bunBin) {
@@ -29,7 +45,7 @@ if (!bunBin) {
 
 const work = mkdtempSync(join(tmpdir(), "teamwork-t4-pack-"))
 try {
-  const packOut = execFileSync(npmBin, ["pack", "--json", "--pack-destination", work], {
+  const packOut = runNpm(["pack", "--json", "--pack-destination", work], {
     cwd: ROOT,
     encoding: "utf8",
   })
@@ -65,7 +81,7 @@ try {
   const consumer = join(work, "consumer")
   mkdirSync(consumer, { recursive: true })
   writeFileSync(join(consumer, "package.json"), JSON.stringify({ name: "t4-consumer", private: true }) + "\n")
-  execFileSync(npmBin, ["install", "--no-audit", "--no-fund", tarballPath], {
+  runNpm(["install", "--no-audit", "--no-fund", tarballPath], {
     cwd: consumer,
     stdio: "inherit",
   })
@@ -76,10 +92,22 @@ try {
   assert.strictEqual(Object.keys(installedPkg.dependencies ?? {}).length, 0, "installed package must have zero runtime dependencies")
 
   // Load the packed artifact via `{ package: "<installed>" }` in L1 specs.
+  // A1's directory mode is the load proof; the packed L2 smoke plans a run
+  // through the installed package. A2/A3 run in memory mode against the
+  // working tree, so they are a command/catalog cross-check, not a second
+  // package-loading proof.
   if (existsSync(join(RUNTIME_DIR, "node_modules"))) {
     execFileSync(
       bunBin,
-      ["test", "--timeout", "30000", "spec/a1-load.test.ts", "spec/a2-catalog.test.ts", "spec/a3-commands.test.ts"],
+      [
+        "test",
+        "--timeout",
+        "30000",
+        "spec/a1-load.test.ts",
+        "spec/a2-catalog.test.ts",
+        "spec/a3-commands.test.ts",
+        "e2e/packed-l2.test.ts",
+      ],
       {
         cwd: RUNTIME_DIR,
         stdio: "inherit",

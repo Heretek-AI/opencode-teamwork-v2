@@ -12,27 +12,147 @@ jobs:
   # L1/L2: the real plugin inside the real OpenCode 2.4.1 runtime, with no model
   # call and no network at test time. Dependencies are pinned in
   # tests/runtime/package.json; the root package stays dependency-free.
+  #
+  # The pinned CLI is a dev-only global install (scripts are allowed: its
+  # postinstall selects the platform binary). The process E2E spec is skipped
+  # when `which opencode` fails, so the skip assertion below is what makes the
+  # install a gate rather than a suggestion.
   runtime-l1:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.4
 
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
       - name: Install harness dependencies
         working-directory: tests/runtime
         run: bun install --frozen-lockfile --ignore-scripts
 
-      - name: L1/L2/L3 runtime suite
+      - name: Install the pinned OpenCode 2.4.1 CLI
+        # The pinned host CLI needs its own postinstall to materialize the
+        # tested binary. This is a dev-only CI tool, not a package dependency.
+        run: npm install --global --no-audit --no-fund @opencode/cli@2.4.1 # NOSONAR (S6505): required postinstall for the pinned dev-only host CLI
+
+      # The harness looks up `opencode` with `which`; OPENCODE_BIN is the
+      # harness's explicit override when a global bin directory is not on PATH.
+      - name: Verify the OpenCode host
+        run: |
+          set -euo pipefail
+          bin="$(command -v opencode || true)"
+          if [ -z "$bin" ]; then
+            bin="$(npm prefix -g)/bin/opencode"
+          fi
+          if [ ! -x "$bin" ]; then
+            echo "::error::opencode is not executable after installing @opencode/cli@2.4.1"
+            exit 1
+          fi
+          echo "OPENCODE_BIN=$bin" >> "$GITHUB_ENV"
+          echo "$(dirname "$bin")" >> "$GITHUB_PATH"
+          version="$("$bin" --version | head -n 1)"
+          echo "opencode --version: $version"
+          case "$version" in
+            "opencode v2.4.1"|"2.4.1") ;;
+            *)
+              echo "::error::expected OpenCode 2.4.1, got: $version"
+              exit 1
+              ;;
+          esac
+
+      - name: L1/L2/L3 runtime suite (process E2E included)
         working-directory: tests/runtime
-        run: bun test --timeout 30000
+        run: |
+          set -o pipefail
+          bun test --timeout 30000 2>&1 | tee "$RUNNER_TEMP/runtime.log"
+
+      - name: Assert the only skipped spec is L4 live
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/runtime.log"
+          test -s "$log" || { echo "::error::runtime log is missing"; exit 1; }
+          pass="$(grep -E '^[[:space:]]+[0-9]+ pass$' "$log" | tail -n 1 | awk '{print $1}')"
+          skip="$(grep -E '^[[:space:]]+[0-9]+ skip$' "$log" | tail -n 1 | awk '{print $1}')"
+          fail="$(grep -E '^[[:space:]]+[0-9]+ fail$' "$log" | tail -n 1 | awk '{print $1}')"
+          echo "runtime summary: pass=${pass:-?} skip=${skip:-?} fail=${fail:-?}"
+          test "$pass" = "118" || { echo "::error::expected 118 passing runtime specs, got ${pass:-none}"; exit 1; }
+          test "$skip" = "1" || { echo "::error::expected exactly 1 skip (L4 live), got ${skip:-none}"; exit 1; }
+          test "$fail" = "0" || { echo "::error::runtime specs failed"; exit 1; }
+          if grep -q '2 skip' "$log"; then
+            echo "::error::process E2E skipped; the pinned opencode CLI was not usable"
+            exit 1
+          fi
+          if ! grep -q '\[process-e2e\]' "$log"; then
+            echo "::error::process E2E success marker missing; the spec did not run"
+            exit 1
+          fi
+
+  # L0 parity is a distinct required check: `npm test` does not run it, and a
+  # failure here must be attributable to the parity suite rather than the
+  # engine/catalog suites.
+  l0-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: L0 parity and audit regression suite
+        run: node scripts/test-agy-parity.mjs
+
+  # T4: pack the tarball, install it into a clean project, verify sha256 and
+  # file whitelist, then run the L1 load/catalog/commands specs plus the packed
+  # L2 plan smoke against the installed tree. A1's directory mode is the load
+  # proof; A2/A3 run in memory mode (working tree), so this job does not claim
+  # every L2/L3 scenario is exercised from the tarball.
+  pack-t4:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Install runtime harness dependencies (T4)
+        working-directory: tests/runtime
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Packed-tarball install test (T4)
+        run: node scripts/test-packed-tarball.mjs
+
+  # The root package, the plugin package and the changelog must name the same
+  # release. On a tag build the ref must be exactly v<version>.
+  release-consistency:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Check package/changelog/tag consistency
+        run: node scripts/check-release-consistency.mjs
 
   signer:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Test reference non-oracle signer (Rust)
         run: cargo test --manifest-path signer/Cargo.toml
 
@@ -43,10 +163,10 @@ jobs:
       matrix:
         node-version: ["22", "24"]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # The package has no dependencies; every script uses Node built-ins only.
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: ${{ matrix.node-version }}
           package-manager-cache: false
@@ -64,7 +184,7 @@ jobs:
           const p = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/pack.json", "utf8"));
           const paths = p[0].files.map((f) => f.path);
           const bad = paths.filter((x) => x === "docs/re" || x.startsWith("docs/re/") || x === "tests" || x.startsWith("tests/") || x === "signer" || x.startsWith("signer/"));
-          const need = ["docs/ARTIFACTS.md", "docs/GUARDRAILS.md", "docs/ADMIN-HARDENING.md", "docs/SIGNER-PROTOCOL.md", "docs/adr/0005-artifact-authenticity.md", "docs/adr/0008-signer-spi-and-trust-levels.md", "docs/adr/0014-verifiable-witness-and-signer-v2.md", "docs/adr/0015-offline-verification.md", "docs/adr/0018-ci-attestation.md", "SECURITY.md", "scripts/hardening-check.sh", "scripts/attest-sign.mjs", "plugins/opencode-teamwork/index.ts", "plugins/opencode-teamwork/auth.ts", "plugins/opencode-teamwork/attestation.mjs", "plugins/opencode-teamwork/authorize.ts", "plugins/opencode-teamwork/url-guard.mjs", "plugins/opencode-teamwork/strict.ts", "plugins/opencode-teamwork/briefing.ts", "plugins/opencode-teamwork/victory.ts", "plugins/opencode-teamwork/safe-fs.mjs", "lib/verify.mjs", "scripts/test-verify.mjs", "agents/team/victory-auditor.md"];
+          const need = ["docs/ARTIFACTS.md", "docs/GUARDRAILS.md", "docs/ADMIN-HARDENING.md", "docs/SIGNER-PROTOCOL.md", "docs/adr/0005-artifact-authenticity.md", "docs/adr/0008-signer-spi-and-trust-levels.md", "docs/adr/0014-verifiable-witness-and-signer-v2.md", "docs/adr/0015-offline-verification.md", "docs/adr/0018-ci-attestation.md", "SECURITY.md", "scripts/hardening-check.sh", "scripts/attest-sign.mjs", "plugins/opencode-teamwork/index.ts", "plugins/opencode-teamwork/auth.ts", "plugins/opencode-teamwork/attestation.mjs", "plugins/opencode-teamwork/authorize.ts", "plugins/opencode-teamwork/url-guard.mjs", "plugins/opencode-teamwork/strict.ts", "plugins/opencode-teamwork/briefing.ts", "plugins/opencode-teamwork/victory.ts", "plugins/opencode-teamwork/safe-fs.mjs", "lib/verify.mjs", "scripts/test-verify.mjs", "agents/team/victory-auditor.md", "docs/RELEASE-RUNBOOK.md", "scripts/check-release-consistency.mjs", "scripts/test-release-consistency.mjs"];
           const miss = need.filter((n) => !paths.includes(n));
           const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
           const deps = Object.keys(pkg.dependencies ?? {});

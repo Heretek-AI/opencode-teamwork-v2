@@ -4,7 +4,7 @@
 // Opaque-box 4-tier test suite covering N = 13 feature units across 5 surfaces:
 //   - M1 regressions: M1.1 (dbPathFor), M1.2 (S3923), M1.3 (approval-driver runId), M1.4 (service*.json URL guard)
 //   - agy parity gaps: A1..A9
-//   - Tiers: T1 (Feature Coverage, 65), T2 (Boundary & Corner, 65), T3 (Pairwise, 15), T4 (E2E Scenarios, 7) => 152 cases
+//   - Tiers: T1 (Feature Coverage, 66), T2 (Boundary & Corner, 65), T3 (Pairwise, 15), T4 (E2E Scenarios, 7) => 153 cases
 //
 // Zero runtime dependencies; no @opencode/* imports.
 // Usage: node scripts/test-agy-parity.mjs [--milestone=M1|M3|M4|all] [--tier=T1|T2|T3|T4|all] [--verbose]
@@ -539,7 +539,8 @@ function addCase(def) {
 }
 
 // =============================================================================
-// TIER 1: FEATURE COVERAGE (65 cases: 5 per feature M1.1..M1.4 + A1..A9)
+// TIER 1: FEATURE COVERAGE (66 cases: 5 per feature M1.1..M1.4 + A1..A9,
+// plus the extra A7 toolchain case)
 // =============================================================================
 
 // --- M1.1 dbPathFor(env) (lib/security.mjs) ---
@@ -3781,7 +3782,7 @@ addCase({
   milestone: "M4",
   feature: "A7+A8",
   tier: "T3",
-  title: "A7+A8: document-review PDF completes document_record, victory_audit, and final_verify when extracted cleanly",
+  title: "A7+A8: document-review completes document_record + victory_audit, then final_verify fails closed on unsigned route evidence",
   fn: () =>
     withSandbox("pair-10", async (dir) => {
       const pdf = join(dir, "clean.pdf")
@@ -3831,7 +3832,11 @@ addCase({
       await h.tools.teamwork_handoff.execute(makeHandoffInput(runId, undefined, "Victory"), { sessionID: "ses_victory" })
       await h.tools.teamwork_handoff.execute(makeHandoffInput(runId, undefined, "Done"), { sessionID: "ses_sentinel" })
       const fv = await h.tools.teamwork_final_verify.execute({ sessionId: runId }, { sessionID: "ses_verifier" })
-      assert.equal(fv.status, "PASS", fv.content)
+      assert.equal(fv.status, "FAIL", fv.content)
+      assert.ok(
+        fv.reasons?.some((r) => r.includes("DOCUMENT_REVIEW_EVIDENCE_UNSIGNED")),
+        `final_verify must name the unsigned document-review evidence: ${JSON.stringify(fv.reasons)}`,
+      )
     }),
 })
 
@@ -4135,7 +4140,7 @@ addCase({
   milestone: "M4",
   feature: "A7+M1.4",
   tier: "T4",
-  title: "Scenario 4: PDF Document Review pre-flight MISSING (PREREQUISITES.md) vs valid PDF full workflow PASS",
+  title: "Scenario 4: PDF Document Review pre-flight MISSING (PREREQUISITES.md) vs valid PDF full workflow blocked at final_verify by unsigned route evidence",
   fn: () =>
     withSandbox("e2e-04", async (dir) => {
       const binDir = join(dir, "bin")
@@ -4189,7 +4194,11 @@ addCase({
       await h2.tools.teamwork_handoff.execute(makeHandoffInput(okRun, undefined, "Victory"), { sessionID: "ses_victory" })
       await h2.tools.teamwork_handoff.execute(makeHandoffInput(okRun, undefined, "Done"), { sessionID: "ses_sentinel" })
       const fv = await h2.tools.teamwork_final_verify.execute({ sessionId: okRun }, { sessionID: "ses_verifier" })
-      assert.equal(fv.status, "PASS", fv.content)
+      assert.equal(fv.status, "FAIL", fv.content)
+      assert.ok(
+        fv.reasons?.some((r) => r.includes("DOCUMENT_REVIEW_EVIDENCE_UNSIGNED")),
+        `final_verify must name the unsigned document-review evidence: ${JSON.stringify(fv.reasons)}`,
+      )
     }),
 })
 

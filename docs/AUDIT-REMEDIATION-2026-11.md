@@ -12,6 +12,13 @@ This report covers the four requested outputs: findings by source with
 evidence, every remediation, the tools or endpoints that were unavailable, and
 the items left unresolved. It also records the independent five-surface rubric.
 
+**Count discipline.** This is a historical remediation record, and its numbers
+move with the release. Sections 2 and 5 carry the 0.19.1/0.19.2 counts;
+§8's rubric notes are the 0.19.0 review record and say so in place. The current
+run record is [`TEST_READY.md`](TEST_READY.md). In particular, `152` L0 cases,
+`61` runtime parity specs and `113 pass + 1 skip` describe the 0.19.0 review, not
+the current tree (`153`, `62`, and the `runtime-l1` gate of 118 pass + 1 skip).
+
 ## 1. Method
 
 | Source | How it was run | Scope |
@@ -32,9 +39,9 @@ symbol, and the tool output or observed `agy` behaviour that produced it.
 | fallow dead-code | **255** issues: 18 unused files, 214 unused exports, 15 unused types, 5 duplicate exports, 1 unresolved import, 2 unlisted deps | **0** issues (exit 0) | n/a (local tool) |
 | SonarCloud open issues | **1,234** total; **1,050** outside `docs/re` (55 bugs, 45 vulnerabilities, 950 code smells) | Target bugs/vulnerabilities and the dead-code/duplication findings are fixed; the secrets scan is clean. The 0.19.1 PR analysis is gate-OK with **0 new bugs/vulnerabilities** | `main` @ `7e0de63` (0.19.1): **1,292 open** (7 bugs, 5 vulnerabilities, 1,280 smells); **all 12 bugs/vulnerabilities are in `docs/re/`**, **0 outside**. The nine #49 findings are fixed or line-suppressed |
 | GitHub code scanning | **44** alerts: 22 open, 14 fixed, 8 dismissed. Open: 19 `js/file-system-race`, 2 `js/file-access-to-http`, 1 `actions/unpinned-tag` | All 22 are fixed, plus the 3 new alerts introduced by the merge (`#66-68`); 0 new alerts in 0.19.1 | **52 alerts: 0 open, 43 fixed, 9 dismissed** after the 0.19.1 analysis. The 0.19.1 addition is a deterministic test-fixture nonce in `signer/tests/spec_28.rs`, dismissed as used in tests |
-| Runtime gates | 52 pass, 1 skip (L4 live), 0 fail | 114 pass, 1 skip (L4 live), 0 fail | local |
+| Runtime gates | 52 pass, 1 skip (L4 live), 0 fail | Local host with `opencode`: 118 pass, 1 skip (L4 live), 0 fail. The `runtime-l1` CI gate installs `@opencode/cli@2.4.1` and requires the same 118/1/0; a host-less 117 pass + 2 skip run fails it | local / CI |
 | Rust signer | 5/5 | 5/5 | local |
-| Packaging | 103 files, 0 deps | 109 files, 0 deps (the parity script and `url-guard.mjs` + `.d.mts` ship); no `tests/`, `docs/re/`, or `signer/` | local |
+| Packaging | 103 files, 0 deps | 115 files on the 0.19.2 release line (`lib/oidc-fetch.mjs` and the two attestation-input scripts add three; the release-consistency check, its self-test and the release runbook add three); 0 deps (the parity script and `url-guard.mjs` + `.d.mts` ship); no `tests/`, `docs/re/`, or `signer/` | local release branch |
 
 The local-vs-remote distinction is deliberate: local gates and the actual
 remote `main` analyses are recorded separately.
@@ -104,7 +111,11 @@ code smells).
 
 After 0.19.1, `main` @ `7e0de63` reports **1,292** open issues (7 bugs, 5
 vulnerabilities, 1,280 code smells); all 12 bugs/vulnerabilities are in the
-never-shipped `docs/re/` corpus, 0 outside.
+never-shipped `docs/re/` corpus, 0 outside. The checked-in analysis scope is
+[`sonar-project.properties`](../sonar-project.properties); the exclusion policy
+and its two narrow rule-level exceptions are in §3.2.1. `docs/re/**` is out of
+scope, so those 12 findings do not appear in a new analysis. The quality gate is
+server-side and is not set by the properties file.
 
 **Code smells.** The dead-code and duplicate findings above are the targeted
 M2 smells. The remaining large family is cognitive complexity (`S3776`, 106
@@ -112,6 +123,49 @@ TypeScript + 81 JavaScript occurrences across the whole project, including
 `docs/re`) and other style rules. Those were not mass-refactored: a wholesale
 complexity rewrite would be a separate, higher-risk change and is recorded as
 unresolved in §7.
+
+### 3.2.1 Sonar configuration policy
+
+`sonar-project.properties` is the checked-in analysis scope for
+`Heretek-AI/opencode-teamwork-v2` (organization `heretek-ai`). It defines what
+SonarCloud reads; it does not define the quality gate.
+
+**Scope.**
+
+- **`docs/re/**` is excluded.** It is the reverse-engineering corpus: captured
+  third-party output, decompiled assets, transcripts and screenshots. It never
+  ships in the npm package (`package.json` `files` plus `!docs/re/**`), it is
+  not product code, and leaving it in the analysis would bury the shipped
+  plugin's findings under research artifacts. The exclusion is a scope decision,
+  not a claim that the corpus is defect-free.
+- `tests/runtime/node_modules/**` is excluded as the dev-only dependency tree;
+  it is not source and is absent on a clean checkout.
+- Everything else under `sonar.sources=.` is in scope: shipped plugin code,
+  `lib/`/`bin/` CLI code, agents, tests and the maintained docs.
+
+**Rule-level exclusions.** Two exclusions exist, each for one rule and one path:
+
+| Rule | Path | Why |
+| --- | --- | --- |
+| `javascript:S9382` (sequential `await` in a loop) | `scripts/test-*.mjs` | The test loops deliberately await in order against one shared fixture. Parallelising them would change test semantics and make failures nondeterministic. This is test harness code, not a production hot path. |
+| `javascript:S1313` (hardcoded IP address) | `plugins/opencode-teamwork/url-guard.mjs` | The literals are the SSRF blocklist (loopback, private, link-local, cloud metadata). Making them configurable would let a caller widen the allowlist; the fixed deny ranges are the security control and are exercised by negative tests. |
+
+Both are declared in `sonar.issue.ignore.multicriteria` with a named criterion
+and a comment beside each entry. There are no all-file or all-rule suppression
+entries and no blanket `NOSONAR` policy. A new exclusion needs the same
+treatment: one rule, one path, a written reason, and review as a code change.
+Line-targeted `// NOSONAR` is reserved for cases where no narrower mechanism
+exists, and the comment must state why.
+
+**Quality gate.** The gate is a server-side setting. The properties file does
+not set a gate, `sonar.qualitygate.wait`, or a new-code definition; those are
+configured in the SonarCloud UI for the project (and for the organization's
+default gate). Changing the file cannot loosen or tighten the gate that a pull
+request is evaluated against. With a token and `sonar-scanner` available,
+`sonar-scanner -Dsonar.token="$SONAR_TOKEN"` uploads the analysis; it does not
+run the gate locally. The repository's own gates remain `npm test`,
+`npm run lint:prompts`, `node scripts/lint-security-claims.mjs`, the runtime
+suite under `tests/runtime/`, and `npm pack --dry-run`.
 
 ### 3.3 GitHub code scanning / CodeQL
 
@@ -141,7 +195,7 @@ proof column names the reproducible tests.
 | **A4** small-focused loop | up to 32 refinement rounds over an open-issues ledger, at most 2 victory audits | `maxRounds` clamp 1..32; report-derived feedback; signed `auditCount` cap (small-focused only) | L0 `A4-T1-01..05`, `A4-T2-01..05`, PAIR-05/06; runtime `[M4 A4]`, `[T3 A4]` |
 | **A5** survey/tracking | two scouts, Feature Inventory, dual-track E2E, `DEAD_ENDS.md` oscillation guard | 2-scout prompt, `PROJECT/SCOPE/TEST_INFRA` create-only stubs, failure signatures, `DEAD_ENDS.md`, integrity warning | L0 `A5-T1-01..05`, `A5-T2-01..05`, PAIR-06; runtime `[M4 A5]`, `[T4.3]` |
 | **A6** verification wave | default Reviewer + Challenger + Forensic Auditor; empirical challenger | distributed-coding strict default; GATE_STATUS wave line; falsifier shell allow/edit deny | L0 `A6-T1-01..05`, `A6-T2-01..05`, PAIR-07/08; runtime `[M4 A6]`, `[T3 A5xA6]` |
-| **A7** prerequisites | probes `pypdfium2`/`Pillow` before PDF work, writes `PREREQUISITES.md`, `leap doctor` | trusted `python3` PDF ingest; root `PREREQUISITES.md` on MISSING/OUTAGE; `leap doctor` status | L0 `A7-T1-01..05`, `A7-T2-01..05`, PAIR-09/10/15; runtime `[M4 A7]`, `[T4.4/4.5]` |
+| **A7** prerequisites | probes `pypdfium2`/`Pillow` before PDF work, writes `PREREQUISITES.md`, `leap doctor` | trusted `python3` PDF ingest; root `PREREQUISITES.md` on MISSING/OUTAGE; `leap doctor --offline` status (a `LEAN_PROJECT_DIR`-only failure is `WARN`, not a block) | L0 `A7-T1-01..06`, `A7-T2-01..05`, PAIR-09/10/15; runtime `[M4 A7]`, `[T4.4/4.5]` |
 | **A8** victory audit | three-phase `=== VICTORY AUDIT REPORT ===`, pause vs terminal non-victory | `victory-auditor.md` 3-phase mandate; `sentinel.md` pause/terminal rules; `worker.md` handoff fix; 2-audit cap | L0 `A8-T1-01..05`, `A8-T2-01..05`, PAIR-14; runtime `[M4 A8]` |
 | **A9** toggle/protection/interrupted | feature disable, prompt protection, `interrupted.md`, legacy command clarity | `OPENCODE_TEAMWORK_DISABLED` early return; protection block in all 15 agents; abort-time `interrupted.md`; legacy descriptions | L0 `A9-T1-01..05`, `A9-T2-01..05`, E2E-07; runtime `[M3 A9]` |
 
@@ -153,7 +207,7 @@ proof column names the reproducible tests.
 | M2 | 8-10 | 5 duplicate exports consolidated/renamed, 219 un-exports, 29 dead private names removed, scoped `.fallowrc.json`, fallow 255 → 0 |
 | M3 | 11-14 | A1 bracket parsing/Parameters, A2 interview gate and behavioural integrity mode, A3 follow-up append/re-sign, A9 toggle/protection/interrupted/legacy |
 | M4 | 15-19 | A4 loop/ledger/audit cap, A5 survey/stubs/DEAD_ENDS, A6 strict default/wave/empirical challenger, A7 PDF/LEMMA prerequisites, A8 victory format/terminal discipline |
-| E2E | 20 | 152 L0 cases + 61 runtime specs, `npm run test:agy-parity`, `docs/TEST_INFRA.md`, `docs/TEST_READY.md` |
+| E2E | 20 | 152 L0 cases + 61 runtime specs at the 0.19.0 milestone (153/62 after 0.19.1), `npm run test:agy-parity`, `docs/TEST_INFRA.md`, `docs/TEST_READY.md` |
 | M5 | 21 | this report, final re-audit, five-surface rubric, full suite |
 
 ### Post-merge follow-ups
@@ -166,9 +220,9 @@ proof column names the reproducible tests.
   now reports **0 open**.
 - The parity script is shipped with the other test scripts so the published
   `test:agy-parity` entry is valid (108-file tarball).
-- Residual work is tracked in #49 (9 Sonar bugs/vulnerabilities outside
-  `docs/re`), #50 (LEMMA live-toolchain CI), #51 (document-review visual audit)
-  and #52 (per-dispatch model override).
+- #49 (9 Sonar bugs/vulnerabilities outside `docs/re`) and #50 (LEMMA
+  live-toolchain CI) were closed by 0.19.1. #51 (document-review visual audit)
+  and #52 (per-dispatch model override) remain open.
 
 ### Findings from the independent verification waves
 
@@ -208,14 +262,16 @@ The adversarial agents found defects that the implementation workers had not:
 All commands below were run from the repo root unless noted.
 
 ```sh
-npm test                                   # exit 0; 15 L0 suites
+npm test                                   # exit 0; all L0 suites (17 on the 0.19.2 release line, including the release-consistency self-test)
 npm run test:agy-parity                    # 153/153 parity
 node scripts/lint-security-claims.mjs      # 31 files clean
 npm run lint:prompts                       # 15 agents, 6 topologies
-npm pack --dry-run                         # 109 files, 0 deps, no tests/docs/re/signer
+node scripts/test-packed-tarball.mjs       # T4: install, A1 directory load, packed L2 plan smoke
+node scripts/check-release-consistency.mjs # root/plugin version + CHANGELOG heading agree
+npm pack --dry-run                         # 115 files on the 0.19.2 release line, 0 deps, no tests/docs/re/signer
 cargo test --manifest-path signer/Cargo.toml  # 5/5
 fallow dead-code --no-cache                # 0 issues, exit 0
-cd tests/runtime && bun test --timeout 30000  # 114 pass, 1 skip (L4 live), 0 fail
+cd tests/runtime && bun test --timeout 30000  # local 118 pass, 1 skip (L4 live); the runtime-l1 CI gate installs @opencode/cli@2.4.1 and requires 118/1/0
 ```
 
 The full audit and test evidence is in the fresh run recorded with this report.
@@ -318,22 +374,28 @@ below is the recorded run in `docs/TEST_READY.md`.
 wrote none of the implementation. Comparison: survey matrix features 1-17, each
 tagged with one of the five surfaces above. Local: source, L0, and direct CLI
 probes. `tests/runtime` was deliberately not run here; its rows cite the
-recorded `docs/TEST_READY.md` run for 0.19.0 (61/61 parity; 113 pass, 1 skip,
-0 fail overall). The 0.19.1 counts are in §§2 and 5.
+recorded `docs/TEST_READY.md` run for 0.19.0 (at that review: 61/61 parity;
+113 pass, 1 skip, 0 fail overall). Those are **0.19.0** counts; the current
+0.19.1/0.19.2 record is 153/153 L0 (T1 66), 62 runtime parity specs, and
+118 pass + 1 skip in the `runtime-l1` gate (local 118/1; a host-less 117/2 run
+fails the gate).
 
 **Commands run for this rubric.**
 
 - `npm test` -> exit 0; 15 L0 suites plus parity; 152/152 (T1 65, T2 65, T3 15,
   T4 7). One engine check prints `[SKIP] LEMMA live-toolchain` because
   `lean`/`lake`/`leap` are not installed on this host; no parity case skips.
-- `node scripts/test-agy-parity.mjs --milestone=M1|M3|M4` -> 44/44, 46/46, 62/62.
+- `node scripts/test-agy-parity.mjs --milestone=M1|M3|M4` -> 44/44, 46/46, 62/62
+  at the 0.19.0 review (63/63 after 0.19.1).
 - `node scripts/test-catalog.mjs` -> 26 tools, 23 prompt tokens, v0.19.0.
 - Direct tool load -> 26 ids, 0 bad `options`, 0 non-`strictInput`, 0 `output`.
 - CLI probes -> `help` 0; unknown command 1; `verify` with no target, both
   targets, and a traversal id 3.
-- `node scripts/lint-security-claims.mjs` -> 31 files clean after this edit.
-- `npm pack --dry-run` -> 108 files, 0 dependencies; no `tests/`, `docs/re/`,
-  or `signer/`; the parity script ships with the other test scripts.
+- `node scripts/lint-security-claims.mjs` -> 31 files clean at the 0.19.0
+  review, unchanged at 0.19.2.
+- `npm pack --dry-run` -> 108 files at the 0.19.0 review, 110 on the 0.19.2
+  release line; 0 dependencies; no `tests/`, `docs/re/`, or `signer/`; the
+  parity script ships with the other test scripts.
 
 **Residual divergences (outside the eight surface-2 rubric points).**
 
@@ -350,9 +412,10 @@ recorded `docs/TEST_READY.md` run for 0.19.0 (61/61 parity; 113 pass, 1 skip,
   denies it for three (`segment-reviewer`, `formalization-reviewer`,
   `referee`). The code and the permission test agree; the matrix sentence is
   imprecise.
-- Report counts: `npm pack --dry-run` is 109 files and the claim lint sees 31
-  files because this report, `TEST_INFRA.md` and `TEST_READY.md` were added;
-  §§2 and 5 were refreshed to match.
+- Report counts: at the 0.19.0 review `npm pack --dry-run` was 108 files and
+  the claim lint saw 31 files because this report, `TEST_INFRA.md` and
+  `TEST_READY.md` were added. The 0.19.2 counts are 110 packed files on the
+  release line and 31 linted files; §§2 and 5 carry them.
 - `state.json` is unsigned coordinator state. No signature is claimed for the
   ledger itself; the signed artifacts are the manifest, the `_auth`-indexed
   files and the final verdict.

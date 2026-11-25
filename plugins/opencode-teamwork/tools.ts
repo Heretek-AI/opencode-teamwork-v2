@@ -1297,7 +1297,11 @@ async function checkInputUrl(value: string, checkUrls: boolean): Promise<{ statu
   if (!checkUrls) return { status: "UNCHECKED", detail: "checkUrls: false" }
   // HEAD only: no body is read. Redirects are not followed, but a Location is
   // validated so a redirect cannot point at a loopback/private/metadata address.
-  const fetched = await safeFetch(value, { method: "HEAD", timeoutMs: PREFLIGHT_URL_TIMEOUT_MS })
+  const fetched = await safeFetch(value, {
+    method: "HEAD",
+    timeoutMs: PREFLIGHT_URL_TIMEOUT_MS,
+    signal: AbortSignal.timeout(PREFLIGHT_URL_TIMEOUT_MS),
+  })
   if (!fetched.ok) {
     if (fetched.code === "URL_TIMEOUT") return { status: "OUTAGE", detail: "timeout" }
     return { status: "OUTAGE", detail: clean(fetched.error, 160) }
@@ -1307,7 +1311,9 @@ async function checkInputUrl(value: string, checkUrls: boolean): Promise<{ statu
     if (location) {
       try {
         const next = new URL(String(location), value)
-        const target = await assertSafeUrl(next.toString())
+        const target = await assertSafeUrl(next.toString(), {
+          signal: AbortSignal.timeout(PREFLIGHT_URL_TIMEOUT_MS),
+        })
         if (!target.ok) return { status: "OUTAGE", detail: clean(`redirect to blocked address: ${target.error}`, 160) }
       } catch {
         return { status: "OUTAGE", detail: "redirect with an invalid Location" }
@@ -4644,6 +4650,50 @@ function manifestDriftReason(drift: string): string {
     return `[AUTH_STALE] LEMMA policy baseline changed (${drift})`
   }
   return `[AUTH_STALE] ${drift}`
+}
+
+/**
+ * Route evidence authenticity codes. `lemma.ts`, `tournament.ts` and
+ * `document-review.ts` still write their evidence as plain JSON/plain text
+ * without an `_auth` envelope. A signed run must not treat that evidence as a
+ * verified PASS: a run-directory writer could forge a proof, a tournament
+ * verdict, or a document-review report and final_verify would otherwise sign
+ * `verify/final.json` as PASS. This guard is deliberately fail-closed until
+ * those writers sign their artifacts. An explicitly unsigned legacy run keeps
+ * the historical behavior (and records the allowUnsignedLegacy bypass); it is
+ * never upgraded into a signed PASS. The check never invents an envelope.
+ */
+type RouteEvidenceAuthCode =
+  | "LEMMA_EVIDENCE_UNSIGNED"
+  | "TOURNAMENT_EVIDENCE_UNSIGNED"
+  | "DOCUMENT_REVIEW_EVIDENCE_UNSIGNED"
+
+async function routeEvidenceAuthReason(
+  auth: AuthContext | undefined,
+  runId: string,
+  relPath: string,
+  payload: unknown,
+  code: RouteEvidenceAuthCode,
+): Promise<string | null> {
+  if (!auth) {
+    return `[${code}] ${relPath}: no authenticity context is wired for this run, so the evidence cannot be verified`
+  }
+  try {
+    const check = await auth.verifyRunArtifact(runId, relPath, payload)
+    if (check.status === "signed") return null
+    if (check.status === "unsigned") {
+      return `[${code}] ${relPath} has no _auth envelope; a signed run requires authenticated route evidence`
+    }
+    const failure = check.failure ?? { code: "AUTH_INVALID" as const, message: "route evidence failed verification" }
+    return `[${code}] ${relPath}: ${failure.code} ${failure.message}`
+  } catch (err: any) {
+    return `[${code}] ${relPath}: authenticity check failed (${clean(err?.message, 160)})`
+  }
+}
+
+/** Plain-text route evidence cannot carry an `_auth` envelope: fail closed. */
+function routeTextEvidenceAuthReason(code: RouteEvidenceAuthCode, relPath: string): string {
+  return `[${code}] ${relPath} is a plain-text report written without an _auth envelope; a signed run requires authenticated route evidence`
 }
 
 function manifestDrift(
@@ -13119,6 +13169,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               documentReviewEvidence = { checked: true, segmentReportsComplete: false, finalReportPresent: false }
             } else if (mRes.ok) {
               const docManifest = mRes.data
+              if (requireSigned) {
+                const envelopeReason = await routeEvidenceAuthReason(
+                  auth,
+                  basename(run),
+                  "document-review/manifest.json",
+                  docManifest,
+                  "DOCUMENT_REVIEW_EVIDENCE_UNSIGNED",
+                )
+                if (envelopeReason) reasons.push(envelopeReason)
+              }
               const segs = Array.isArray(docManifest?.segments) ? docManifest.segments : []
               let allUnitReportsOk = segs.length > 0
               if (segs.length === 0) {
@@ -13156,12 +13216,21 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 if (!isRegularNonEmpty(unitPath)) {
                   reasons.push(`document-review segment ${seg.id}: unit-report.md missing or empty`)
                   allUnitReportsOk = false
+                } else if (requireSigned) {
+                  reasons.push(
+                    routeTextEvidenceAuthReason(
+                      "DOCUMENT_REVIEW_EVIDENCE_UNSIGNED",
+                      `document-review/segments/${seg.id}/unit-report.md`,
+                    ),
+                  )
                 }
               }
               const finalDocPath = join(run, "DOCUMENT_REVIEW_REPORT.md")
               const finalReportPresent = isRegularNonEmpty(finalDocPath)
               if (!finalReportPresent) {
                 reasons.push("DOCUMENT_REVIEW_REPORT.md missing or empty")
+              } else if (requireSigned) {
+                reasons.push(routeTextEvidenceAuthReason("DOCUMENT_REVIEW_EVIDENCE_UNSIGNED", "DOCUMENT_REVIEW_REPORT.md"))
               }
               documentReviewEvidence = {
                 checked: true,
@@ -13183,6 +13252,44 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           const lemmaEvidence = isLemmaRun ? evaluateLemmaFinalEvidence(run) : undefined
           if (lemmaEvidence) {
             reasons.push(...lemmaEvidence.reasons)
+            if (requireSigned) {
+              // The exact LEMMA evidence final verification reads: the
+              // manifest, the formalization review, and every node verify
+              // report selected by the manifest. All are written as plain JSON
+              // today, so a signed run fails closed until they are signed.
+              const lemmaEvidenceFiles: Array<[string, unknown]> = []
+              const lemmaManifestRes = readBoundedRunJson<any>(run, join(run, "lemma", "manifest.json"), MAX_RUN_JSON_BYTES)
+              if (lemmaManifestRes.status === "ok") {
+                lemmaEvidenceFiles.push(["lemma/manifest.json", lemmaManifestRes.value])
+              }
+              const lemmaReviewRes = readBoundedRunJson<any>(
+                run,
+                join(run, "lemma", "formalization-review.json"),
+                MAX_RUN_JSON_BYTES,
+              )
+              if (lemmaReviewRes.status === "ok") {
+                lemmaEvidenceFiles.push(["lemma/formalization-review.json", lemmaReviewRes.value])
+              }
+              for (const node of lemmaEvidence.nodes) {
+                if (!node.verifyReport) continue
+                const lemmaReportRes = readBoundedRunJson<any>(
+                  run,
+                  join(run, node.verifyReport),
+                  MAX_RUN_JSON_BYTES,
+                )
+                if (lemmaReportRes.status === "ok") lemmaEvidenceFiles.push([node.verifyReport, lemmaReportRes.value])
+              }
+              for (const [relPath, payload] of lemmaEvidenceFiles) {
+                const envelopeReason = await routeEvidenceAuthReason(
+                  auth,
+                  basename(run),
+                  relPath,
+                  payload,
+                  "LEMMA_EVIDENCE_UNSIGNED",
+                )
+                if (envelopeReason) reasons.push(envelopeReason)
+              }
+            }
           }
           if (context?.signal?.aborted) {
             reasons.push("request aborted via AbortSignal")
@@ -13261,6 +13368,26 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               }
             } else {
               const m = mRes.manifest
+              if (requireSigned) {
+                const manifestReason = await routeEvidenceAuthReason(
+                  auth,
+                  basename(run),
+                  "tournament/manifest.json",
+                  m,
+                  "TOURNAMENT_EVIDENCE_UNSIGNED",
+                )
+                if (manifestReason) reasons.push(manifestReason)
+                if (vRes.status === "ok") {
+                  const verdictReason = await routeEvidenceAuthReason(
+                    auth,
+                    basename(run),
+                    "tournament/verdict.json",
+                    vRes.verdict,
+                    "TOURNAMENT_EVIDENCE_UNSIGNED",
+                  )
+                  if (verdictReason) reasons.push(verdictReason)
+                }
+              }
               const cands = Object.values(m.candidates || {})
               const surviving = cands.filter((c) => c && c.status !== "pruned").length
               const v = vRes.status === "ok" ? vRes.verdict : null

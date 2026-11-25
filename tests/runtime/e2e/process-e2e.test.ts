@@ -18,6 +18,8 @@ const REPO_ROOT = resolve(HERE, "..", "..", "..")
 const PLUGIN_DIR = join(REPO_ROOT, "plugins", "opencode-teamwork")
 
 function findOpencodeBinary(): string | null {
+  const explicit = process.env.OPENCODE_BIN?.trim()
+  if (explicit && existsSync(explicit)) return explicit
   const probe = spawnSync("which", ["opencode"], { encoding: "utf8" })
   if (probe.status === 0 && probe.stdout.trim()) return probe.stdout.trim()
   return null
@@ -180,6 +182,9 @@ test.skipIf(!OPENCODE_BIN)(
       const fetched = await client2.session.get({ sessionID: created.id, ...location })
       expect(fetched.id).toBe(created.id)
       expect(existsSync(dbPath)).toBe(true)
+      // Visible in the CI log; runtime-l1 requires this marker so a missing
+      // host cannot masquerade as a green run with a silent skip.
+      console.log("[process-e2e] real opencode serve loaded the plugin over HTTP and shared state across processes")
     } finally {
       if (srv1) await srv1.stop()
       if (srv2) await srv2.stop()

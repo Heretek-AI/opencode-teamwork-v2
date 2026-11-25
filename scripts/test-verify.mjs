@@ -151,6 +151,8 @@ async function makeRun({
   tasks = [{ id: "R1", agent: "team/worker" }],
   git = undefined,
   unsigned = false,
+  trustLevel = undefined,
+  requireWitness = false,
 } = {}) {
   const ownSigner = signer ?? makeSigner(alg)
   const root = mkdtempSync(join(TEST_ROOT, `${tag}-`))
@@ -265,8 +267,8 @@ async function makeRun({
       lemmaPolicyHash: null,
       runKeyId: ownSigner.keyId,
       runNonce: nonce,
-      trustLevel: ownSigner.alg === "ed25519" ? "external-signer" : "local-hmac",
-      requireWitness: false,
+      trustLevel: trustLevel ?? (ownSigner.alg === "ed25519" ? "external-signer" : "local-hmac"),
+      requireWitness,
       approvalPolicy: "none",
       approvalKeyId: null,
       specHash: null,
@@ -823,6 +825,10 @@ async function main() {
     assert(result.counts.pass > 0)
     assert.strictEqual(result.trust.alg, "ed25519")
     assert.strictEqual(result.trust.keyId, ctx.signer.keyId)
+    assert.strictEqual(result.trust.runTrustLevel, "external-signer")
+    assert.strictEqual(result.trust.approval.status, "NOT_REQUIRED")
+    assert.strictEqual(result.trust.witness.status, "NOT_REQUIRED")
+    assert.strictEqual(result.checks.some((c) => c.id === "trust:approval" || c.id === "trust:witness"), false)
     const cli = runCli(["verify", "--run-dir", ctx.run, ...signedArgs(ctx), "--json"])
     assert.strictEqual(cli.code, 0, cli.stderr)
     assert.strictEqual(JSON.parse(cli.stdout).verdict, "PASS")
@@ -1238,6 +1244,13 @@ async function main() {
     const allowed = await verify(ctx, { allowUnsigned: true })
     assert.strictEqual(allowed.verdict, "UNKNOWN")
     assert.strictEqual(verifyExitCode(allowed), 2)
+    assert.strictEqual(
+      allowed.checks.find((check) => check.id === "manifest:envelope")?.status,
+      "unknown",
+      JSON.stringify(allowed.checks),
+    )
+    assert.strictEqual(allowed.trust.approval.status, "NO_MANIFEST")
+    assert.strictEqual(allowed.trust.witness.status, "NO_MANIFEST")
     ok("T14 unsigned legacy -> UNKNOWN (exit 2), never PASS")
   }
 
@@ -1402,7 +1415,16 @@ async function main() {
       assert(cli.stdout.length > 0, cli.stderr)
       const parsed = JSON.parse(cli.stdout)
       assert.deepStrictEqual(Object.keys(parsed), topKeys)
-      assert.deepStrictEqual(Object.keys(parsed.trust), ["alg", "keyId", "source"])
+      assert.deepStrictEqual(Object.keys(parsed.trust), [
+        "alg",
+        "keyId",
+        "source",
+        "runTrustLevel",
+        "approval",
+        "witness",
+      ])
+      assert.deepStrictEqual(Object.keys(parsed.trust.approval), ["status"])
+      assert.deepStrictEqual(Object.keys(parsed.trust.witness), ["status"])
       assert.deepStrictEqual(Object.keys(parsed.attestation), ["status", "commitSha", "keyId", "issuer"])
       assert.deepStrictEqual(Object.keys(parsed.counts), ["pass", "warn", "fail", "skip", "unknown", "total"])
       for (const check of parsed.checks) {
@@ -1415,6 +1437,12 @@ async function main() {
     }
     assert.strictEqual(payloads[1].verdict, "FAIL")
     assert.strictEqual(payloads[2].verdict, "UNKNOWN")
+    assert.strictEqual(payloads[0].trust.runTrustLevel, "external-signer")
+    assert.strictEqual(payloads[0].trust.approval.status, "NOT_REQUIRED")
+    assert.strictEqual(payloads[0].trust.witness.status, "NOT_REQUIRED")
+    assert.strictEqual(payloads[2].trust.runTrustLevel, null)
+    assert.strictEqual(payloads[2].trust.approval.status, "NO_MANIFEST")
+    assert.strictEqual(payloads[2].trust.witness.status, "NO_MANIFEST")
 
     // Deterministic shape and values (generatedAt is the only clock field).
     const first = runCli(["verify", "--run-dir", happy.run, ...signedArgs(happy), "--json"])
@@ -1450,6 +1478,7 @@ async function main() {
     assert.strictEqual(verifyExitCode(rerun), 0)
     assert.strictEqual(rerun.counts.fail, 0)
     assert(rerun.checks.some((c) => c.id === "provenance:required" && c.status === "pass"))
+    assert(rerun.checks.some((c) => c.id === "rerun:trust" && c.status === "pass"))
     assert.strictEqual(hashTree(repo), before, "the source checkout must be byte-identical after --rerun")
     assert.strictEqual(rerun.rerun.worktrees.length, 1)
     for (const worktree of rerun.rerun.worktrees) {
@@ -2117,6 +2146,214 @@ async function main() {
     assert.strictEqual(allowed.code, 2, `localhost opt-in: expected exit 2, got ${allowed.code}: ${allowed.stderr}`)
     assert.match(allowed.stderr, /loopback/i, `localhost opt-in must still refuse loopback: ${allowed.stderr}`)
     ok("T38 --fetch-jwks refuses non-https, loopback, metadata, and IPv6 loopback issuers (exit 2), even with the localhost opt-in")
+  }
+
+  // -------------------------------------------------------------------------
+  // T39 — C1: --rerun must not execute an unsigned verify/rerun.json.
+  // -------------------------------------------------------------------------
+  {
+    const marker = join(TEST_ROOT, `t39-marker-${process.pid}`)
+    rmSync(marker, { force: true })
+    const argv = [
+      process.execPath,
+      "-e",
+      `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "spawned")`,
+    ]
+    const { repo, ctx } = await commandFixture("t39", { command: argv, output: "" })
+    const rel = "verify/rerun.json"
+    const unsignedRerun = readJson(join(ctx.run, rel))
+    delete unsignedRerun._auth
+    writeJson(join(ctx.run, rel), unsignedRerun)
+
+    const result = await verify(ctx, { rerun: true, repo })
+    assert.notStrictEqual(result.verdict, "PASS", JSON.stringify(result.reasons))
+    assert.strictEqual(result.verdict, "FAIL")
+    assert.strictEqual(verifyExitCode(result), 1)
+    assert.strictEqual(existsSync(marker), false, "an unsigned rerun must not spawn its command")
+    assert.strictEqual(result.rerun, undefined, "no execution report may be produced")
+    assert.strictEqual(
+      result.checks.some((check) => /^rerun:R1:\d+$/.test(check.id)),
+      false,
+      `no command check may run: ${JSON.stringify(result.checks)}`,
+    )
+    const gate = result.checks.find((check) => check.id === "rerun:trust")
+    assert.strictEqual(gate?.status, "unknown", JSON.stringify(result.checks))
+    assert.match(gate.detail, /RERUN_UNTRUSTED/)
+    assert.match(gate.detail, /verify\/rerun\.json/)
+    assert(hasReason(result, "AUTH_MISSING"))
+
+    const cli = runCli(["verify", "--run-dir", ctx.run, ...signedArgs(ctx), "--rerun", "--repo", repo, "--json"])
+    assert.strictEqual(cli.code, 1, cli.stderr)
+    assert.strictEqual(existsSync(marker), false)
+
+    // --allow-unsigned is a legacy-run concession; it is a usage error with --rerun.
+    await assert.rejects(
+      () => verify(ctx, { rerun: true, repo, allowUnsigned: true }),
+      /allow-unsigned cannot be combined with --rerun/,
+    )
+    const usage = runCli([
+      "verify",
+      "--run-dir",
+      ctx.run,
+      ...signedArgs(ctx),
+      "--allow-unsigned",
+      "--rerun",
+      "--repo",
+      repo,
+    ])
+    assert.strictEqual(usage.code, 3, usage.stderr)
+    assert.match(usage.stderr, /allow-unsigned/)
+    ok("T39 unsigned rerun -> RERUN_UNTRUSTED, no worktree/spawn (exit 1); --allow-unsigned + --rerun is usage (exit 3)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T40 — H1: a present manifest never downgrades a missing envelope.
+  // -------------------------------------------------------------------------
+  {
+    // Only the final envelope is missing; every other relation still holds.
+    const finalRun = await makeRun({ tag: "t40a" })
+    await buildComplete(finalRun)
+    const finalPath = join(finalRun.run, "verify/final.json")
+    const final = readJson(finalPath)
+    delete final._auth
+    writeJson(finalPath, final)
+    const finalResult = await verify(finalRun, { allowUnsigned: true })
+    assert.strictEqual(finalResult.verdict, "FAIL", JSON.stringify(finalResult.reasons))
+    assert.strictEqual(verifyExitCode(finalResult), 1)
+    const finalAuth = finalResult.checks.find((check) => check.id === "auth:verify/final.json")
+    assert.strictEqual(finalAuth?.status, "fail", JSON.stringify(finalResult.checks))
+    assert.match(finalAuth.detail, /AUTH_MISSING/)
+
+    // The same rule applies to a report envelope.
+    const reportRun = await makeRun({ tag: "t40b" })
+    await buildComplete(reportRun)
+    const reportPath = join(reportRun.run, "verify/report-R1.json")
+    const unsignedReport = readJson(reportPath)
+    delete unsignedReport._auth
+    writeJson(reportPath, unsignedReport)
+    const reportResult = await verify(reportRun, { allowUnsigned: true })
+    assert.strictEqual(reportResult.verdict, "FAIL", JSON.stringify(reportResult.reasons))
+    const reportAuth = reportResult.checks.find((check) => check.id === "auth:verify/report-R1.json")
+    assert.strictEqual(reportAuth?.status, "fail", JSON.stringify(reportResult.checks))
+    assert.match(reportAuth.detail, /AUTH_MISSING/)
+
+    // And to the signed handoff index entry path.
+    const handoffRun = await makeRun({ tag: "t40c", requireHandoffs: "required" })
+    await buildComplete(handoffRun)
+    const indexPath = join(handoffRun.run, "handoffs/index.json")
+    const index = readJson(indexPath)
+    const entry = index.entries.find((item) => item.taskId === "R1" && item.agent === "team/worker")
+    assert(entry, "fixture must contain the worker handoff index entry")
+    delete entry._auth
+    writeJson(indexPath, index)
+    const handoffResult = await verify(handoffRun, { allowUnsigned: true })
+    assert.strictEqual(handoffResult.verdict, "FAIL", JSON.stringify(handoffResult.reasons))
+    const handoffAuth = handoffResult.checks.find((check) => check.id === "handoff:auth:R1:team/worker")
+    assert.strictEqual(handoffAuth?.status, "fail", JSON.stringify(handoffResult.checks))
+    assert.match(handoffAuth.detail, /AUTH_MISSING/)
+
+    ok("T40 --allow-unsigned with a present manifest -> FAIL for unsigned final/report/handoff")
+  }
+
+  // -------------------------------------------------------------------------
+  // T41 — H2: approval trust levels stay UNKNOWN without enforcement.
+  // -------------------------------------------------------------------------
+  {
+    for (const level of ["human-approved", "ci-attested"]) {
+      const ctx = await makeRun({ tag: `t41-${level}`, trustLevel: level })
+      await buildComplete(ctx)
+      const result = await verify(ctx)
+      assert.strictEqual(result.verdict, "UNKNOWN", `${level}: ${JSON.stringify(result.reasons)}`)
+      assert.strictEqual(verifyExitCode(result), 2)
+      assert(hasReason(result, "AUTH_APPROVAL_UNVERIFIED"), JSON.stringify(result.reasons))
+      assert.strictEqual(result.trust.runTrustLevel, level)
+      assert.strictEqual(result.trust.approval.status, "UNVERIFIED")
+      const approval = result.checks.find((check) => check.id === "trust:approval")
+      assert.strictEqual(approval?.status, "unknown", JSON.stringify(result.checks))
+      assert.match(approval.detail, /AUTH_APPROVAL_UNVERIFIED/)
+      assert.notStrictEqual(result.trust.approval.status, "VERIFIED")
+    }
+    ok("T41 human-approved/ci-attested without approval enforcement -> UNKNOWN (AUTH_APPROVAL_UNVERIFIED)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T42 — H2: requireWitness without a usable receipt stays UNKNOWN.
+  // -------------------------------------------------------------------------
+  {
+    const ctx = await makeRun({ tag: "t42", requireWitness: true })
+    await buildComplete(ctx)
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "UNKNOWN", JSON.stringify(result.reasons))
+    assert.strictEqual(verifyExitCode(result), 2)
+    assert(hasReason(result, "AUTH_WITNESS_UNVERIFIED"), JSON.stringify(result.reasons))
+    assert.strictEqual(result.trust.witness.status, "UNVERIFIED")
+    const witness = result.checks.find((check) => check.id === "trust:witness")
+    assert.strictEqual(witness?.status, "unknown", JSON.stringify(result.checks))
+    assert.match(witness.detail, /AUTH_WITNESS_UNVERIFIED/)
+
+    // A witness key without a receipt is still not a usable witness.
+    const witnessSigner = makeSigner("ed25519")
+    const keyOnly = await verify(ctx, { witnessPublicKey: witnessSigner.publicKey })
+    assert.strictEqual(keyOnly.verdict, "UNKNOWN", JSON.stringify(keyOnly.reasons))
+    assert(hasReason(keyOnly, "AUTH_WITNESS_UNVERIFIED"))
+    assert.strictEqual(keyOnly.trust.witness.status, "UNVERIFIED")
+    ok("T42 requireWitness without a usable receipt -> UNKNOWN (AUTH_WITNESS_UNVERIFIED)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T43 — the OIDC path owns one end-to-end deadline across DNS and both
+  // fetches; a slow resolver cannot outlive it, and discovery + JWKS share the
+  // same signal.
+  // -------------------------------------------------------------------------
+  {
+    const { fetchOidcJwks } = await import("../lib/oidc-fetch.mjs")
+
+    const started = Date.now()
+    await assert.rejects(
+      fetchOidcJwks("https://issuer.example", {
+        timeoutMs: 150,
+        resolveHost: () =>
+          new Promise((resolve) =>
+            setTimeout(() => resolve([{ address: "203.0.113.10", family: 4 }]), 500),
+          ),
+      }),
+      /timed out after 150ms/,
+      "a resolver that never settles must be cut off by the OIDC deadline",
+    )
+    assert(Date.now() - started < 2000, "the OIDC deadline must cover DNS resolution")
+
+    const seen = []
+    const jwks = await fetchOidcJwks("https://issuer.example", {
+      timeoutMs: 5000,
+      fetchJson: async (url, label, options) => {
+        seen.push({ url, label, signal: options.signal })
+        if (label === "OIDC discovery") return { jwks_uri: "https://issuer.example/jwks" }
+        return { keys: [{ kty: "oct", kid: "shared-deadline" }] }
+      },
+    })
+    assert.strictEqual(jwks.keys.length, 1)
+    assert.strictEqual(seen.length, 2, "discovery and JWKS must both be fetched")
+    assert.strictEqual(seen[0].url, "https://issuer.example/.well-known/openid-configuration")
+    assert.strictEqual(seen[1].url, "https://issuer.example/jwks")
+    assert.strictEqual(seen[0].signal, seen[1].signal, "both fetches must share one deadline signal")
+
+    let calls = 0
+    const deadlineStarted = Date.now()
+    await assert.rejects(
+      fetchOidcJwks("https://issuer.example", {
+        timeoutMs: 100,
+        fetchJson: async () => {
+          calls++
+          await new Promise((resolve) => setTimeout(resolve, 250))
+          return { jwks_uri: "https://issuer.example/jwks" }
+        },
+      }),
+      /timed out after 100ms/,
+      "a first fetch that consumes the deadline must stop before the JWKS fetch",
+    )
+    assert.strictEqual(calls, 1, "the expired shared deadline must prevent the second fetch")
+    assert(Date.now() - deadlineStarted < 2000)
+    ok("T43 OIDC discovery/JWKS share one deadline that also covers a slow resolver")
   }
 
   rmSync(TEST_ROOT, { recursive: true, force: true })
