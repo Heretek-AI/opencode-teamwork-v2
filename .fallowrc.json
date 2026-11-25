@@ -34,7 +34,7 @@
       "exports": ["nextEventSeqFromFd"]
     },
     {
-      "file": "plugins/opencode-teamwork/url-guard.ts",
+      "file": "plugins/opencode-teamwork/url-guard.mjs",
       "exports": ["ALLOW_LOCALHOST_ENV"]
     }
   ]

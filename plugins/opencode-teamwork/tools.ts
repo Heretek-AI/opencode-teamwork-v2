@@ -52,7 +52,7 @@ import {
 } from "./document-review.ts"
 import { authorizeToolCall } from "./authorize.ts"
 import { BUDGET_HALT_PCT, budgetPercent, budgetThresholdReached } from "./budget.ts"
-import { assertSafeUrl, parseLoopbackServiceUrl, safeFetch } from "./url-guard.ts"
+import { assertSafeUrl, parseLoopbackServiceUrl, safeFetch } from "./url-guard.mjs"
 import {
   LEAP_REQUIREMENT,
   classifyLemmaRoute,

@@ -28,7 +28,7 @@ import { renderGateStatus, evaluateStrictGate } from "../plugins/opencode-teamwo
 import { evaluateVictoryGate } from "../plugins/opencode-teamwork/victory.ts"
 import { withCrossProcessLock, crossProcessLockPath, observeLockArtifact, quarantineStaleLock } from "../plugins/opencode-teamwork/locks.ts"
 import { recordWriteAnomaly, resolveTrustedExecutable, setWriteAnomalyAuditPathForTest, unacknowledgedWriteAnomalies } from "../plugins/opencode-teamwork/safe-fs.mjs"
-import { assertSafeUrl, blockedAddressReason, parseLoopbackServiceUrl } from "../plugins/opencode-teamwork/url-guard.ts"
+import { assertSafeUrl, blockedAddressReason, parseLoopbackServiceUrl } from "../plugins/opencode-teamwork/url-guard.mjs"
 import { refreshRunBriefing, MAX_BRIEFING_BYTES, refreshAgentBriefing, readAgentBriefingExcerpt, agentBriefingRelativePath, MAX_AGENT_BRIEFING_DIRS } from "../plugins/opencode-teamwork/briefing.ts"
 import { writeHandoff, MAX_HANDOFF_ENTRIES, MAX_HANDOFF_INDEX_BYTES, HANDOFF_SECTION_LABELS, evaluateHandoffGateChecked, readWorkerHandoffBinding } from "../plugins/opencode-teamwork/handoff.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
