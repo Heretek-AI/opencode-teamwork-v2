@@ -529,6 +529,12 @@ The engine contract is tested against the real host, not only against a shim:
 | L2 | Real sessions and KV: plan/manifest v5, claims and recovery, handoff→report→victory binding, approvals |
 | L3 | Full workflows in real git worktrees: standard and strict gates, victory rejection and resume, limits, a two-process claim race, and the verifier CLI |
 
+The 153-case L0 parity/audit suite is a separate `l0-parity` check; it is not
+part of `npm test`. `pack-t4` builds and installs the npm tarball and loads it
+through the real host. `runtime-l1` installs the pinned `@opencode/cli@2.4.1`
+and fails unless the process E2E runs (118 pass, 1 skip, 0 fail). See
+[`docs/RELEASE-RUNBOOK.md`](docs/RELEASE-RUNBOOK.md) for the gate list.
+
 ```sh
 npm test                 # L0, no dependencies beyond Node
 
@@ -618,12 +624,20 @@ using **npm Trusted Publishing** (OIDC, no long-lived token). One-time setup:
 2. On npmjs.com: **Package → Settings → Trusted Publisher → GitHub Actions**
    with user `Heretek-AI`, repo `opencode-teamwork-v2`, workflow `publish.yml`,
    and `npm publish` allowed.
-3. Release afterwards by tagging:
+3. Release afterwards by bumping **both** package versions and the changelog in
+   one commit, then tagging that commit (full steps in
+   [`docs/RELEASE-RUNBOOK.md`](docs/RELEASE-RUNBOOK.md)):
 
    ```sh
-   npm version patch        # bumps package.json + creates the vX.Y.Z tag
+   npm version patch --no-git-tag-version  # then bump plugins/opencode-teamwork/package.json
+   # add the ## [X.Y.Z] section to CHANGELOG.md, commit, then:
+   git tag "v$(node -p "require('./package.json').version")"
    git push --follow-tags   # triggers the workflow
    ```
+
+   `scripts/check-release-consistency.mjs` refuses a tag whose name does not
+   match the package version and a release whose two package versions or
+   changelog heading disagree.
 
 Release tags are provenance-checked before publish:
 `scripts/check-release-tag.mjs` requires the tag's commit to be an ancestor of
@@ -631,6 +645,14 @@ Release tags are provenance-checked before publish:
 commits with trees identical to their `main` release commits; they predate this
 guard. Every future `v*` tag push must point at a commit already on `main`, and
 published tags are never rewritten.
+
+The complete gate list, the tag-only publish boundary, the dry-run path and the
+admin-owned ruleset settings are in
+[`docs/RELEASE-RUNBOOK.md`](docs/RELEASE-RUNBOOK.md). CI runs the 153-case parity
+suite as a distinct `l0-parity` job, the packed-tarball install as `pack-t4`,
+release consistency as `release-consistency`, and the full runtime suite with
+the pinned `@opencode/cli@2.4.1` in `runtime-l1`. The process E2E is expected to
+run; that job fails unless the only skip is the L4 live spec.
 
 Note that npm is restricting bypass-2FA tokens from January 2027, so Trusted
 Publishing is the durable option.

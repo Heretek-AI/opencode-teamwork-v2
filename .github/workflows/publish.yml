@@ -15,9 +15,10 @@ name: Publish Package
 #
 # PRIVILEGE BOUNDARY
 # ------------------
-# `verify` runs `npm test`, the packaging guard, the tag guard and T4 with
-# `contents: read` only. It has no OIDC token and no registry credential, so a
-# test-writable script cannot mint a trusted-publishing token.
+# `verify` runs `npm test`, the L0 parity suite, the packaging guard, the
+# version/changelog/tag guard and T4 with `contents: read` only. It has no OIDC
+# token and no registry credential, so a test-writable script cannot mint a
+# trusted-publishing token.
 #
 # `publish` is the only job with `id-token: write`. It is gated to
 # `refs/tags/v*`, so a `workflow_dispatch` on a branch can only run the
@@ -60,6 +61,14 @@ jobs:
           node-version: "24"
           package-manager-cache: false # never cache in release builds
 
+      - name: Release consistency
+        # --require-clean is safe here: this is a fresh checkout before any
+        # test writes, and the privileged job re-packs the same commit.
+        run: node scripts/check-release-consistency.mjs --require-clean
+
+      - name: L0 parity
+        run: node scripts/test-agy-parity.mjs
+
       - name: Test
         run: npm test
 
@@ -73,7 +82,7 @@ jobs:
           const p = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/pack.json", "utf8"));
           const paths = p[0].files.map((f) => f.path);
           const bad = paths.filter((x) => x === "docs/re" || x.startsWith("docs/re/"));
-          const need = ["docs/ARTIFACTS.md", "docs/GUARDRAILS.md", "docs/ADMIN-HARDENING.md", "docs/SIGNER-PROTOCOL.md", "SECURITY.md", "docs/adr/0008-signer-spi-and-trust-levels.md", "docs/adr/0014-verifiable-witness-and-signer-v2.md", "docs/adr/0015-offline-verification.md", "scripts/hardening-check.sh", "plugins/opencode-teamwork/index.ts", "plugins/opencode-teamwork/auth.ts", "plugins/opencode-teamwork/authorize.ts", "plugins/opencode-teamwork/url-guard.mjs", "plugins/opencode-teamwork/strict.ts", "plugins/opencode-teamwork/briefing.ts", "plugins/opencode-teamwork/victory.ts", "plugins/opencode-teamwork/safe-fs.mjs", "lib/verify.mjs", "scripts/test-verify.mjs", "agents/team/victory-auditor.md"];
+          const need = ["docs/ARTIFACTS.md", "docs/GUARDRAILS.md", "docs/ADMIN-HARDENING.md", "docs/SIGNER-PROTOCOL.md", "SECURITY.md", "docs/adr/0008-signer-spi-and-trust-levels.md", "docs/adr/0014-verifiable-witness-and-signer-v2.md", "docs/adr/0015-offline-verification.md", "scripts/hardening-check.sh", "plugins/opencode-teamwork/index.ts", "plugins/opencode-teamwork/auth.ts", "plugins/opencode-teamwork/authorize.ts", "plugins/opencode-teamwork/url-guard.mjs", "plugins/opencode-teamwork/strict.ts", "plugins/opencode-teamwork/briefing.ts", "plugins/opencode-teamwork/victory.ts", "plugins/opencode-teamwork/safe-fs.mjs", "lib/verify.mjs", "scripts/test-verify.mjs", "agents/team/victory-auditor.md", "docs/RELEASE-RUNBOOK.md", "scripts/check-release-consistency.mjs", "scripts/test-release-consistency.mjs"];
           const miss = need.filter((n) => !paths.includes(n));
           console.log(`packed files: ${paths.length}`);
           if (bad.length) console.error("forbidden docs/re paths:\n" + bad.join("\n"));

@@ -44,7 +44,7 @@ These are not style preferences; breaking them breaks the product.
 ## Testing
 
 ```sh
-npm test                                  # L0: unit, catalog, verifier, security
+npm test                                  # L0: unit, catalog, verifier, security, release consistency
 npm run lint:prompts                      # after changing agents or commands
 node scripts/lint-security-claims.mjs     # after changing docs
 npm pack --dry-run                       # packaging guard; tests/ and docs/re/ must not ship
@@ -102,6 +102,7 @@ bun run test                              # L1-L3 against the real OpenCode 2.4.
 | `docs/ADMIN-HARDENING.md` | hardened deployment runbook |
 | `docs/SIGNER-PROTOCOL.md` | non-oracle signer contract |
 | `docs/OPENCODE-COMPATIBILITY.md` | host API audit and test strategy |
+| `docs/RELEASE-RUNBOOK.md` | release gates, tag-only publish, admin-owned rulesets |
 | `sonar-project.properties` | SonarCloud project/scope config (not shipped; policy in the audit report §3.2.1) |
 | `docs/re/` | reverse-engineering corpus (never shipped) |
 | `tests/runtime/` | L1-L3 integration harness (never shipped) |

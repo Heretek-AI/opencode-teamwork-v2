@@ -398,7 +398,7 @@ tests/runtime/
   spec/a1-load.test.ts … spec/a8-result-shape.test.ts  # contract, catalog, commands, schema, hooks
   spec/b-plan.test.ts … spec/j-strict-input.test.ts
   spec/agy-parity.test.ts                    # parity specs
-  e2e/process-e2e.test.ts                    # real `opencode serve`; skips without the CLI
+  e2e/process-e2e.test.ts                    # real `opencode serve`; skips locally without the CLI (CI installs @opencode/cli@2.4.1)
   live/l4-live.test.ts                       # skipped unless TEAMWORK_LIVE=1
 ```
 
@@ -506,7 +506,7 @@ namespaces.
 | **T1** | L1 + L2 on pinned `@opencode/*@2.4.1` | every push / PR | yes |
 | **T2** | L3 in a real git worktree | every push / PR | yes |
 | **T3** | Nightly `@opencode/*@latest` drift, plus the macOS/Windows containment matrix | nightly / push | drift: no (reports); platform: yes |
-| **T4** | Release tarball: `npm pack`, install into a clean dir, load the installed package through the A1 directory-mode L1 spec (A2/A3 in the same run still use the working tree) | release tag | yes |
+| **T4** | Release tarball: `npm pack`, install into a clean dir, load the installed package through the A1 directory-mode L1 spec, then plan one L2 run through the same install (`e2e/packed-l2.test.ts`); A2/A3 in the same run still use the working tree | every push / PR and release tag | yes |
 
 Notes (INFERRED):
 
@@ -514,9 +514,14 @@ Notes (INFERRED):
   should be visible in the nightly report, not stop a security release at 02:00.
   The macOS/Windows containment jobs are a separate blocking matrix; they do not
   run the full engine suite. The pinned 2.4.1 jobs remain the contract.
+- T1's CI job (`runtime-l1`) installs `@opencode/cli@2.4.1` and runs the
+  process E2E against a real `opencode serve`. The job asserts 118 pass, 1 skip
+  (L4 live), 0 fail and requires the `[process-e2e]` log marker, so a missing
+  host is a failure rather than a silent skip.
 - T4 is the only tier that proves the published `files` list is sufficient.
   `tests/` being excluded by omission is verified by the tarball, not by a unit
-  test reading `package.json`.
+  test reading `package.json`. The packed L2 smoke covers one plan flow; the L3
+  worktree/claim/verifier scenarios are not re-run from the tarball.
 - L4 never appears in a required tier. It costs money, depends on a provider,
   and answers a different question ("can a model cope?") than the contract does.
 
