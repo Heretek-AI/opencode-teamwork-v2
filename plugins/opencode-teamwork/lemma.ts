@@ -477,7 +477,7 @@ function parseLeapDoctorFailures(text: string): string[] {
     const name = clean(match[1], 64)
     if (name) failures.add(name)
   }
-  return [...failures].sort()
+  return [...failures].sort((a, b) => a.localeCompare(b))
 }
 
 function probeLeapCli(env: NodeJS.ProcessEnv, timeoutMs: number): BinaryProbeResult {
