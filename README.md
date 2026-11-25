@@ -477,6 +477,53 @@ commit, and a CI principal reachable by the agent's UID is not a boundary. See
 [ADR 0018](docs/adr/0018-ci-attestation.md) and
 [`docs/ARTIFACTS.md`](docs/ARTIFACTS.md#offline-verification-opencode-teamwork-verify).
 
+## Runtime integration tests
+
+The engine contract is tested against the real host, not only against a shim:
+
+| Layer | What it proves |
+| --- | --- |
+| L0 | `npm test`: engine logic, crypto envelopes, containment primitives, catalog, verifier, security |
+| L1 | The plugin loads in OpenCode 2.4.1 (in memory and from a local directory): 26 `teamwork_*` tools, `codemode:false`, schemas, 7 commands, permission hook, storage namespacing, agent decoding, result shape |
+| L2 | Real sessions and KV: plan/manifest v5, claims and recovery, handoff→report→victory binding, approvals |
+| L3 | Full workflows in real git worktrees: standard and strict gates, victory rejection and resume, limits, a two-process claim race, and the verifier CLI |
+
+```sh
+npm test                 # L0, no dependencies beyond Node
+
+cd tests/runtime
+bun install --frozen-lockfile
+bun run test             # L1-L3, exact @opencode/*@2.4.1
+```
+
+The harness is dev-only: `tests/runtime/` is excluded from the tarball, its
+dependencies live in its own `package.json`, and the shipped package stays
+dependency-free. Assertions are made on tool results and run artifacts
+(`state.json`, `run.manifest.json`, `verify/*`, `handoffs/index.json`,
+`events.jsonl`, exit codes), never on model prose. The tool catalog is pinned as
+a golden so a host change cannot silently rename or hide a tool. No model is
+called by the default suite.
+
+The audited host contract, the 2.4.1 drift list and the boundaries no harness can
+cross are in [`docs/OPENCODE-COMPATIBILITY.md`](docs/OPENCODE-COMPATIBILITY.md)
+and [ADR 0017](docs/adr/0017-opencode-plugin-contract-and-test-strategy.md).
+
+## Known open work
+
+Tracked in GitHub issues:
+
+- [#38](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/38) L4 live-model opt-in suite
+- [#39](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/39) nightly OpenCode host-drift job
+- [#40](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/40) apply and verify the admin hardening runbook
+- [#41](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/41) NFS harness and `doctor --locks/--unlock`
+- [#42](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/42) durable containment incident records
+- [#43](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/43) reference non-oracle signer
+- [#44](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/44) real OIDC claim validation for attestations
+- [#45](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/45) strict-input diagnostics and host-repair independence
+- [#46](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/46) packed-tarball release test
+- [#47](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/47) process-level CLI/server E2E harness
+- [#48](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/48) remaining Document Review and PDF corpus runs
+
 ## Model assignment
 
 Each agent's model lives in the `model:` frontmatter of its markdown file. The
