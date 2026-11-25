@@ -41,7 +41,7 @@ import { createAuthContext } from "../plugins/opencode-teamwork/auth.ts"
 import { refreshRunBriefing } from "../plugins/opencode-teamwork/briefing.ts"
 import { probeLemmaToolchain } from "../plugins/opencode-teamwork/lemma.ts"
 import { evaluateStrictGate, renderGateStatus } from "../plugins/opencode-teamwork/strict.ts"
-import { setWriteAnomalyAuditPathForTest } from "../plugins/opencode-teamwork/safe-fs.mjs"
+import { setWriteAnomalyAuditPathForTest, resolveTrustedExecutable } from "../plugins/opencode-teamwork/safe-fs.mjs"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(HERE, "..")
@@ -50,6 +50,7 @@ const APPROVAL_DRIVER_PATH = join(REPO_ROOT, "scripts", "approval-driver.mjs")
 const PROMPT_LINT_PATH = join(REPO_ROOT, "scripts", "lint-prompts.mjs")
 const CATALOG_TEST_PATH = join(REPO_ROOT, "scripts", "test-catalog.mjs")
 const GIT_BIN = ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"].find(existsSync) ?? "git"
+const SQLITE_BIN = resolveTrustedExecutable("sqlite3")
 
 // CLI flags
 const args = process.argv.slice(2)
@@ -170,7 +171,12 @@ async function createSessionDb(dbPath, rows) {
           .join(", ")})`,
     ),
   ]
-  execFileSync("sqlite3", [dbPath, `${stmts.join(";\n")};`], { encoding: "utf8", timeout: 5000 })
+  if (!SQLITE_BIN) {
+    throw new Error(
+      "sqlite3 fallback unavailable: no trusted sqlite3 executable on PATH (install sqlite3 or use a Node build with the node:sqlite module)",
+    )
+  }
+  execFileSync(SQLITE_BIN, [dbPath, `${stmts.join(";\n")};`], { encoding: "utf8", timeout: 5000 })
 }
 
 const DEFAULT_AGENTS = {
@@ -1923,7 +1929,7 @@ addCase({
 const fs = require("node:fs");
 const a = process.argv.slice(2);
 if (a.includes("doctor")) {
-  fs.writeFileSync(${JSON.stringify(marker)}, "called");
+  fs.writeFileSync(${JSON.stringify(marker)}, a.join(" "));
   console.log("doctor ok");
   process.exit(0);
 }
@@ -1935,7 +1941,9 @@ process.exit(0);
         const h = await makeHarness(dir)
         const probe = await h.tools.teamwork_lemma_probe.execute({}, { sessionID: "ses_sentinel" })
         assert.equal(probe.ready, true, probe.content)
+        assert.equal(probe.leap.doctor.status, "READY", "a passing offline doctor must be READY")
         assert.equal(existsSync(marker), true, "teamwork_lemma_probe must invoke `leap doctor`")
+        assert.match(readFileSync(marker, "utf8"), /--offline/, "teamwork_lemma_probe must invoke `leap doctor --offline`")
         assert.equal(existsSync(join(dir, "PREREQUISITES.md")), false, "a READY probe must not write PREREQUISITES.md")
       })
     }),
@@ -1960,6 +1968,52 @@ addCase({
       assert.ok(!String(res.content).startsWith("refused:"), res.content)
       assert.equal(existsSync(join(dir, ".opencode", "teamwork", runId, "document-review", "DOCUMENT_TEXT_MAP.md")), true)
       assert.equal(existsSync(join(dir, ".opencode", "teamwork", runId, "document-review", "ANALYSIS_PARTITION.md")), true)
+    }),
+})
+
+addCase({
+  id: "A7-T1-06",
+  milestone: "M4",
+  feature: "A7",
+  tier: "T1",
+  title: "teamwork_lemma_probe treats a LEAN_PROJECT_DIR-only leap doctor failure as READY/WARN",
+  fn: () =>
+    withSandbox("a7-t1-06", async (dir) => {
+      const binDir = join(dir, "bin")
+      const leapStub = `
+const a = process.argv.slice(2);
+if (a.includes("doctor")) {
+  console.log("[FAIL] LEAN_PROJECT_DIR -- no local Lean project found");
+  process.exit(1);
+}
+console.log("leap 1.0.0"); process.exit(0);
+`
+      writeStubBin(binDir, "lean", `console.log("Lean (version 4.14.0)"); process.exit(0);`)
+      writeStubBin(binDir, "lake", `console.log("lake version 5.0.0"); process.exit(0);`)
+      writeStubBin(binDir, "leap", leapStub)
+      await withEnv({ PATH: `${binDir}:${process.env.PATH ?? ""}` }, async () => {
+        const h = await makeHarness(dir)
+        const probe = await h.tools.teamwork_lemma_probe.execute({}, { sessionID: "ses_sentinel" })
+        assert.equal(probe.ready, true, `a project-only doctor warning must keep the probe READY: ${probe.content}`)
+        assert.equal(probe.status, "READY", `expected READY on a core-only host, got ${probe.status}`)
+        assert.equal(probe.leap.available, true, "a doctor warning must not make the LEAP CLI unavailable")
+        assert.equal(probe.leap.doctor.status, "WARN", "only LEAN_PROJECT_DIR failed, so doctor must be WARN")
+        assert.match(String(probe.content), /WARN/, "teamwork_lemma_probe must show the doctor warning")
+        assert.match(String(probe.content), /LEAN_PROJECT_DIR/, "the probe must name the failed check")
+        assert.equal(existsSync(join(dir, "PREREQUISITES.md")), false, "a READY/WARN probe must not write PREREQUISITES.md")
+
+        // When another binary blocks the route, PREREQUISITES.md must still show
+        // the doctor warning so the operator can tell it is advisory.
+        const partialBin = join(dir, "bin-leap-only")
+        writeStubBin(partialBin, "leap", leapStub)
+        await withEnv({ PATH: partialBin }, async () => {
+          const partial = await h.tools.teamwork_lemma_probe.execute({}, { sessionID: "ses_sentinel" })
+          assert.equal(partial.ready, false, "missing lean/lake must still block the probe")
+          const prereq = readFileSync(join(dir, "PREREQUISITES.md"), "utf8")
+          assert.match(prereq, /leap doctor: WARN/, `PREREQUISITES.md must show the doctor warning:\n${prereq}`)
+          assert.match(prereq, /LEAN_PROJECT_DIR/, "PREREQUISITES.md must name the failed doctor check")
+        })
+      })
     }),
 })
 

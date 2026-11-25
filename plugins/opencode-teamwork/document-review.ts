@@ -19,7 +19,7 @@ import { homedir } from "node:os"
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { inflateRawSync, inflateSync } from "node:zlib"
 import { resolveTrustedExecutable } from "./safe-fs.mjs"
-import { assertSafeUrl, safeFetch } from "./url-guard.ts"
+import { assertSafeUrl, safeFetch } from "./url-guard.mjs"
 
 const MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
 const MAX_INLINE_BYTES = 512 * 1024

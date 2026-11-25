@@ -151,15 +151,16 @@ plan or spend until it is resolved. The file is only written on failure: its
 | Route | Required | Probe |
 | --- | --- | --- |
 | PDF `document-review` | Python 3 with `pypdfium2` **and** `Pillow` | imports both modules and extracts one page |
-| LEMMA (`lemmaMode: true`) | `lean`, `lake`, and the LEAP CLI (`leap`) | `leap doctor`, plus the individual tool probes |
+| LEMMA (`lemmaMode: true`) | `lean`, `lake`, and the LEAP CLI (`leap`) | `leap doctor --offline`, plus the individual tool probes |
 
-Each probe records one verdict:
+Each probe records one verdict (`WARN` applies only to `leap doctor`):
 
 | Verdict | Meaning |
 | --- | --- |
 | `READY` | found and usable; clears the route and writes no `PREREQUISITES.md` |
 | `MISSING` | not installed or not on `PATH`; blocks the route |
 | `OUTAGE` | installed but unusable (non-zero probe, corrupt toolchain, fetch/network failure) |
+| `WARN` | `leap doctor --offline` failed only its `LEAN_PROJECT_DIR` check (no local Lake project). Core Lean and the LEAP CLI are usable, so the route is not blocked and no `PREREQUISITES.md` is written; Mathlib/`leap lean` remains optional |
 
 `READY` clears that route; `MISSING`/`OUTAGE` block it and the file records the
 exact install commands plus the probe output. The file is written atomically,
@@ -1303,7 +1304,7 @@ The block list is deliberately **narrow**:
 Path checks report `READY` (with `file`/`dir`) when the path exists and
 `MISSING` otherwise. URL checks record `UNCHECKED` when `checkUrls` is false
 (the default); with `checkUrls: true` each URL is first validated by the SSRF
-guard (`url-guard.ts`), then gets one `HEAD` request with a 3 s timeout and is
+guard (`url-guard.mjs`), then gets one `HEAD` request with a 3 s timeout and is
 `READY` on 2xx/3xx or `OUTAGE` on any other status, error or timeout. A URL whose
 hostname resolves to loopback/private/link-local/metadata (or any other
 non-public address) is `OUTAGE` before a connection is made; a 3xx `Location` is
@@ -2442,7 +2443,7 @@ One line per entry:
 
 ### LEMMA (`lemma/` — explicit opt-in Lean 4 mode under `proof` + `lemmaMode: true`)
 
-When `teamwork_plan` is invoked with `lemmaMode: true` (or `route: "lemma"`, requiring `topology: "proof"`), the engine first probes `lean`, `lake`, and the LEAP CLI (`leap`; legacy `leap-tools` accepted) on `PATH` **before `mkdir`**. If any tool is missing or unusable (even when `allowMissingInputs: true`), planning is refused immediately with exact install instructions for both Lean 4 (`elan`) and the pinned LEAP CLI (`pipx install git+https://github.com/billkunghappy/LEAP-CLI@afc016d23579d8236050a157fe6cac8f17b13096`), writing zero files and spending zero budget.
+When `teamwork_plan` is invoked with `lemmaMode: true` (or `route: "lemma"`, requiring `topology: "proof"`), the engine first probes `lean`, `lake`, and the LEAP CLI (`leap`; legacy `leap-tools` accepted) on `PATH` **before `mkdir`**. The LEAP CLI check runs `leap doctor --offline`; a failure of only its `LEAN_PROJECT_DIR` check (no local Lake project) is a `WARN`, not a block, because core Lean and the CLI are usable and Mathlib is optional. If any tool is missing or unusable (even when `allowMissingInputs: true`), planning is refused immediately with exact install instructions for both Lean 4 (`elan`) and the pinned LEAP CLI (`pipx install git+https://github.com/billkunghappy/LEAP-CLI@afc016d23579d8236050a157fe6cac8f17b13096`), writing zero files and spending zero budget.
 
 When the toolchain is ready, the run initializes `.opencode/teamwork/<session-id>/lemma/`:
 

@@ -43,6 +43,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs"
 import { createHmac, createPublicKey, generateKeyPairSync, randomBytes, verify as cryptoVerify } from "node:crypto"
@@ -1251,7 +1252,26 @@ try {
     }
     assert(!existsSync(join(drvRoot, ".opencode", "escape", "prompt_draft.md")), "traversal must not write outside .opencode/teamwork")
     assert(!existsSync(join(drvRoot, "escape", "prompt_draft.md")), "traversal must not write into root")
-    console.log("✓ approval-driver rejects traversal/invalid runIds with exit 2")
+
+    // The draft entry itself must not be followed when it is a symlink.
+    const symRunId = "20261125-000000-symdraft"
+    const symRunDir = join(drvRoot, ".opencode", "teamwork", symRunId)
+    mkdirSync(symRunDir, { recursive: true })
+    const outside = join(drvRoot, "outside-draft.txt")
+    writeFileSync(outside, "untouched")
+    symlinkSync(outside, join(symRunDir, "prompt_draft.md"))
+    const symRes = spawnSync(
+      process.execPath,
+      [DRIVER, JSON.stringify({ root: drvRoot, storage: drvStorage, action: "write-draft", runId: symRunId, draft: "pwn" })],
+      { encoding: "utf8", timeout: 30_000 },
+    )
+    assert.strictEqual(symRes.status, 0, `an atomic draft replace must succeed: ${symRes.stdout}${symRes.stderr}`)
+    const draftEntry = join(symRunDir, "prompt_draft.md")
+    // A followed symlink would leave the target's "untouched" bytes; reading
+    // "pwn" from the draft entry proves the entry itself was replaced.
+    assert.strictEqual(readFileSync(draftEntry, "utf8"), "pwn", "the draft must be written to the replaced entry")
+    assert.strictEqual(readFileSync(outside, "utf8"), "untouched", "the symlink target must not be overwritten")
+    console.log("✓ approval-driver rejects traversal/invalid runIds with exit 2 and replaces a symlinked draft without following it")
   }
 
   console.log("All authenticated prompt-approval tests passed")

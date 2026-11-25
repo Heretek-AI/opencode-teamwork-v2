@@ -28,7 +28,7 @@ import { renderGateStatus, evaluateStrictGate } from "../plugins/opencode-teamwo
 import { evaluateVictoryGate } from "../plugins/opencode-teamwork/victory.ts"
 import { withCrossProcessLock, crossProcessLockPath, observeLockArtifact, quarantineStaleLock } from "../plugins/opencode-teamwork/locks.ts"
 import { recordWriteAnomaly, resolveTrustedExecutable, setWriteAnomalyAuditPathForTest, unacknowledgedWriteAnomalies } from "../plugins/opencode-teamwork/safe-fs.mjs"
-import { assertSafeUrl, blockedAddressReason, parseLoopbackServiceUrl } from "../plugins/opencode-teamwork/url-guard.ts"
+import { assertSafeUrl, blockedAddressReason, parseLoopbackServiceUrl, safeFetch } from "../plugins/opencode-teamwork/url-guard.mjs"
 import { refreshRunBriefing, MAX_BRIEFING_BYTES, refreshAgentBriefing, readAgentBriefingExcerpt, agentBriefingRelativePath, MAX_AGENT_BRIEFING_DIRS } from "../plugins/opencode-teamwork/briefing.ts"
 import { writeHandoff, MAX_HANDOFF_ENTRIES, MAX_HANDOFF_INDEX_BYTES, HANDOFF_SECTION_LABELS, evaluateHandoffGateChecked, readWorkerHandoffBinding } from "../plugins/opencode-teamwork/handoff.ts"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
@@ -4317,7 +4317,7 @@ try {
     "http://169.254.169.254/latest/meta-data",
     "http://169.254.169.254",
     "https://evil.example",
-    "http://10.0.0.1:4096",
+    "http://10.0.0.1:4096", // NOSONAR (S5332): negative fixture; plain-http private addresses must be rejected
     "http://user:pass@127.0.0.1:4096",
     "http://127.0.0.1:4096/bad",
     "http://127.0.0.1:4096?x=1",
@@ -4348,6 +4348,32 @@ try {
     resolveHost: async () => [{ address: "127.0.0.1", family: 4 }],
   })
   assert.strictEqual(okLoop.ok, true)
+
+  // A total deadline must abort a slow-drip response, not only socket inactivity.
+  const slowServer = createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" })
+    res.write("{")
+    const beat = setInterval(() => res.write(" "), 100)
+    res.on("close", () => clearInterval(beat))
+  })
+  await new Promise((resolve) => slowServer.listen(0, "127.0.0.1", resolve))
+  try {
+    const slowAddress = slowServer.address()
+    assert(slowAddress && typeof slowAddress === "object", "slow-drip fixture must bind a TCP port")
+    const started = Date.now()
+    const slowRes = await safeFetch(`http://127.0.0.1:${slowAddress.port}/slow`, {
+      allowLocalhost: true,
+      timeoutMs: 5000,
+      signal: AbortSignal.timeout(300),
+    })
+    assert.strictEqual(slowRes.ok, false, "a slow-drip response must not complete")
+    assert.strictEqual(slowRes.code, "URL_TIMEOUT")
+    assert(Date.now() - started < 2000, "the total deadline must abort a slow-drip response promptly")
+  } finally {
+    if (typeof slowServer.closeAllConnections === "function") slowServer.closeAllConnections()
+    await new Promise((resolve) => slowServer.close(resolve))
+  }
+  console.log("✓ url-guard total deadline aborts slow-drip responses")
 
   const svcDir = mkdtempSync(join(tmpdir(), "teamwork-svc-guard-"))
   const home = join(svcDir, "home")
@@ -6873,6 +6899,132 @@ process.exit(0);
       assert.strictEqual(probeOutage.ready, false)
       assert.strictEqual(probeOutage.status, "OUTAGE", "non-zero probe on existing binary must report OUTAGE")
 
+      // `leap doctor --offline` (issue #50): a core-only host has no local Lake
+      // project, so doctor exits non-zero with only LEAN_PROJECT_DIR failed.
+      // That is a WARN: core Lean and the LEAP CLI are usable, Mathlib optional.
+      const projectWarnDir = mkdtempSync(join(lemmaTestDir, "doctor-project-warn-"))
+      const leapArgvLog = join(projectWarnDir, "leap-argv.log")
+      writeStubBin(projectWarnDir, "lean", `console.log("Lean (version 4.14.0)")`)
+      writeStubBin(projectWarnDir, "lake", `console.log("Lake version 5.0.0")`)
+      writeStubBin(
+        projectWarnDir,
+        "leap",
+        `
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(leapArgvLog)}, args.join(" ") + "\\n");
+if (args.includes("--version")) {
+  console.error("usage: leap [-h] {lean,doctor,config} ...");
+  process.exit(2);
+}
+if (args.includes("--help")) {
+  console.log("usage: leap [-h] {lean,doctor,config} ...");
+  process.exit(0);
+}
+if (args.includes("doctor")) {
+  console.log("[INFO] checking local Lean toolchain");
+  console.log("[FAIL] LEAN_PROJECT_DIR -- no local Lean project found");
+  console.log("[FAIL] LEAN_PROJECT_DIR -- no local Lean project found (run inside a Lake project)");
+  process.exit(1);
+}
+process.exit(0);
+`,
+      )
+      const probeProjectWarn = probeLemmaToolchain({ env: { PATH: projectWarnDir } })
+      assert.strictEqual(probeProjectWarn.ready, true, "a LEAN_PROJECT_DIR-only doctor failure must keep the probe ready")
+      assert.strictEqual(probeProjectWarn.status, "READY", "a doctor warning must not become OUTAGE")
+      assert.strictEqual(probeProjectWarn.leap.available, true, "a doctor warning must keep leap available")
+      assert.strictEqual(probeProjectWarn.leap.doctor?.status, "WARN", "only LEAN_PROJECT_DIR failed, so doctor must be WARN")
+      assert.deepStrictEqual(probeProjectWarn.leap.doctor?.failedChecks, ["LEAN_PROJECT_DIR"])
+      assert.match(String(probeProjectWarn.leap.doctor?.warning), /LEAN_PROJECT_DIR|Mathlib/i)
+      const leapArgv = readFileSync(leapArgvLog, "utf8").trim().split("\n")
+      assert(
+        leapArgv.includes("doctor --offline"),
+        `leap doctor must be invoked with --offline, saw argv: ${leapArgv.join(" | ")}`,
+      )
+      assert(
+        formatMissingToolchainRefusal(probeProjectWarn).includes("leap doctor: WARN"),
+        "refusal diagnostics must surface a doctor WARN",
+      )
+
+      // Any other FAIL check is still an OUTAGE: core LEAN_PROJECT_DIR-only is
+      // the sole downgrade.
+      const doctorFailDir = mkdtempSync(join(lemmaTestDir, "doctor-check-fail-"))
+      writeStubBin(doctorFailDir, "lean", `console.log("Lean (version 4.14.0)")`)
+      writeStubBin(doctorFailDir, "lake", `console.log("Lake version 5.0.0")`)
+      writeStubBin(
+        doctorFailDir,
+        "leap",
+        `
+const args = process.argv.slice(2);
+if (args.includes("doctor")) {
+  console.log("[FAIL] state_manager_bin -- not on PATH");
+  process.exit(1);
+}
+if (args.includes("--version")) process.exit(2);
+console.log("usage: leap ...");
+process.exit(0);
+`,
+      )
+      const probeDoctorFail = probeLemmaToolchain({ env: { PATH: doctorFailDir } })
+      assert.strictEqual(probeDoctorFail.ready, false, "a non-project doctor FAIL must block the probe")
+      assert.strictEqual(probeDoctorFail.status, "OUTAGE")
+      assert.strictEqual(probeDoctorFail.leap.available, false)
+      assert.strictEqual(probeDoctorFail.leap.doctor?.status, "OUTAGE")
+      assert.deepStrictEqual(probeDoctorFail.leap.doctor?.failedChecks, ["state_manager_bin"])
+
+      // An arbitrary non-zero doctor exit with no [FAIL] lines stays OUTAGE.
+      const doctorBareDir = mkdtempSync(join(lemmaTestDir, "doctor-bare-fail-"))
+      writeStubBin(doctorBareDir, "lean", `console.log("Lean (version 4.14.0)")`)
+      writeStubBin(doctorBareDir, "lake", `console.log("Lake version 5.0.0")`)
+      writeStubBin(
+        doctorBareDir,
+        "leap",
+        `
+const args = process.argv.slice(2);
+if (args.includes("doctor")) {
+  console.error("doctor failed");
+  process.exit(1);
+}
+if (args.includes("--version")) process.exit(2);
+console.log("usage: leap ...");
+process.exit(0);
+`,
+      )
+      const probeDoctorBare = probeLemmaToolchain({ env: { PATH: doctorBareDir } })
+      assert.strictEqual(probeDoctorBare.ready, false)
+      assert.strictEqual(probeDoctorBare.status, "OUTAGE")
+      assert.strictEqual(probeDoctorBare.leap.doctor?.status, "OUTAGE")
+      assert.deepStrictEqual(probeDoctorBare.leap.doctor?.failedChecks, [])
+      assert(probeDoctorBare.leap.doctor?.error?.includes("doctor failed"), "the bounded doctor error must be surfaced")
+
+      // A doctor killed by the probe timeout must stay OUTAGE even when a
+      // wrapper prints a project-only FAIL and exits non-zero after SIGTERM.
+      const doctorTimeoutDir = mkdtempSync(join(lemmaTestDir, "doctor-timeout-"))
+      writeStubBin(doctorTimeoutDir, "lean", `console.log("Lean (version 4.14.0)")`)
+      writeStubBin(doctorTimeoutDir, "lake", `console.log("Lake version 5.0.0")`)
+      writeStubBin(
+        doctorTimeoutDir,
+        "leap",
+        `
+const args = process.argv.slice(2);
+if (args.includes("doctor")) {
+  console.log("[FAIL] LEAN_PROJECT_DIR -- no local Lean project found");
+  setTimeout(() => {}, 5000);
+} else if (args.includes("--version")) {
+  process.exit(2);
+} else {
+  console.log("usage: leap ...");
+  process.exit(0);
+}
+`,
+      )
+      const probeDoctorTimeout = probeLemmaToolchain({ env: { PATH: doctorTimeoutDir }, timeoutMs: 300 })
+      assert.strictEqual(probeDoctorTimeout.ready, false, "a timed-out doctor must not be downgraded to WARN")
+      assert.strictEqual(probeDoctorTimeout.status, "OUTAGE")
+      assert.strictEqual(probeDoctorTimeout.leap.doctor?.status, "OUTAGE")
+      assert.match(String(probeDoctorTimeout.leap.doctor?.error), /timed out/i)
+
       const refusalMsg = formatMissingToolchainRefusal(probeNoLeap)
       assert(refusalMsg.startsWith("refused:"), "refusal must start with refused:")
       assert(refusalMsg.includes("elan") && refusalMsg.includes("leanprover/lean4:stable"), "must include Lean 4 install instructions")
@@ -7920,7 +8072,17 @@ process.exit(0);
       process.env.PATH = savedPath
       const hostProbe = probeLemmaToolchain({ env: { ...process.env, PATH: savedPath } })
       if (!hostProbe.ready) {
-        console.log(`[SKIP] LEMMA live-toolchain E2E skipped: missing host binaries (${hostProbe.missing.join(", ")})`)
+        // Keep the exact `[SKIP] LEMMA live-toolchain E2E skipped:` prefix (the
+        // CI workflow greps it) and add the per-binary detail plus the doctor
+        // verdict so a skipped run is diagnosable without re-running locally.
+        const details = formatMissingToolchainRefusal(hostProbe)
+          .split("\n")
+          .filter((line) => /^ {2}- /.test(line))
+          .map((line) => line.replace(/\s+/g, " ").trim())
+          .join("; ")
+        console.log(
+          `[SKIP] LEMMA live-toolchain E2E skipped: missing host binaries (${hostProbe.missing.join(", ")}); ${details}`,
+        )
       } else {
         const rootLive = mkdtempSync(join(lemmaTestDir, "root-live-"))
         const tools = await makeToolsFor(rootLive)

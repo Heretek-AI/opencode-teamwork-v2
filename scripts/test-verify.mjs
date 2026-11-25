@@ -772,12 +772,13 @@ function checkIds(result) {
   return result.checks.map((check) => check.id)
 }
 
-function runCli(args) {
+function runCli(args, timeout = 30000, extraEnv = {}) {
   try {
     const stdout = execFileSync(process.execPath, [CLI, ...args], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: 30000,
+      timeout,
+      env: { ...process.env, ...extraEnv },
     })
     return { code: 0, stdout, stderr: "" }
   } catch (err) {
@@ -2090,6 +2091,32 @@ async function main() {
       `requireHandoffs=required without workerHandoff binding must fail report:R1:handoff: ${JSON.stringify(resRequired.checks)}`,
     )
     ok("T37 omitted requireHandoffs defaults to skip while required still enforces handoffs")
+  }
+
+  // -------------------------------------------------------------------------
+  // T38 — S8476/S5144: --fetch-jwks refuses non-https, loopback, metadata, and
+  // IPv6 loopback issuers before any run fixture is read.
+  // -------------------------------------------------------------------------
+  {
+    const cases = [
+      { issuer: "http://127.0.0.1:9", pattern: /https:\/\//i, why: "plain http" },
+      { issuer: "https://127.0.0.1:9", pattern: /loopback/i, why: "IPv4 loopback" },
+      { issuer: "https://169.254.169.254/latest/meta-data", pattern: /cloud metadata/i, why: "cloud metadata" },
+      { issuer: "https://[::1]:9", pattern: /loopback/i, why: "IPv6 loopback" },
+    ]
+    for (const entry of cases) {
+      const res = runCli(["verify", "--fetch-jwks", entry.issuer], 15000)
+      assert.strictEqual(res.code, 2, `${entry.why}: expected exit 2, got ${res.code}: ${res.stderr}`)
+      assert.match(res.stderr, entry.pattern, `${entry.why}: unexpected stderr: ${res.stderr}`)
+      assert(res.stderr.length < 1000, `${entry.why}: stderr is not bounded (${res.stderr.length} bytes)`)
+    }
+    // The OIDC path must not honor the guard's localhost test opt-in.
+    const allowed = runCli(["verify", "--fetch-jwks", "https://127.0.0.1:9"], 15000, {
+      OPENCODE_TEAMWORK_ALLOW_LOCALHOST: "1",
+    })
+    assert.strictEqual(allowed.code, 2, `localhost opt-in: expected exit 2, got ${allowed.code}: ${allowed.stderr}`)
+    assert.match(allowed.stderr, /loopback/i, `localhost opt-in must still refuse loopback: ${allowed.stderr}`)
+    ok("T38 --fetch-jwks refuses non-https, loopback, metadata, and IPv6 loopback issuers (exit 2), even with the localhost opt-in")
   }
 
   rmSync(TEST_ROOT, { recursive: true, force: true })

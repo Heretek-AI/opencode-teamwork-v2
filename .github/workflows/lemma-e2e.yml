@@ -75,6 +75,7 @@ jobs:
           export PATH="$HOME/.elan/bin:$PATH"
           elan toolchain install leanprover/lean4:stable
           elan default leanprover/lean4:stable
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
           lean --version
           lake --version
 
@@ -97,6 +98,32 @@ jobs:
           lake --version
           leap --help
 
+      - name: Configure runtime PATH
+        run: |
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Diagnostics only: never fail the job here. The test step below stays
+      # strict ("live E2E must run, not skip"), and this log explains a skip.
+      - name: Record LEMMA toolchain
+        continue-on-error: true
+        run: |
+          {
+            echo "== command -v =="
+            for bin in lean lake leap state_manager_bin lean_verifier_tool_bin lean_search_tool_bin; do
+              printf '%s: ' "$bin"
+              command -v "$bin" || echo "MISSING"
+            done
+            echo "== lean --version =="
+            lean --version || true
+            echo "== lake --version =="
+            lake --version || true
+            echo "== leap --help (head -5) =="
+            leap --help 2>&1 | head -5 || true
+            echo "== leap doctor --offline =="
+            leap doctor --offline || true
+          } 2>&1 | tee "$RUNNER_TEMP/toolchain.txt"
+
       - name: Tests (live LEMMA E2E must run, not skip)
         run: |
           set -o pipefail
@@ -106,3 +133,13 @@ jobs:
             exit 1
           fi
           grep -F "live Lean 4 E2E verification passed" "$RUNNER_TEMP/npm-test.log"
+
+      - name: Upload LEMMA E2E diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemma-e2e-diagnostics
+          path: |
+            ${{ runner.temp }}/npm-test.log
+            ${{ runner.temp }}/toolchain.txt
+          if-no-files-found: warn

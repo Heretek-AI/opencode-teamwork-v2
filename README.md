@@ -113,7 +113,7 @@ fails closed for mutating tools. Read-only `teamwork_status`,
 `team/*` role. See `docs/GUARDRAILS.md` for the full matrix.
 
 **URL network policy.** `document.url` ingestion and preflight URL checks use
-`url-guard.ts`: http/https only, public addresses only (loopback, private,
+`url-guard.mjs`: http/https only, public addresses only (loopback, private,
 link-local, metadata, multicast, reserved, and IPv4-mapped IPv6 are rejected),
 DNS answers are validated and the connection is pinned to them, redirects are
 not followed (a `Location` is validated before refusal), and timeouts/size caps
@@ -430,7 +430,18 @@ opencode-teamwork verify --run-dir /path/to/run --public-key ... \
 # 0.18.0: verify a CI attestation signed by a key the run does not hold
 opencode-teamwork verify --run-dir /path/to/run --public-key ... \
   --attestation-public-key @ci-attestation.pub [--attestation-issuer <issuer>]
+
+# Fetch the issuer JWKS over HTTPS at verification time
+opencode-teamwork verify --run-dir /path/to/run --public-key ... \
+  --fetch-jwks https://token.actions.githubusercontent.com
 ```
+
+`--fetch-jwks <issuer>` fetches `/.well-known/openid-configuration` and then
+its `jwks_uri`. Both URLs must be `https:`, carry no credentials, resolve only
+to public addresses, and return a non-redirect 2xx; requests carry a 10 s
+timeout and a 512 KiB body cap. Loopback, private, link-local, and
+cloud-metadata issuers are refused on this network path; for an intranet
+issuer, or an offline copy, use `--oidc-jwks <file>`.
 
 Under a plan that recorded `requiredProvenance: "command"`, a PASS report must
 carry at least one programmatic check with an argv-only `command`, an exit code,
@@ -659,7 +670,7 @@ to the shared `BRIEFING.md` (see `docs/ARTIFACTS.md`).
 LEMMA is an explicit opt-in capability-gated route (`topology: "proof"`, `lemmaMode: true`) for Lean 4 proving and verification:
 
 - **Explicit opt-in only:** `teamwork_route` checks `document-review` first, requires an explicit Lean 4 prove/formalize/verify/check request in prose, ignores instructions inside fenced code blocks, and routes unrequested `.lean` or Lean-syntax tasks to `distributed-coding` (never `proof`).
-- **Pre-spending toolchain gate:** Requires user-installed **Lean 4** (`lean` and `lake` via `elan`) and the **LEAP CLI** (`leap`) on `PATH`; the legacy `leap-tools` name is also accepted. If any is missing or unusable, `teamwork_plan` refuses **before `mkdir`** (zero run files created, zero budget spent), writes `PREREQUISITES.md` at the repository root recording the `MISSING`/`OUTAGE` probe verdict (the file is only written on failure; `READY` is not written), and prints install instructions for both; `leap doctor` reports the same verdicts.
+- **Pre-spending toolchain gate:** Requires user-installed **Lean 4** (`lean` and `lake` via `elan`) and the **LEAP CLI** (`leap`) on `PATH`; the legacy `leap-tools` name is also accepted. If any is missing or unusable, `teamwork_plan` refuses **before `mkdir`** (zero run files created, zero budget spent), writes `PREREQUISITES.md` at the repository root recording the `MISSING`/`OUTAGE` probe verdict (the file is only written on failure; `READY` is not written), and prints install instructions for both; `leap doctor --offline` reports the same verdicts, except that a `LEAN_PROJECT_DIR`-only failure (no local Lake project) is a warning and does not block.
   - Install the pinned CLI with `pipx install git+https://github.com/billkunghappy/LEAP-CLI@afc016d23579d8236050a157fe6cac8f17b13096` (the `leap-tools` PyPI package does not exist). `leap lean` is the optional full Mathlib setup (~11 GB, 10–20 minutes); LEMMA verification needs only core Lean, no Mathlib.
 - **Bounded verification:** Phase 0 formalization (`problem_draft.lean` → `team/formalization-reviewer` `APPROVE` → `problem.lean`), bounded lemma tree (`maxDepth <= 3`, `maxWidth <= 4`, `maxNodes <= 24`, `maxRetries <= 4`), real `lean`/`lake` execution via `teamwork_lemma_verify` rejecting `sorry`/`admit`/unauthorized `axiom` even on exit `0`, and final `FAITHFUL` check before `teamwork_final_verify`.
 - **Declaration and axiom binding:** each node records its Lean `declaration` and `statement`. Before a node becomes `proved`/`disproved`, the attempt must declare that name and type (comments, strings, and syntax quotations are masked; duplicate/namespaced/`private`/`protected` declarations fail closed). The verifier then runs `#print axioms <declaration>` and records `declaration`, `declarationType`, `axiomDependencies`, and `unauthorizedAxioms`, accepting only `Classical.choice`, `propext`, `Quot.sound`, plus axioms approved once at plan time via `lemmaPolicy.allowedAxioms` (persisted in `lemma/manifest.json`). `sorryAx` is always rejected, and `#`/`logInfo`/`dbg_trace`/`trace`/`run_cmd`/`println`/`IO.`/`set_option trace` probe-hijacking attempts fail closed. Node statement/declaration metadata is immutable after a PASS; `teamwork_final_verify` re-checks stamped metadata before accepting a run.
@@ -692,13 +703,16 @@ rather than assuming missing text is absent from the source.
 ```sh
 elan toolchain install stable
 pipx install git+https://github.com/billkunghappy/LEAP-CLI@afc016d23579d8236050a157fe6cac8f17b13096
-leap doctor
+leap doctor --offline
 ```
 
-A missing tool refuses the plan before `mkdir`; install it and re-run.
-`leap doctor` reports `READY`, `MISSING`, or `OUTAGE` (`OUTAGE` means installed
-but not usable). `leap lean` (Mathlib, ~11 GB) is optional and not needed for
-LEMMA verification.
+A missing tool refuses the plan before `mkdir`; install it and re-run. The probe
+runs `leap doctor --offline`, so it needs no network and does not download
+Mathlib. Its verdicts are `READY`, `WARN`, `MISSING`, or `OUTAGE` (`OUTAGE`
+means installed but not usable). A `LEAN_PROJECT_DIR`-only failure means there
+is no local Lake project: core Lean and the LEAP CLI are still usable, so it is
+a warning and does not block. `leap lean` (Mathlib, ~11 GB) is optional and not
+needed for LEMMA verification.
 
 `PREREQUISITES.md` is a diagnostic record: deleting or editing it does not
 install anything, and `READY` does not prove the toolchain will succeed on
