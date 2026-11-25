@@ -13,10 +13,18 @@ name: CI attestation
 #     skipped. The code and the test command come from that protected checkout,
 #     never from an input.
 #   * Inputs are only the run id and the manifest digest. Both are validated as
-#     fixed-shape values and passed through environment variables; no input is
-#     interpolated into a shell command.
-#   * The signing key is a repository/environment secret exposed only to this
-#     job (`environment: ci-attestation`, which can be gated by required
+#     fixed-shape values by `scripts/check-attest-input.mjs` and passed through
+#     environment variables; no input is interpolated into a shell command and
+#     no input names a path. The manifest path is derived from the validated
+#     run id: `.opencode/teamwork/<run_id>/run.manifest.json`. A symlink or a
+#     path outside that location is rejected.
+#   * Testing and signing are separate jobs with separate privileges. The test
+#     job has `contents: read` and no OIDC token. The signing job checks out the
+#     protected commit fresh, holds `id-token: write` and the environment
+#     secret, and runs no repository test code: it verifies the uploaded record
+#     and then runs only the checked-in `scripts/attest-sign.mjs`.
+#   * The signing key is a repository/environment secret exposed only to the
+#     signing job (`environment: ci-attestation`, which can be gated by required
 #     reviewers). The agent's UID never receives it; if it does, the key is not
 #     a separate principal and the attestation is not a boundary (SECURITY.md).
 #   * The run manifest must already exist in the protected checkout at the
@@ -26,7 +34,9 @@ name: CI attestation
 #
 # Residual: a compromised CI runner, a secret readable by the agent, a test
 # edited in the same commit, or a weak suite still produce a valid attestation.
-# This template records what CI observed; it does not prove the suite is good.
+# The test job is untrusted code: its uploaded exit code and output digest are
+# what CI observed, not proof that the suite is meaningful. This template
+# records that observation; it does not prove the suite is good.
 
 on:
   workflow_dispatch:
@@ -39,72 +49,62 @@ on:
         description: "Payload digest of run.manifest.json (64 lowercase hex)"
         required: true
         type: string
-      manifest_path:
-        description: "Path to run.manifest.json in the protected checkout"
-        required: false
-        default: ""
-        type: string
 
 permissions:
   contents: read
-  id-token: write
 
 concurrency:
   group: ci-attestation-${{ inputs.run_id }}
   cancel-in-progress: false
 
 jobs:
-  attest:
+  # Unprivileged: runs repository test code with no OIDC token and no signing
+  # key. The uploaded record is the only thing the signing job consumes.
+  test:
+    name: Run the protected test command
     # Fail closed: only the protected default branch can attest. A dispatch
     # from another ref is a no-op, not a weaker attestation.
     if: >-
       github.ref_protected == true &&
       github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
-    environment: ci-attestation
+    permissions:
+      contents: read
     steps:
-      - name: Validate inputs (no shell interpolation)
-        env:
-          RUN_ID: ${{ inputs.run_id }}
-          MANIFEST_DIGEST: ${{ inputs.manifest_digest }}
-        run: |
-          node -e '
-          const runId = process.env.RUN_ID || "";
-          const digest = (process.env.MANIFEST_DIGEST || "").trim().toLowerCase();
-          if (!/^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$/.test(runId)) {
-            console.error("invalid run_id");
-            process.exit(1);
-          }
-          if (!/^[0-9a-f]{64}$/.test(digest)) {
-            console.error("invalid manifest_digest");
-            process.exit(1);
-          }
-          '
-
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # Always the dispatched protected ref; never an input.
-          ref: ${{ github.ref }}
+          # Pin the exact commit the workflow was dispatched for; the signing
+          # job checks out the same SHA.
+          ref: ${{ github.sha }}
           persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "24"
           package-manager-cache: false
 
-      - name: Confirm the protected checkout and the run manifest
+      - name: Validate inputs and the fixed manifest path
+        id: inputs
         env:
           RUN_ID: ${{ inputs.run_id }}
-          MANIFEST_PATH_INPUT: ${{ inputs.manifest_path }}
+          MANIFEST_DIGEST: ${{ inputs.manifest_digest }}
+        run: node scripts/check-attest-input.mjs --require-manifest
+
+      - name: Confirm the protected checkout
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          test "$GITHUB_REF" = "refs/heads/${{ github.event.repository.default_branch }}"
-          manifest="${MANIFEST_PATH_INPUT:-.opencode/teamwork/${RUN_ID}/run.manifest.json}"
-          if [ ! -f "$manifest" ]; then
-            echo "run.manifest.json is not present in the protected checkout at $manifest" >&2
-            echo "upload it as a protected artifact and download it before this job; do not pass it as an input" >&2
-            exit 1
-          fi
-          echo "TEAMWORK_MANIFEST=$manifest" >> "$GITHUB_ENV"
+          test "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      # Snapshot the exact bytes that existed before the test suite ran. The
+      # signing job verifies this artifact against the dispatcher's digest.
+      - name: Snapshot the run manifest
+        env:
+          MANIFEST_PATH: ${{ steps.inputs.outputs.manifest_path }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/attest-input"
+          cp -- "$MANIFEST_PATH" "$RUNNER_TEMP/attest-input/run.manifest.json"
 
       - name: Run the project test command
         id: tests
@@ -113,7 +113,7 @@ jobs:
         # step successful so the failure is signed rather than hidden.
         run: |
           set +e
-          npm test > "$RUNNER_TEMP/test-output.txt" 2>&1
+          npm test > "$RUNNER_TEMP/attest-input/test-output.txt" 2>&1
           code=$?
           set -e
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
@@ -125,11 +125,14 @@ jobs:
       - name: Build the command record
         env:
           TEST_EXIT: ${{ steps.tests.outputs.exit_code }}
+          RUN_ID: ${{ inputs.run_id }}
+          MANIFEST_DIGEST: ${{ inputs.manifest_digest }}
         run: |
           node -e '
           const fs = require("fs");
           const crypto = require("crypto");
-          const output = fs.readFileSync(process.env.RUNNER_TEMP + "/test-output.txt");
+          const dir = process.env.RUNNER_TEMP + "/attest-input";
+          const output = fs.readFileSync(dir + "/test-output.txt");
           const record = [{
             argv: ["npm", "test"],
             cwd: ".",
@@ -137,16 +140,91 @@ jobs:
             outputSha256: crypto.createHash("sha256").update(output).digest("hex"),
             outputBytes: output.length,
           }];
-          fs.writeFileSync(process.env.RUNNER_TEMP + "/commands.json", JSON.stringify(record));
+          fs.writeFileSync(dir + "/commands.json", JSON.stringify(record));
+          const testRecord = {
+            runId: process.env.RUN_ID,
+            manifestDigest: (process.env.MANIFEST_DIGEST || "").trim().toLowerCase(),
+            commit: process.env.GITHUB_SHA,
+            ref: process.env.GITHUB_REF,
+            testExitCode: Number(process.env.TEST_EXIT),
+          };
+          fs.writeFileSync(dir + "/test-record.json", JSON.stringify(testRecord, null, 2) + "\n");
           '
+
+      - name: Upload the test record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: teamwork-attest-input-${{ inputs.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/attest-input
+          if-no-files-found: error
+          retention-days: 7
+
+  # Privileged: clean checkout, OIDC token and the environment key. It never
+  # runs `npm test` or any other test-writable script from the test job.
+  sign:
+    name: Sign the attestation
+    needs: test
+    if: >-
+      github.ref_protected == true &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    environment: ci-attestation
+    permissions:
+      contents: read
+      id-token: write # OIDC token for the attestation payload
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Same commit as the unprivileged test job, never an input.
+          ref: ${{ github.sha }}
+          fetch-depth: 2 # record the base commit when it is available
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Validate inputs
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          MANIFEST_DIGEST: ${{ inputs.manifest_digest }}
+        run: node scripts/check-attest-input.mjs
+
+      - name: Confirm the protected checkout
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/$DEFAULT_BRANCH"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Download the test record
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: teamwork-attest-input-${{ inputs.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/attest-input
+
+      # Verify the record before the signing key is loaded: exactly one
+      # `npm test` command, the recorded exit code, a matching output digest,
+      # the expected commit/ref, and a manifest whose payload digest matches the
+      # dispatcher's input. The manifest is required to be a regular file.
+      - name: Verify the test record
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          MANIFEST_DIGEST: ${{ inputs.manifest_digest }}
+          RECORD_DIR: ${{ runner.temp }}/attest-input
+        run: node scripts/check-attest-input.mjs --verify-record "$RECORD_DIR"
 
       - name: Sign the attestation with the CI-only key
         env:
           ATTESTATION_PRIVATE_KEY: ${{ secrets.ATTESTATION_PRIVATE_KEY }}
           RUN_ID: ${{ inputs.run_id }}
           MANIFEST_DIGEST: ${{ inputs.manifest_digest }}
+          MANIFEST: ${{ runner.temp }}/attest-input/run.manifest.json
+          RECORD_DIR: ${{ runner.temp }}/attest-input
         run: |
           key="$RUNNER_TEMP/attestation-key.pem"
+          trap 'rm -f "$key" "$RUNNER_TEMP/oidc.json" "$RUNNER_TEMP/oidc.jwt"' EXIT
           umask 077
           printf '%s' "$ATTESTATION_PRIVATE_KEY" > "$key"
           if [ ! -s "$key" ]; then
@@ -173,10 +251,10 @@ jobs:
           node scripts/attest-sign.mjs \
             --run-id "$RUN_ID" \
             --manifest-digest "$MANIFEST_DIGEST" \
-            --manifest "$TEAMWORK_MANIFEST" \
+            --manifest "$MANIFEST" \
             --commit "$(git rev-parse HEAD)" \
             --base "$base" \
-            --commands "@$RUNNER_TEMP/commands.json" \
+            --commands "@$RECORD_DIR/commands.json" \
             --key "$key" \
             --workflow "ci-attestation" \
             --repository "$GITHUB_REPOSITORY" \
@@ -185,10 +263,10 @@ jobs:
             --oidc-audience "opencode-teamwork" \
             "${oidc_args[@]}" \
             --out verify/ci/attestation.json
-          rm -f "$key" "$RUNNER_TEMP/oidc.json" "$RUNNER_TEMP/oidc.jwt"
+          rm -f "$key"
 
       - name: Upload the attestation
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: teamwork-attestation-${{ inputs.run_id }}
           path: verify/ci/attestation.json
