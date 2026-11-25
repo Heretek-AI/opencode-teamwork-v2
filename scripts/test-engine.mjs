@@ -4420,7 +4420,7 @@ try {
       assert.strictEqual(tooLarge.code, "URL_TOO_LARGE")
       assert(Date.now() - started < 1500, "an oversized Content-Length must be refused promptly")
       const closeDeadline = Date.now() + 1500
-      while (!bodyClosed && Date.now() < closeDeadline) await new Promise((resolve) => setTimeout(resolve, 20))
+      while (!bodyClosed && Date.now() < closeDeadline) await new Promise((resolve) => setTimeout(resolve, 20)) // NOSONAR (S2189): bodyClosed is set by the server close event, not in the loop body
       assert(bodyClosed, "an oversized Content-Length must destroy the response instead of draining the slow body")
     } finally {
       if (typeof leakServer.closeAllConnections === "function") leakServer.closeAllConnections()
@@ -4449,7 +4449,7 @@ try {
       assert.strictEqual(headRes.ok, true)
       assert.strictEqual(headRes.status, 200)
       const closeDeadline = Date.now() + 1500
-      while (!headClosed && Date.now() < closeDeadline) await new Promise((resolve) => setTimeout(resolve, 20))
+      while (!headClosed && Date.now() < closeDeadline) await new Promise((resolve) => setTimeout(resolve, 20)) // NOSONAR (S2189): headClosed is set by the server close event, not in the loop body
       assert(headClosed, "HEAD must destroy the response/socket instead of leaving it open")
     } finally {
       if (typeof headServer.closeAllConnections === "function") headServer.closeAllConnections()

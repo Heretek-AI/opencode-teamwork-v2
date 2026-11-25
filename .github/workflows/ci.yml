@@ -36,7 +36,9 @@ jobs:
         run: bun install --frozen-lockfile --ignore-scripts
 
       - name: Install the pinned OpenCode 2.4.1 CLI
-        run: npm install --global --no-audit --no-fund @opencode/cli@2.4.1
+        # The pinned host CLI needs its own postinstall to materialize the
+        # tested binary. This is a dev-only CI tool, not a package dependency.
+        run: npm install --global --no-audit --no-fund @opencode/cli@2.4.1 # NOSONAR (S6505): required postinstall for the pinned dev-only host CLI
 
       # The harness looks up `opencode` with `which`; OPENCODE_BIN is the
       # harness's explicit override when a global bin directory is not on PATH.
