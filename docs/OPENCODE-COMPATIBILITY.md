@@ -276,6 +276,34 @@ registration. It makes that tool accept unvalidated input. The tool's own
 `execute` body must therefore not assume the schema ran; our tools do their own
 sanitisation, which is why this is a latent risk rather than an active exploit.
 
+### 3.7 Excess input properties are stripped before the tool runs (closed plugin-side in 0.18.1)
+
+OBSERVED:
+
+- The runtime compiles a raw JSON-Schema input to an Effect codec and decodes
+  with `onExcessProperty: "ignore"` (`packages/core/src/tool/runtime.ts:115-121`,
+  `:187-201`).
+- The built-in `opencode.tool.input.repair` plugin runs on `execute.before`
+  (`packages/core/src/plugin/tool-input-repair.ts:32,41-58`). Its `repairObject`
+  deletes every undeclared key when the schema says
+  `additionalProperties: false` (`:161-171`), before the runtime validator sees
+  the input.
+
+INFERRED: `additionalProperties: false` alone does not reject an unknown key on
+2.4.1; by the time any decoder runs, the repair pass has removed it. A tool
+input that is a Standard Schema still receives this repaired object.
+
+**Closed in 0.18.1 (ADR 0019).** Every Teamwork tool input is wrapped in
+`strictInput()`, a Standard Schema. The runtime calls
+`schema["~standard"].validate` and turns its `{path, message}` issues into
+`Tool.Error` (`packages/core/src/tool/runtime.ts:76-82`, `:101-113`,
+`:148-167`), while `jsonSchema.input` returns the original schema unchanged
+(`:169-185`). The wrapper also attaches a non-enumerable empty
+`patternProperties` to each closed object so the repair pass leaves unknown keys
+in place; the validator then rejects them at the exact path. The catalog is
+byte-identical, and L1 A4 plus L2 J1 assert the refusal. `additionalProperties:
+true` records remain intentionally open.
+
 `Tool.Result` is defined at `packages/schema/src/tool.ts:121-125`; `Tool.Info`
 and `Options` at `:127-143`.
 

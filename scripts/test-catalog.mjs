@@ -193,5 +193,5 @@ assert(
 )
 
 console.log(
-  `✓ test-catalog passed: ${ids.length} teamwork_* tools, namespace/codemode/input contract, ${referenced.size} prompt token(s) all resolve, version ${rootPackage.version}`,
+  `✓ test-catalog passed: ${ids.length} teamwork_* tools, namespace/codemode/strict-input contract, ${referenced.size} prompt token(s) all resolve, version ${rootPackage.version}`,
 )
