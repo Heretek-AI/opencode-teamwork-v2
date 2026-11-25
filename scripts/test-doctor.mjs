@@ -281,6 +281,42 @@ try {
   }
 
   console.log("✓ nextSteps maps the first non-pass check only; all-pass yields []")
+
+  // Issue #41: doctor --locks inventory and --unlock --confirm safety rules
+  const { inventoryLocks, unlockLock, formatLocksReport } = await import("../lib/locks-doctor.mjs")
+  const { utimesSync, existsSync } = await import("node:fs")
+  const lockRoot = join(testDir, "locks-root", "run-1")
+  mkdirSync(lockRoot, { recursive: true })
+  const stalePath = join(lockRoot, "state.json.lock")
+  const foreignPath = join(lockRoot, "costs.json.lock")
+  const livePath = join(lockRoot, "events.json.lock")
+  const tmpPath = join(lockRoot, "state.json.tmp")
+  const now = Date.now()
+  const old = new Date(now - 120_000)
+  writeFileSync(stalePath, JSON.stringify({ pid: 999999, host: "local-host", at: old.toISOString(), nonce: "n1" }))
+  utimesSync(stalePath, old, old)
+  writeFileSync(foreignPath, JSON.stringify({ pid: 999999, host: "remote-host", at: old.toISOString(), nonce: "n2" }))
+  utimesSync(foreignPath, old, old)
+  writeFileSync(livePath, JSON.stringify({ pid: process.pid, host: "local-host", at: old.toISOString(), nonce: "n3" }))
+  utimesSync(livePath, old, old)
+  writeFileSync(tmpPath, "partial")
+
+  const inv = inventoryLocks(join(testDir, "locks-root"), { host: "local-host", now, leaseMs: 30_000, isProcessAlive: (p) => p === process.pid })
+  assert.strictEqual(inv.count, 4)
+  assert.strictEqual(inv.entries.find((e) => e.path === stalePath).classification, "stale-local-dead")
+  assert.strictEqual(inv.entries.find((e) => e.path === foreignPath).classification, "foreign-host")
+  assert.strictEqual(inv.entries.find((e) => e.path === livePath).classification, "active-local-over-lease")
+  assert.strictEqual(inv.entries.find((e) => e.path === tmpPath).artifactType, "tmp")
+  assert.match(formatLocksReport(inv), /best-effort duplicate suppression, never exactly-once/)
+
+  // --unlock requires --confirm, refuses foreign-host and live-pid, removes only stale same-host dead-pid
+  assert.strictEqual(unlockLock(stalePath, { confirm: false, host: "local-host" }).code, "CONFIRM_REQUIRED")
+  assert.strictEqual(unlockLock(foreignPath, { confirm: true, host: "local-host", now, leaseMs: 30_000, isProcessAlive: () => false }).code, "FOREIGN_LOCK_REFUSED")
+  assert.ok(existsSync(foreignPath), "foreign lock must remain untouched")
+  assert.strictEqual(unlockLock(livePath, { confirm: true, host: "local-host", now, leaseMs: 30_000, isProcessAlive: () => true }).code, "OWNER_ALIVE")
+  assert.strictEqual(unlockLock(stalePath, { confirm: true, host: "local-host", now, leaseMs: 30_000, isProcessAlive: () => false }).ok, true)
+  assert.strictEqual(existsSync(stalePath), false, "stale same-host dead-pid lock must be removed")
+  console.log("✓ doctor --locks inventory and --unlock safety rules pass")
 } finally {
   rmSync(testDir, { recursive: true, force: true })
   for (const dir of fixtureDirs) rmSync(dir, { recursive: true, force: true })

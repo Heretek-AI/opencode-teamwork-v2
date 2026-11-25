@@ -88,6 +88,12 @@ export interface CrossProcessLockOptions {
   disableHardlinks?: boolean
   /** Test seam: fail the `mkdir` fallback owner-file publication. */
   failOwnerWrite?: boolean
+  /** Test seam: fault/delay hooks around link/rename/mkdir primitives (Issue #41). */
+  faults?: {
+    beforeLink?: (info: { tempPath: string; lockPath: string }) => void
+    beforeRename?: (info: { from: string; to: string }) => void
+    beforeMkdir?: (info: { lockPath: string }) => void
+  }
   /**
    * Internal: the lock path is already `/proc/self/fd/<dirfd>/<name>` from a
    * pinned run directory. Skips the path-level directory checks (which would see
@@ -377,6 +383,7 @@ function tryCreateLock(
     try {
       writeFileSync(tempPath, JSON.stringify(owner), { flag: "wx", mode: 0o600 })
       wroteTemp = true
+      options.faults?.beforeLink?.({ tempPath, lockPath })
       linkSync(tempPath, lockPath)
       hardlinkSupport = "yes"
       return "created"
@@ -416,6 +423,7 @@ function tryCreateLock(
   }
 
   try {
+    options.faults?.beforeMkdir?.({ lockPath })
     mkdirSync(lockPath, { mode: 0o700 })
   } catch (err: any) {
     if (err?.code === "EEXIST") return "exists"
@@ -431,7 +439,9 @@ function tryCreateLock(
     }
     const tempOwner = join(lockPath, `owner.${owner.nonce}.tmp`)
     writeFileSync(tempOwner, JSON.stringify(owner), { flag: "wx", mode: 0o600 })
-    renameSync(tempOwner, join(lockPath, "owner.json"))
+    const destOwner = join(lockPath, "owner.json")
+    options.faults?.beforeRename?.({ from: tempOwner, to: destOwner })
+    renameSync(tempOwner, destOwner)
   } catch (err: any) {
     try {
       rmSync(lockPath, { recursive: true, force: true })
@@ -723,7 +733,8 @@ async function acquireLock(lockPath: string, options: CrossProcessLockOptions): 
   const retryBaseMs = Math.max(1, options.retryBaseMs ?? DEFAULT_RETRY_BASE_MS)
   const retryMaxMs = Math.max(retryBaseMs, options.retryMaxMs ?? DEFAULT_RETRY_MAX_MS)
   const now = options.now ?? Date.now
-  const host = options.host ?? SELF_HOST
+  const envTestHost = typeof process.env.OPENCODE_TEAMWORK_TEST_HOST === "string" ? process.env.OPENCODE_TEAMWORK_TEST_HOST.trim() : ""
+  const host = options.host ?? (envTestHost || SELF_HOST)
   const pid = options.pid ?? process.pid
   const isAlive = options.isProcessAlive ?? processIsAlive
   const nonce = randomBytes(12).toString("hex")

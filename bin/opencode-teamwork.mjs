@@ -27,6 +27,7 @@ import {
 import { detectAvailableModels, pickModels, applyOverrides } from "../lib/picker.mjs"
 import { listTeamworkRuns, inspectTeamworkRun, pruneTeamworkWorktrees } from "../lib/runs.mjs"
 import { runDoctor, nextSteps } from "../lib/doctor.mjs"
+import { inventoryLocks, unlockLock, formatLocksReport } from "../lib/locks-doctor.mjs"
 import { collectSecurityReport, hardenedExitCode } from "../lib/security.mjs"
 import { buildTimeline, renderTimeline, timelineWarnings } from "../lib/timeline.mjs"
 import { buildExportData, renderExport } from "../lib/export.mjs"
@@ -170,6 +171,15 @@ function parseArgs(argv) {
         break
       case "--security":
         options.security = true
+        break
+      case "--locks":
+        options.locks = true
+        break
+      case "--unlock":
+        options.unlock = rest.shift() ?? ""
+        break
+      case "--confirm":
+        options.confirm = true
         break
       case "--require-hardened":
         options.security = true
@@ -660,6 +670,21 @@ async function verifyCommand(options) {
 }
 
 function doctorCommand(options) {
+  if (options.unlock !== undefined) {
+    const result = unlockLock(options.unlock, { confirm: options.confirm === true })
+    if (options.json) console.log(JSON.stringify(result, null, 2))
+    else console.log(result.message)
+    process.exitCode = result.ok ? 0 : 1
+    return
+  }
+  if (options.locks) {
+    const root = options.runDir ? resolve(options.runDir) : join(process.cwd(), ".opencode", "teamwork")
+    const inventory = inventoryLocks(root)
+    if (options.json) console.log(JSON.stringify(inventory, null, 2))
+    else console.log(formatLocksReport(inventory))
+    process.exitCode = 0
+    return
+  }
   const configDir = resolveConfigDir(options.configDir)
   const report = runDoctor({ configDir, cwd: process.cwd() })
   const steps = nextSteps(report.checks)
