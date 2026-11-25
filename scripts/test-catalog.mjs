@@ -119,15 +119,34 @@ for (const [id, tool] of registered) {
   assertSupportedKeywords(jsonSchema, id)
 }
 
-// The guard itself must be able to fail: an unsupported keyword is refused at
-// registration time, not treated as an annotation.
-let unsupportedRefused = false
-try {
-  strictInput({ type: "object", properties: { x: { type: "string", format: "email" } }, additionalProperties: false })
-} catch (error) {
-  unsupportedRefused = /unsupported keyword "format"/.test(String(error?.message))
+// The guard itself must be able to fail: unsupported constructs (format, $ref,
+// oneOf) are refused loudly at registration time, not treated as annotations.
+for (const [label, candidate, pattern] of [
+  ["format", { type: "object", properties: { x: { type: "string", format: "email" } }, additionalProperties: false }, /unsupported keyword "format"/],
+  ["$ref", { type: "object", properties: { x: { $ref: "#/$defs/x" } }, additionalProperties: false }, /unsupported keyword "\$ref"/],
+  ["oneOf", { type: "object", oneOf: [{ type: "object", properties: {}, additionalProperties: false }] }, /unsupported keyword "oneOf"/],
+]) {
+  let refused = false
+  try {
+    strictInput(candidate)
+  } catch (error) {
+    refused = pattern.test(String(error?.message))
+  }
+  assert(refused, `strictInput must refuse unsupported construct (${label})`)
 }
-assert(unsupportedRefused, "strictInput must refuse an unsupported keyword (format)")
+
+// Verify anyOf branch-specific diagnostics on the live teamwork_document_record tool.
+{
+  const docTool = registered.get("teamwork_document_record")
+  const bad = docTool.input["~standard"].validate({
+    stage: "segment_analysis",
+    summary: "ok",
+    findings: [{ id: "F1", bogus: true }],
+  })
+  assert(Array.isArray(bad.issues) && bad.issues.length === 1, "teamwork_document_record must reject bad anyOf item")
+  assert.match(bad.issues[0].message, /branch 0 \(string\)/)
+  assert.match(bad.issues[0].message, /branch 1 \(object\): bogus: unknown property/)
+}
 
 
 function markdownFiles(dir) {
