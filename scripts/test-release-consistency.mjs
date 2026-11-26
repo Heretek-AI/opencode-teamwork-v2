@@ -2,13 +2,14 @@
 // Self-test for scripts/check-release-consistency.mjs.
 //
 // Builds throwaway fixture trees; every case is a package version, changelog
-// heading, tag ref and (optional) dirty worktree. Proves that a version or
-// changelog mismatch fails, a tag mismatch fails, and --require-clean is the
-// only way a dirty worktree fails.
+// heading, tag ref, npm/yarn config file, publishConfig and (optional) dirty
+// worktree. Proves that a version/changelog mismatch fails, a tag mismatch
+// fails, repository npm config or a privileged publishConfig key fails, and
+// --require-clean is the only way a dirty worktree fails.
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { checkReleaseConsistency } from "./check-release-consistency.mjs"
 
 let passed = 0
@@ -24,18 +25,30 @@ function check(name, condition, detail) {
   }
 }
 
-function fixture({ rootVersion = "1.2.3", pluginVersion = "1.2.3", changelog = "## [1.2.3] - 2026-11-25\n" } = {}) {
+function fixture({
+  rootVersion = "1.2.3",
+  pluginVersion = "1.2.3",
+  changelog = "## [1.2.3] - 2026-11-25\n",
+  rootPackage,
+  pluginPackage,
+  files = {},
+} = {}) {
   const root = mkdtempSync(join(tmpdir(), "release-consistency-"))
   mkdirSync(join(root, "plugins", "opencode-teamwork"), { recursive: true })
   writeFileSync(
     join(root, "package.json"),
-    JSON.stringify({ name: "@heretek-ai/fixture", version: rootVersion }) + "\n",
+    JSON.stringify(rootPackage ?? { name: "@heretek-ai/fixture", version: rootVersion }) + "\n",
   )
   writeFileSync(
     join(root, "plugins", "opencode-teamwork", "package.json"),
-    JSON.stringify({ name: "@heretek-ai/fixture-plugin", version: pluginVersion }) + "\n",
+    JSON.stringify(pluginPackage ?? { name: "@heretek-ai/fixture-plugin", version: pluginVersion }) + "\n",
   )
   writeFileSync(join(root, "CHANGELOG.md"), changelog)
+  for (const [relativePath, contents] of Object.entries(files)) {
+    const target = join(root, relativePath)
+    mkdirSync(dirname(target), { recursive: true })
+    writeFileSync(target, contents)
+  }
   return root
 }
 
@@ -121,6 +134,99 @@ function run(options) {
 {
   const result = run({ fixture: { rootVersion: "1.2", pluginVersion: "1.2" } })
   check("invalid semver fails", !result.ok)
+}
+
+// 7. A committed npm/yarn config could redirect or authenticate the release.
+for (const configFile of [".npmrc", ".yarnrc", ".yarnrc.yml"]) {
+  const result = run({
+    fixture: { files: { [configFile]: "registry=https://registry.example.invalid/\n" } },
+  })
+  check(`${configFile} is rejected`, !result.ok)
+  check(
+    `${configFile} failure names the file`,
+    result.errors.some((error) => error.startsWith(`${configFile}:`)),
+    result.errors.join("; "),
+  )
+}
+
+// 8. `publishConfig` may only carry `access`; npm applies the other keys from
+// the tarball during `npm publish`, even when the workflow passes flags.
+{
+  const result = run({
+    fixture: {
+      rootPackage: { name: "@heretek-ai/fixture", version: "1.2.3", publishConfig: { access: "public" } },
+      pluginPackage: {
+        name: "@heretek-ai/fixture-plugin",
+        version: "1.2.3",
+        publishConfig: { access: "public" },
+      },
+    },
+  })
+  check("publishConfig access passes", result.ok, result.errors.join("; "))
+}
+for (const key of ["registry", "tag", "provenance"]) {
+  const result = run({
+    fixture: {
+      rootPackage: { name: "@heretek-ai/fixture", version: "1.2.3", publishConfig: { [key]: "forbidden" } },
+    },
+  })
+  check(`publishConfig ${key} is rejected`, !result.ok)
+  check(
+    `publishConfig ${key} failure names the key`,
+    result.errors.some((error) => error.includes(`publishConfig (package.json)`) && error.includes(`"${key}"`)),
+    result.errors.join("; "),
+  )
+}
+{
+  const result = run({
+    fixture: {
+      pluginPackage: {
+        name: "@heretek-ai/fixture-plugin",
+        version: "1.2.3",
+        publishConfig: { registry: "https://registry.example.invalid/" },
+      },
+    },
+  })
+  check("plugin package publishConfig registry is rejected", !result.ok)
+  check(
+    "plugin publishConfig failure names the plugin package",
+    result.errors.some((error) => error.includes("plugins/opencode-teamwork/package.json")),
+    result.errors.join("; "),
+  )
+}
+{
+  const result = run({
+    fixture: {
+      rootPackage: {
+        name: "@heretek-ai/fixture",
+        version: "1.2.3",
+        publishConfig: { access: "public", tag: "next" },
+      },
+    },
+  })
+  check("publishConfig access plus a forbidden key is rejected", !result.ok)
+  check(
+    "mixed publishConfig failure names only the forbidden key",
+    result.errors.some((error) => error.includes('forbidden key(s) "tag"')),
+    result.errors.join("; "),
+  )
+}
+{
+  const result = run({
+    fixture: {
+      rootPackage: {
+        name: "@heretek-ai/fixture",
+        version: "1.2.3",
+        publishConfig: "https://registry.example.invalid/",
+      },
+    },
+  })
+  check("non-object publishConfig is rejected", !result.ok)
+  check(
+    "non-object publishConfig failure says so",
+    result.errors.some((error) => error.includes("not-an-object")),
+    result.errors.join("; "),
+  )
 }
 
 const total = passed + failed

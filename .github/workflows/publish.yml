@@ -20,25 +20,38 @@ name: Publish Package
 # token and no registry credential, so a test-writable script cannot mint a
 # trusted-publishing token.
 #
-# `publish` is the only job with `id-token: write`. It is gated to
-# `refs/tags/v*`, so a `workflow_dispatch` on a branch can only run the
-# unprivileged `verify` dry-run and can never reach `npm publish`. The publish
-# job starts from a fresh checkout of the same commit, downloads the tarball
+# `publish` is the only job with `id-token: write`. The workflow has no
+# `workflow_dispatch` trigger: only a pushed `v*` tag can start it, so a branch
+# or a manual dispatch has no path to the OIDC-bearing job. The publish job
+# starts from a fresh checkout of the same commit, downloads the tarball
 # produced by `verify`, verifies its sha256, and re-packs the clean checkout
-# (`--ignore-scripts`) to prove the artifact still matches the repository. Only
-# then does it invoke `npm publish` on the tarball, which — unlike a directory
-# publish — runs no repository lifecycle scripts either.
+# (`--ignore-scripts`) to prove the artifact still matches the repository.
 #
-# No protected `npm-publish` environment is configured in this repository, so
-# this job intentionally has no `environment:` (adding an unconfigured one would
-# block the release). Create the environment with required reviewers and add
-# `environment: npm-publish` here if that gate is wanted.
+# The privileged job executes no script from the checkout. The tag/version
+# provenance step below is inline `git`/Node rather than
+# `scripts/check-release-tag.mjs`, because a tag can point at a commit whose
+# test-writable scripts were modified. It then invokes `npm publish` on the
+# tarball, which — unlike a directory publish — runs no repository lifecycle
+# scripts either. npm itself runs from a clean temp directory with a temporary
+# `NPM_CONFIG_USERCONFIG` and an explicit `--registry`, so a repository
+# `.npmrc`/`.yarnrc` cannot redirect the registry, inject credentials or change
+# the publish tag.
+#
+# ENVIRONMENT CHECKLIST (deliberately not enabled)
+# ------------------------------------------------
+# This job intentionally has no `environment:`. Do NOT add
+# `environment: npm-publish` unless the npm Trusted Publisher entry above is
+# first bound to that exact environment name. The binding is an npm-side
+# setting: adding the environment here first would leave the trusted publisher
+# unbound and every release would fail. To enable the gate, create the
+# `npm-publish` environment with required reviewers, update the trusted
+# publisher to name it, then add `environment: npm-publish` to `publish` in the
+# same change.
 
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -93,9 +106,19 @@ jobs:
       # Trusted publishing (OIDC) needs npm >= 11.5.1. Prefer the latest npm but
       # fall back to the newest 11.x if the latest requires a newer Node.
       # Both jobs pin the same npm version so `npm pack` is byte-identical.
+      #
+      # Run from a clean temp directory: npm reads `.npmrc` relative to the
+      # working directory, and the consistency guard rejects a committed
+      # `.npmrc`. The empty user config keeps this install independent of any
+      # file in the checkout.
       - name: Ensure recent npm
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npm-userconfig
         run: |
-          npm install -g --ignore-scripts npm@11.21.3
+          : > "$NPM_CONFIG_USERCONFIG"
+          mkdir -p "$RUNNER_TEMP/npm-clean"
+          cd "$RUNNER_TEMP/npm-clean"
+          npm install -g --ignore-scripts --registry=https://registry.npmjs.org npm@11.21.3
           npm --version
           node -e "const v=require('child_process').execSync('npm --version').toString().trim().split('.').map(Number); if(v[0]<11||(v[0]===11&&v[1]<5)){console.error('npm too old for OIDC:',v.join('.'));process.exit(1)}"
 
@@ -110,8 +133,9 @@ jobs:
 
       # Only new tag pushes are guarded; existing tags are never rewritten. A
       # release tag must be an ancestor of origin/main, so a tag on a detached
-      # or sibling commit cannot publish code that main does not contain. A
-      # branch workflow_dispatch skips this step (the publish job is tag-gated).
+      # or sibling commit cannot publish code that main does not contain. This
+      # unprivileged job may run the repository guard; the privileged job
+      # repeats the check inline without executing a checkout script.
       - name: Release tag provenance
         if: startsWith(github.ref, 'refs/tags/')
         run: |
@@ -134,11 +158,20 @@ jobs:
       # Build the exact artifact the privileged job will publish. The tests
       # above can modify the worktree; `publish` re-packs a clean checkout with
       # --ignore-scripts and refuses to publish if the digest differs.
+      #
+      # Pack from a clean temp cwd with an empty user config, mirroring the
+      # privileged job exactly, so `npm pack <checkout>` is the only npm input
+      # from the repository.
       - name: Build the release tarball
         id: release
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npm-pack-userconfig
+          WORKSPACE: ${{ github.workspace }}
         run: |
-          mkdir -p "$RUNNER_TEMP/release"
-          npm pack --json --pack-destination "$RUNNER_TEMP/release" > "$RUNNER_TEMP/pack-release.json"
+          : > "$NPM_CONFIG_USERCONFIG"
+          mkdir -p "$RUNNER_TEMP/npm-pack" "$RUNNER_TEMP/release"
+          cd "$RUNNER_TEMP/npm-pack"
+          npm pack --json --pack-destination "$RUNNER_TEMP/release" "$WORKSPACE" > "$RUNNER_TEMP/pack-release.json"
           node -e '
           const fs = require("fs");
           const path = require("path");
@@ -149,7 +182,7 @@ jobs:
             console.error("npm pack returned an unsafe tarball filename");
             process.exit(1);
           }
-          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const pkg = JSON.parse(fs.readFileSync(path.join(process.env.WORKSPACE, "package.json"), "utf8"));
           if (meta.name !== pkg.name || meta.version !== pkg.version) {
             console.error(`packed ${meta.name}@${meta.version} does not match package.json ${pkg.name}@${pkg.version}`);
             process.exit(1);
@@ -179,8 +212,8 @@ jobs:
   publish:
     name: Publish verified tarball
     needs: verify
-    # Branch/workflow_dispatch runs stop at `verify` (safe dry-run). Only a
-    # pushed release tag can reach the OIDC-token-bearing publish job.
+    # The workflow only runs on a pushed `v*` tag; this repeats the gate at the
+    # job level so a future trigger cannot reach the OIDC-token-bearing job.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -196,15 +229,24 @@ jobs:
           fetch-tags: true
           persist-credentials: false
 
+      # No `registry-url`: it writes a runner-level `.npmrc` that would compete
+      # with the explicit temp user config below. Every npm command passes
+      # `--registry=https://registry.npmjs.org` instead.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
           package-manager-cache: false # never cache in release builds
 
+      # Run npm from a clean temp directory with an empty user config so no
+      # `.npmrc` can reach the install, the pack or the publish.
       - name: Ensure recent npm
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npm-userconfig
         run: |
-          npm install -g --ignore-scripts npm@11.21.3
+          : > "$NPM_CONFIG_USERCONFIG"
+          mkdir -p "$RUNNER_TEMP/npm-clean"
+          cd "$RUNNER_TEMP/npm-clean"
+          npm install -g --ignore-scripts --registry=https://registry.npmjs.org npm@11.21.3
           npm --version
 
       - name: Download the release tarball
@@ -222,9 +264,14 @@ jobs:
         # --ignore-scripts means this privileged job executes no repository
         # lifecycle code. A package that needs a `prepare`/`prepack` step will
         # not match the tested tarball and publishing stops (fail closed).
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npm-pack-userconfig
+          WORKSPACE: ${{ github.workspace }}
         run: |
-          mkdir -p "$RUNNER_TEMP/repack"
-          npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP/repack" > "$RUNNER_TEMP/repack.json"
+          : > "$NPM_CONFIG_USERCONFIG"
+          mkdir -p "$RUNNER_TEMP/npm-repack" "$RUNNER_TEMP/repack"
+          cd "$RUNNER_TEMP/npm-repack"
+          npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP/repack" "$WORKSPACE" > "$RUNNER_TEMP/repack.json"
           node -e '
           const fs = require("fs");
           const path = require("path");
@@ -254,7 +301,7 @@ jobs:
             fail(`tarball.sha256 is unreadable (${err?.message ?? err})`);
           }
           if (recorded !== sha256) fail("tarball.sha256 does not match the downloaded tarball");
-          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const pkg = JSON.parse(fs.readFileSync(path.join(process.env.WORKSPACE, "package.json"), "utf8"));
           if (meta.name !== pkg.name || meta.version !== pkg.version) {
             fail(`artifact ${meta.name}@${meta.version} does not match package.json ${pkg.name}@${pkg.version}`);
           }
@@ -276,17 +323,72 @@ jobs:
           console.log(`verified ${meta.filename} (sha256 ${sha256}) against the clean checkout`);
           '
 
-      # Re-run the guard in the privileged checkout. The tag guard only reads
-      # git refs; it never executes repository test code.
-      - name: Release tag provenance
-        if: startsWith(github.ref, 'refs/tags/')
-        run: node scripts/check-release-tag.mjs
+      # Privileged-job guard, inline on purpose: the OIDC-bearing job must not
+      # execute scripts/check-release-tag.mjs (or any other script) from the
+      # checkout, because the tag can point at a commit whose test-writable
+      # files were modified. The workflow definition itself is loaded from the
+      # tag ref, so CODEOWNERS on `.github/workflows/` and the tag ruleset are
+      # the outer guard; this check is defence in depth. Never rewrite a tag.
+      - name: Release tag provenance and version (inline)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "$tag" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]{0,63}$ ]]; then
+            echo "::error::refusing to publish: invalid release tag name $tag"
+            exit 1
+          fi
+          node -e '
+          const fs = require("fs");
+          const path = require("path");
+          const pkg = JSON.parse(fs.readFileSync(path.join(process.env.GITHUB_WORKSPACE, "package.json"), "utf8"));
+          const expected = `v${pkg.version}`;
+          const actual = process.env.GITHUB_REF_NAME;
+          if (actual !== expected) {
+            console.error(`refusing to publish: tag ${actual} does not match package.json ${expected}`);
+            process.exit(1);
+          }
+          // Privileged copy of the consistency rule: npm applies the tarball's
+          // publishConfig during publish, so a registry/tag/provenance key
+          // could override the explicit flags below.
+          if (pkg.publishConfig !== undefined) {
+            const publishConfig = pkg.publishConfig;
+            if (publishConfig === null || typeof publishConfig !== "object" || Array.isArray(publishConfig)) {
+              console.error("refusing to publish: package.json publishConfig is not an object");
+              process.exit(1);
+            }
+            const forbidden = Object.keys(publishConfig).filter((key) => key !== "access");
+            if (forbidden.length > 0) {
+              console.error(`refusing to publish: publishConfig has forbidden key(s) ${forbidden.join(", ")}; only "access" is allowed`);
+              process.exit(1);
+            }
+          }
+          '
+          git fetch --tags --force origin
+          git fetch --force origin "main:refs/remotes/origin/main"
+          if ! git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" > /dev/null; then
+            echo "::error::refusing to publish: tag ${tag} does not resolve"
+            exit 1
+          fi
+          tag_commit="$(git rev-parse "refs/tags/${tag}^{commit}")"
+          if ! git merge-base --is-ancestor "$tag_commit" "refs/remotes/origin/main"; then
+            echo "::error::refusing to publish: ${tag} (${tag_commit:0:12}) is not an ancestor of origin/main"
+            exit 1
+          fi
+          echo "tag ${tag} (${tag_commit:0:12}) is an ancestor of origin/main"
 
       # `repository.url` in package.json must exactly match this GitHub repo or
       # provenance/OIDC verification fails. npm generates provenance
       # automatically under trusted publishing — no --provenance flag needed.
-      # Publishing a tarball runs no repository lifecycle scripts.
+      # Publishing a tarball runs no repository lifecycle scripts. The temp
+      # cwd and empty user config mean no checkout `.npmrc` is consulted; the
+      # registry and dist-tag are explicit.
       - name: Publish
         env:
           TARBALL: ${{ steps.verify.outputs.tarball_path }}
-        run: npm publish --access public "$TARBALL"
+          NPM_CONFIG_USERCONFIG: ${{ runner.temp }}/npm-publish-userconfig
+        run: |
+          : > "$NPM_CONFIG_USERCONFIG"
+          mkdir -p "$RUNNER_TEMP/npm-publish"
+          cd "$RUNNER_TEMP/npm-publish"
+          npm publish --registry=https://registry.npmjs.org --tag latest --access public "$TARBALL"

@@ -1,0 +1,26 @@
+# Code owners for the release and privilege-boundary surface.
+#
+# GitHub reads this file from the default branch. An entry only takes effect
+# when the owner is a user or an existing team with write access to this
+# repository; an unknown owner makes the rule unenforceable. This file records
+# the review expectation — the branch ruleset must also require code-owner
+# review for it to be enforced.
+#
+# Last matching pattern wins. Keep the privileged paths below owned even if the
+# default owner changes.
+
+# Workflow definitions run with repository privileges: a change here can alter
+# what the OIDC-bearing publish job executes.
+/.github/workflows/ @BillyOutlast
+/.github/CODEOWNERS @BillyOutlast
+
+# Release guards and their self-tests: a weakened guard must not merge
+# unreviewed.
+/scripts/check-release-* @BillyOutlast
+/scripts/test-release-* @BillyOutlast
+
+# Privilege and trust boundaries in the plugin and verifier.
+/plugins/opencode-teamwork/auth.ts @BillyOutlast
+/plugins/opencode-teamwork/tools.ts @BillyOutlast
+/plugins/opencode-teamwork/url-guard.mjs @BillyOutlast
+/lib/verify.mjs @BillyOutlast
