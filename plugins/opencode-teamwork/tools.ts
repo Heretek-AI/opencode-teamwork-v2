@@ -4530,20 +4530,136 @@ type ManifestCheck =
   | { ok: false; failure: AuthFailure }
 
 /**
+ * Control-plane artifacts that only a signed run writes. If the manifest is
+ * missing but one of these still carries an `_auth` envelope, the run was
+ * signed and the baseline was deleted: that is a downgrade, never a legacy run.
+ */
+const SIGNED_CONTROL_ARTIFACT_PATHS = [
+  "verify/final.json",
+  "verify/security-audit.json",
+  "verify/victory.json",
+  "verify/rerun.json",
+  "verify/ci/attestation.json",
+  "document-review/manifest.json",
+  "lemma/manifest.json",
+  "tournament/manifest.json",
+] as const
+/** Per-task signed artifacts (`report-*`, strict `challenge-*` / `audit-*`). */
+const SIGNED_VERIFY_ARTIFACT_NAME = /^(?:report|challenge|audit)-[A-Za-z0-9][A-Za-z0-9._-]*\.json$/
+const SIGNED_CONTROL_ARTIFACT_SCAN_MAX = 512
+
+/** True when a parsed control artifact carries a signed `_auth` envelope. */
+function carriesAuthEnvelope(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false
+  const record = value as Record<string, any>
+  return record._auth !== undefined && record._auth !== null
+}
+
+/** Bounded list of control artifacts whose `_auth` marker proves a signed run. */
+function signedControlArtifactPaths(run: string): string[] {
+  const paths = new Set<string>(SIGNED_CONTROL_ARTIFACT_PATHS)
+  let names: string[] = []
+  try {
+    names = readdirSync(join(run, "verify")).slice(0, SIGNED_CONTROL_ARTIFACT_SCAN_MAX)
+  } catch {}
+  for (const name of names) {
+    if (SIGNED_VERIFY_ARTIFACT_NAME.test(name)) paths.add(`verify/${name}`)
+  }
+  return [...paths]
+}
+
+/**
+ * Classify a run that has no `run.manifest.json`. A run whose signed-run state
+ * survives in `ctx.storage` (the pinned nonce/key id) or in a signed control
+ * artifact is a signed run with its baseline removed: `allowUnsignedLegacy`
+ * must not be able to downgrade it into an unsigned legacy run. Only a run with
+ * no such evidence is a genuine pre-authenticity legacy run.
+ */
+async function signedRunWithoutManifest(
+  run: string,
+  auth?: AuthContext,
+): Promise<{ code: "AUTH_LEGACY" | "AUTH_INVALID"; reason: string } | undefined> {
+  if (auth) {
+    const runId = basename(run)
+    let nonce: string | undefined
+    let keyId: string | undefined
+    try {
+      nonce = await auth.runNonce(runId)
+    } catch {}
+    try {
+      keyId = nonce ? undefined : await auth.runKeyId(runId)
+    } catch {}
+    if (nonce) return { code: "AUTH_LEGACY", reason: "ctx.storage records the signed run nonce" }
+    if (keyId) return { code: "AUTH_LEGACY", reason: `ctx.storage records the signed run key id ${clean(keyId, 96)}` }
+  }
+  for (const relPath of signedControlArtifactPaths(run)) {
+    const res = readRegularJson<any>(run, join(run, relPath))
+    if (!res.ok) continue
+    if (carriesAuthEnvelope(res.data)) {
+      return { code: "AUTH_INVALID", reason: `${relPath} carries a signed _auth envelope` }
+    }
+  }
+  return undefined
+}
+
+/**
  * Read and verify `run.manifest.json`. A present-but-unsigned manifest is an
  * AUTH_INVALID failure (never a legacy run), and a missing index entry fails
  * closed rather than adopting the artifact.
+ *
+ * A missing manifest is only a legacy run when no signed-run state exists. The
+ * path is inspected with `lstat` (only ENOENT is absent), so a deleted or
+ * dangling-symlink manifest cannot be reported as "legacy": a symlink and a
+ * file that vanishes between inspection and read fail AUTH_INVALID.
  */
 async function readRunManifest(run: string, auth?: AuthContext): Promise<ManifestCheck> {
-  if (!existsSync(runManifestFile(run))) return { ok: true, signed: false }
-  const res = readRegularJson<any>(run, runManifestFile(run))
-  if (!res.ok) {
-    if (res.reason === "missing") return { ok: true, signed: false }
+  const manifestFile = runManifestFile(run)
+  let manifestStat
+  try {
+    manifestStat = lstatSync(manifestFile)
+  } catch (err: any) {
+    if (err?.code !== "ENOENT") {
+      return {
+        ok: false,
+        failure: {
+          code: "AUTH_INVALID",
+          message: `run.manifest.json cannot be inspected (${clean(err?.code ?? err?.message, 40)})`,
+        },
+      }
+    }
+    const signed = await signedRunWithoutManifest(run, auth)
+    if (signed) {
+      return {
+        ok: false,
+        failure: {
+          code: signed.code,
+          message: `run.manifest.json is missing but ${signed.reason}; the signed baseline was removed, so this run cannot be treated as unsigned legacy`,
+        },
+      }
+    }
+    return { ok: true, signed: false }
+  }
+  if (manifestStat.isSymbolicLink() || !manifestStat.isFile()) {
     return {
       ok: false,
       failure: {
         code: "AUTH_INVALID",
-        message: `run.manifest.json is ${res.reason === "symlink" ? "a symlink" : "unreadable or malformed"}`,
+        message: "run.manifest.json is a symlink or not a regular file",
+      },
+    }
+  }
+  const res = readRegularJson<any>(run, manifestFile)
+  if (!res.ok) {
+    // The lstat above already established a regular file, so a "missing" here
+    // is a deletion race: fail closed instead of falling back to legacy.
+    return {
+      ok: false,
+      failure: {
+        code: "AUTH_INVALID",
+        message:
+          res.reason === "missing"
+            ? "run.manifest.json disappeared between inspection and read"
+            : `run.manifest.json is ${res.reason === "symlink" ? "a symlink" : "unreadable or malformed"}`,
       },
     }
   }
@@ -5762,8 +5878,10 @@ async function evaluateTrustGate(
   if (manifest.requireWitness === true) {
     // A required witness is checked, not merely counted: when a witness
     // public key is configured the receipt signature must cover this run,
-    // path, digest and nonce. With no public key the receipt stays
-    // `unverified` (detection-only), which is the pre-0.14 behavior.
+    // path, digest and nonce. With no public key the receipt is
+    // `unverified` (detection-only) and the requirement fails closed: a
+    // receipt nobody can check is not evidence, so a run that requires a
+    // witness can never PASS on an unverifiable one.
     const check = auth
       ? await auth.verifyWitnessReceipt(runId, RUN_MANIFEST, {
           digest: manifest._auth?.digest,
@@ -5783,9 +5901,11 @@ async function evaluateTrustGate(
       reasons.push(
         `[${check.failure?.code ?? "AUTH_INVALID"}] the witness receipt for run.manifest.json is not valid: ${check.failure?.message ?? "verification failed"}`,
       )
+    } else if (check.status === "unverified") {
+      reasons.push(
+        "[AUTH_WITNESS_UNVERIFIED] requireWitness is set and a witness receipt exists, but no OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY is configured, so the receipt cannot be verified; configure the verify-only witness key or omit requireWitness",
+      )
     }
-    // `unverified` is accepted only because no witness public key is
-    // configured; final_verify records that label in its evidence.
   }
   return reasons
 }
@@ -6631,8 +6751,15 @@ async function createPlanRun(
     }
   }
   // Benchmark mode is the strictest integrity contract: it refuses to exist
-  // unsigned and it refuses the victory-audit skip.
-  if (integrityMode === "benchmark" && allowUnsignedLegacy) {
+  // unsigned and it refuses the victory-audit skip. The refusal is repeated on
+  // every tool that accepts `allowUnsignedLegacy` (plan/next/final_verify), not
+  // only at creation: a run whose persisted contract is benchmark cannot be
+  // downgraded by a later bypass.
+  const persistedIntegrityModeForBypass =
+    normalizeIntegrityMode(persistedPlan?.integrityMode) ??
+    normalizeIntegrityMode(persistedState?.integrityMode) ??
+    readIntegrityMode(run).mode
+  if (allowUnsignedLegacy && (integrityMode === "benchmark" || persistedIntegrityModeForBypass === "benchmark")) {
     return {
       ok: false,
       content:
@@ -9625,6 +9752,21 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         }
         const signedRun = manifestCheck.signed
         const allowUnsignedLegacy = input?.allowUnsignedLegacy === true
+        // Benchmark is unsigned-hostile at every stage, not only at plan time.
+        if (
+          allowUnsignedLegacy &&
+          (readIntegrityMode(run).mode === "benchmark" ||
+            normalizeIntegrityMode(plan?.integrityMode) === "benchmark" ||
+            normalizeIntegrityMode(state?.integrityMode) === "benchmark")
+        ) {
+          return {
+            status: "AUTH_LEGACY",
+            auth: "AUTH_LEGACY",
+            refused: "AUTH_LEGACY",
+            content:
+              "refused: [AUTH_LEGACY] benchmark mode cannot run unsigned; allowUnsignedLegacy is not permitted on a benchmark run.",
+          }
+        }
 
         // 0.12.0: contradictions are checked before any "ready for worker" or
         // completion path, so a failing task cannot sit under a CONFIRMED audit.
@@ -12729,6 +12871,24 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             }
           }
           const allowUnsignedLegacy = input?.allowUnsignedLegacy === true
+          // Benchmark is unsigned-hostile at every stage, not only at plan time.
+          if (
+            allowUnsignedLegacy &&
+            (readIntegrityMode(run).mode === "benchmark" ||
+              normalizeIntegrityMode(plan?.integrityMode) === "benchmark" ||
+              normalizeIntegrityMode(state?.integrityMode) === "benchmark")
+          ) {
+            return {
+              status: "FAIL",
+              auth: "AUTH_LEGACY",
+              refused: "AUTH_LEGACY",
+              content:
+                "FINAL VERIFICATION FAILED: [AUTH_LEGACY] benchmark mode cannot run unsigned; allowUnsignedLegacy is not permitted on a benchmark run. Final merge is BLOCKED.",
+              reasons: [
+                "[AUTH_LEGACY] benchmark mode cannot run unsigned; allowUnsignedLegacy is not permitted on a benchmark run",
+              ],
+            }
+          }
           const signedRun = manifestCheck.signed
           const legacyUnsignedBlock = !signedRun && !allowUnsignedLegacy
           if (!signedRun && allowUnsignedLegacy) {
@@ -13570,12 +13730,14 @@ export async function registerTeamworkTools(ctx: any, root: string) {
                 }
             const required = manifestCheck.manifest.requireWitness === true
             if (required || (witnessCheck.status !== "missing" && witnessCheck.status !== "unknown")) {
+              const failureCode =
+                witnessCheck.failure?.code ?? (required && witnessCheck.status === "unverified" ? "AUTH_WITNESS_UNVERIFIED" : undefined)
               witnessEvidence = {
                 required,
                 status: witnessCheck.status,
                 ...(witnessCheck.keyId ? { keyId: witnessCheck.keyId } : {}),
                 ...(witnessCheck.at ? { at: witnessCheck.at } : {}),
-                ...(witnessCheck.failure ? { failure: witnessCheck.failure.code } : {}),
+                ...(failureCode ? { failure: failureCode } : {}),
               }
             }
           }
