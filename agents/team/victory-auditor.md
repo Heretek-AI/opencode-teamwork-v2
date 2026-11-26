@@ -57,7 +57,13 @@ denied). `webfetch` is denied; work from the local artifacts and the repository.
    evidence must be non-empty (path, command, observed output, or artifact).
 5. **Check scope fidelity.** Flag work that is missing, out of scope, or that
    silently changes the requested behavior. Integrity-mode violations reported
-   by the security auditor are binding context.
+   by the security auditor are binding context. On `document-review` PDF runs
+   where `document-review/manifest.json` reports `pageImageStatus: "rendered"`,
+   inspect the relevant `document-review/page_images/page-<N>.png` artifacts
+   directly and record a run-level visual verdict via
+   `teamwork_document_visual_audit({ sessionId, scope: "run", verdict, summary, inspectedImages, findings })`
+   (or `NOT_EVALUATED` with `inspectedImages: []` when page images were not
+   rendered on a text-only host).
 6. **Record the verdict** with `teamwork_victory_audit`:
    - `verdict: "VICTORY CONFIRMED"` only when every requirement is met and the
      delivered work matches the original request.

@@ -12,6 +12,7 @@ const EXPECTED_TOOLS = [
   "teamwork_cost",
   "teamwork_document_record",
   "teamwork_document_triage",
+  "teamwork_document_visual_audit",
   "teamwork_evidence",
   "teamwork_final_verify",
   "teamwork_handoff",
@@ -57,7 +58,7 @@ function toolTokens(text: string): string[] {
   return tokens
 }
 
-test("A2 catalog: exactly 26 effective teamwork_* ids with namespace + codemode + object input", async () => {
+test("A2 catalog: exactly 27 effective teamwork_* ids with namespace + codemode + object input", async () => {
   const project = createProject("a2-catalog")
   const loaded = await loadHost(project, { mode: "memory" })
   try {

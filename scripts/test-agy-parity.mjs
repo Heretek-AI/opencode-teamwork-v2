@@ -2018,6 +2018,263 @@ console.log("leap 1.0.0"); process.exit(0);
     }),
 })
 
+addCase({
+  id: "A7-T1-07",
+  milestone: "M4",
+  feature: "A7",
+  tier: "T1",
+  title: "Issue #51: readable multi-page PDF produces bounded page_images + manifest and visual audit verdict",
+  fn: () =>
+    withSandbox("a7-t1-07", async (dir) => {
+      const binDir = join(dir, "bin")
+      // Minimal valid 1x1 PNG bytes (base64)
+      const tinyPngB64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+      const pyStub = `
+const args = process.argv.slice(2);
+const dpi = Number(args[2] || 200);
+const maxPages = Number(args[3] || 32);
+const allPages = [
+  { page: 1, width: 1700, height: 2200, pngBase64: ${JSON.stringify(tinyPngB64)} },
+  { page: 2, width: 1700, height: 2200, pngBase64: ${JSON.stringify(tinyPngB64)} },
+  { page: 3, width: 1700, height: 2200, pngBase64: ${JSON.stringify(tinyPngB64)} },
+];
+const slice = allPages.slice(0, maxPages);
+console.log(JSON.stringify({
+  ok: true,
+  dpi,
+  pageCount: allPages.length,
+  truncated: allPages.length > slice.length,
+  pages: slice,
+}));
+process.exit(0);
+`
+      writeStubBin(binDir, "python3", pyStub)
+      const pdfPath = join(dir, "paper.pdf")
+      writeFileSync(pdfPath, makePdfBuffer("Section 1 Introduction. Theorem 1 holds with Figure 1."))
+      await withEnv({ PATH: binDir }, async () => {
+        const h = await makeHarness(dir)
+        const runId = "20261126-120000-vis1"
+        const triage = await h.tools.teamwork_document_triage.execute(
+          {
+            sessionId: runId,
+            document: { path: pdfPath, format: "pdf" },
+            skipInterview: true,
+            renderDpi: 150,
+            maxRenderPages: 2,
+          },
+          { sessionID: "ses_sentinel" },
+        )
+        assert.ok(!String(triage.content).startsWith("refused:"), triage.content)
+        assert.equal(triage.pageImageStatus, "rendered")
+        assert.equal(triage.pageImageCount, 2)
+
+        const runDir = join(dir, ".opencode", "teamwork", runId)
+        const pageManifest = JSON.parse(
+          readFileSync(join(runDir, "document-review", "page_images", "manifest.json"), "utf8"),
+        )
+        assert.equal(pageManifest.dpi, 150)
+        assert.equal(pageManifest.pageCount, 3)
+        assert.equal(pageManifest.renderedPages, 2)
+        assert.equal(pageManifest.truncated, true)
+        assert.equal(pageManifest.pages.length, 2)
+        assert.equal(pageManifest.pages[0].file, "page-1.png")
+        assert.equal(pageManifest.pages[1].file, "page-2.png")
+        assert.equal(existsSync(join(runDir, "document-review", "page_images", "page-1.png")), true)
+        assert.equal(existsSync(join(runDir, "document-review", "page_images", "page-2.png")), true)
+
+        const textMap = readFileSync(join(runDir, "document-review", "DOCUMENT_TEXT_MAP.md"), "utf8")
+        assert.match(textMap, /page-1\.png/)
+        assert.match(textMap, /page-2\.png/)
+
+        // Segment reviewer records a segment-scoped visual audit citing page-1.png with digest
+        const segAudit = await h.tools.teamwork_document_visual_audit.execute(
+          {
+            sessionId: runId,
+            scope: "segment",
+            segmentId: "seg-01",
+            verdict: "PASS",
+            summary: "Verified Figure 1 on page 1 matches text claims.",
+            inspectedImages: [
+              { file: "page-1.png", sha256: pageManifest.pages[0].sha256, notes: "Checked Figure 1 axes" },
+            ],
+          },
+          { sessionID: "ses_seg" },
+        )
+        assert.equal(segAudit.verdict, "PASS", segAudit.content)
+        assert.equal(
+          existsSync(join(runDir, "document-review", "segments", "seg-01", "visual-audit.json")),
+          true,
+        )
+
+        // Victory auditor records a run-scoped visual audit citing both rendered pages
+        const runAudit = await h.tools.teamwork_document_visual_audit.execute(
+          {
+            sessionId: runId,
+            scope: "run",
+            verdict: "PASS",
+            summary: "Independently verified rendered PDF pages 1-2.",
+            inspectedImages: ["page-1.png", "page-2.png"],
+          },
+          { sessionID: "ses_victory" },
+        )
+        assert.equal(runAudit.verdict, "PASS", runAudit.content)
+        assert.equal(runAudit.inspectedImages.length, 2)
+        assert.equal(existsSync(join(runDir, "document-review", "visual-audit.json")), true)
+
+        // Cannot claim NOT_EVALUATED when page images were rendered
+        const badSkip = await h.tools.teamwork_document_visual_audit.execute(
+          {
+            sessionId: runId,
+            scope: "run",
+            verdict: "NOT_EVALUATED",
+            summary: "Attempting to skip visual audit",
+            inspectedImages: [],
+          },
+          { sessionID: "ses_victory" },
+        )
+        assert.match(String(badSkip.content), /^refused:/)
+      })
+    }),
+})
+
+addCase({
+  id: "A7-T2-06",
+  milestone: "M4",
+  feature: "A7",
+  tier: "T2",
+  title: "Issue #51: visual audit refuses traversal, unlisted/duplicate images, bad sha256, symlinks, and unauthorized callers",
+  fn: () =>
+    withSandbox("a7-t2-06", async (dir) => {
+      const binDir = join(dir, "bin")
+      const tinyPngB64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+      writeStubBin(
+        binDir,
+        "python3",
+        `console.log(JSON.stringify({ ok: true, dpi: 200, pageCount: 1, truncated: false, pages: [{ page: 1, width: 100, height: 100, pngBase64: ${JSON.stringify(tinyPngB64)} }] })); process.exit(0);`,
+      )
+      const pdfPath = join(dir, "single.pdf")
+      writeFileSync(pdfPath, makePdfBuffer("Readable PDF content for negative visual audit checks."))
+      await withEnv({ PATH: binDir }, async () => {
+        const h = await makeHarness(dir)
+        const runId = "20261126-120001-vis2"
+        const triage = await h.tools.teamwork_document_triage.execute(
+          { sessionId: runId, document: { path: pdfPath, format: "pdf" }, skipInterview: true },
+          { sessionID: "ses_sentinel" },
+        )
+        assert.equal(triage.pageImageStatus, "rendered", triage.content)
+
+        // Unauthorized role (team/worker)
+        const unauth = await h.tools.teamwork_document_visual_audit.execute(
+          { sessionId: runId, verdict: "PASS", summary: "worker attempt", inspectedImages: ["page-1.png"] },
+          { sessionID: "ses_worker" },
+        )
+        assert.match(String(unauth.content), /refused|denied|not authorized/i)
+
+        // Traversal filename
+        const trav = await h.tools.teamwork_document_visual_audit.execute(
+          { sessionId: runId, verdict: "PASS", summary: "trav", inspectedImages: ["../manifest.json"] },
+          { sessionID: "ses_victory" },
+        )
+        assert.match(String(trav.content), /^refused:/)
+
+        // Unlisted image
+        const unlisted = await h.tools.teamwork_document_visual_audit.execute(
+          { sessionId: runId, verdict: "PASS", summary: "unlisted", inspectedImages: ["page-99.png"] },
+          { sessionID: "ses_victory" },
+        )
+        assert.match(String(unlisted.content), /^refused:/)
+
+        // Duplicate image
+        const dup = await h.tools.teamwork_document_visual_audit.execute(
+          { sessionId: runId, verdict: "PASS", summary: "dup", inspectedImages: ["page-1.png", "page-1.png"] },
+          { sessionID: "ses_victory" },
+        )
+        assert.match(String(dup.content), /^refused:/)
+
+        // Mismatched sha256
+        const badSha = await h.tools.teamwork_document_visual_audit.execute(
+          {
+            sessionId: runId,
+            verdict: "PASS",
+            summary: "bad sha",
+            inspectedImages: [{ file: "page-1.png", sha256: "0".repeat(64) }],
+          },
+          { sessionID: "ses_victory" },
+        )
+        assert.match(String(badSha.content), /^refused:.*sha256/)
+
+        // Planted symlink replacing page-1.png
+        const imgPath = join(dir, ".opencode", "teamwork", runId, "document-review", "page_images", "page-1.png")
+        const outside = join(dir, "outside.png")
+        writeFileSync(outside, Buffer.from(tinyPngB64, "base64"))
+        rmSync(imgPath)
+        symlinkSync(outside, imgPath)
+        const symRes = await h.tools.teamwork_document_visual_audit.execute(
+          { sessionId: runId, verdict: "PASS", summary: "symlink check", inspectedImages: ["page-1.png"] },
+          { sessionID: "ses_victory" },
+        )
+        assert.match(String(symRes.content), /^refused:/)
+      })
+    }),
+})
+
+addCase({
+  id: "A7-T2-07",
+  milestone: "M4",
+  feature: "A7",
+  tier: "T2",
+  title: "Issue #51: missing pypdfium2/Pillow keeps text-only fallback + NOT_EVALUATED and refuses image-only PDF pre-mkdir",
+  fn: () =>
+    withSandbox("a7-t2-07", async (dir) => {
+      const binDir = join(dir, "bin")
+      writeStubBin(
+        binDir,
+        "python3",
+        `console.log(JSON.stringify({ ok: false, status: "MISSING", detail: "pypdfium2/Pillow import failed: No module named pypdfium2" })); process.exit(0);`,
+      )
+      const readablePdf = join(dir, "readable.pdf")
+      writeFileSync(readablePdf, makePdfBuffer("Readable text PDF without python renderer."))
+      const imageOnlyPdf = join(dir, "scanned.pdf")
+      writeFileSync(imageOnlyPdf, Buffer.from("%PDF-1.4\n1 0 obj<<>>endobj\n%%EOF\n", "latin1"))
+
+      await withEnv({ PATH: binDir }, async () => {
+        const h = await makeHarness(dir)
+        // 1) Readable PDF succeeds with text-only fallback and accepts NOT_EVALUATED
+        const runId = "20261126-120002-vis3"
+        const triage = await h.tools.teamwork_document_triage.execute(
+          { sessionId: runId, document: { path: readablePdf, format: "pdf" }, skipInterview: true },
+          { sessionID: "ses_sentinel" },
+        )
+        assert.ok(!String(triage.content).startsWith("refused:"), triage.content)
+        assert.equal(triage.pageImageStatus, "unavailable_missing_deps")
+
+        const notEval = await h.tools.teamwork_document_visual_audit.execute(
+          {
+            sessionId: runId,
+            scope: "run",
+            verdict: "NOT_EVALUATED",
+            summary: "Host lacks pypdfium2/Pillow; text-only review completed.",
+            inspectedImages: [],
+          },
+          { sessionID: "ses_victory" },
+        )
+        assert.equal(notEval.verdict, "NOT_EVALUATED", notEval.content)
+
+        // 2) Image-only PDF still refuses pre-mkdir with PREREQUISITES.md (MISSING)
+        const refusedRunId = "20261126-120003-vis4"
+        const refused = await h.tools.teamwork_document_triage.execute(
+          { sessionId: refusedRunId, document: { path: imageOnlyPdf, format: "pdf" }, skipInterview: true },
+          { sessionID: "ses_sentinel" },
+        )
+        assert.match(String(refused.content), /^refused: MISSING/)
+        assert.equal(existsSync(join(dir, ".opencode", "teamwork", refusedRunId)), false)
+        assert.equal(existsSync(join(dir, "PREREQUISITES.md")), true)
+      })
+    }),
+})
+
 // --- A8: Victory Auditor 3-phase report, terminal-state discipline, worker.md:87 ---
 addCase({
   id: "A8-T1-01",
@@ -2112,12 +2369,12 @@ addCase({
   milestone: "M3",
   feature: "A9",
   tier: "T1",
-  title: "plugin.setup(ctx) registers 26 tools and 7 commands when OPENCODE_TEAMWORK_DISABLED is unset",
+  title: "plugin.setup(ctx) registers 27 tools and 7 commands when OPENCODE_TEAMWORK_DISABLED is unset",
   fn: () =>
     withSandbox("a9-t1-02", async (dir) => {
       await withEnv({ OPENCODE_TEAMWORK_DISABLED: undefined }, async () => {
         const h = await makeHarness(dir, { viaSetup: true })
-        assert.equal(Object.keys(h.tools).length, 26)
+        assert.equal(Object.keys(h.tools).length, 27)
         assert.equal(Object.keys(h.commands).length, 7)
         assert.equal(typeof h.permissionHooks.evaluate, "function")
       })
@@ -3485,7 +3742,7 @@ addCase({
       for (const val of ["0", "false"]) {
         await withEnv({ OPENCODE_TEAMWORK_DISABLED: val }, async () => {
           const h = await makeHarness(dir, { viaSetup: true })
-          assert.equal(Object.keys(h.tools).length, 26, `val=${val} should register 26 tools`)
+          assert.equal(Object.keys(h.tools).length, 27, `val=${val} should register 27 tools`)
           assert.equal(Object.keys(h.commands).length, 7, `val=${val} should register 7 commands`)
         })
       }

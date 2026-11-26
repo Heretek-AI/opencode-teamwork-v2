@@ -571,6 +571,27 @@ resolve the peer.
 
 ---
 
+## 8.1 Per-dispatch model override decision (Issue #52)
+
+**Decision:** intentional host/design difference — do **not** add a per-dispatch
+`Model` override to the plugin contract on OpenCode 2.4.1.
+
+- **Observed difference:** `agy` (`1.5.17`/`1.5.18`) exposes a per-dispatch
+  `Model` parameter on `invoke_subagent` alongside a default team tier.
+- **OpenCode 2.4.1 contract:** OpenCode binds models to agents through agent
+  frontmatter (`agents/team/*.md`) and install-time configuration
+  (`~/.config/opencode/teamwork.json`), and exposes a process-level
+  `OPENCODE_TEAMWORK_DISABLED` toggle. The OpenCode 2.4.1 plugin API
+  (`ctx.session`, `ctx.agent`, `ctx.model.default`) does not provide a
+  per-subagent-dispatch model override parameter.
+- **Supported controls:** operators configure per-role models at install time
+  via `opencode-teamwork init` / `~/.config/opencode/teamwork.json` (or by
+  editing the installed `team/*.md` frontmatter). Parity matrix feature 2 is
+  classified as an intentional host/design difference rather than a plugin
+  defect.
+
+---
+
 ## 9. What remains unverified
 
 - The audit in §1–§3 was a source read of 2.4.1, not an execution. Statements

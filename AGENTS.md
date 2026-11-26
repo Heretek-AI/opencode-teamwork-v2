@@ -5,7 +5,7 @@ Instructions for coding agents working in this repository.
 ## What this is
 
 `@heretek-ai/opencode-teamwork-v2` is a zero-runtime-dependency OpenCode V2
-plugin: 26 `teamwork_*` engine tools, 7 slash commands, and 15 agent markdown
+plugin: 27 `teamwork_*` engine tools, 7 slash commands, and 15 agent markdown
 files. The shipped package must keep working with `dependencies: {}`.
 
 - Plugin entry: `plugins/opencode-teamwork/index.ts` (`{ id, setup }`).

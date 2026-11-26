@@ -80,7 +80,7 @@ jobs:
           skip="$(grep -E '^[[:space:]]+[0-9]+ skip$' "$log" | tail -n 1 | awk '{print $1}')"
           fail="$(grep -E '^[[:space:]]+[0-9]+ fail$' "$log" | tail -n 1 | awk '{print $1}')"
           echo "runtime summary: pass=${pass:-?} skip=${skip:-?} fail=${fail:-?}"
-          test "$pass" = "118" || { echo "::error::expected 118 passing runtime specs, got ${pass:-none}"; exit 1; }
+          test "$pass" = "119" || { echo "::error::expected 119 passing runtime specs, got ${pass:-none}"; exit 1; }
           test "$skip" = "1" || { echo "::error::expected exactly 1 skip (L4 live), got ${skip:-none}"; exit 1; }
           test "$fail" = "0" || { echo "::error::runtime specs failed"; exit 1; }
           if grep -q '2 skip' "$log"; then
