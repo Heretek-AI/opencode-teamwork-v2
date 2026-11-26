@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.4] - 2026-11-26
+
+### Changed
+
+- SonarQube cleanup: no change to verifier, trust, or release behaviour.
+  - `signedRunStorageMarker` isolates the durable-storage probe from
+    `signedRunWithoutManifest`, bringing both helpers under the cognitive
+    complexity limit.
+  - The manifest read failure message and the `publishConfig` diagnostic are
+    explicit branches instead of nested ternaries.
+  - The privileged tag-check here-doc uses string concatenation instead of
+    template literals, so GitHub Actions static analysis does not read the
+    backticks as command substitution.
+  - The T56 command fixture uses `String.raw` instead of an escaped backslash.
+
 ## [0.19.3] - 2026-11-26
 
 ### Security
