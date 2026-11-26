@@ -53,14 +53,13 @@ git push --follow-tags
 
 | Job | Trigger | Permissions | What it does |
 | --- | --- | --- | --- |
-| `verify` | tag push or `workflow_dispatch` | `contents: read` | release consistency, `npm test`, L0 parity, packaging guard, tag provenance, T4 |
+| `verify` | tag push only | `contents: read` | release consistency, `npm test`, L0 parity, packaging guard, tag provenance, T4 |
 | `publish` | tag-only, `needs: verify` | `contents: read`, `id-token: write` | downloads the verified tarball, checks its sha256 and that a fresh `npm pack --ignore-scripts` of the same commit is byte-identical, then `npm publish` |
 
 The branch/tag boundary is structural:
 
-- `publish` has `if: startsWith(github.ref, 'refs/tags/v')`. A
-  `workflow_dispatch` run can reach only `verify`; it has no route to the
-  OIDC-bearing `publish` job, and a skipped job receives no token.
+- `publish.yml` has no `workflow_dispatch`; only a pushed `v*` tag can start it.
+  A branch or manual dispatch has no route to the OIDC-bearing `publish` job.
 - `npm publish` is the only publish command in the repository's workflows and
   lives only in the `publish` job. `verify` has no registry credential.
 - The privileged job runs no repository script and never runs repository test
@@ -75,11 +74,12 @@ The branch/tag boundary is structural:
   whose commit is not on `origin/main`; the tag-tip rule in section 1 is
   stricter and remains a release-manager requirement.
 
-To dry-run a release without publishing: open a pull request (CI runs every
-gate), or dispatch `publish.yml` on a branch (only `verify` runs). There is no
-separate `release-dry-run.yml`: `ci.yml` already runs parity, T4, the packaging
-guard and release consistency on every PR and push, so a second workflow would
-only duplicate those jobs.
+To dry-run a release without publishing, open a pull request and use
+`.github/workflows/release-dry-run.yml` (`workflow_dispatch` or
+`pull_request`). It has `contents: read`, no `id-token`, no secrets and no
+publish command; it runs release consistency, `npm test`, L0 parity, the
+packaging guard and T4. It is a rehearsal, not a required check; `ci.yml`
+continues to run the required gates on every PR/push.
 
 ### 2.1 Post-publish order
 
