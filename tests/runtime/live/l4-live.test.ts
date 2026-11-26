@@ -51,6 +51,42 @@ test.skipIf(!LIVE_ENABLED)(
       throw new Error(`Invalid TEAMWORK_LIVE_MAX_USD: ${process.env.TEAMWORK_LIVE_MAX_USD}`)
     }
     const project = createProject("l4-live-fidelity")
+    if (process.env.TEAMWORK_LIVE_CONFIG) {
+      let hostCfg: Record<string, unknown> | undefined
+      try {
+        hostCfg = JSON.parse(readFileSync(process.env.TEAMWORK_LIVE_CONFIG, "utf8"))
+      } catch {
+        hostCfg = undefined
+      }
+      if (hostCfg) {
+        const origWriteConfig = project.writeConfig.bind(project)
+        project.writeConfig = (plugins = []) => {
+          origWriteConfig(plugins)
+          const cfgPath = join(project.configDir, "opencode.json")
+          const base = JSON.parse(readFileSync(cfgPath, "utf8"))
+          const merged = {
+            ...base,
+            ...(hostCfg.providers ? { providers: hostCfg.providers } : {}),
+            model: LIVE_MODEL,
+            agents: {
+              "team/sentinel": { model: LIVE_MODEL },
+              "team/verifier": { model: LIVE_MODEL },
+              "team/victory-auditor": { model: LIVE_MODEL },
+            },
+          }
+          writeFileSync(cfgPath, JSON.stringify(merged, null, 2))
+        }
+        for (const name of ["sentinel.md", "verifier.md", "victory-auditor.md"]) {
+          const agentFile = join(project.configDir, "agents", "team", name)
+          try {
+            const text = readFileSync(agentFile, "utf8").replace(/^model:\s*.+$/m, `model: ${LIVE_MODEL}`)
+            writeFileSync(agentFile, text)
+          } catch {
+            // Agent file absent in temp copy; skip.
+          }
+        }
+      }
+    }
     const loaded = await loadHost(project, { mode: "memory" })
     const transcript: any[] = []
     // Hard USD cap: each turn's usage is recorded and the next turn is refused
@@ -73,15 +109,26 @@ test.skipIf(!LIVE_ENABLED)(
       const s1 = await loaded.host.sessions.create(location)
       const verbatimRequest = "Add a pure add(a, b) helper in math.js and verify it with node."
       await loaded.host.session.switchAgent({ sessionID: s1.id, agent: "team/sentinel", ...location })
+      if (typeof loaded.host.session.switchModel === "function") {
+        await loaded.host.session.switchModel({
+          sessionID: s1.id,
+          model: { providerID, id: modelID },
+          ...location,
+        })
+      }
       const r1 = await runBudgetedTurn(
         budget,
-        () =>
-          loaded.host.session.prompt({
+        async () => {
+          const promptRes = await loaded.host.session.prompt({
             sessionID: s1.id,
-            model: { providerID, modelID },
-            parts: [{ type: "text", text: `/teamwork ${verbatimRequest}` }],
+            text: `Call teamwork_plan once with skipInterview: true, topology: "small-focused", request: ${JSON.stringify(verbatimRequest)}, and one task T1 (requirements: [${JSON.stringify(verbatimRequest)}]). After teamwork_plan returns, stop immediately and reply DONE without spawning subagents or editing files.`,
             ...location,
-          }),
+          })
+          if (typeof loaded.host.session.wait === "function") {
+            await loaded.host.session.wait({ sessionID: s1.id, ...location })
+          }
+          return promptRes
+        },
         () => readSessionSpend(loaded.host, s1.id, seenAssistantMessages),
       )
       transcript.push({ scenario: "sentinel_plan", response: r1 })

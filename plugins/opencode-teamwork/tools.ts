@@ -4502,6 +4502,46 @@ function normalizeVisualFindings(raw: unknown): Array<{ id: string; severity?: s
   })
 }
 
+function evaluateDocumentVisualAuditGate(
+  run: string,
+  docManifest: any,
+): { ok: boolean; reasons: string[] } {
+  if (docManifest?.format !== "pdf" || docManifest?.pageImageStatus !== "rendered") {
+    return { ok: true, reasons: [] }
+  }
+  const reasons: string[] = []
+  const docDir = join(run, "document-review")
+  const visualRes = readRegularJson<any>(run, join(docDir, "visual-audit.json"))
+  if (!visualRes.ok) {
+    const label = visualRes.reason === "symlink" ? "is a symlink" : "is missing or unreadable"
+    reasons.push(`document-review/visual-audit.json ${label} (required for rendered PDF runs)`)
+    return { ok: false, reasons }
+  }
+  const audit = visualRes.data
+  if (audit?.verdict !== "PASS") {
+    reasons.push(`document-review/visual-audit.json verdict is ${clean(audit?.verdict, 32)} (expected PASS)`)
+  }
+  const inspected = Array.isArray(audit?.inspectedImages) ? audit.inspectedImages : []
+  if (inspected.length === 0) {
+    reasons.push("document-review/visual-audit.json cites no inspectedImages")
+  }
+  const pageManifestRes = readRegularJson<any>(run, join(docDir, "page_images", "manifest.json"))
+  if (!pageManifestRes.ok) {
+    reasons.push("document-review/page_images/manifest.json missing or unreadable")
+    return { ok: false, reasons }
+  }
+  const pageIndex = buildManifestPageIndex(pageManifestRes.data?.pages)
+  for (const item of inspected) {
+    const file = typeof item?.file === "string" ? item.file : ""
+    const sha = typeof item?.sha256 === "string" ? item.sha256.toLowerCase() : ""
+    const expected = pageIndex.get(file)
+    if (!expected || expected.sha256.toLowerCase() !== sha) {
+      reasons.push(`document-review/visual-audit.json image "${clean(file, 64)}" does not match page_images/manifest.json`)
+    }
+  }
+  return { ok: reasons.length === 0, reasons }
+}
+
 function readRegularJson<T>(run: string, targetFile: string): { ok: true; data: T } | { ok: false; reason: "missing" | "symlink" | "invalid" } {
   const res = readBoundedRunFile(run, targetFile, MAX_RUN_FILE_BYTES)
   if (res.status === "absent") return { ok: false, reason: "missing" }
@@ -13699,7 +13739,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           }
 
           let documentReviewEvidence:
-            | { checked: boolean; segmentReportsComplete: boolean; finalReportPresent: boolean }
+            | { checked: boolean; segmentReportsComplete: boolean; finalReportPresent: boolean; visualAuditOk?: boolean }
             | undefined
           if (plan?.topology === "document-review") {
             const manifestPath = join(run, "document-review", "manifest.json")
@@ -13778,10 +13818,14 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               } else if (requireSigned) {
                 reasons.push(routeTextEvidenceAuthReason("DOCUMENT_REVIEW_EVIDENCE_UNSIGNED", "DOCUMENT_REVIEW_REPORT.md"))
               }
+              const visualGate = evaluateDocumentVisualAuditGate(run, docManifest)
+              for (const vr of visualGate.reasons) reasons.push(vr)
+              const visualApplicable = docManifest?.format === "pdf" && docManifest?.pageImageStatus === "rendered"
               documentReviewEvidence = {
                 checked: true,
                 segmentReportsComplete: allUnitReportsOk,
                 finalReportPresent,
+                ...(visualApplicable ? { visualAuditOk: visualGate.ok } : {}),
               }
             }
           }
