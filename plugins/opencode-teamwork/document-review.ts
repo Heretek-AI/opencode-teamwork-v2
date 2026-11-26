@@ -38,6 +38,18 @@ const URL_FETCH_TIMEOUT_MS = 3000
 const MAX_PDF_INFLATE_BYTES = 4 * 1024 * 1024
 
 export const SEGMENT_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/
+const PAGE_IMAGE_NAME = /^page-[1-9][0-9]{0,3}\.png$/
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+const DEFAULT_PDF_RENDER_DPI = 200
+const MIN_PDF_RENDER_DPI = 72
+const MAX_PDF_RENDER_DPI = 200
+const MAX_PDF_RENDER_PAGES = 32
+const MAX_PDF_PAGE_PNG_BYTES = 4 * 1024 * 1024
+const MAX_PDF_TOTAL_PNG_BYTES = 32 * 1024 * 1024
+
+export function isSafePageImageName(name: unknown): name is string {
+  return typeof name === "string" && PAGE_IMAGE_NAME.test(name)
+}
 
 const DOC_EXT_RE = /\.(?:md|markdown|pdf|tex|txt|rst|html?|adoc)$/i
 const URL_TOKEN_RE = /https?:\/\/[^\s)>\]}"']+/gi
@@ -1754,6 +1766,217 @@ export function ingestPdfWithPython(
 
 function cleanPdfDetail(value: unknown): string {
   return String(value ?? "").replace(/[\x00-\x1f\x7f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 500)
+}
+
+// Constant stdin-fed script for bounded PDF page-image rendering (Issue #51).
+// Python never writes to the filesystem; Node validates PNG headers, byte caps,
+// and digests, then writes each image through pinned-fd run containment.
+const PYTHON_PDF_RENDER_SCRIPT = [
+  "import sys, io, json, base64",
+  "try:",
+  "    import pypdfium2 as pdfium",
+  "    from PIL import Image  # noqa: F401",
+  "except Exception as exc:",
+  '    print(json.dumps({"ok": False, "status": "MISSING", "detail": "pypdfium2/Pillow import failed: %s" % (exc,)}))',
+  "    raise SystemExit(0)",
+  "dpi = int(sys.argv[1])",
+  "max_pages = int(sys.argv[2])",
+  "max_page_bytes = int(sys.argv[3])",
+  "max_total_bytes = int(sys.argv[4])",
+  "try:",
+  "    payload = sys.stdin.buffer.read()",
+  "    document = pdfium.PdfDocument(payload)",
+  "except Exception as exc:",
+  '    print(json.dumps({"ok": False, "status": "OUTAGE", "detail": "PDF open failed: %s" % (exc,)}))',
+  "    raise SystemExit(0)",
+  "page_count = len(document)",
+  "limit = min(page_count, max_pages)",
+  "truncated = page_count > limit",
+  "total_bytes = 0",
+  "scale = dpi / 72.0",
+  "pages = []",
+  "for index in range(limit):",
+  "    try:",
+  "        page = document[index]",
+  "        pil_img = page.render(scale=scale).to_pil()",
+  "        out = io.BytesIO()",
+  '        pil_img.save(out, format="PNG")',
+  "        raw = out.getvalue()",
+  "    except Exception as exc:",
+  '        print(json.dumps({"ok": False, "status": "OUTAGE", "detail": "PDF page %d render failed: %s" % (index + 1, exc)}))',
+  "        raise SystemExit(0)",
+  "    if len(raw) > max_page_bytes or total_bytes + len(raw) > max_total_bytes:",
+  "        truncated = True",
+  "        break",
+  "    total_bytes += len(raw)",
+  "    pages.append({",
+  '        "page": index + 1,',
+  '        "width": int(pil_img.width),',
+  '        "height": int(pil_img.height),',
+  '        "pngBase64": base64.b64encode(raw).decode("ascii"),',
+  "    })",
+  'print(json.dumps({"ok": True, "dpi": dpi, "pageCount": page_count, "truncated": truncated, "pages": pages}))',
+].join("\n")
+
+export interface RenderedPdfPage {
+  page: number
+  file: string
+  width: number
+  height: number
+  bytes: number
+  sha256: string
+  png: Buffer
+}
+
+export type PdfPageRenderResult =
+  | {
+      ok: true
+      dpi: number
+      pageCount: number
+      renderedPages: number
+      truncated: boolean
+      totalBytes: number
+      pages: RenderedPdfPage[]
+    }
+  | { ok: false; status: "MISSING" | "OUTAGE"; detail: string }
+
+function clampBoundedInt(raw: unknown, fallback: number, min: number, max: number): number {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return fallback
+  return Math.max(min, Math.min(max, Math.floor(n)))
+}
+
+function decodeRenderedPdfPages(
+  rawPages: unknown[],
+  maxPages: number,
+  maxPageBytes: number,
+  maxTotalBytes: number,
+): { ok: true; pages: RenderedPdfPage[]; totalBytes: number; truncated: boolean } | { ok: false; detail: string } {
+  const pages: RenderedPdfPage[] = []
+  let totalBytes = 0
+  let truncated = false
+  for (let i = 0; i < rawPages.length; i++) {
+    if (pages.length >= maxPages) {
+      truncated = true
+      break
+    }
+    const item = rawPages[i] as Record<string, unknown> | null
+    const pageNum = Number(item?.page)
+    const width = Number(item?.width)
+    const height = Number(item?.height)
+    const b64 = typeof item?.pngBase64 === "string" ? item.pngBase64 : ""
+    if (!Number.isInteger(pageNum) || pageNum < 1 || pageNum > 9999) {
+      return { ok: false, detail: `invalid page number at rendered index ${i}` }
+    }
+    if (!Number.isInteger(width) || width < 1 || !Number.isInteger(height) || height < 1) {
+      return { ok: false, detail: `invalid PNG dimensions for page ${pageNum}` }
+    }
+    const png = Buffer.from(b64, "base64")
+    if (png.length < PNG_MAGIC.length || !png.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC)) {
+      return { ok: false, detail: `page ${pageNum} output is not a valid PNG` }
+    }
+    if (png.length > maxPageBytes || totalBytes + png.length > maxTotalBytes) {
+      truncated = true
+      break
+    }
+    totalBytes += png.length
+    pages.push({
+      page: pageNum,
+      file: `page-${pageNum}.png`,
+      width,
+      height,
+      bytes: png.length,
+      sha256: createHash("sha256").update(png).digest("hex"),
+      png,
+    })
+  }
+  return { ok: true, pages, totalBytes, truncated }
+}
+
+/**
+ * Render bounded per-page PNGs for a PDF using trusted `python3` + pypdfium2 +
+ * Pillow (Issue #51). Enforces DPI, page count, per-page byte, and total-byte
+ * caps on both sides of the subprocess boundary.
+ */
+export function renderPdfPageImages(
+  buf: Buffer,
+  options?: {
+    dpi?: number
+    maxPages?: number
+    maxPageBytes?: number
+    maxTotalBytes?: number
+    env?: NodeJS.ProcessEnv
+    timeoutMs?: number
+  },
+): PdfPageRenderResult {
+  const dpi = clampBoundedInt(options?.dpi, DEFAULT_PDF_RENDER_DPI, MIN_PDF_RENDER_DPI, MAX_PDF_RENDER_DPI)
+  const maxPages = clampBoundedInt(options?.maxPages, MAX_PDF_RENDER_PAGES, 1, MAX_PDF_RENDER_PAGES)
+  const maxPageBytes = clampBoundedInt(options?.maxPageBytes, MAX_PDF_PAGE_PNG_BYTES, 1024, MAX_PDF_PAGE_PNG_BYTES)
+  const maxTotalBytes = clampBoundedInt(options?.maxTotalBytes, MAX_PDF_TOTAL_PNG_BYTES, 1024, MAX_PDF_TOTAL_PNG_BYTES)
+  const env = options?.env ?? process.env
+  const python = resolveTrustedExecutable("python3", {
+    env: { PATH: env.PATH, PATHEXT: env.PATHEXT },
+    fallbackToStandard: false,
+  })
+  if (!python) {
+    return { ok: false, status: "MISSING", detail: "python3 was not found on a trusted PATH entry" }
+  }
+  let stdout = ""
+  try {
+    stdout = execFileSync(
+      python,
+      ["-c", PYTHON_PDF_RENDER_SCRIPT, String(dpi), String(maxPages), String(maxPageBytes), String(maxTotalBytes)],
+      {
+        input: buf,
+        encoding: "utf8",
+        timeout: clampBoundedInt(options?.timeoutMs, 20000, 1000, 60000),
+        maxBuffer: 64 * 1024 * 1024,
+        stdio: ["pipe", "pipe", "pipe"],
+        env,
+      },
+    )
+  } catch (err: any) {
+    const stderr = String(err?.stderr ?? "")
+    const out = String(err?.stdout ?? "")
+    if (err?.code === "ETIMEDOUT") {
+      return { ok: false, status: "OUTAGE", detail: "python3 PDF page rendering timed out" }
+    }
+    const detail = stderr.split(/\r?\n/).map((l) => l.trim()).find(Boolean) || cleanPdfDetail(err?.message) || "python3 PDF page rendering failed"
+    const missingDep = /ModuleNotFoundError|No module named|ImportError/i.test(`${stderr}\n${out}`)
+    return { ok: false, status: missingDep ? "MISSING" : "OUTAGE", detail }
+  }
+  const jsonLine = stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .pop()
+  let parsed: any
+  try {
+    parsed = JSON.parse(jsonLine ?? "")
+  } catch {
+    return { ok: false, status: "OUTAGE", detail: "python3 returned an unrecognised PDF render payload" }
+  }
+  if (parsed?.ok !== true || !Array.isArray(parsed?.pages)) {
+    const status = parsed?.status === "MISSING" ? "MISSING" : "OUTAGE"
+    return { ok: false, status, detail: cleanPdfDetail(parsed?.detail) || "pypdfium2 could not render PDF pages" }
+  }
+  const decoded = decodeRenderedPdfPages(parsed.pages, maxPages, maxPageBytes, maxTotalBytes)
+  if (!decoded.ok) {
+    return { ok: false, status: "OUTAGE", detail: decoded.detail }
+  }
+  if (decoded.pages.length === 0) {
+    return { ok: false, status: "OUTAGE", detail: "pypdfium2 rendered no PNG pages within configured byte bounds" }
+  }
+  const pageCount = Math.max(decoded.pages.length, clampBoundedInt(parsed.pageCount, decoded.pages.length, 1, 100000))
+  return {
+    ok: true,
+    dpi,
+    pageCount,
+    renderedPages: decoded.pages.length,
+    truncated: Boolean(parsed.truncated) || decoded.truncated || pageCount > decoded.pages.length,
+    totalBytes: decoded.totalBytes,
+    pages: decoded.pages,
+  }
 }
 
 export function ingestDocument(

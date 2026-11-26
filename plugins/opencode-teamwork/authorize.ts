@@ -161,6 +161,13 @@ const RULES: Record<string, RoleSpec> = {
     descendantOnly: true,
     requireRoot: true,
   },
+  document_visual_audit: {
+    actions: {
+      "*": ["team/segment-reviewer", "team/victory-auditor"],
+    },
+    descendantOnly: true,
+    requireRoot: true,
+  },
 
   // LEMMA.
   lemma_probe: { actions: { "*": SENTINEL } },

@@ -38,6 +38,7 @@ const EXPECTED_TOOLS = [
   "teamwork_cost",
   "teamwork_document_record",
   "teamwork_document_triage",
+  "teamwork_document_visual_audit",
   "teamwork_evidence",
   "teamwork_final_verify",
   "teamwork_handoff",

@@ -44,7 +44,9 @@ import {
   classifyDocumentRoute,
   ingestDocument,
   ingestPdfWithPython,
+  isSafePageImageName,
   isSafeSegmentId,
+  renderPdfPageImages,
   resolveAndReadDocument,
   segmentDocument,
   splitInstructionAndInlineDoc,
@@ -4310,6 +4312,12 @@ function writeTextSafe(run: string, targetFile: string, content: string) {
   writeFileAtomicWithin(run, runRel(run, targetFile), content)
 }
 
+function writeBytesSafe(run: string, targetFile: string, content: Buffer) {
+  assertRunRootIdentity(run)
+  ensureSafeRunSubpath(run, targetFile)
+  writeFileAtomicWithin(run, runRel(run, targetFile), content)
+}
+
 function writeJsonSafe(run: string, targetFile: string, value: unknown) {
   writeJson(run, targetFile, value)
 }
@@ -8076,6 +8084,9 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           maxSegments: { type: "number" },
           reviewTreeShape: { type: "array", items: { type: "number" } },
           synthTreeShape: { type: "array", items: { type: "number" } },
+          renderImages: { type: "boolean" },
+          renderDpi: { type: "number" },
+          maxRenderPages: { type: "number" },
           fetchUrl: { type: "boolean" },
           checkUrls: { type: "boolean" },
           allowMissingInputs: { type: "boolean" },
@@ -8106,13 +8117,16 @@ export async function registerTeamworkTools(ctx: any, root: string) {
 
         let ingested = ingestDocument(readRes.doc.bufferOrText, readRes.doc.format)
         if (!ingested.ok) return { content: ingested.error }
+        let pdfBuffer: Buffer | undefined
+        if (ingested.format === "pdf") {
+          pdfBuffer = Buffer.isBuffer(readRes.doc.bufferOrText)
+            ? readRes.doc.bufferOrText
+            : Buffer.from(String(readRes.doc.bufferOrText), "latin1")
+        }
         // A7: an image-only PDF needs the pypdfium2 + Pillow ingestor. It runs
         // BEFORE createPlanRun, so a MISSING toolchain refuses without creating
         // a run directory, and a readable extraction replaces the empty text.
-        if (ingested.extractionStatus === "needs_ingestor") {
-          const pdfBuffer = Buffer.isBuffer(readRes.doc.bufferOrText)
-            ? readRes.doc.bufferOrText
-            : Buffer.from(String(readRes.doc.bufferOrText), "latin1")
+        if (ingested.extractionStatus === "needs_ingestor" && pdfBuffer) {
           const pythonIngest = ingestPdfWithPython(pdfBuffer)
           if (!pythonIngest.ok) {
             const prereqWritten = writePrerequisitesSafe(
@@ -8130,6 +8144,28 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             format: "pdf",
             text: pythonIngest.text,
             extractionStatus: "extracted",
+          }
+        }
+
+        // Issue #51: render bounded per-page PNGs for PDFs when pypdfium2 +
+        // Pillow are available; keep a text-only fallback when pure-JS text
+        // succeeded on a host without those Python packages.
+        const pageRender =
+          pdfBuffer && input?.renderImages !== false
+            ? renderPdfPageImages(pdfBuffer, {
+                dpi: input?.renderDpi,
+                maxPages: input?.maxRenderPages,
+              })
+            : undefined
+        let pageImageStatus: "rendered" | "unavailable_missing_deps" | "unavailable_outage" | "not_applicable" =
+          "not_applicable"
+        let pageImageDetail: string | undefined
+        if (pageRender) {
+          if (pageRender.ok) {
+            pageImageStatus = "rendered"
+          } else {
+            pageImageStatus = pageRender.status === "MISSING" ? "unavailable_missing_deps" : "unavailable_outage"
+            pageImageDetail = clean(pageRender.detail, 240)
           }
         }
 
@@ -8178,6 +8214,8 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         let manifestPath = ""
         let textMapPath = ""
         let partitionPath = ""
+        let pageImagesDir = ""
+        let pageImagesManifestPath = ""
         let manifest: any
 
         const planRes = await createPlanRun(
@@ -8205,11 +8243,17 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             manifestPath = join(docDir, "manifest.json")
             textMapPath = join(docDir, "DOCUMENT_TEXT_MAP.md")
             partitionPath = join(docDir, "ANALYSIS_PARTITION.md")
+            pageImagesDir = join(docDir, "page_images")
+            pageImagesManifestPath = join(pageImagesDir, "manifest.json")
             if (existsSync(planRun)) {
               try {
                 ensureSafeRunSubpath(planRun, manifestPath)
                 ensureSafeRunSubpath(planRun, textMapPath)
                 ensureSafeRunSubpath(planRun, partitionPath)
+                if (pageRender?.ok) {
+                  ensureSafeRunSubpath(planRun, pageImagesDir)
+                  ensureSafeRunSubpath(planRun, pageImagesManifestPath)
+                }
               } catch (err: any) {
                 return `refused: failed to write document-review artifacts (${clean(err?.message, 160)})`
               }
@@ -8224,6 +8268,15 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               format: ingested.format,
               byteLength: readRes.doc.byteLength,
               extractionStatus: ingested.extractionStatus,
+              pageImageStatus,
+              ...(pageRender?.ok
+                ? {
+                    pageImageDir: "document-review/page_images",
+                    pageImageManifest: "document-review/page_images/manifest.json",
+                    pageImageCount: pageRender.renderedPages,
+                  }
+                : {}),
+              ...(pageImageDetail ? { pageImageDetail } : {}),
               ...(ingested.warning ? { warning: clean(ingested.warning, 300) } : {}),
               bounds,
               segments: segments.map((s) => ({
@@ -8234,21 +8287,46 @@ export async function registerTeamworkTools(ctx: any, root: string) {
               })),
               createdAt: new Date().toISOString(),
             }
+            const pageImageLine = pageRender?.ok
+              ? `\n- Page images: document-review/page_images (${pageRender.renderedPages} of ${pageRender.pageCount} page(s) at ${pageRender.dpi} DPI: ${pageRender.pages.map((p) => p.file).join(", ")})`
+              : ""
             const textMapSections = segments
               .map((s) => `## ${s.id}: ${s.title}\n\n- Characters: ${s.charCount}\n- SHA-256: ${s.sha256}\n\n${s.content}`)
               .join("\n\n---\n\n")
             const textMapBody = cleanBlock(
-              `# Document Text Map\n\n- Session: ${planSid}\n- Source: ${readRes.doc.sourceLabel} (${readRes.doc.sourceType}, ${ingested.format})\n- Extraction status: ${ingested.extractionStatus}${ingested.warning ? `\n- Warning: ${ingested.warning}` : ""}\n\n${textMapSections}\n`,
+              `# Document Text Map\n\n- Session: ${planSid}\n- Source: ${readRes.doc.sourceLabel} (${readRes.doc.sourceType}, ${ingested.format})\n- Extraction status: ${ingested.extractionStatus}${pageImageLine}${ingested.warning ? `\n- Warning: ${ingested.warning}` : ""}\n\n${textMapSections}\n`,
               MAX_TEXT_MAP_CHARS,
             )
             const partitionRows = segments
               .map((s) => `| \`${s.id}\` | ${s.title.replaceAll("\\", "\\\\").replaceAll("|", "\\|")} | ${s.charCount} | \`${s.sha256.slice(0, 12)}\` |`)
               .join("\n")
             const partitionBody = cleanBlock(
-              `# Analysis Partition\n\n- Session: ${planSid}\n- Segments: ${segments.length} (maxSegments=${bounds.maxSegments})\n- Per-segment RSA tree shape: [${bounds.reviewTreeShape.join(", ")}]\n- Cross-segment synthesis shape: [${bounds.synthTreeShape.join(", ")}]\n\n| Segment | Title | Chars | SHA-256 |\n| --- | --- | ---: | --- |\n${partitionRows}\n\n## Schedule\n\n1. Segment reviews (${segments.map((s) => `\`${s.id}\``).join(", ")}) run in parallel using \`team/segment-reviewer\` bounded by [${bounds.reviewTreeShape.join(", ")}].\n2. \`doc-synthesis\` runs \`team/synthesizer\` bounded by [${bounds.synthTreeShape.join(", ")}] after all segments pass.\n`,
+              `# Analysis Partition\n\n- Session: ${planSid}\n- Input format: ${ingested.format}\n- Page images: ${pageImageStatus}\n- Segments: ${segments.length} (maxSegments=${bounds.maxSegments})\n- Per-segment RSA tree shape: [${bounds.reviewTreeShape.join(", ")}]\n- Cross-segment synthesis shape: [${bounds.synthTreeShape.join(", ")}]\n\n| Segment | Title | Chars | SHA-256 |\n| --- | --- | ---: | --- |\n${partitionRows}\n\n## Schedule\n\n1. Segment reviews (${segments.map((s) => `\`${s.id}\``).join(", ")}) run in parallel using \`team/segment-reviewer\` bounded by [${bounds.reviewTreeShape.join(", ")}].\n2. \`doc-synthesis\` runs \`team/synthesizer\` bounded by [${bounds.synthTreeShape.join(", ")}] after all segments pass.\n`,
               64_000,
             )
             try {
+              if (pageRender?.ok) {
+                const pageManifest = {
+                  version: 1,
+                  dpi: pageRender.dpi,
+                  pageCount: pageRender.pageCount,
+                  renderedPages: pageRender.renderedPages,
+                  truncated: pageRender.truncated,
+                  totalBytes: pageRender.totalBytes,
+                  pages: pageRender.pages.map((p) => ({
+                    page: p.page,
+                    file: p.file,
+                    width: p.width,
+                    height: p.height,
+                    bytes: p.bytes,
+                    sha256: p.sha256,
+                  })),
+                }
+                for (const p of pageRender.pages) {
+                  writeBytesSafe(planRun, join(pageImagesDir, p.file), p.png)
+                }
+                writeJsonSafe(planRun, pageImagesManifestPath, pageManifest)
+              }
               writeJsonSafe(planRun, manifestPath, manifest)
               writeTextSafe(planRun, textMapPath, textMapBody.endsWith("\n") ? textMapBody : textMapBody + "\n")
               writeTextSafe(planRun, partitionPath, partitionBody.endsWith("\n") ? partitionBody : partitionBody + "\n")
@@ -8262,11 +8340,20 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         if (!planRes.ok) return { content: planRes.content }
 
         return {
-          content: `${planRes.content}\nDocument triage: ${segments.length} segment(s) (${ingested.extractionStatus}).\nManifest: ${manifestPath}`,
+          content: `${planRes.content}\nDocument triage: ${segments.length} segment(s) (${ingested.extractionStatus}, pageImages: ${pageImageStatus}).\nManifest: ${manifestPath}`,
           sessionId: planRes.sessionId,
           runDir: planRes.run,
           topology: "document-review",
           extractionStatus: ingested.extractionStatus,
+          pageImageStatus,
+          ...(pageRender?.ok
+            ? {
+                pageImageDir: pageImagesDir,
+                pageImageManifestPath: pageImagesManifestPath,
+                pageImageCount: pageRender.renderedPages,
+              }
+            : {}),
+          ...(pageImageDetail ? { pageImageDetail } : {}),
           ...(ingested.warning ? { warning: ingested.warning } : {}),
           bounds,
           segments: manifest.segments,
@@ -8517,6 +8604,230 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         return {
           content: `Recorded DOCUMENT_REVIEW_REPORT.md at ${outFile}`,
           stage,
+          artifactPath: outFile,
+        }
+      },
+    })
+
+    editor.add({
+      name: "document_visual_audit",
+      options: { namespace: "teamwork", codemode: false },
+      description:
+        "Record a document-review visual audit verdict citing inspected PDF page images from document-review/page_images/manifest.json. Verifies image filenames, manifest digests, and regular-file containment; accepts NOT_EVALUATED only when page images were not rendered (text-only fallback or non-PDF).",
+      input: strictInput({
+        type: "object",
+        properties: {
+          sessionId: { type: "string" },
+          scope: { type: "string", description: "segment | run (defaults to segment if segmentId is provided, else run)" },
+          segmentId: { type: "string" },
+          verdict: { type: "string", enum: ["PASS", "FAIL", "NOT_EVALUATED"] },
+          summary: { type: "string" },
+          inspectedImages: {
+            type: "array",
+            items: {
+              anyOf: [
+                { type: "string" },
+                {
+                  type: "object",
+                  properties: {
+                    file: { type: "string" },
+                    sha256: { type: "string" },
+                    notes: { type: "string" },
+                  },
+                  required: ["file"],
+                  additionalProperties: false,
+                },
+              ],
+            },
+          },
+          findings: {
+            type: "array",
+            items: {
+              anyOf: [
+                { type: "string" },
+                {
+                  type: "object",
+                  properties: {
+                    id: { type: "string" },
+                    severity: { type: "string" },
+                    page: { type: "number" },
+                    description: { type: "string" },
+                  },
+                  additionalProperties: false,
+                },
+              ],
+            },
+          },
+        },
+        required: ["verdict", "summary", "inspectedImages"],
+        additionalProperties: false,
+      }),
+      execute: async (input: any, context: any) => {
+        const resolved = resolveRun(root, input?.sessionId)
+        if (resolved.error) return { content: resolved.error }
+        const run = resolved.run as string
+        const rawScope = typeof input?.scope === "string" ? clean(input.scope, 16).trim() : ""
+        const scope = rawScope || (input?.segmentId ? "segment" : "run")
+        if (scope !== "segment" && scope !== "run") {
+          return { content: `refused: invalid visual audit scope "${scope}" (expected segment or run)` }
+        }
+        const authz = await authorizeToolAction(ctx, run, "document_visual_audit", scope, context)
+        if (!authz.ok) return { content: authz.content }
+
+        const docDir = join(run, "document-review")
+        const manifestRes = readRegularJson<any>(run, join(docDir, "manifest.json"))
+        if (!manifestRes.ok) {
+          return {
+            content:
+              manifestRes.reason === "symlink"
+                ? "refused: document-review/manifest.json is a symlink"
+                : "refused: document-review/manifest.json missing or invalid — call teamwork_document_triage first",
+          }
+        }
+        const manifest = manifestRes.data
+        const summary = clean(input?.summary, 500).trim()
+        if (!summary) return { content: "refused: summary must be non-empty" }
+        const verdict = String(input?.verdict ?? "")
+        if (verdict !== "PASS" && verdict !== "FAIL" && verdict !== "NOT_EVALUATED") {
+          return { content: `refused: invalid verdict "${clean(verdict, 32)}" (expected PASS, FAIL, or NOT_EVALUATED)` }
+        }
+
+        let segmentId: string | undefined
+        if (scope === "segment") {
+          if (!isSafeSegmentId(input?.segmentId)) {
+            return { content: `refused: invalid segmentId "${clean(input?.segmentId, 32)}" (must match ${SEGMENT_ID})` }
+          }
+          const knownSegs = new Set<string>(
+            Array.isArray(manifest?.segments) ? manifest.segments.map((s: any) => String(s?.id || "")) : [],
+          )
+          if (!knownSegs.has(input.segmentId)) {
+            return { content: `refused: unknown segmentId "${input.segmentId}" (not in document-review/manifest.json)` }
+          }
+          segmentId = input.segmentId
+        }
+
+        const rawInspected = Array.isArray(input?.inspectedImages) ? input.inspectedImages : []
+        const pageImagesDir = join(docDir, "page_images")
+        const pageManifestRes = readRegularJson<any>(run, join(pageImagesDir, "manifest.json"))
+        const renderedAvailable = manifest?.pageImageStatus === "rendered"
+
+        if (verdict === "NOT_EVALUATED") {
+          if (renderedAvailable) {
+            return {
+              content:
+                "refused: page images were rendered for this run; inspect them and record PASS or FAIL with inspectedImages instead of NOT_EVALUATED",
+            }
+          }
+          if (rawInspected.length > 0) {
+            return { content: "refused: NOT_EVALUATED visual audit must pass an empty inspectedImages list" }
+          }
+        }
+
+        const verifiedImages: Array<{ file: string; page: number; sha256: string; notes?: string }> = []
+        if (verdict !== "NOT_EVALUATED") {
+          if (!pageManifestRes.ok) {
+            return {
+              content:
+                pageManifestRes.reason === "symlink"
+                  ? "refused: document-review/page_images/manifest.json is a symlink"
+                  : "refused: document-review/page_images/manifest.json is missing — use verdict NOT_EVALUATED for text-only or non-PDF runs",
+            }
+          }
+          if (rawInspected.length === 0) {
+            return { content: `refused: verdict ${verdict} requires at least one inspected page image` }
+          }
+          const manifestPages = new Map<string, { page: number; sha256: string }>()
+          for (const entry of Array.isArray(pageManifestRes.data?.pages) ? pageManifestRes.data.pages : []) {
+            if (isSafePageImageName(entry?.file) && typeof entry?.sha256 === "string") {
+              manifestPages.set(entry.file, { page: Number(entry.page) || 0, sha256: entry.sha256 })
+            }
+          }
+          const seen = new Set<string>()
+          for (const item of rawInspected) {
+            const file = typeof item === "string" ? item.trim() : String(item?.file ?? "").trim()
+            const claimedSha = typeof item === "object" && item !== null && typeof item.sha256 === "string"
+              ? item.sha256.trim().toLowerCase()
+              : undefined
+            const notes = typeof item === "object" && item !== null && typeof item.notes === "string"
+              ? clean(item.notes, 300).trim()
+              : undefined
+            if (!isSafePageImageName(file)) {
+              return { content: `refused: invalid page image filename "${clean(file, 64)}" (must match page-<N>.png)` }
+            }
+            if (seen.has(file)) {
+              return { content: `refused: duplicate inspected image "${file}"` }
+            }
+            seen.add(file)
+            const expected = manifestPages.get(file)
+            if (!expected) {
+              return { content: `refused: image "${file}" is not listed in document-review/page_images/manifest.json` }
+            }
+            if (claimedSha && claimedSha !== expected.sha256.toLowerCase()) {
+              return { content: `refused: sha256 mismatch for "${file}"` }
+            }
+            const imgPath = join(pageImagesDir, file)
+            try {
+              ensureSafeRunSubpath(run, imgPath)
+              refuseSymlink(imgPath)
+              const st = lstatSync(imgPath)
+              if (!st.isFile()) return { content: `refused: "${file}" is not a regular file` }
+            } catch (err: any) {
+              return { content: `refused: inspected image "${file}" failed containment check (${clean(err?.message, 120)})` }
+            }
+            verifiedImages.push({
+              file,
+              page: expected.page,
+              sha256: expected.sha256,
+              ...(notes ? { notes } : {}),
+            })
+          }
+        }
+
+        const rawFindings = Array.isArray(input?.findings) ? input.findings.slice(0, MAX_FINDINGS) : []
+        const findings = rawFindings.map((f: any, idx: number) => {
+          if (typeof f === "string") return { id: `V-${idx + 1}`, description: clean(f, 300) }
+          return {
+            id: clean(f?.id || `V-${idx + 1}`, 32),
+            ...(f?.severity ? { severity: clean(f.severity, 24) } : {}),
+            ...(typeof f?.page === "number" && Number.isInteger(f.page) ? { page: f.page } : {}),
+            description: clean(f?.description || "", 300),
+          }
+        })
+
+        const outFile =
+          scope === "segment" && segmentId
+            ? join(docDir, "segments", segmentId, "visual-audit.json")
+            : join(docDir, "visual-audit.json")
+        const record = {
+          version: 1,
+          scope,
+          ...(segmentId ? { segmentId } : {}),
+          auditor: authz.caller?.agent ?? "unknown",
+          verdict,
+          summary,
+          pageImageStatus: manifest?.pageImageStatus ?? "unknown",
+          inspectedImages: verifiedImages,
+          findings,
+          recordedAt: new Date().toISOString(),
+        }
+        try {
+          writeJsonSafe(run, outFile, record)
+        } catch (err: any) {
+          return { content: `refused: ${clean(err?.message, 160)}` }
+        }
+        appendEvent(run, {
+          type: "document_visual_audit",
+          scope,
+          ...(segmentId ? { segmentId } : {}),
+          verdict,
+          inspectedCount: verifiedImages.length,
+        })
+        return {
+          content: `Recorded document visual audit (${scope}${segmentId ? `/${segmentId}` : ""}): ${verdict} (${verifiedImages.length} image(s) cited) at ${outFile}`,
+          scope,
+          ...(segmentId ? { segmentId } : {}),
+          verdict,
+          inspectedImages: verifiedImages,
           artifactPath: outFile,
         }
       },

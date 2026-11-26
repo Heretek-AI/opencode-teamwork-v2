@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] - 2026-11-26
+
+### Added
+
+- **Document-review visual audit (Issue #51):**
+  - Bounded per-page PDF PNG rendering (`renderPdfPageImages` in
+    `plugins/opencode-teamwork/document-review.ts`) using trusted `python3` +
+    `pypdfium2` + `Pillow`, writing `document-review/page_images/page-<N>.png`
+    and `document-review/page_images/manifest.json` (`dpi`, `pageCount`,
+    `renderedPages`, `truncated`, `totalBytes`, per-page dimensions and
+    SHA-256 digests) through pinned-fd run containment.
+  - Dedicated 27th engine tool `teamwork_document_visual_audit` (authorized
+    for `team/segment-reviewer` and `team/victory-auditor`, wrapped in
+    `strictInput()`, `{ namespace: "teamwork", codemode: false }`) to record
+    segment-level (`segments/<segId>/visual-audit.json`) or run-level
+    (`document-review/visual-audit.json`) verdicts citing verified page images
+    from `page_images/manifest.json` (or `NOT_EVALUATED` on text-only / non-PDF
+    runs).
+  - Updated `agents/team/segment-reviewer.md`, `agents/team/victory-auditor.md`,
+    `docs/ARTIFACTS.md`, and the 27-tool catalog goldens.
+
+### Documented
+
+- **Per-dispatch model override (Issue #52):** recorded the intentional
+  OpenCode 2.4.1 host/design difference in `docs/OPENCODE-COMPATIBILITY.md`
+  §8.1 (install-time `teamwork.json` / agent frontmatter model binding).
+
 ## [0.19.4] - 2026-11-26
 
 ### Changed

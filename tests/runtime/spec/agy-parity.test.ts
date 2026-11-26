@@ -624,6 +624,60 @@ describe("Tier 1: Feature Coverage [M1, M3, M4]", () => {
     })
   })
 
+  test("[M4 #51] readable PDF renders bounded page_images + manifest and teamwork_document_visual_audit verifies cited images", async () => {
+    await withHost("a7-visual-audit", async ({ project, loaded, root }) => {
+      const tinyPng =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+      const binDir = makeMockBinDir(project, "py-render-ok", {
+        python3: `printf '%s\\n' '{"ok":true,"dpi":150,"pageCount":2,"truncated":false,"pages":[{"page":1,"width":1200,"height":1600,"pngBase64":"${tinyPng}"},{"page":2,"width":1200,"height":1600,"pngBase64":"${tinyPng}"}]}'`,
+      })
+      const pdfPath = join(project.root, "visual-paper.pdf")
+      writeFileSync(pdfPath, READABLE_PDF)
+      const sessionId = "20261126-000001-vis"
+      await withEnv({ PATH: binDir }, async () => {
+        const triage = await execute(loaded, root, "document_triage", {
+          sessionId,
+          request: "Critique visual-paper.pdf",
+          skipInterview: true,
+          renderDpi: 150,
+          document: { path: "visual-paper.pdf", format: "pdf" },
+        })
+        expect(String(triage.content)).not.toContain("refused:")
+        expect(triage.pageImageStatus).toBe("rendered")
+        expect(triage.pageImageCount).toBe(2)
+
+        const pageManifest = JSON.parse(
+          readFileSync(runFile(project, sessionId, "document-review/page_images/manifest.json"), "utf8"),
+        )
+        expect(pageManifest.dpi).toBe(150)
+        expect(pageManifest.pages).toHaveLength(2)
+
+        const victoryChild = await createSessionChild(loaded, root, "team/victory-auditor")
+        const passRes = await execute(loaded, victoryChild, "document_visual_audit", {
+          sessionId,
+          scope: "run",
+          verdict: "PASS",
+          summary: "Inspected pages 1 and 2.",
+          inspectedImages: [
+            { file: "page-1.png", sha256: pageManifest.pages[0].sha256, notes: "Checked page 1" },
+            { file: "page-2.png", sha256: pageManifest.pages[1].sha256, notes: "Checked page 2" },
+          ],
+        })
+        expect(passRes.verdict).toBe("PASS")
+        expect(existsSync(runFile(project, sessionId, "document-review/visual-audit.json"))).toBe(true)
+
+        const badRes = await execute(loaded, victoryChild, "document_visual_audit", {
+          sessionId,
+          scope: "run",
+          verdict: "PASS",
+          summary: "Unlisted page attempt",
+          inspectedImages: ["page-99.png"],
+        })
+        expect(String(badRes.content)).toContain("refused:")
+      })
+    })
+  })
+
   test("[M4 A7] teamwork_lemma_probe executes leap doctor --offline when lean, lake, leap exist on PATH", async () => {
     await withHost("a7-lemma-probe-doctor", async ({ project, loaded, root }) => {
       const binDir = makeMockBinDir(project, "lemma-ok", {
@@ -1327,7 +1381,7 @@ describe("Tier 2: Boundary & Corner Cases [M1, M3, M4]", () => {
   })
 
   // --- A9 Boundaries --------------------------------------------------------
-  test("[M3 A9] OPENCODE_TEAMWORK_DISABLED='true' disables plugin while '0' leaves 7 commands & 26 tools active", async () => {
+  test("[M3 A9] OPENCODE_TEAMWORK_DISABLED='true' disables plugin while '0' leaves 7 commands & 27 tools active", async () => {
     const projTrue = createProject("a9-true")
     await withEnv({ OPENCODE_TEAMWORK_DISABLED: "true" }, async () => {
       const loaded = await loadHost(projTrue, { mode: "memory" })
@@ -1359,7 +1413,7 @@ describe("Tier 2: Boundary & Corner Cases [M1, M3, M4]", () => {
         }
         expect(names.filter((name) => name.startsWith("teamwork") || name.startsWith("team-"))).toHaveLength(7)
         const { list } = await openLocationTools(loaded, projZero.root)
-        expect(list.filter((t: any) => String(t.id).startsWith("teamwork_"))).toHaveLength(26)
+        expect(list.filter((t: any) => String(t.id).startsWith("teamwork_"))).toHaveLength(27)
       } finally {
         await loaded.close()
         projZero.cleanup()
