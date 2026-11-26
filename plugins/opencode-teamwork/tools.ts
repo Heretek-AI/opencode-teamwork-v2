@@ -4366,10 +4366,27 @@ function parseInspectedImageEntry(item: unknown): { file: string; claimedSha?: s
   if (typeof item === "string") return { file: item.trim() }
   const obj = item && typeof item === "object" ? (item as Record<string, unknown>) : {}
   return {
-    file: String(obj.file ?? "").trim(),
+    file: typeof obj.file === "string" ? obj.file.trim() : "",
     claimedSha: typeof obj.sha256 === "string" ? obj.sha256.trim().toLowerCase() : undefined,
     notes: typeof obj.notes === "string" ? clean(obj.notes, 300).trim() : undefined,
   }
+}
+
+function parseVisualAuditInput(
+  input: any,
+): { ok: true; scope: "segment" | "run"; summary: string; verdict: "PASS" | "FAIL" | "NOT_EVALUATED" } | { ok: false; content: string } {
+  const rawScope = typeof input?.scope === "string" ? clean(input.scope, 16).trim() : ""
+  const scope = rawScope || (input?.segmentId ? "segment" : "run")
+  if (scope !== "segment" && scope !== "run") {
+    return { ok: false, content: `refused: invalid visual audit scope "${scope}" (expected segment or run)` }
+  }
+  const summary = clean(input?.summary, 500).trim()
+  if (!summary) return { ok: false, content: "refused: summary must be non-empty" }
+  const verdict = typeof input?.verdict === "string" ? input.verdict : ""
+  if (verdict !== "PASS" && verdict !== "FAIL" && verdict !== "NOT_EVALUATED") {
+    return { ok: false, content: `refused: invalid verdict "${clean(verdict, 32)}" (expected PASS, FAIL, or NOT_EVALUATED)` }
+  }
+  return { ok: true, scope, summary, verdict }
 }
 
 function buildManifestPageIndex(rawPages: unknown): Map<string, { page: number; sha256: string }> {
@@ -8812,31 +8829,23 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         const resolved = resolveRun(root, input?.sessionId)
         if (resolved.error) return { content: resolved.error }
         const run = resolved.run as string
-        const rawScope = typeof input?.scope === "string" ? clean(input.scope, 16).trim() : ""
-        const scope = rawScope || (input?.segmentId ? "segment" : "run")
-        if (scope !== "segment" && scope !== "run") {
-          return { content: `refused: invalid visual audit scope "${scope}" (expected segment or run)` }
-        }
+        const parsed = parseVisualAuditInput(input)
+        if (!parsed.ok) return { content: parsed.content }
+        const { scope, summary, verdict } = parsed
+
         const authz = await authorizeToolAction(ctx, run, "document_visual_audit", scope, context)
         if (!authz.ok) return { content: authz.content }
 
         const docDir = join(run, "document-review")
         const manifestRes = readRegularJson<any>(run, join(docDir, "manifest.json"))
         if (!manifestRes.ok) {
-          return {
-            content:
-              manifestRes.reason === "symlink"
-                ? "refused: document-review/manifest.json is a symlink"
-                : "refused: document-review/manifest.json missing or invalid — call teamwork_document_triage first",
-          }
+          const reason =
+            manifestRes.reason === "symlink"
+              ? "refused: document-review/manifest.json is a symlink"
+              : "refused: document-review/manifest.json missing or invalid — call teamwork_document_triage first"
+          return { content: reason }
         }
         const manifest = manifestRes.data
-        const summary = clean(input?.summary, 500).trim()
-        if (!summary) return { content: "refused: summary must be non-empty" }
-        const verdict = String(input?.verdict ?? "")
-        if (verdict !== "PASS" && verdict !== "FAIL" && verdict !== "NOT_EVALUATED") {
-          return { content: `refused: invalid verdict "${clean(verdict, 32)}" (expected PASS, FAIL, or NOT_EVALUATED)` }
-        }
 
         const segRes = resolveVisualAuditSegment(scope, input?.segmentId, manifest)
         if (!segRes.ok) return { content: segRes.content }
@@ -8852,21 +8861,20 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         )
         if (!imgRes.ok) return { content: imgRes.content }
 
-        const findings = normalizeVisualFindings(input?.findings)
-        const outFile =
-          scope === "segment" && segmentId
-            ? join(docDir, "segments", segmentId, "visual-audit.json")
-            : join(docDir, "visual-audit.json")
+        const outFile = segmentId
+          ? join(docDir, "segments", segmentId, "visual-audit.json")
+          : join(docDir, "visual-audit.json")
+        const segPatch = segmentId ? { segmentId } : {}
         const record = {
           version: 1,
           scope,
-          ...(segmentId ? { segmentId } : {}),
+          ...segPatch,
           auditor: authz.caller?.agent ?? "unknown",
           verdict,
           summary,
           pageImageStatus: manifest?.pageImageStatus ?? "unknown",
           inspectedImages: imgRes.images,
-          findings,
+          findings: normalizeVisualFindings(input?.findings),
           recordedAt: new Date().toISOString(),
         }
         try {
@@ -8877,7 +8885,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         await appendEvent(run, {
           type: "document_visual_audit",
           scope,
-          ...(segmentId ? { segmentId } : {}),
+          ...segPatch,
           verdict,
           inspectedCount: imgRes.images.length,
         })
@@ -8885,7 +8893,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
         return {
           content: `Recorded document visual audit (${scopeLabel}): ${verdict} (${imgRes.images.length} image(s) cited) at ${outFile}`,
           scope,
-          ...(segmentId ? { segmentId } : {}),
+          ...segPatch,
           verdict,
           inspectedImages: imgRes.images,
           artifactPath: outFile,
