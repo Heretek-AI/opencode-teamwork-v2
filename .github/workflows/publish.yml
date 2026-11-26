@@ -338,7 +338,7 @@ jobs:
             echo "::error::refusing to publish: invalid release tag name $tag"
             exit 1
           fi
-          node -e '
+          node <<'NODE'
           const fs = require("fs");
           const path = require("path");
           const pkg = JSON.parse(fs.readFileSync(path.join(process.env.GITHUB_WORKSPACE, "package.json"), "utf8"));
@@ -348,7 +348,7 @@ jobs:
             console.error(`refusing to publish: tag ${actual} does not match package.json ${expected}`);
             process.exit(1);
           }
-          // Privileged copy of the consistency rule: npm applies the tarball's
+          // Privileged copy of the consistency rule: npm applies the tarball
           // publishConfig during publish, so a registry/tag/provenance key
           // could override the explicit flags below.
           if (pkg.publishConfig !== undefined) {
@@ -363,7 +363,7 @@ jobs:
               process.exit(1);
             }
           }
-          '
+          NODE
           git fetch --tags --force origin
           git fetch --force origin "main:refs/remotes/origin/main"
           if ! git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" > /dev/null; then
