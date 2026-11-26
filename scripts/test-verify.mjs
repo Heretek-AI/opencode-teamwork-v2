@@ -2705,6 +2705,52 @@ async function main() {
     ok("T57 rendered PDF visual-audit gate: missing -> VISUAL_AUDIT_MISSING, stale -> VISUAL_AUDIT_STALE, valid -> PASS")
   }
 
+  // -------------------------------------------------------------------------
+  // T58 — Post-merge diffHash verification uses recorded report.baseSha when
+  // teamwork/base-<runId> has already merged the task branch.
+  // -------------------------------------------------------------------------
+  {
+    const buildPostMerge = async (tag, diffHashOverride) => {
+      const ctx = await makeRun({ tag, requireHandoffs: "skip", victoryAudit: "skip" })
+      const base = initGitRepo(ctx.root)
+      const baseBranch = `teamwork/base-${ctx.runId}`
+      const taskBranch = `teamwork/${ctx.runId}-R1`
+      gitRun(ctx.root, ["branch", baseBranch, base])
+      gitRun(ctx.root, ["checkout", "-q", "-b", taskBranch])
+      writeText(join(ctx.root, "task.txt"), "post-merge task\n")
+      gitRun(ctx.root, ["add", "task.txt"])
+      gitRun(ctx.root, ["commit", "-q", "-m", "task R1"])
+      const head1 = gitRun(ctx.root, ["rev-parse", "HEAD"])
+      const diff1 = gitRun(ctx.root, ["diff", "--no-color", `${base}..${head1}`])
+      const report = makeReportPayload(ctx, "R1", {
+        headSha: head1,
+        diffHash: diffHashOverride ?? sha256Hex(diff1),
+      })
+      report.baseSha = base
+      await signWrite(ctx, "verify/report-R1.json", report)
+      // Simulate Step 13 merging the verified task branch into teamwork/base-<runId>
+      gitRun(ctx.root, ["checkout", "-q", baseBranch])
+      gitRun(ctx.root, ["merge", "--no-ff", "-q", "-m", "merge task R1", taskBranch])
+      return ctx
+    }
+
+    const passCtx = await buildPostMerge("t58a")
+    const passRes = await verify(passCtx, { repo: passCtx.root })
+    assert.strictEqual(
+      checkById(passRes, "git:report:R1")?.status,
+      "pass",
+      `post-merge report diffHash should verify against recorded baseSha: ${JSON.stringify(passRes.checks.filter((c) => c.id.startsWith("git:") || c.id.startsWith("contradiction:")))}`,
+    )
+    assert(!hasReason(passRes, "INCONSISTENT_REPORT_BRANCH"), JSON.stringify(passRes.reasons))
+
+    const tamperCtx = await buildPostMerge("t58b", sha256Hex("tampered diff\n"))
+    const tamperRes = await verify(tamperCtx, { repo: tamperCtx.root })
+    assert.strictEqual(tamperRes.verdict, "FAIL")
+    assert(hasReason(tamperRes, "INCONSISTENT_REPORT_BRANCH"), JSON.stringify(tamperRes.reasons))
+
+    ok("T58 post-merge verify --repo passes via report.baseSha and still catches tampered diffHash")
+  }
+
   rmSync(TEST_ROOT, { recursive: true, force: true })
   console.log(`\n${passed} verify tests passed`)
 }

@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.2] - 2026-11-26
+
+### Fixed
+
+- **Post-merge `diffHash` verification (`lib/verify.mjs`):** `opencode-teamwork verify --repo`
+  now resolves the signed `report.baseSha` commit (when present in
+  `verify/report-<taskId>.json`) as the diff base for `git:report:<taskId>`,
+  falling back to `teamwork/base-<runId>` when absent. This eliminates the
+  false `INCONSISTENT_REPORT_BRANCH` failure after Step 13 merges a verified
+  task branch into `teamwork/base-<runId>`, while continuing to detect moved
+  `headSha` commits and tampered `diffHash` values (`T58` in
+  `scripts/test-verify.mjs`).
+
 ## [0.20.1] - 2026-11-26
 
 ### Changed
