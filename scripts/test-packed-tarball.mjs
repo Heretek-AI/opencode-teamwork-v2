@@ -79,11 +79,25 @@ try {
 
   // Install into an isolated temp project and verify zero runtime dependencies.
   const consumer = join(work, "consumer")
+  const installHome = join(work, "home")
+  const installXdg = join(work, "xdg")
   mkdirSync(consumer, { recursive: true })
+  mkdirSync(installHome, { recursive: true })
+  mkdirSync(installXdg, { recursive: true })
   writeFileSync(join(consumer, "package.json"), JSON.stringify({ name: "t4-consumer", private: true }) + "\n")
+  // The packed package has a postinstall that writes opt-in user config. This
+  // test installs it into a throwaway HOME and skips the interactive install so
+  // it never mutates the developer's real config.
   runNpm(["install", "--no-audit", "--no-fund", tarballPath], {
     cwd: consumer,
     stdio: "inherit",
+    env: {
+      ...process.env,
+      HOME: installHome,
+      USERPROFILE: installHome,
+      XDG_CONFIG_HOME: installXdg,
+      OPENCODE_TEAMWORK_SKIP: "1",
+    },
   })
 
   const installedPkgDir = join(consumer, "node_modules", "@heretek-ai", "opencode-teamwork-v2")
