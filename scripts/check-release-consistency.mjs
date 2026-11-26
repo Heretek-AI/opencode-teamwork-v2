@@ -5,6 +5,13 @@
 // name the same release. When GitHub runs a tag build, the tag must be exactly
 // `v<version>`; a branch build (GITHUB_REF_TYPE=branch) skips that check.
 //
+// The guard also refuses repository npm configuration that could act on the
+// privileged publish step: a committed `.npmrc`/`.yarnrc`/`.yarnrc.yml`, and a
+// `publishConfig` key other than `access` in either package. npm reads a
+// tarball's `publishConfig` during `npm publish`, so `registry`, `tag` and
+// `provenance` there could redirect or weaken a release. The publish workflow
+// passes those as command-line flags from a clean temp directory instead.
+//
 // Usage:
 //   node scripts/check-release-consistency.mjs [--require-clean]
 //
@@ -23,6 +30,16 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..")
 const PLUGIN_PACKAGE = "plugins/opencode-teamwork/package.json"
 const CHANGELOG = "CHANGELOG.md"
 const VERSION_RE = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/
+
+// npm and yarn read these from the working directory. None belong in a release
+// checkout: they can redirect the registry, inject an auth token or change the
+// dist-tag that the privileged job publishes.
+const FORBIDDEN_CONFIG_FILES = [".npmrc", ".yarnrc", ".yarnrc.yml"]
+
+// `access` is a publish visibility setting; `--access public` is passed
+// explicitly in the workflow. Every other publishConfig key is refused,
+// notably `registry`, `tag` and `provenance`.
+const ALLOWED_PUBLISH_CONFIG_KEYS = new Set(["access"])
 
 // Resolve git to an absolute path once; never fall back to PATH lookup.
 const GIT_BIN = ["/usr/bin/git", "/bin/git", "/usr/local/bin/git"].find(existsSync) ?? "/usr/bin/git"
@@ -58,9 +75,26 @@ function gitStatus(root) {
 }
 
 /**
- * Check package versions, changelog coverage, the tag ref and optionally the
- * worktree. Pure apart from reading `root` and, when `statusOutput` is not
- * supplied, running `git status` in `root`.
+ * List the `publishConfig` keys npm would apply when publishing this package.
+ * `undefined` means the key is absent; a non-object value is reported as one
+ * invalid key rather than being silently ignored.
+ *
+ * @param {unknown} pkg
+ * @returns {string[]}
+ */
+function publishConfigKeys(pkg) {
+  const publishConfig = pkg?.publishConfig
+  if (publishConfig === undefined) return []
+  if (publishConfig === null || typeof publishConfig !== "object" || Array.isArray(publishConfig)) {
+    return ["<not-an-object>"]
+  }
+  return Object.keys(publishConfig)
+}
+
+/**
+ * Check package versions, changelog coverage, npm/yarn config, the tag ref and
+ * optionally the worktree. Pure apart from reading `root` and, when
+ * `statusOutput` is not supplied, running `git status` in `root`.
  *
  * @param {{
  *   root?: string,
@@ -107,6 +141,41 @@ export function checkReleaseConsistency(options = {}) {
   if (version !== null && changelog !== null) {
     const heading = `## [${version}]`
     record("changelog", changelog.includes(heading), `${CHANGELOG} must contain ${JSON.stringify(heading)}`)
+  }
+
+  // Repository npm/yarn configuration is refused outright. The release jobs
+  // run npm from a clean temp directory with a temporary user config, but a
+  // committed file still affects local/manual publishes and is never part of a
+  // deliberate release. Remove the file rather than trying to sanitise it.
+  for (const relativePath of FORBIDDEN_CONFIG_FILES) {
+    const present = existsSync(resolve(root, relativePath))
+    record(
+      relativePath,
+      !present,
+      present
+        ? "committed at the repository root; remove it. npm/yarn read it during pack/publish, where it can redirect the registry, inject credentials or change the dist-tag. Pass --registry/--tag explicitly in the release job instead."
+        : "absent",
+    )
+  }
+
+  // `publishConfig` is embedded in the tarball and applied by `npm publish`
+  // even when publishing a tarball. Only the visibility key is allowed.
+  for (const [relativePath, pkgFile] of [
+    ["package.json", pkg],
+    [PLUGIN_PACKAGE, pluginPkg],
+  ]) {
+    if (pkgFile === null) continue // read/parse error already recorded
+    const keys = publishConfigKeys(pkgFile)
+    const forbidden = keys.filter((key) => !ALLOWED_PUBLISH_CONFIG_KEYS.has(key))
+    record(
+      `publishConfig (${relativePath})`,
+      forbidden.length === 0,
+      forbidden.length === 0
+        ? keys.length === 0
+          ? "absent"
+          : 'only "access" is set'
+        : `forbidden key(s) ${forbidden.map((key) => JSON.stringify(key)).join(", ")}; only "access" is allowed because registry/tag/provenance in the tarball can redirect or weaken npm publish. Pass --registry and --tag on the publish command line instead.`,
+    )
   }
 
   if (env.GITHUB_REF_TYPE === "tag") {

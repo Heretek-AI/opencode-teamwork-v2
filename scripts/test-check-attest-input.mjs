@@ -257,7 +257,7 @@ try {
         /^\s+if:\s+startsWith\(github\.ref,\s*'refs\/tags\/v'\)\s*$/m,
         "the publish job must be gated to refs/tags/v*",
       )
-      // Explicitly document why the gate is enough for the workflow_dispatch case.
+      // Any branch, pull-request or non-release ref must fail the publish gate.
       for (const ref of ["refs/heads/main", "refs/heads/fix/ci-trust", "refs/pull/1/merge"]) {
         assert.ok(!ref.startsWith("refs/tags/v"), `${ref} must not pass the publish tag gate`)
       }

@@ -1,5 +1,15 @@
 name: CI attestation
 
+# STATUS: EXPERIMENTAL TEMPLATE — NOT A final_verify BOUNDARY
+# -----------------------------------------------------------
+# This workflow is kept as a template and is not part of the release gate. It
+# does not currently produce an attestation that `teamwork_final_verify`
+# accepts through its OIDC (`ci-attested`) path: JWKS-pinned token
+# verification, commit binding and expiry binding are not implemented here.
+# Treat its output as a recorded observation, not proof that the suite is good
+# or that a release is verified. Do not remove the workflow; it is the starting
+# point for that work.
+#
 # Produce a signed `verify/ci/attestation.json` for a Teamwork run.
 #
 # THREAT MODEL / WHY THIS IS NOT AGENT-TRIGGERABLE WITH ARBITRARY CODE
