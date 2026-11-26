@@ -544,6 +544,38 @@ async function buildComplete(ctx, {
 }
 
 /**
+ * C-1: stamp the audit and final verdict onto a fixture that wrote its own
+ * report(s). A signed run without these required artifacts can no longer be
+ * PASS, so wave/fixture tests that intend to assert PASS must be complete.
+ */
+async function stampAuditAndFinal(
+  ctx,
+  { victory = "SKIPPED (explicit): fixture skip", handoffs = "SKIPPED (explicit)" } = {},
+) {
+  const reports = {}
+  const tasks = []
+  for (const task of ctx.tasks) {
+    const path = join(ctx.run, `verify/report-${task.id}.json`)
+    if (!existsSync(path)) continue
+    reports[task.id] = keyedDigestFile(path)
+    tasks.push({
+      id: task.id,
+      status: "verified_pass",
+      report: `verify/report-${task.id}.json`,
+      reportStatus: "PASS",
+    })
+  }
+  await signWrite(ctx, "verify/security-audit.json", auditPayload(ctx, { ...reports }))
+  const auditDigest = keyedDigestFile(join(ctx.run, "verify/security-audit.json"))
+  await signWrite(
+    ctx,
+    "verify/final.json",
+    finalPayload(ctx, { reportDigests: { ...reports }, auditDigest, tasks, victory, handoffs }),
+  )
+  return { reports, auditDigest }
+}
+
+/**
  * A checks[] v2 programmatic entry. The engine computes every provenance field;
  * the fixture computes the same values so the verifier can recompute them.
  */
@@ -770,6 +802,10 @@ function hasReason(result, code) {
   return result.reasons.some((reason) => reason.includes(code))
 }
 
+function checkById(result, id) {
+  return result.checks.find((check) => check.id === id)
+}
+
 function checkIds(result) {
   return result.checks.map((check) => check.id)
 }
@@ -965,6 +1001,7 @@ async function main() {
         generatedAt: "2026-11-24T12:02:00.000Z",
       })
     }
+    await stampAuditAndFinal(ctx)
 
     const base = await verify(ctx)
     assert.strictEqual(base.verdict, "PASS", JSON.stringify(base.reasons))
@@ -1182,6 +1219,7 @@ async function main() {
         evidence: cite.path,
         generatedAt: "2026-11-24T12:02:00.000Z",
       })
+      await stampAuditAndFinal(ctx)
       return ctx
     }
 
@@ -2354,6 +2392,246 @@ async function main() {
     assert.strictEqual(calls, 1, "the expired shared deadline must prevent the second fetch")
     assert(Date.now() - deadlineStarted < 2000)
     ok("T43 OIDC discovery/JWKS share one deadline that also covers a slow resolver")
+  }
+
+  // -------------------------------------------------------------------------
+  // T44 — C-1: a signed run with no verify/final.json can never be PASS.
+  // -------------------------------------------------------------------------
+  {
+    const ctx = await makeRun({ tag: "t44" })
+    await buildComplete(ctx, { withFinal: false })
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "FAIL", JSON.stringify(result.reasons))
+    assert.strictEqual(verifyExitCode(result), 1)
+    assert.notStrictEqual(result.verdict, "PASS")
+    const check = checkById(result, "final:present")
+    assert.strictEqual(check?.status, "fail", JSON.stringify(result.checks))
+    assert.match(check.detail, /FINAL_MISSING/)
+    // The rest of the evidence is present: only the final verdict is missing.
+    assert.strictEqual(checkById(result, "audit:present")?.status, "pass")
+    assert.strictEqual(checkById(result, "report:R1:present")?.status, "pass")
+    assert.strictEqual(checkById(result, "victory:required")?.status, "pass")
+    ok("T44 missing verify/final.json -> FAIL (final:present FINAL_MISSING, exit 1)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T45 — C-1: an unreadable verify/final.json is a named FAIL.
+  // -------------------------------------------------------------------------
+  {
+    const ctx = await makeRun({ tag: "t45" })
+    await buildComplete(ctx)
+    writeFileSync(join(ctx.run, "verify/final.json"), "{not json\n")
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "FAIL", JSON.stringify(result.reasons))
+    assert.strictEqual(verifyExitCode(result), 1)
+    const check = checkById(result, "final:present")
+    assert.strictEqual(check?.status, "fail", JSON.stringify(result.checks))
+    assert.match(check.detail, /FINAL_UNREADABLE/)
+    ok("T45 unreadable verify/final.json -> FAIL (final:present FINAL_UNREADABLE, exit 1)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T46 — C-1: verify/final.json with status FAIL is a FAIL verdict.
+  // -------------------------------------------------------------------------
+  {
+    const ctx = await makeRun({ tag: "t46" })
+    await buildComplete(ctx)
+    const rel = "verify/final.json"
+    const final = readJson(join(ctx.run, rel))
+    final.status = "FAIL"
+    writeJson(join(ctx.run, rel), await ctx.signer.auth.signRunArtifact(ctx.runId, rel, final))
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "FAIL", JSON.stringify(result.reasons))
+    assert.strictEqual(verifyExitCode(result), 1)
+    const check = checkById(result, "final:status")
+    assert.strictEqual(check?.status, "fail", JSON.stringify(result.checks))
+    assert.match(check.detail, /FINAL_FAILED/)
+    ok("T46 final status FAIL -> FAIL (final:status FINAL_FAILED, exit 1)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T47 — C-1: a FAIL task report fails the run.
+  // -------------------------------------------------------------------------
+  {
+    const ctx = await makeRun({ tag: "t47" })
+    await buildComplete(ctx, { reportOptions: { status: "FAIL", summary: "Task failed." } })
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "FAIL", JSON.stringify(result.reasons))
+    assert.strictEqual(verifyExitCode(result), 1)
+    const check = checkById(result, "report:R1:status")
+    assert.strictEqual(check?.status, "fail", JSON.stringify(result.checks))
+    assert.match(check.detail, /REPORT_FAILED/)
+    ok("T47 FAIL task report -> FAIL (report:R1:status REPORT_FAILED, exit 1)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T48 — C-1: a missing task report fails the run by name.
+  // -------------------------------------------------------------------------
+  {
+    const ctx = await makeRun({ tag: "t48" })
+    await buildComplete(ctx)
+    rmSync(join(ctx.run, "verify/report-R1.json"))
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "FAIL", JSON.stringify(result.reasons))
+    assert.strictEqual(verifyExitCode(result), 1)
+    const check = checkById(result, "report:R1:present")
+    assert.strictEqual(check?.status, "fail", JSON.stringify(result.checks))
+    assert.match(check.detail, /REPORT_MISSING/)
+    ok("T48 missing task report -> FAIL (report:R1:present REPORT_MISSING, exit 1)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T49 — C-1: a FAIL security audit fails the run.
+  // -------------------------------------------------------------------------
+  {
+    const ctx = await makeRun({ tag: "t49" })
+    await buildComplete(ctx, { auditOptions: { status: "FAIL", summary: "Audit failed." } })
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "FAIL", JSON.stringify(result.reasons))
+    assert.strictEqual(verifyExitCode(result), 1)
+    const check = checkById(result, "audit:status")
+    assert.strictEqual(check?.status, "fail", JSON.stringify(result.checks))
+    assert.match(check.detail, /AUDIT_FAILED/)
+    ok("T49 FAIL security audit -> FAIL (audit:status AUDIT_FAILED, exit 1)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T50 — C-1: a missing security audit fails even without a PASS final claim.
+  // -------------------------------------------------------------------------
+  {
+    const ctx = await makeRun({ tag: "t50" })
+    await buildComplete(ctx)
+    rmSync(join(ctx.run, "verify/security-audit.json"))
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "FAIL", JSON.stringify(result.reasons))
+    assert.strictEqual(verifyExitCode(result), 1)
+    const check = checkById(result, "audit:present")
+    assert.strictEqual(check?.status, "fail", JSON.stringify(result.checks))
+    assert.match(check.detail, /AUDIT_MISSING/)
+    ok("T50 missing security audit -> FAIL (audit:present AUDIT_MISSING, exit 1)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T51 — C-1: a REJECTED victory fails a run that requires victory.
+  // -------------------------------------------------------------------------
+  {
+    const ctx = await makeRun({ tag: "t51" })
+    await buildComplete(ctx)
+    const rel = "verify/victory.json"
+    const victory = readJson(join(ctx.run, rel))
+    victory.verdict = "VICTORY REJECTED"
+    writeJson(join(ctx.run, rel), await ctx.signer.auth.signRunArtifact(ctx.runId, rel, victory))
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "FAIL", JSON.stringify(result.reasons))
+    assert.strictEqual(verifyExitCode(result), 1)
+    const check = checkById(result, "victory:required")
+    assert.strictEqual(check?.status, "fail", JSON.stringify(result.checks))
+    assert.match(check.detail, /VICTORY_REJECTED/)
+    ok("T51 VICTORY REJECTED -> FAIL (victory:required VICTORY_REJECTED, exit 1)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T52 — C-1: a missing victory verdict fails a run that requires victory.
+  // -------------------------------------------------------------------------
+  {
+    const ctx = await makeRun({ tag: "t52" })
+    await buildComplete(ctx, { withVictory: false })
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "FAIL", JSON.stringify(result.reasons))
+    assert.strictEqual(verifyExitCode(result), 1)
+    const check = checkById(result, "victory:required")
+    assert.strictEqual(check?.status, "fail", JSON.stringify(result.checks))
+    assert.match(check.detail, /VICTORY_MISSING/)
+    ok("T52 missing required victory -> FAIL (victory:required VICTORY_MISSING, exit 1)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T53 — C-1: no task ids means no task evidence, never PASS.
+  // -------------------------------------------------------------------------
+  {
+    const ctx = await makeRun({ tag: "t53", tasks: [], victoryAudit: "skip", requireHandoffs: "skip" })
+    await buildComplete(ctx)
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "UNKNOWN", JSON.stringify(result.reasons))
+    assert.strictEqual(verifyExitCode(result), 2)
+    const check = checkById(result, "tasks:present")
+    assert.strictEqual(check?.status, "unknown", JSON.stringify(result.checks))
+    assert.match(check.detail, /TASKS_MISSING/)
+    ok("T53 empty task list -> UNKNOWN (tasks:present TASKS_MISSING, exit 2)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T54 — C-1: an unsigned final on a signed run is a FAIL.
+  // -------------------------------------------------------------------------
+  {
+    const ctx = await makeRun({ tag: "t54" })
+    await buildComplete(ctx)
+    const path = join(ctx.run, "verify/final.json")
+    const final = readJson(path)
+    delete final._auth
+    writeJson(path, final)
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "FAIL", JSON.stringify(result.reasons))
+    assert.strictEqual(verifyExitCode(result), 1)
+    const check = checkById(result, "final:present")
+    assert.strictEqual(check?.status, "fail", JSON.stringify(result.checks))
+    assert.match(check.detail, /AUTH_MISSING/)
+    assert.strictEqual(checkById(result, "auth:verify/final.json")?.status, "fail")
+    ok("T54 unsigned final on a signed run -> FAIL (final:present AUTH_MISSING, exit 1)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T55 — positive control: the complete run passes every required check.
+  // -------------------------------------------------------------------------
+  {
+    const ctx = await makeRun({ tag: "t55" })
+    await buildComplete(ctx)
+    const result = await verify(ctx)
+    assert.strictEqual(result.verdict, "PASS", JSON.stringify(result.reasons))
+    assert.strictEqual(verifyExitCode(result), 0)
+    for (const id of [
+      "tasks:present",
+      "final:present",
+      "final:status",
+      "report:R1:present",
+      "report:R1:status",
+      "audit:present",
+      "audit:status",
+      "victory:required",
+    ]) {
+      const check = checkById(result, id)
+      assert.strictEqual(check?.status, "pass", `${id}: ${JSON.stringify(result.checks)}`)
+    }
+    ok("T55 complete signed run -> PASS, every required-artifact check passes (exit 0)")
+  }
+
+  // -------------------------------------------------------------------------
+  // T56 — M-1: the rerun projection binds outputSha256, not just byte count.
+  // -------------------------------------------------------------------------
+  {
+    const command = [process.execPath, "-e", "process.stdout.write('ok\\n')"]
+    const output = "ok\n"
+    const check = makeCommandCheck({ command, output })
+    const rerun = rerunEntryFromCheck(check)
+    rerun.outputSha256 = contentSha256Hex("no\n")
+    assert.strictEqual(rerun.outputBytes, Buffer.byteLength(output), "fixture outputs must have equal byte length")
+
+    const tampered = await commandFixture("t56a", { command, output, rerunChecks: [rerun] })
+    const tamperedResult = await verify(tampered.ctx)
+    assert.strictEqual(tamperedResult.verdict, "FAIL", JSON.stringify(tamperedResult.reasons))
+    assert.strictEqual(verifyExitCode(tamperedResult), 1)
+    const link = checkById(tamperedResult, "rerun:R1:link")
+    assert.strictEqual(link?.status, "fail", JSON.stringify(tamperedResult.checks))
+    assert.match(link.detail, /AUTH_STALE/)
+
+    const good = await commandFixture("t56b", { command, output })
+    const goodResult = await verify(good.ctx)
+    assert.strictEqual(
+      checkById(goodResult, "rerun:R1:link")?.status,
+      "pass",
+      JSON.stringify(goodResult.checks),
+    )
+    ok("T56 same argv/exit/bytes but different output digest -> rerun link AUTH_STALE; matching digest passes")
   }
 
   rmSync(TEST_ROOT, { recursive: true, force: true })
