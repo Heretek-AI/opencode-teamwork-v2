@@ -51,30 +51,39 @@ test.skipIf(!LIVE_ENABLED)(
       throw new Error(`Invalid TEAMWORK_LIVE_MAX_USD: ${process.env.TEAMWORK_LIVE_MAX_USD}`)
     }
     const project = createProject("l4-live-fidelity")
-    if (process.env.TEAMWORK_LIVE_CONFIG && existsSync(process.env.TEAMWORK_LIVE_CONFIG)) {
-      const hostCfg = JSON.parse(readFileSync(process.env.TEAMWORK_LIVE_CONFIG, "utf8"))
-      const origWriteConfig = project.writeConfig.bind(project)
-      project.writeConfig = (plugins = []) => {
-        origWriteConfig(plugins)
-        const cfgPath = join(project.configDir, "opencode.json")
-        const base = JSON.parse(readFileSync(cfgPath, "utf8"))
-        const merged = {
-          ...base,
-          ...(hostCfg.providers ? { providers: hostCfg.providers } : {}),
-          model: LIVE_MODEL,
-          agents: {
-            "team/sentinel": { model: LIVE_MODEL },
-            "team/verifier": { model: LIVE_MODEL },
-            "team/victory-auditor": { model: LIVE_MODEL },
-          },
-        }
-        writeFileSync(cfgPath, JSON.stringify(merged, null, 2))
+    if (process.env.TEAMWORK_LIVE_CONFIG) {
+      let hostCfg: Record<string, unknown> | undefined
+      try {
+        hostCfg = JSON.parse(readFileSync(process.env.TEAMWORK_LIVE_CONFIG, "utf8"))
+      } catch {
+        hostCfg = undefined
       }
-      for (const name of ["sentinel.md", "verifier.md", "victory-auditor.md"]) {
-        const agentFile = join(project.configDir, "agents", "team", name)
-        if (existsSync(agentFile)) {
-          const text = readFileSync(agentFile, "utf8").replace(/^model:\s*.+$/m, `model: ${LIVE_MODEL}`)
-          writeFileSync(agentFile, text)
+      if (hostCfg) {
+        const origWriteConfig = project.writeConfig.bind(project)
+        project.writeConfig = (plugins = []) => {
+          origWriteConfig(plugins)
+          const cfgPath = join(project.configDir, "opencode.json")
+          const base = JSON.parse(readFileSync(cfgPath, "utf8"))
+          const merged = {
+            ...base,
+            ...(hostCfg.providers ? { providers: hostCfg.providers } : {}),
+            model: LIVE_MODEL,
+            agents: {
+              "team/sentinel": { model: LIVE_MODEL },
+              "team/verifier": { model: LIVE_MODEL },
+              "team/victory-auditor": { model: LIVE_MODEL },
+            },
+          }
+          writeFileSync(cfgPath, JSON.stringify(merged, null, 2))
+        }
+        for (const name of ["sentinel.md", "verifier.md", "victory-auditor.md"]) {
+          const agentFile = join(project.configDir, "agents", "team", name)
+          try {
+            const text = readFileSync(agentFile, "utf8").replace(/^model:\s*.+$/m, `model: ${LIVE_MODEL}`)
+            writeFileSync(agentFile, text)
+          } catch {
+            // Agent file absent in temp copy; skip.
+          }
         }
       }
     }
