@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.3] - 2026-11-26
+
+### Security
+
+- **Verifier completeness (C-1):** the final verdict now refuses `PASS` when
+  `verify/final.json` is missing or `FAIL`, when any planned task report is
+  missing or `FAIL`, when `verify/security-audit.json` is `FAIL`, when the
+  victory audit is missing or `REJECTED`, or when the plan/state task set is
+  empty. A PASS requires a positive final verdict over a non-empty, fully
+  passing evidence set; the absence of a failing check is not enough.
+- **Central signed-run legacy downgrade (H-1):** a missing `run.manifest.json`,
+  including a dangling-symlink manifest, is refused instead of treated as an
+  unsigned legacy run when the central store records the run nonce/key or any
+  control artifact carries an `_auth` envelope. `allowUnsignedLegacy` cannot
+  downgrade a centrally signed run, and benchmark mode repeats its refusal at
+  completion so a run cannot finish through a weaker path.
+- **`requireWitness` fail-closed (M-4):** at completion, `requireWitness: true`
+  now fails closed (`AUTH_WITNESS_UNVERIFIED`) when no witness public key is
+  configured.
+  An optional witness receipt without a key is still recorded as `unverified`;
+  it no longer satisfies a required witness.
+- **Release-pipeline hardening (C-2):** the publish workflow has no privileged
+  `workflow_dispatch` path, the OIDC job runs no repository script and starts
+  from a clean npm config with an explicit registry, release checks reject a
+  repository `.npmrc` or a `publishConfig` that could redirect registry, access
+  or tag, the prompt `lint` check is unfiltered, and `CODEOWNERS` covers the
+  workflows and release scripts.
+- **CI attestation is experimental:** `attestationPolicy` and `attest.yml` are
+  not a working control until OIDC JWKS verification, commit binding and expiry
+  handling are fixed. `required` may refuse a run, but it must not be treated
+  as independent assurance yet.
+
+### Fixed
+
+- **Re-execution output-digest binding (M-1):** `verify --rerun` now binds each
+  `outputSha256`/`outputBytes` in `verify/rerun.json` to the PASS report check
+  it projects, alongside argv, cwd and expected exit. A divergence is
+  `AUTH_STALE`, so a rerun record cannot select a different expected output
+  from the report it claims to mirror.
+- **Docs truth pass:** corrected the packed-file count to 115, documented the
+  10 required checks with LEMMA/CodeQL/Sonar as advisory or path-filtered,
+  added the post-publish order, tag-tip and manual-publish fallback, and
+  recorded the published advisory plus the 0.19.3 verifier fixes.
+
 ## [0.19.2] - 2026-11-25
 
 ### Security

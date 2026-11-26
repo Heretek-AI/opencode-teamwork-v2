@@ -496,8 +496,10 @@ stored at `auth/witness/<runId>/<relPath>`. The v2 witness request is
 `{v:2, receipt, alg, keyId, sig, at, verified:true, record, recordedAt}`.
 `final_verify` verifies it when `requireWitness` is set: a missing receipt is
 `AUTH_WITNESS_UNAVAILABLE`, a forged/foreign/different-digest record is
-`AUTH_INVALID`. Without a witness public key the receipt is stored with
-`alg:"unverified"`, `verified:false`, and final.json records
+`AUTH_INVALID`, and since 0.19.3 a required witness with no configured witness
+public key fails closed (`AUTH_WITNESS_UNVERIFIED`) instead of accepting an
+unverified receipt. Without a witness public key an optional receipt is stored
+with `alg:"unverified"`, `verified:false`, and final.json records
 `evidence.witness.status: "unverified"` (detection-only).
 
 `teamwork_plan` also records `trustLevel` (`local-hmac` default,
@@ -1907,6 +1909,11 @@ and stamps `evidence.rerunDigest` (keyed digest of the file bytes) into
 `requiredProvenance: "command"`.
 
 ### `verify/ci/attestation.json` — signed CI attestation (0.18.0)
+
+> **Experimental in 0.19.3.** The artifact format and evaluator exist, but CI
+> attestation is not a working control until OIDC JWKS verification, commit
+> binding and expiry handling are fixed. `attestationPolicy: "required"` may
+> refuse a run; it is not independent assurance.
 
 Produced outside the agent's process by `scripts/attest-sign.mjs` under a CI
 principal whose Ed25519 key is distinct from the run's `runKeyId`:

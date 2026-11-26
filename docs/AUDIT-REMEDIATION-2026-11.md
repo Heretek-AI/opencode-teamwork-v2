@@ -394,7 +394,7 @@ fails the gate).
   targets, and a traversal id 3.
 - `node scripts/lint-security-claims.mjs` -> 31 files clean at the 0.19.0
   review, unchanged at 0.19.2.
-- `npm pack --dry-run` -> 108 files at the 0.19.0 review, 110 on the 0.19.2
+- `npm pack --dry-run` -> 108 files at the 0.19.0 review, 115 on the 0.19.2
   release line; 0 dependencies; no `tests/`, `docs/re/`, or `signer/`; the
   parity script ships with the other test scripts.
 
@@ -415,7 +415,7 @@ fails the gate).
   imprecise.
 - Report counts: at the 0.19.0 review `npm pack --dry-run` was 108 files and
   the claim lint saw 31 files because this report, `TEST_INFRA.md` and
-  `TEST_READY.md` were added. The 0.19.2 counts are 110 packed files on the
+  `TEST_READY.md` were added. The 0.19.2 counts are 115 packed files on the
   release line and 31 linted files; §§2 and 5 carry them.
 - `state.json` is unsigned coordinator state. No signature is claimed for the
   ledger itself; the signed artifacts are the manifest, the `_auth`-indexed

@@ -1,0 +1,85 @@
+name: Release dry run
+
+# Unprivileged release rehearsal.
+#
+# This workflow exists so a maintainer can run the release gates without a tag
+# and without the ability to publish. It has `contents: read` only: no
+# `id-token: write`, no environment, no secret and no `npm publish`.
+# `publish.yml` deliberately has no `workflow_dispatch` trigger, so a manual run
+# here can never reach the OIDC-bearing publish job; a tag push remains the only
+# path to the registry.
+#
+# A green run means the commit would pass the `verify` job in `publish.yml`. It
+# is not a release, not a required check, and not proof that an artifact was
+# published.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    name: Release dry run
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0 # full history: the release-tag guard needs origin/main
+          fetch-tags: true
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Release consistency
+        # --require-clean is safe here: this is a fresh checkout before any test
+        # writes, and no artifact is published from this workflow.
+        run: node scripts/check-release-consistency.mjs --require-clean
+
+      - name: L0 parity
+        run: node scripts/test-agy-parity.mjs
+
+      - name: Test
+        run: npm test
+
+      # Guards the npm `files` whitelist: docs/re, tests/ and signer/ must never
+      # ship, and the published package must still contain the shipped docs and
+      # plugin entry.
+      - name: Packaging guard
+        run: |
+          npm pack --dry-run --json > "$RUNNER_TEMP/pack.json"
+          node -e '
+          const fs = require("fs");
+          const p = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/pack.json", "utf8"));
+          const paths = p[0].files.map((f) => f.path);
+          const bad = paths.filter((x) => x === "docs/re" || x.startsWith("docs/re/") || x === "tests" || x.startsWith("tests/") || x === "signer" || x.startsWith("signer/"));
+          const need = ["docs/ARTIFACTS.md", "docs/GUARDRAILS.md", "docs/ADMIN-HARDENING.md", "docs/SIGNER-PROTOCOL.md", "SECURITY.md", "docs/adr/0008-signer-spi-and-trust-levels.md", "docs/adr/0014-verifiable-witness-and-signer-v2.md", "docs/adr/0015-offline-verification.md", "scripts/hardening-check.sh", "plugins/opencode-teamwork/index.ts", "plugins/opencode-teamwork/auth.ts", "plugins/opencode-teamwork/authorize.ts", "plugins/opencode-teamwork/url-guard.mjs", "plugins/opencode-teamwork/strict.ts", "plugins/opencode-teamwork/briefing.ts", "plugins/opencode-teamwork/victory.ts", "plugins/opencode-teamwork/safe-fs.mjs", "lib/verify.mjs", "scripts/test-verify.mjs", "agents/team/victory-auditor.md", "docs/RELEASE-RUNBOOK.md", "scripts/check-release-consistency.mjs", "scripts/test-release-consistency.mjs"];
+          const miss = need.filter((n) => !paths.includes(n));
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const deps = Object.keys(pkg.dependencies ?? {});
+          console.log(`packed files: ${paths.length}`);
+          if (bad.length) console.error("forbidden docs/re or tests paths:\n" + bad.join("\n"));
+          if (miss.length) console.error("missing required paths:\n" + miss.join("\n"));
+          if (deps.length) console.error("root dependencies must stay empty:\n" + deps.join("\n"));
+          process.exit(bad.length + miss.length + deps.length ? 1 : 0);
+          '
+
+      # T4: pack the tarball, install it into a clean project, verify sha256 and
+      # the file whitelist, and load the installed tree through the real host.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Install runtime harness dependencies (T4)
+        working-directory: tests/runtime
+        run: bun install --frozen-lockfile --ignore-scripts
+
+      - name: Packed-tarball install test (T4)
+        run: node scripts/test-packed-tarball.mjs

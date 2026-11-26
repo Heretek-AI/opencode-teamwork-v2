@@ -161,7 +161,7 @@ installer copies that reference to
 
 - `verified_pass` requires a legal lifecycle transition and PASS evidence (an inline PASS verdict or a `PASS` per-task report).
 - A plan writes a signed `run.manifest.json` (the default). Verifier reports, security audit, strict-wave verdicts, victory verdict, and final verdict carry an `_auth` envelope and a `ctx.storage` digest-index entry. `final_verify`/`next` fail as `AUTH_MISSING`, `AUTH_INVALID`, `AUTH_UNKNOWN_KEY`, `AUTH_INDEX_MISSING`, or `AUTH_STALE` when an artifact is forged, copied, edited, or the signed plan/requirements/policy baseline drifts. See [`docs/adr/0005-artifact-authenticity.md`](docs/adr/0005-artifact-authenticity.md).
-- `_auth` supports HMAC-SHA256 (backward-compatible `mac`) and Ed25519 (`sig`). Every new signed run pins a 128-bit `runNonce` and `runKeyId` in the manifest, so a cross-run copy or a rotated re-sign fails. With Ed25519, verification needs only the SPKI public key. `teamwork_plan` also records `trustLevel` (`local-hmac` default, `external-signer`, `human-approved`, `ci-attested`) and optional `requireWitness`; `final_verify` enforces the level, and `OPENCODE_TEAMWORK_SIGNER`/`OPENCODE_TEAMWORK_WITNESS` fail closed (`AUTH_SIGNER_UNAVAILABLE`/`AUTH_WITNESS_UNAVAILABLE`). 0.14.0 signs witness receipts (`OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY`) so a forged KV record is `AUTH_INVALID`, labels a receipt `unverified` without that key, and adds signer protocol v2 plus `opencode-teamwork approve signer` when `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` is set. `human-approved`/`ci-attested` require an Ed25519 approval from `OPENCODE_TEAMWORK_APPROVAL_DIR`, signed by a key distinct from the run key and bound to the **exact bytes of `prompt_draft.md`** plus the run id and a one-use nonce (0.11.0; manifest version 3). The plan verifies it before any `mkdir`, `final_verify` re-hashes the draft, and a re-plan cannot change the binding. The plugin/command signer refuses `approvals/` paths (`AUTH_APPROVAL_SCOPE`). See [`docs/adr/0011-authenticated-prompt-approval.md`](docs/adr/0011-authenticated-prompt-approval.md), [`docs/adr/0008-signer-spi-and-trust-levels.md`](docs/adr/0008-signer-spi-and-trust-levels.md) and [`SECURITY.md`](SECURITY.md).
+- `_auth` supports HMAC-SHA256 (backward-compatible `mac`) and Ed25519 (`sig`). Every new signed run pins a 128-bit `runNonce` and `runKeyId` in the manifest, so a cross-run copy or a rotated re-sign fails. With Ed25519, verification needs only the SPKI public key. `teamwork_plan` also records `trustLevel` (`local-hmac` default, `external-signer`, `human-approved`, `ci-attested`) and optional `requireWitness`; `final_verify` enforces the level, and `OPENCODE_TEAMWORK_SIGNER`/`OPENCODE_TEAMWORK_WITNESS` fail closed (`AUTH_SIGNER_UNAVAILABLE`/`AUTH_WITNESS_UNAVAILABLE`). 0.14.0 signs witness receipts (`OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY`) so a forged KV record is `AUTH_INVALID`, labels an optional receipt `unverified` without that key, and adds signer protocol v2 plus `opencode-teamwork approve signer` when `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` is set; since 0.19.3 a required witness fails closed when no witness key is configured. `human-approved`/`ci-attested` require an Ed25519 approval from `OPENCODE_TEAMWORK_APPROVAL_DIR`, signed by a key distinct from the run key and bound to the **exact bytes of `prompt_draft.md`** plus the run id and a one-use nonce (0.11.0; manifest version 3). The plan verifies it before any `mkdir`, `final_verify` re-hashes the draft, and a re-plan cannot change the binding. The plugin/command signer refuses `approvals/` paths (`AUTH_APPROVAL_SCOPE`). See [`docs/adr/0011-authenticated-prompt-approval.md`](docs/adr/0011-authenticated-prompt-approval.md), [`docs/adr/0008-signer-spi-and-trust-levels.md`](docs/adr/0008-signer-spi-and-trust-levels.md) and [`SECURITY.md`](SECURITY.md).
 - A run completes only with a `PASS` `verify/final.json` stamped by `teamwork_final_verify`; an unstamped report needs the recorded `allowUnstamped` bypass. An unsigned legacy run returns `AUTH_LEGACY` until the recorded `allowUnsignedLegacy` bypass is passed at the completion gate; `benchmark` refuses that bypass, `victoryAudit: "skip"`, and `requireHandoffs: "skip"`.
 - `teamwork_victory_audit`, `teamwork_wave_record`, and `teamwork_report` require the caller session to descend from the plan-time `rootSessionId`, so a top-level `opencode run --agent team/victory-auditor` cannot self-authorize.
 - That PASS also needs a `verify/victory.json` from the independent `team/victory-auditor` reporting `VICTORY CONFIRMED` for every requirement and the current `ORIGINAL_REQUEST.md` hash, unless the plan explicitly recorded `victoryAudit: "skip"` with a non-empty `victorySkipReason` (then `final_verify` records `victory: "SKIPPED (explicit): <reason>"`). A skip without a reason is refused; the legacy no-baseline default is labelled `SKIPPED (legacy default: no requirements baseline)`.
@@ -472,8 +472,12 @@ authenticated manifest and reports.
 A manifest `trustLevel` of `human-approved` or `ci-attested` is reported as
 `trust:approval` / `AUTH_APPROVAL_UNVERIFIED` (`UNKNOWN`), because offline
 verification has no approval enforcement. `requireWitness` without a usable
-receipt is `trust:witness` / `AUTH_WITNESS_UNVERIFIED` (`UNKNOWN`). The JSON
-`trust` object carries `runTrustLevel`, `approval.status` and `witness.status`.
+receipt is `trust:witness` / `AUTH_WITNESS_UNVERIFIED` (`UNKNOWN`) offline. At
+completion, since 0.19.3 `final_verify` fails closed (`AUTH_WITNESS_UNVERIFIED`)
+when `requireWitness: true` has no configured witness public key instead of
+accepting an `unverified` receipt; an optional witness without a key is still
+recorded as `unverified`. The JSON `trust` object carries `runTrustLevel`,
+`approval.status` and `witness.status`.
 
 Since 0.18.0 a plan can set `attestationPolicy: "optional" | "required"`. A CI
 job runs `.github/workflows/attest.yml` (or `scripts/attest-sign.mjs`) under a
@@ -483,8 +487,12 @@ digest. `final_verify` refuses a `required` run without a valid attestation
 (`AUTH_ATTESTATION_MISSING/STALE/UNTRUSTED/COMMIT_MISMATCH/REPLAY`), and `verify`
 reports `attestation.status` plus `attested: true` with
 `--attestation-public-key`; without that key a present attestation is `UNKNOWN`
-(exit 2), never `PASS`. The attestation key must differ from `runKeyId`. See
-[ADR 0018](docs/adr/0018-ci-attestation.md).
+(exit 2), never `PASS`. The attestation key must differ from `runKeyId`.
+
+> **Experimental in 0.19.3.** CI attestation is not a working control until
+> OIDC JWKS verification, commit binding and expiry handling are fixed.
+> `attestationPolicy: "required"` may refuse a run, but it is not independent
+> assurance yet. See [ADR 0018](docs/adr/0018-ci-attestation.md).
 
 The signed `run.manifest.json` is the anchor: its `runNonce`, `runKeyId` and
 algorithm are covered by the envelope, and every other artifact is pinned to
@@ -565,11 +573,16 @@ Tracked in GitHub issues:
 - [#51](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/51) document-review visual audit (per-page PNGs / `view_file`)
 - [#52](https://github.com/Heretek-AI/opencode-teamwork-v2/issues/52) per-dispatch model override
 
-Security and release work in flight for 0.19.2 — tracked in the changelog and
-pull requests rather than a single issue — covers the `verify --rerun` trust
-gate, the `--allow-unsigned` restriction, attestation input validation,
-fail-closed trust/evidence, and the Sonar/packaging checks. The earlier matrix
-(#39, #41–#47) is implemented and closed.
+0.19.2 shipped the critical `verify --rerun`/`--allow-unsigned` false-PASS fix
+recorded in [GHSA-jf59-xgq8-hjmv](https://github.com/Heretek-AI/opencode-teamwork-v2/security/advisories/GHSA-jf59-xgq8-hjmv),
+together with attestation input validation, fail-closed trust/evidence, and the
+Sonar/packaging checks. 0.19.3 adds the verifier-completeness (C-1) and central
+signed-run legacy-downgrade (H-1) fixes, rerun output-digest binding (M-1),
+`requireWitness` fail-closed behavior (M-4), and release-pipeline hardening
+(C-2); CI attestation is explicitly experimental until JWKS, commit and expiry
+handling are fixed. A new advisory is required for the 0.19.2 verifier defects;
+GHSA-jf59-xgq8-hjmv covers the earlier `--rerun` defect and is not reused. The
+earlier matrix (#39, #41–#47) is implemented and closed.
 
 > **Breaking for signed LEMMA, tournament and document-review runs.** Those
 > writers still emit plain JSON/text without `_auth` envelopes, so
@@ -612,9 +625,13 @@ git tag v0.3.0 && git push origin main --tags
 npm config set //registry.npmjs.org/:_authToken=TOKEN
 npm whoami                       # verify
 npm pack                         # inspect the tarball
-npm publish --dry-run
-npm publish --access public
+npm publish --dry-run heretek-ai-opencode-teamwork-v2-<version>.tgz
+npm publish --access public heretek-ai-opencode-teamwork-v2-<version>.tgz
 ```
+
+Publish the packed tarball, not the directory: a directory publish can run
+repository lifecycle code. Release checks reject a repository `.npmrc` and a
+`publishConfig` entry that could redirect the registry, access or tag.
 
 For CI, this repo ships [`.github/workflows/publish.yml`](.github/workflows/publish.yml)
 using **npm Trusted Publishing** (OIDC, no long-lived token). One-time setup:
@@ -641,7 +658,9 @@ using **npm Trusted Publishing** (OIDC, no long-lived token). One-time setup:
 
 Release tags are provenance-checked before publish:
 `scripts/check-release-tag.mjs` requires the tag's commit to be an ancestor of
-`origin/main`. The historical `v0.6.0` and `v0.7.0` tags are sibling release
+`origin/main`. The runbook additionally requires a new release tag to point at
+the current tip of `main`; ancestry alone is not sufficient. The historical
+`v0.6.0` and `v0.7.0` tags are sibling release
 commits with trees identical to their `main` release commits; they predate this
 guard. Every future `v*` tag push must point at a commit already on `main`, and
 published tags are never rewritten.

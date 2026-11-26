@@ -1,19 +1,13 @@
 name: Lint prompts
 
+# No `paths:` filter on purpose. `lint` is a required status check for `main`;
+# a path-filtered workflow does not report the check on a pull request that
+# touches no matching path, which leaves the required check pending forever
+# (the "expected" deadlock). Run it on every push and pull request instead; the
+# linter is Node-only and fast.
 on:
   push:
-    paths:
-      - "agents/**"
-      - "plugins/**"
-      - "docs/**"
-      - "scripts/lint-prompts.mjs"
-      - ".github/workflows/lint-prompts.yml"
   pull_request:
-    paths:
-      - "agents/**"
-      - "plugins/**"
-      - "docs/**"
-      - "scripts/lint-prompts.mjs"
   workflow_dispatch:
 
 permissions:

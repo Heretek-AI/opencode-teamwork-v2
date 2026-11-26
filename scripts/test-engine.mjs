@@ -9283,6 +9283,206 @@ if (args.includes("doctor")) {
       assert(/benchmark mode requires the independent victory audit/.test(benchSkip.content), `benchmark must refuse victoryAudit skip: ${benchSkip.content}`)
     }
 
+    // H-1: deleting the signed baseline must never turn the run into a legacy
+    // run that `allowUnsignedLegacy` can complete.
+    {
+      const runId = "20261123-000018-auth-manifest-deleted"
+      await seedVerifiedRun(runId, ["D1"], { request: "Authenticity deleted manifest fixture.", victoryAudit: "skip" })
+      assert(
+        existsSync(runFile(testDir, runId, "run.manifest.json")),
+        "the fixture must start from a signed run with a manifest",
+      )
+      assert(
+        rootStores.get(testDir).map.get(`auth/run/${runId}/.nonce`),
+        "the fixture must have a storage-recorded run nonce",
+      )
+      rmSync(runFile(testDir, runId, "run.manifest.json"))
+
+      const nextDefault = await registeredTools.teamwork_next.execute({ sessionId: runId })
+      assert.notStrictEqual(nextDefault.status, "ALL_PASSED", "a deleted manifest must not complete")
+      assert.strictEqual(nextDefault.auth, "AUTH_LEGACY", `a storage-recorded nonce must refuse as AUTH_LEGACY: ${nextDefault.content}`)
+      assert(/ctx\.storage records the signed run nonce/.test(nextDefault.content), nextDefault.content)
+      assert(/run\.manifest\.json is missing/.test(nextDefault.content), nextDefault.content)
+
+      const nextBypass = await registeredTools.teamwork_next.execute({ sessionId: runId, allowUnsignedLegacy: true })
+      assert.notStrictEqual(nextBypass.status, "ALL_PASSED", "allowUnsignedLegacy must not bypass a deleted signed manifest")
+      assert(!/(?:^|\n)ALL_PASSED/.test(String(nextBypass.content)), nextBypass.content)
+
+      const fv = await registeredTools.teamwork_final_verify.execute({ sessionId: runId, allowUnsignedLegacy: true })
+      assert.strictEqual(fv.status, "FAIL", `final_verify must refuse a deleted signed manifest: ${fv.content}`)
+      assert.strictEqual(fv.auth, "AUTH_LEGACY", JSON.stringify(fv))
+
+      const report = await registeredTools.teamwork_report.execute(
+        { sessionId: runId, taskId: "D1", status: "PASS", summary: "must not be written" },
+        { sessionID: "ses_fixture_verifier" },
+      )
+      assert(String(report.content).startsWith("refused:"), `report must refuse a deleted signed manifest: ${report.content}`)
+      assert(/AUTH_LEGACY/.test(report.content), report.content)
+      const audit = await registeredTools.teamwork_security_audit.execute(
+        { sessionId: runId, status: "PASS", findings: [] },
+        { sessionID: "ses_fixture_security_auditor" },
+      )
+      assert(String(audit.content).startsWith("refused:"), `security_audit must refuse a deleted signed manifest: ${audit.content}`)
+      assert(/AUTH_LEGACY/.test(audit.content), audit.content)
+
+      const replan = await registeredTools.teamwork_plan.execute({
+        sessionId: runId,
+        topology: "iterative-coding",
+        skipInterview: true,
+        allowUnsignedLegacy: true,
+        victoryAudit: "skip",
+        victorySkipReason: "fixture: deleted-manifest re-plan must refuse",
+        tasks: [{ id: "D1" }],
+      })
+      assert(/run\.manifest\.json is missing/.test(replan.content), `a re-plan must refuse the deleted manifest: ${replan.content}`)
+    }
+
+    // H-1: a dangling-symlink manifest is AUTH_INVALID, not an absent legacy run.
+    {
+      const runId = "20261123-000019-auth-manifest-symlink"
+      await seedVerifiedRun(runId, ["Y1"], { request: "Authenticity dangling manifest fixture.", victoryAudit: "skip" })
+      const manifestFile = runFile(testDir, runId, "run.manifest.json")
+      rmSync(manifestFile)
+      symlinkSync(join(dirname(manifestFile), "missing-manifest-target.json"), manifestFile)
+      const next = await registeredTools.teamwork_next.execute({ sessionId: runId })
+      assert.notStrictEqual(next.status, "ALL_PASSED", "a dangling symlink manifest must not complete")
+      assert.strictEqual(next.auth, "AUTH_INVALID", `a dangling symlink manifest must be AUTH_INVALID: ${next.content}`)
+      const nextBypass = await registeredTools.teamwork_next.execute({ sessionId: runId, allowUnsignedLegacy: true })
+      assert.strictEqual(nextBypass.auth, "AUTH_INVALID", `the legacy bypass must not accept a symlink manifest: ${nextBypass.content}`)
+      const fv = await registeredTools.teamwork_final_verify.execute({ sessionId: runId })
+      assert.strictEqual(fv.status, "FAIL")
+      assert.strictEqual(fv.auth, "AUTH_INVALID", JSON.stringify(fv))
+    }
+
+    // H-1: a signed control artifact without a manifest still proves the run
+    // was signed. The storage markers are cleared and the tools are registered
+    // fresh, so only the `_auth` envelope can identify the run.
+    {
+      const markerRoot = mkdtempSync(join(testDir, "auth-marker-"))
+      try {
+        const markerTools = await makeToolsFor(markerRoot)
+        const markerCtx = { session: { get: async (args) => fixtureSessionGet(args) }, storage: storageFor(markerRoot) }
+        const seedMarker = makeSeedVerifiedRun(markerTools, markerCtx, markerRoot)
+        const runId = "20261123-000020-auth-marker-only"
+        await seedMarker(runId, ["K1"], { victoryAudit: "skip" })
+        const fv = await markerTools.teamwork_final_verify.execute({ sessionId: runId })
+        assert.strictEqual(fv.status, "PASS", `the marker fixture must start from a complete signed run: ${fv.content}`)
+        // Delete the baseline and every storage marker; keep the signed artifacts.
+        rmSync(join(markerRoot, ".opencode", "teamwork", runId, "run.manifest.json"))
+        const store = rootStores.get(markerRoot).map
+        store.delete(`auth/run/${runId}/.nonce`)
+        store.delete(`auth/run/${runId}/.keyid`)
+        const freshTools = await makeToolsFor(markerRoot)
+        const next = await freshTools.teamwork_next.execute({ sessionId: runId })
+        assert.notStrictEqual(next.status, "ALL_PASSED", "a signed-artifact marker without a manifest must not complete")
+        assert.strictEqual(next.auth, "AUTH_INVALID", `a signed artifact without a manifest must refuse: ${next.content}`)
+        assert(/signed _auth envelope/.test(next.content), next.content)
+        const nextBypass = await freshTools.teamwork_next.execute({ sessionId: runId, allowUnsignedLegacy: true })
+        assert.strictEqual(nextBypass.auth, "AUTH_INVALID", `the legacy bypass must not accept a signed marker: ${nextBypass.content}`)
+      } finally {
+        rmSync(markerRoot, { recursive: true, force: true })
+      }
+    }
+
+    // H-1 old behavior: an unsigned legacy run with no storage at all (no key
+    // source, no signed artifacts) remains a legacy run.
+    {
+      const legacyRoot = mkdtempSync(join(testDir, "auth-legacy-nostore-"))
+      try {
+        const legacyTools = {}
+        await registerTeamworkTools(
+          {
+            tool: {
+              transform: async (cb) =>
+                cb({ namespace: () => {}, add: (tool) => registerTool(legacyTools, tool, withFixtureSession) }),
+            },
+            session: { get: async (args) => fixtureSessionGet(args) },
+          },
+          legacyRoot,
+        )
+        const runId = "20261123-000021-auth-legacy-nostore"
+        const planned = await legacyTools.teamwork_plan.execute({
+          sessionId: runId,
+          topology: "iterative-coding",
+          skipInterview: true,
+          allowUnsignedLegacy: true,
+          request: "Genuine pre-authenticity legacy run with no storage.",
+          tasks: [{ id: "G1" }],
+        })
+        assert(String(planned.content).startsWith("Planned"), planned.content)
+        assert(!existsSync(join(legacyRoot, ".opencode", "teamwork", runId, "run.manifest.json")), "a legacy plan writes no manifest")
+        const withoutBypass = await legacyTools.teamwork_next.execute({ sessionId: runId })
+        assert.strictEqual(withoutBypass.status, "AUTH_LEGACY", `a legacy run still needs the recorded bypass: ${withoutBypass.content}`)
+        const withBypass = await legacyTools.teamwork_next.execute({ sessionId: runId, allowUnsignedLegacy: true })
+        assert.strictEqual(withBypass.readyForWorker?.[0]?.id, "G1", `the legacy bypass must keep working: ${withBypass.content}`)
+      } finally {
+        rmSync(legacyRoot, { recursive: true, force: true })
+      }
+    }
+
+    // M-4: a required witness that cannot be verified (no public key) fails
+    // closed with AUTH_WITNESS_UNVERIFIED instead of PASSing as `unverified`.
+    {
+      const witnessRoot = mkdtempSync(join(testDir, "auth-witness-unverified-"))
+      const witnessScriptPath = join(testDir, "witness-fixture.mjs")
+      writeFileSync(
+        witnessScriptPath,
+        `#!/usr/bin/env node
+import { readFileSync } from "node:fs"
+const request = JSON.parse(readFileSync(0, "utf8"))
+process.stdout.write(JSON.stringify({ receipt: "fixture-receipt:" + request.runId + ":" + request.path }))
+`,
+      )
+      chmodSync(witnessScriptPath, 0o755)
+      const savedWitness = process.env.OPENCODE_TEAMWORK_WITNESS
+      try {
+        process.env.OPENCODE_TEAMWORK_WITNESS = `command:${witnessScriptPath}`
+        const witnessTools = await makeToolsFor(witnessRoot)
+        const witnessCtx = { session: { get: async (args) => fixtureSessionGet(args) }, storage: storageFor(witnessRoot) }
+        const seedWitness = makeSeedVerifiedRun(witnessTools, witnessCtx, witnessRoot)
+        const runId = "20261123-000022-auth-witness-unverified"
+        await seedWitness(runId, ["W1"], {
+          request: "RequireWitness without a verify key must fail closed.",
+          victoryAudit: "skip",
+          requireWitness: true,
+        })
+        assert(
+          await storageFor(witnessRoot).get(`auth/witness/${runId}/run.manifest.json`),
+          "the fixture must record a witness receipt",
+        )
+        const fv = await witnessTools.teamwork_final_verify.execute({ sessionId: runId })
+        assert.strictEqual(fv.status, "FAIL", `requireWitness without a verify key must FAIL: ${fv.content}`)
+        assert(
+          fv.reasons.some((r) => r.includes("AUTH_WITNESS_UNVERIFIED")),
+          `an unverifiable required witness must be named: ${JSON.stringify(fv.reasons)}`,
+        )
+        const final = readJsonFile(join(witnessRoot, ".opencode", "teamwork", runId, "verify", "final.json"))
+        assert.strictEqual(final.status, "FAIL")
+        assert.strictEqual(final.evidence?.witness?.status, "unverified")
+        assert.strictEqual(final.evidence?.witness?.failure, "AUTH_WITNESS_UNVERIFIED")
+      } finally {
+        if (savedWitness === undefined) delete process.env.OPENCODE_TEAMWORK_WITNESS
+        else process.env.OPENCODE_TEAMWORK_WITNESS = savedWitness
+        rmSync(witnessRoot, { recursive: true, force: true })
+      }
+    }
+
+    // M-4 / H-1: benchmark runs refuse `allowUnsignedLegacy` on the completion
+    // paths, not only when the plan is created.
+    {
+      const runId = "20261123-000023-auth-bench-bypass"
+      await seedVerifiedRun(runId, ["B1"], {
+        request: "Benchmark bypass must be refused at every stage.",
+        integrityMode: "benchmark",
+      })
+      const next = await registeredTools.teamwork_next.execute({ sessionId: runId, allowUnsignedLegacy: true })
+      assert.strictEqual(next.auth, "AUTH_LEGACY", `next must refuse allowUnsignedLegacy on benchmark: ${next.content}`)
+      assert.notStrictEqual(next.status, "ALL_PASSED", next.content)
+      const fv = await registeredTools.teamwork_final_verify.execute({ sessionId: runId, allowUnsignedLegacy: true })
+      assert.strictEqual(fv.status, "FAIL", `final_verify must refuse allowUnsignedLegacy on benchmark: ${fv.content}`)
+      assert.strictEqual(fv.auth, "AUTH_LEGACY", JSON.stringify(fv))
+    }
+
     // Storage unavailable refuses a signed plan; the env key is a usable override;
     // a malformed key ring fails closed without rotating.
     {
