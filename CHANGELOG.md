@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.1] - 2026-11-26
+
+### Changed
+
+- Live-run prompt and schema polish (from real OpenCode 2.4.2 end-to-end testing):
+  - `agents/team/falsifier.md` and `agents/team/security-auditor.md` now
+    explicitly pass `cites: ["verify/report-<taskId>.json"]` in their
+    `teamwork_wave_record` examples so strict-wave verdicts bind reviewed
+    evidence without `[legacy_unbound_wave]` warnings.
+  - `agents/team/sentinel.md` clarifies not to merge a verified task branch into
+    the base branch before `team/victory-auditor` and `teamwork_final_verify`
+    complete (avoiding premature `report.diffHash` invalidation).
+  - Tightened `teamwork_victory_audit.summary` and `teamwork_wave_record.cites`
+    input schema descriptions in `plugins/opencode-teamwork/tools.ts`.
+
 ## [0.20.0] - 2026-11-26
 
 ### Added

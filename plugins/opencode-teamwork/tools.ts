@@ -12635,7 +12635,11 @@ export async function registerTeamworkTools(ctx: any, root: string) {
             items: { type: "string" },
             description: "Optional. Up to 50 concrete gaps found during the audit.",
           },
-          summary: { type: "string", description: "Optional. The auditor's prose (max 2000 chars)." },
+          summary: {
+            type: "string",
+            description:
+              "Auditor report prose (max 2000 chars). Include the 3-phase `=== VICTORY AUDIT REPORT ===` block (PHASE A — TIMELINE, PHASE B — INTEGRITY CHECK, PHASE C — INDEPENDENT TEST EXECUTION).",
+          },
         },
         required: ["verdict", "requirements"],
         additionalProperties: false,
@@ -12703,7 +12707,7 @@ export async function registerTeamworkTools(ctx: any, root: string) {
           cites: {
             type: "array",
             description:
-              "Optional verify/ evidence paths this verdict reviewed (max 16). The engine hashes each file; a missing file refuses the call and a changed/missing cite makes the verdict stale.",
+              "verify/ evidence paths this verdict reviewed (max 16) — always include `verify/report-<taskId>.json` (plus any `verify/evidence/*` files) to bind the verdict without legacy-unbound warnings. The engine hashes each file; a missing file refuses the call and a changed/missing cite makes the verdict stale.",
             items: { type: "string" },
           },
         },
