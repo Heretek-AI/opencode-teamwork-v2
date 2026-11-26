@@ -16,6 +16,22 @@ verification from bytes and a public key is specified in
 command evidence is specified in
 [ADR 0016](docs/adr/0016-re-executable-verification.md).
 
+## Reporting a vulnerability
+
+Report suspected vulnerabilities privately through GitHub Security Advisories:
+<https://github.com/Heretek-AI/opencode-teamwork-v2/security/advisories/new>.
+Do not open a public issue for an unpatched vulnerability.
+
+The published advisory for the `verify --rerun`/`--allow-unsigned` false-PASS
+defect fixed in 0.19.2 is
+[GHSA-jf59-xgq8-hjmv](https://github.com/Heretek-AI/opencode-teamwork-v2/security/advisories/GHSA-jf59-xgq8-hjmv)
+(critical; affected `<= 0.18.1`, patched `0.19.2`).
+
+The verifier-completeness (C-1) and central signed-run legacy-downgrade (H-1)
+defects affect 0.19.2 and are fixed in 0.19.3. They require a new advisory:
+GHSA-jf59-xgq8-hjmv does not cover them, and no replacement ID is assigned in
+this document.
+
 ## What is protected
 
 Control-plane artifacts — `run.manifest.json`, `verify/report-<task>.json`,
@@ -213,6 +229,11 @@ semantics.
 
 ### CI attestation (`attestationPolicy`, 0.18.0)
 
+> **Experimental in 0.19.3.** CI attestation is not a working control until
+> OIDC JWKS verification, commit binding and expiry handling are fixed. The
+> `required` policy may refuse a run, but the attestation must not be treated
+> as independent assurance yet.
+
 `attestationPolicy` (`off` | `optional` | `required`, default `off`) is a
 separate, post-plan requirement. A CI job holding an Ed25519 key the run does
 not have signs `verify/ci/attestation.json` over the run nonce, plan hash,
@@ -257,16 +278,20 @@ the default is used.
    signed write and checked by `final_verify` (`AUTH_WITNESS_UNAVAILABLE` when
    required and missing). Configure `OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY` to
    make the receipt a signature over `(runId, path, digest, nonce, at)`: a
-   forged KV receipt is then `AUTH_INVALID` instead of accepted. Without that
-   public key the receipt is recorded and labelled `unverified` in
-   `verify/final.json`; a local file/command witness is detection-only and
-   shares the same UID either way.
+   forged KV receipt is then `AUTH_INVALID` instead of accepted. An optional
+   receipt without that key is recorded and labelled `unverified` in
+   `verify/final.json`; since 0.19.3 `requireWitness: true` fails closed
+   (`AUTH_WITNESS_UNVERIFIED`) when no witness public key is configured, so an
+   unverified receipt cannot satisfy a required witness. A local file/command
+   witness is detection-only and shares the same UID either way.
 5. **You need an observer outside the agent's process.** Run
    `.github/workflows/attest.yml` (or `scripts/attest-sign.mjs`) under a CI
    principal, set `attestationPolicy: "required"`, and give the verifier only
-   `OPENCODE_TEAMWORK_ATTESTATION_PUBLIC_KEY`. The attestation binds the signed
-   plan, the report's commit and the command outputs to a key the run does not
-   hold. It is only a boundary when the agent's UID cannot read the CI key.
+   `OPENCODE_TEAMWORK_ATTESTATION_PUBLIC_KEY`. The attestation is intended to
+   bind the signed plan, the report's commit and the command outputs to a key
+   the run does not hold, but it is **experimental** in 0.19.3: JWKS
+   verification, commit binding and expiry handling are not fixed, so it is not
+   yet a working control and not independent assurance.
 
 The hardened profile is an administrator/deployment change (a system service,
 separate UID, SELinux labels, or a remote approver). The plugin cannot create
@@ -357,8 +382,9 @@ signer's policy is outside the plugin.
   plugin storage. A same-UID writer can rewrite them; the witness is the
   optional cross-check. A witness receipt is only `verified` when a witness
   public key is configured and its signature covers the run, path, digest,
-  nonce and signed time. Without that key it is `unverified` (detection-only),
-  and a local witness shares the UID.
+  nonce and signed time. Without that key an optional receipt is `unverified`
+  (detection-only) and cannot satisfy `requireWitness: true`, which fails
+  closed in 0.19.3; a local witness shares the UID.
 - **Approval artifact.** `approvals/<runId>.json` is verified with the
   configured approval key. The plugin refuses to sign an `approvals/` path, and
   0.11.0 requires an Ed25519 approver key distinct from `runKeyId` and an

@@ -18,7 +18,7 @@ is the first execution evidence for that wiring.
 | Full runtime L1–L3 | `cd tests/runtime && bun test --timeout 30000` | local host with `opencode` 2.4.1 on `PATH`: **118 pass, 1 skip (L4 live), 0 fail**. Intended CI gate: same **118/1/0**, asserted by `runtime-l1` after installing `@opencode/cli@2.4.1`; a run without a usable host is 117 pass, 2 skip (process E2E, L4 live) and fails that gate |
 | L0 repository suite | `npm test` | all L0 suites (17 at 0.19.2; the release-consistency self-test is one), exit 0 |
 | Rust signer | `cargo test --manifest-path signer/Cargo.toml` | 5/5 |
-| Packaging | `npm pack --dry-run` | 115 files on the 0.19.2 release line (`lib/oidc-fetch.mjs` and the two attestation-input scripts add three; `scripts/check-release-consistency.mjs`, `scripts/test-release-consistency.mjs` and `docs/RELEASE-RUNBOOK.md` add three), 0 dependencies, no `tests/`, `docs/re/`, or `signer/`; the parity script ships with the other test scripts |
+| Packaging | `npm pack --dry-run` | 115 files on the 0.19.3 release line (unchanged from 0.19.2; `lib/oidc-fetch.mjs` and the two attestation-input scripts add three, and `scripts/check-release-consistency.mjs`, `scripts/test-release-consistency.mjs` and `docs/RELEASE-RUNBOOK.md` add three), 0 dependencies, no `tests/`, `docs/re/`, or `signer/`; the parity script ships with the other test scripts |
 
 ## CI gates added for the 0.19.2 release line
 

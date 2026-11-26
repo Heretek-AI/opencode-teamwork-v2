@@ -119,8 +119,10 @@ rather than being treated as local.
   and are not enforced by the plugin. **0.14.0 witness and signer v2:** a
   witness receipt is `verified` only when `OPENCODE_TEAMWORK_WITNESS_PUBLIC_KEY`
   is configured and the receipt signature covers the run, path, digest, nonce
-  and signed time; otherwise it is `unverified` and detection-only. A forged KV
-  receipt is `AUTH_INVALID`, not a pass. When
+  and signed time; otherwise an optional receipt is `unverified` and
+  detection-only, and cannot satisfy `requireWitness: true` (0.19.3 fails
+  closed when no witness key is configured). A forged KV receipt is
+  `AUTH_INVALID`, not a pass. When
   `OPENCODE_TEAMWORK_SIGNER_APPROVAL_DIR` is set the plugin sends a v2 request
   with the derived `approvalRef`, but it does not read the approval: the
   signer's policy remains outside the plugin; the Rust reference signer in
