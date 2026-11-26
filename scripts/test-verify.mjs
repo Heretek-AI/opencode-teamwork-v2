@@ -2634,6 +2634,77 @@ async function main() {
     ok("T56 same argv/exit/bytes but different output digest -> rerun link AUTH_STALE; matching digest passes")
   }
 
+  // -------------------------------------------------------------------------
+  // T57 — Document-review PDF visual audit completeness gate (Issue #51).
+  // -------------------------------------------------------------------------
+  {
+    const makeVisualFixture = async (name, mode) => {
+      const ctx = await makeRun({ tag: name })
+      await buildComplete(ctx)
+      const docDir = join(ctx.run, "document-review")
+      const pageDir = join(docDir, "page_images")
+      mkdirSync(pageDir, { recursive: true })
+      const pageSha = contentSha256Hex("png-bytes-1")
+      writeFileSync(
+        join(docDir, "manifest.json"),
+        JSON.stringify({ version: 1, format: "pdf", pageImageStatus: "rendered", segments: [{ id: "seg-01" }] }),
+      )
+      writeFileSync(
+        join(pageDir, "manifest.json"),
+        JSON.stringify({
+          version: 1,
+          dpi: 200,
+          pageCount: 1,
+          renderedPages: 1,
+          truncated: false,
+          totalBytes: 11,
+          pages: [{ page: 1, file: "page-1.png", width: 100, height: 100, bytes: 11, sha256: pageSha }],
+        }),
+      )
+      if (mode === "pass") {
+        writeFileSync(
+          join(docDir, "visual-audit.json"),
+          JSON.stringify({
+            version: 1,
+            scope: "run",
+            verdict: "PASS",
+            summary: "Verified page 1.",
+            inspectedImages: [{ file: "page-1.png", page: 1, sha256: pageSha }],
+          }),
+        )
+      } else if (mode === "stale") {
+        writeFileSync(
+          join(docDir, "visual-audit.json"),
+          JSON.stringify({
+            version: 1,
+            scope: "run",
+            verdict: "PASS",
+            summary: "Tampered digest.",
+            inspectedImages: [{ file: "page-1.png", page: 1, sha256: "0".repeat(64) }],
+          }),
+        )
+      }
+      return ctx
+    }
+
+    const missingRes = await verify(await makeVisualFixture("t57a", "missing"))
+    assert.strictEqual(missingRes.verdict, "FAIL")
+    const missingCheck = checkById(missingRes, "document-review:visualAudit")
+    assert.strictEqual(missingCheck?.status, "fail")
+    assert.match(missingCheck?.detail ?? "", /VISUAL_AUDIT_MISSING/)
+
+    const staleRes = await verify(await makeVisualFixture("t57b", "stale"))
+    assert.strictEqual(staleRes.verdict, "FAIL")
+    const staleCheck = checkById(staleRes, "document-review:visualAudit")
+    assert.strictEqual(staleCheck?.status, "fail")
+    assert.match(staleCheck?.detail ?? "", /VISUAL_AUDIT_STALE/)
+
+    const passRes = await verify(await makeVisualFixture("t57c", "pass"))
+    assert.strictEqual(passRes.verdict, "PASS", JSON.stringify(passRes.reasons))
+    assert.strictEqual(checkById(passRes, "document-review:visualAudit")?.status, "pass")
+    ok("T57 rendered PDF visual-audit gate: missing -> VISUAL_AUDIT_MISSING, stale -> VISUAL_AUDIT_STALE, valid -> PASS")
+  }
+
   rmSync(TEST_ROOT, { recursive: true, force: true })
   console.log(`\n${passed} verify tests passed`)
 }

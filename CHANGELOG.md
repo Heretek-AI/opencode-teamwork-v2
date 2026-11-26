@@ -22,6 +22,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (`document-review/visual-audit.json`) verdicts citing verified page images
     from `page_images/manifest.json` (or `NOT_EVALUATED` on text-only / non-PDF
     runs).
+  - Enforced rendered-PDF visual-audit completeness (`document-review/visual-audit.json`
+    `PASS` with manifest-matching image digests) in both `teamwork_final_verify`
+    and the standalone CLI verifier `lib/verify.mjs` (`VISUAL_AUDIT_MISSING` /
+    `VISUAL_AUDIT_FAILED` / `VISUAL_AUDIT_STALE`).
   - Updated `agents/team/segment-reviewer.md`, `agents/team/victory-auditor.md`,
     `docs/ARTIFACTS.md`, and the 27-tool catalog goldens.
 
