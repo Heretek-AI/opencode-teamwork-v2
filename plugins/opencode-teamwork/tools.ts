@@ -4575,22 +4575,30 @@ function signedControlArtifactPaths(run: string): string[] {
  * must not be able to downgrade it into an unsigned legacy run. Only a run with
  * no such evidence is a genuine pre-authenticity legacy run.
  */
+async function signedRunStorageMarker(
+  runId: string,
+  auth: AuthContext,
+): Promise<{ code: "AUTH_LEGACY"; reason: string } | undefined> {
+  let nonce: string | undefined
+  try {
+    nonce = await auth.runNonce(runId)
+  } catch {}
+  if (nonce) return { code: "AUTH_LEGACY", reason: "ctx.storage records the signed run nonce" }
+  let keyId: string | undefined
+  try {
+    keyId = await auth.runKeyId(runId)
+  } catch {}
+  if (keyId) return { code: "AUTH_LEGACY", reason: `ctx.storage records the signed run key id ${clean(keyId, 96)}` }
+  return undefined
+}
+
 async function signedRunWithoutManifest(
   run: string,
   auth?: AuthContext,
 ): Promise<{ code: "AUTH_LEGACY" | "AUTH_INVALID"; reason: string } | undefined> {
   if (auth) {
-    const runId = basename(run)
-    let nonce: string | undefined
-    let keyId: string | undefined
-    try {
-      nonce = await auth.runNonce(runId)
-    } catch {}
-    try {
-      keyId = nonce ? undefined : await auth.runKeyId(runId)
-    } catch {}
-    if (nonce) return { code: "AUTH_LEGACY", reason: "ctx.storage records the signed run nonce" }
-    if (keyId) return { code: "AUTH_LEGACY", reason: `ctx.storage records the signed run key id ${clean(keyId, 96)}` }
+    const marker = await signedRunStorageMarker(basename(run), auth)
+    if (marker) return marker
   }
   for (const relPath of signedControlArtifactPaths(run)) {
     const res = readRegularJson<any>(run, join(run, relPath))
@@ -4652,16 +4660,15 @@ async function readRunManifest(run: string, auth?: AuthContext): Promise<Manifes
   if (!res.ok) {
     // The lstat above already established a regular file, so a "missing" here
     // is a deletion race: fail closed instead of falling back to legacy.
-    return {
-      ok: false,
-      failure: {
-        code: "AUTH_INVALID",
-        message:
-          res.reason === "missing"
-            ? "run.manifest.json disappeared between inspection and read"
-            : `run.manifest.json is ${res.reason === "symlink" ? "a symlink" : "unreadable or malformed"}`,
-      },
+    let message: string
+    if (res.reason === "missing") {
+      message = "run.manifest.json disappeared between inspection and read"
+    } else if (res.reason === "symlink") {
+      message = "run.manifest.json is a symlink"
+    } else {
+      message = "run.manifest.json is unreadable or malformed"
     }
+    return { ok: false, failure: { code: "AUTH_INVALID", message } }
   }
   const value = res.data
   if (

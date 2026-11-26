@@ -167,15 +167,15 @@ export function checkReleaseConsistency(options = {}) {
     if (pkgFile === null) continue // read/parse error already recorded
     const keys = publishConfigKeys(pkgFile)
     const forbidden = keys.filter((key) => !ALLOWED_PUBLISH_CONFIG_KEYS.has(key))
-    record(
-      `publishConfig (${relativePath})`,
-      forbidden.length === 0,
-      forbidden.length === 0
-        ? keys.length === 0
-          ? "absent"
-          : 'only "access" is set'
-        : `forbidden key(s) ${forbidden.map((key) => JSON.stringify(key)).join(", ")}; only "access" is allowed because registry/tag/provenance in the tarball can redirect or weaken npm publish. Pass --registry and --tag on the publish command line instead.`,
-    )
+    let detail
+    if (forbidden.length > 0) {
+      detail = `forbidden key(s) ${forbidden.map((key) => JSON.stringify(key)).join(", ")}; only "access" is allowed because registry/tag/provenance in the tarball can redirect or weaken npm publish. Pass --registry and --tag on the publish command line instead.`
+    } else if (keys.length === 0) {
+      detail = "absent"
+    } else {
+      detail = 'only "access" is set'
+    }
+    record(`publishConfig (${relativePath})`, forbidden.length === 0, detail)
   }
 
   if (env.GITHUB_REF_TYPE === "tag") {

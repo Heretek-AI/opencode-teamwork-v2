@@ -342,10 +342,10 @@ jobs:
           const fs = require("fs");
           const path = require("path");
           const pkg = JSON.parse(fs.readFileSync(path.join(process.env.GITHUB_WORKSPACE, "package.json"), "utf8"));
-          const expected = `v${pkg.version}`;
+          const expected = "v" + pkg.version;
           const actual = process.env.GITHUB_REF_NAME;
           if (actual !== expected) {
-            console.error(`refusing to publish: tag ${actual} does not match package.json ${expected}`);
+            console.error("refusing to publish: tag " + actual + " does not match package.json " + expected);
             process.exit(1);
           }
           // Privileged copy of the consistency rule: npm applies the tarball
@@ -359,7 +359,7 @@ jobs:
             }
             const forbidden = Object.keys(publishConfig).filter((key) => key !== "access");
             if (forbidden.length > 0) {
-              console.error(`refusing to publish: publishConfig has forbidden key(s) ${forbidden.join(", ")}; only "access" is allowed`);
+              console.error("refusing to publish: publishConfig has forbidden key(s) " + forbidden.join(", ") + '; only "access" is allowed');
               process.exit(1);
             }
           }

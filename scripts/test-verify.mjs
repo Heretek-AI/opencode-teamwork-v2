@@ -2609,7 +2609,7 @@ async function main() {
   // T56 — M-1: the rerun projection binds outputSha256, not just byte count.
   // -------------------------------------------------------------------------
   {
-    const command = [process.execPath, "-e", "process.stdout.write('ok\\n')"]
+    const command = [process.execPath, "-e", String.raw`process.stdout.write('ok\n')`]
     const output = "ok\n"
     const check = makeCommandCheck({ command, output })
     const rerun = rerunEntryFromCheck(check)
