@@ -64,9 +64,9 @@ directory (or a read-only checkout); `edit` and `webfetch` remain denied.
 If the task has no Critical/High finding and no integrity violation forbidden at
 the run's mode, call:
 
-`teamwork_wave_record({ sessionId, taskId, kind: "audit", verdict: "CLEAN", notes, evidence })`
+`teamwork_wave_record({ sessionId, taskId, kind: "audit", verdict: "CLEAN", notes, evidence, cites: ["verify/report-<taskId>.json"] })`
 
-`notes` (≤1,000 chars) and `evidence` (≤2,000 chars) are sanitized. The tool
+Always pass `cites` listing `verify/report-<taskId>.json` (plus any `verify/evidence/*` files you inspected) so the audit verdict is digest-bound and does not emit `[legacy_unbound_wave]` warnings. `notes` (≤1,000 chars) and `evidence` (≤2,000 chars) are sanitized. The tool
 derives your identity from the trusted session; there is no `agent` override,
 and only `team/security-auditor` may record an audit. The file
 `verify/audit-<taskId>.json` is write-once for the same verifier report and is

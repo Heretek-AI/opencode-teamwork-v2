@@ -84,9 +84,9 @@ challenge an already verifier-PASSed task. Read
 `verify/report-<taskId>.json` and the diff/artifacts it cites, then attack it
 again. If you find no FATAL or SERIOUS flaw, call:
 
-`teamwork_wave_record({ sessionId, taskId, kind: "challenge", verdict: "PASS", notes, evidence })`
+`teamwork_wave_record({ sessionId, taskId, kind: "challenge", verdict: "PASS", notes, evidence, cites: ["verify/report-<taskId>.json"] })`
 
-`notes` (≤1,000 chars) and `evidence` (≤2,000 chars) are sanitized. The tool
+Always pass `cites` listing `verify/report-<taskId>.json` (plus any `verify/evidence/*` files you inspected) so the challenge verdict is digest-bound and does not emit `[legacy_unbound_wave]` warnings. `notes` (≤1,000 chars) and `evidence` (≤2,000 chars) are sanitized. The tool
 derives your identity from the trusted session; there is no `agent` override,
 and only `team/falsifier` may record a challenge. The file
 `verify/challenge-<taskId>.json` is write-once for the same verifier report and
