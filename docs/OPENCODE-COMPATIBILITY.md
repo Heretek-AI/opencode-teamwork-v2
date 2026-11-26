@@ -15,7 +15,7 @@ implementation departs from them, and how the departure is tested.
 `/home/john/Projects/opencode`. Package version and commit are OBSERVED
 (`package.json:5`; `git log -1` in the clone). **Audited plugin (historical):**
 this checkout at `main` `6340f64` (`package.json` version `0.16.0`). The
-current tree is version 0.19.2; its runtime evidence is recorded in
+current tree is version 0.19.3; the 0.19.2 runtime evidence is recorded in
 [`TEST_READY.md`](TEST_READY.md).
 
 **Evidence labels.** Every claim below is marked:

@@ -1,6 +1,7 @@
 # ADR 0018: CI Attestation and the Second Principal
 
-- **Status:** Accepted (0.18.0)
+- **Status:** Accepted (0.18.0); experimental in 0.19.3 — not a working control
+  until OIDC JWKS verification, commit binding and expiry handling are fixed
 - **Date:** 2026-11-24
 - **Scope:** `plugins/opencode-teamwork/attestation.mjs`,
   `plugins/opencode-teamwork/{auth.ts,approval-format.mjs,tools.ts}`,

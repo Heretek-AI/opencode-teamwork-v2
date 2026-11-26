@@ -111,9 +111,11 @@ bun run test                              # L1-L3 against the real OpenCode 2.4.
 
 Open GitHub issues: #38 (L4 live-model suite), #40 (admin hardening applied on a
 real host), #48 (remaining Document Review/PDF corpus), #51 (document-review
-visual audit) and #52 (per-dispatch model override). The 0.19.2
-security/release work — verify re-run trust gate, `--allow-unsigned`
-restriction, attestation input validation, fail-closed trust/evidence, and the
-Sonar/packaging checks — is tracked in the changelog and pull requests. The
-host-drift, NFS, containment-incident, signer, OIDC, strict-input,
+visual audit) and #52 (per-dispatch model override). The 0.19.3 security/release
+work — verifier completeness (C-1), rerun output-digest binding (M-1), central
+signed-run legacy downgrade (H-1), `requireWitness` fail-closed (M-4),
+release-pipeline hardening (C-2), and the experimental CI-attestation warning —
+is tracked in the changelog and pull requests. The 0.19.2 advisory/false-PASS
+fix is GHSA-jf59-xgq8-hjmv; a new advisory is required for the 0.19.2 verifier
+defects. The host-drift, NFS, containment-incident, signer, OIDC, strict-input,
 packed-tarball and process-E2E items (#39, #41–#47) are implemented and closed.
