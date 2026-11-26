@@ -38,7 +38,7 @@ const URL_FETCH_TIMEOUT_MS = 3000
 const MAX_PDF_INFLATE_BYTES = 4 * 1024 * 1024
 
 export const SEGMENT_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/
-const PAGE_IMAGE_NAME = /^page-[1-9][0-9]{0,3}\.png$/
+const PAGE_IMAGE_NAME = /^page-[1-9]\d{0,3}\.png$/
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 const DEFAULT_PDF_RENDER_DPI = 200
 const MIN_PDF_RENDER_DPI = 72
@@ -1740,8 +1740,7 @@ export function ingestPdfWithPython(
   const jsonLine = stdout
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter(Boolean)
-    .pop()
+    .findLast(Boolean)
   let parsed: any
   try {
     parsed = JSON.parse(jsonLine ?? "")
@@ -1948,8 +1947,7 @@ export function renderPdfPageImages(
   const jsonLine = stdout
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter(Boolean)
-    .pop()
+    .findLast(Boolean)
   let parsed: any
   try {
     parsed = JSON.parse(jsonLine ?? "")
