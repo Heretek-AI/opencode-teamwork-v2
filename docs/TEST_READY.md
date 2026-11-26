@@ -1,34 +1,35 @@
 # Test readiness — audit remediation and `agy` parity
 
-Status: **READY** (2026-11-25)
+Status: **READY** (2026-11-26)
 
 The dual-track E2E suite described in [`TEST_INFRA.md`](TEST_INFRA.md) is green
-on the 0.19.x branch line, on top of OpenCode 2.4.1. Counts below are labelled
-by where they were recorded; the 0.19.x evidence is the last full local run.
+on the **0.20.0** release line, on top of OpenCode 2.4.1 (27 `teamwork_*` tools,
+7 commands, 15 agents). Counts below are labelled by where they were recorded;
+the 0.20.0 evidence is the latest full local and CI run.
 The `runtime-l1` CI job installs the pinned `@opencode/cli@2.4.1` and requires
-the process E2E to run (see the CI gates section below); the hosted Actions run
-is the first execution evidence for that wiring.
+the process E2E to run (see the CI gates section below).
 
 ## Last recorded run
 
 | Layer | Command | Result |
 | --- | --- | --- |
-| L0 parity/regression | `npm run test:agy-parity` | **153/153** (T1 66, T2 65, T3 15, T4 7) |
-| Runtime parity | `cd tests/runtime && bun test --timeout 30000 spec/agy-parity.test.ts` | **62/62**, 0 fail |
-| Full runtime L1–L3 | `cd tests/runtime && bun test --timeout 30000` | local host with `opencode` 2.4.1 on `PATH`: **118 pass, 1 skip (L4 live), 0 fail**. Intended CI gate: same **118/1/0**, asserted by `runtime-l1` after installing `@opencode/cli@2.4.1`; a run without a usable host is 117 pass, 2 skip (process E2E, L4 live) and fails that gate |
-| L0 repository suite | `npm test` | all L0 suites (17 at 0.19.2; the release-consistency self-test is one), exit 0 |
+| L0 parity/regression | `npm run test:agy-parity` | **156/156** (including `#51` PDF visual audit) |
+| Runtime parity | `cd tests/runtime && bun test --timeout 30000 spec/agy-parity.test.ts` | **63/63**, 0 fail |
+| Full runtime L1–L3 | `cd tests/runtime && bun test --timeout 30000` | local host and CI (`runtime-l1` with `@opencode/cli@2.4.1`): **119 pass, 1 skip (L4 live), 0 fail**; a run without a usable host is 118 pass, 2 skip (process E2E, L4 live) and fails that gate |
+| L4 live-model prompt fidelity | `TEAMWORK_LIVE=1 TEAMWORK_LIVE_MODEL=opencode/deepseek-v4.1-flash-free bun test live/l4-live.test.ts` | **1 pass, 0 fail** (opt-in; logged in `docs/re/antigravity-teamwork/live-l4-log.jsonl`) |
+| L0 repository suite | `npm test` | all 17 L0 suites (27 tools, 57 verify tests, 34 release-consistency tests, 32 security-linted files), exit 0 |
 | Rust signer | `cargo test --manifest-path signer/Cargo.toml` | 5/5 |
-| Packaging | `npm pack --dry-run` | 115 files on the 0.19.4 release line (unchanged from 0.19.2; `lib/oidc-fetch.mjs` and the two attestation-input scripts add three, and `scripts/check-release-consistency.mjs`, `scripts/test-release-consistency.mjs` and `docs/RELEASE-RUNBOOK.md` add three), 0 dependencies, no `tests/`, `docs/re/`, or `signer/`; the parity script ships with the other test scripts |
+| Packaging | `npm pack --dry-run` | 115 files on the 0.20.0 release line, 0 dependencies, no `tests/`, `docs/re/`, or `signer/`; the parity script ships with the other test scripts |
 
-## CI gates added for the 0.19.2 release line
+## CI gates on the 0.20.0 release line
 
 `ci.yml` keeps the gates distinct so a failure names the contract it broke:
 
 | Check | What it runs | Why it is separate |
 | --- | --- | --- |
 | `test (22)`, `test (24)` | `npm test`, packaging whitelist guard | L0 engine/catalog/verifier suites on both supported Node versions |
-| `runtime-l1` | `bun test --timeout 30000` after installing `@opencode/cli@2.4.1` | Full L1–L3 plus the real-host process E2E; asserts `118 pass, 1 skip, 0 fail` and requires the `[process-e2e]` marker |
-| `l0-parity` | `node scripts/test-agy-parity.mjs` | 153-case parity/audit suite is not part of `npm test` |
+| `runtime-l1` | `bun test --timeout 30000` after installing `@opencode/cli@2.4.1` | Full L1–L3 plus the real-host process E2E; asserts `119 pass, 1 skip, 0 fail` and requires the `[process-e2e]` marker |
+| `l0-parity` | `node scripts/test-agy-parity.mjs` | 156-case parity/audit suite is not part of `npm test` |
 | `pack-t4` | `node scripts/test-packed-tarball.mjs` after `bun install` in `tests/runtime` | Packed-tarball install and load; see the T4 boundary below |
 | `release-consistency` | `node scripts/check-release-consistency.mjs` | Root/plugin version, changelog heading, `v<version>` on tag builds |
 | `lint` | `node scripts/lint-prompts.mjs` | Prompt/agent contract |

@@ -15,9 +15,12 @@ the items left unresolved. It also records the independent five-surface rubric.
 **Count discipline.** This is a historical remediation record, and its numbers
 move with the release. Sections 2 and 5 carry the 0.19.1/0.19.2 counts;
 §8's rubric notes are the 0.19.0 review record and say so in place. The current
-run record is [`TEST_READY.md`](TEST_READY.md). In particular, `152` L0 cases,
-`61` runtime parity specs and `113 pass + 1 skip` describe the 0.19.0 review, not
-the current tree (`153`, `62`, and the `runtime-l1` gate of 118 pass + 1 skip).
+run record is [`TEST_READY.md`](TEST_READY.md). On the **0.20.0** release line,
+PRs #60 and #61 closed `#51` (27th tool `teamwork_document_visual_audit` +
+rendered-PDF verifier gate), `#52` (documented host boundary), and `#38` (L4
+live-model run), bringing the current tree to **27 tools**, **156** L0 parity
+cases, **63** runtime parity specs, **57** verifier tests, and the `runtime-l1`
+gate of **119 pass + 1 skip**.
 
 ## 1. Method
 
