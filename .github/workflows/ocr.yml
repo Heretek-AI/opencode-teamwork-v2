@@ -37,6 +37,6 @@ permissions:
 
 jobs:
   review:
-    uses: Heretek-AI/.github/.github/workflows/ocr-review.yml@a560a6e0478f0767de3262fdc1645bc3d86d86e0 # main
+    uses: Heretek-AI/.github/.github/workflows/ocr-review.yml@20dcb70d58eda458ac8b48721d184da2abe241f7 # main
     secrets:
       OCR_LLM_TOKEN: ${{ secrets.OCR_LLM_TOKEN }}
